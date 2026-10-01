@@ -1,0 +1,26 @@
+# render — render every mermaid block in every note of the v4 vault (pinned mermaid 11.17.2,
+# playwright 1.62.1, cached chromium). The verification runs the plant control, which must FAIL
+# with exit 1 and print control=tripped.
+name = "render"
+purpose = "Render all vault mermaid blocks in headless chromium; render_fail must be 0"
+cwd = "/var/home/Louranicas/herdr-engineering-engine-v4"
+
+[[precondition]]
+check = "test -d '/var/mnt/STORAGE-10TB/fedora-obsidian-vaults/herdr-engineering-engine-v4.vault' && echo mounted"
+expect = "mounted"
+message = "the v4 vault is not mounted"
+
+[[precondition]]
+check = "test -f ~/.cache/hee4-render/node_modules/playwright/package.json && test -d ~/.cache/ms-playwright/chromium-1234 && echo render_setup"
+expect = "render_setup"
+message = "render modules or the cached chromium-1234 are absent: see ops/checks/render/README.md"
+
+[[step]]
+name = "render"
+just = "render"
+expect = "render verdict=PASS render_fail=0"
+
+[verify]
+just = "render plant"
+expect_rc = 1
+contains = "control=tripped"

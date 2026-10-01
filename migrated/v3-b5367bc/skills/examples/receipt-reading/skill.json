@@ -1,0 +1,37 @@
+{
+  "schema": "hee3.skills.skill.v1",
+  "skill_id": "receipt-reading",
+  "skill_version": 2,
+  "lifecycle": "published",
+  "purpose": "Read an engine receipt without mistaking a caption for a measurement: quote the number a step printed, and treat a step that printed no number as one that measured nothing.",
+  "supersedes": [
+    1
+  ],
+  "requires_actions": [
+    "task.get",
+    "task.list",
+    "health"
+  ],
+  "requires_skills": [],
+  "entry": "Before quoting any verdict, find the line the tree computes for it and quote that line. If no such line exists, say so rather than quoting the caption beside it. A verdict names the tree it measured.",
+  "references": [
+    {
+      "reference_id": "reading-a-receipt",
+      "path": "references/reading-a-receipt.md",
+      "scope": [
+        "reviewer",
+        "operator"
+      ],
+      "depth": 1,
+      "sha256": "ddf9c7aa0cb84b84b033ecdc9dae8a7e8c63b5d0dbd52e5901a43672930f489d"
+    },
+    {
+      "reference_id": "operator-only-notes",
+      "path": "references/operator-notes.md",
+      "scope": [
+        "operator"
+      ],
+      "depth": 1
+    }
+  ]
+}

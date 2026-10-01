@@ -1,0 +1,134 @@
+# Decision points in HEE-v3 at b5367bc (condensed; for the v4 module funnel)
+
+**Source:** three read-only agents on 2026-10-01 (git show and git grep at b5367bc). Spot-checks by louranicas-2c: candidates.rs:220-236, namespace.rs:1364, native.rs:1636. Rows are condensed from the agent reports (site · kind · note). Full Jev dispositions: `~/hee4-evidence/reference/v3-evidence-b5367bc/jev-decision-map-b5367bc.md`.
+
+**Kinds:**
+- EXACT: a correctness rule; stays code.
+- THRESHOLD: a tunable constant; stays code and is calibrated by measurement.
+- JUDGMENT: interprets unstructured input; a Jev candidate only under a grant.
+
+**Totals** *(rev 2026-10-01, V3 §2)*: **201 sites in the three agents' reports; 93 condensed rows here (36/31/26); only JUDGMENT=14 is recountable from this file (4/3/7); the EXACT/THRESHOLD split (145/42) is the agents' assertion.** The section headings below keep the agents' per-report site counts (91/60/50), not the row counts of their tables.
+
+**Locator corrections** *(rev 2026-10-01, V3 §1; re-read with `git show b5367bc:<path>`)*. Six locators V3 read as comment lines were **wrong-file** cites: the line numbers are right in a submodule. Nine were shifted. Each is marked ⚠ in its row with the corrected locator; the full list is also in `~/hee4-evidence/reference/ERRATA-v3-evidence-b5367bc.md`.
+| cited | what is at the cited line | corrected locator |
+|---|---|---|
+| service.rs:93 (validate) | obsidian anchor comment | `service/observations.rs:93` `fn validate` |
+| service.rs:130 (prepare_probe) | obsidian anchor comment | `service/probe.rs:130` `pub fn prepare_probe` |
+| service.rs:174 (local probe verdict) | obsidian anchor comment | `service/local_probe.rs:174` (an expected-stdout comparison; likely the verdict site, not confirmed as the agent's intent) |
+| service.rs:277 (admit_recipe) | obsidian anchor comment | `service/local_probe.rs:277` `fn admit_recipe` |
+| numerical.rs:143 (classify) | obsidian anchor comment | `numerical/process.rs:143` `fn classify` |
+| actions.rs:343 (admit) | doc comment on `Owner` | `actions/control.rs:343` `fn admit` |
+| actions.rs:313 (replay_expired) | module doc | `actions/control.rs:313` `fn replay_expired` |
+| aggregate.rs:443 (stop_empty) | inside another fn | `worker/aggregate.rs:432` `fn stop_empty` |
+| budget.rs:999 (release) | `fn frees_remainder` | `budget.rs:1424` `pub fn release` |
+| budget.rs:1357 (apply) | a `return Err(HardCeilingIncompatible)` | no `apply` fn exists; the ceiling check sits inside `report` (`budget.rs:1344`) |
+| store.rs:2297 (obligation classifier) | a closing `)` | `store.rs:2284` `fn obligation_of` |
+| startup.rs:173 (presence) | `fn gone` | `app/startup.rs:207` `pub fn presence` |
+| context.rs:968 (caps) | `fn insert` | caps are the `MAX_*` consts at `context.rs:329-361` |
+| Cohesion.jl:752 (comparison) | `function cohesion` entry (decode + refusals) | the comparison is built at `Cohesion.jl:921` (`comparison = (;`) |
+| install-release:44 (target_refusal) | the OWNED regex | `install-release:121` `def target_refusal` |
+
+## Core and worker (91 rows: EXACT 71, THRESHOLD 16, JUDGMENT 4)
+| module | site | kind | note |
+|---|---|---|---|
+| app/candidates | ClassPrompt::new :133 | EXACT | empty/sha/utf8 refuse |
+| app/candidates | render history :158-176 | JUDGMENT | repair feedback is a fixed template (J3) |
+| app/candidates | render bound :187 | THRESHOLD | MAX_PROMPT_BYTES |
+| app/candidates | grammar truncation :213 | EXACT | Finish==Length |
+| app/candidates | grammar fence parse :220-236 | JUDGMENT | column-0 ``` count (J1) |
+| app/candidates | grammar emptiness :237 | JUDGMENT(weak) | trim-empty (J4, not Jev) |
+| app/candidates | judge :403-452 | JUDGMENT | reply → Replacement/Refused; no plausibility (J2); Tools arm unreachable (native.rs:1636) |
+| app/candidates | custody_settled :458 · settle_children :492 · ready :531 | EXACT | custody, settle, one load on Identity |
+| worker/native | execute window :1531 | THRESHOLD | MAX_RUN 15 min (:394) |
+| worker/native | execute selection :1538 | EXACT | profile equality, name charset |
+| worker/native | ADAPTERS :373 | THRESHOLD | num_ctx/num_predict table |
+| worker/native | exchange timeout :1300 | THRESHOLD | 180 s / 5 s literal |
+| worker/native | clean :1266 · catalogue :1368 · resident :1430 · response :1606 · usage :1613 · done_reason :1618 · identity :1626 · cancel :1563 | EXACT | readbacks and bounds |
+| worker/native | select_daemon :855 · listener :936 · holder :967 · hash_file :686 · daemon/resolve :758,:1145 | EXACT | identity, pid-reuse guard |
+| worker/process | settle_step :154 · observe_limits :773 · drive scan :636 · drive exit :687 · Census::step :822 · parse_stat :1025 | EXACT | lifecycle |
+| worker/process | ProcessSpec::validate :464 | THRESHOLD+EXACT | argv/env/stream caps |
+| worker/process | drive escalation :675-681 | THRESHOLD | TERM_GRACE 5 s, CLEANUP 10 s |
+| worker/namespace | terminal_status :1164 · native_status :1205 · status_consistent :1253 · stop mapping :1343 · scratch mounts :1691 · postrun :1775 | EXACT | status protocol, mounts |
+| worker/namespace | stop kill :1364 | THRESHOLD | **literal 5 s, a second door on TERM_GRACE** |
+| worker/resources | validate_limits :471 · parse_population :487 (twin aggregate.rs:639) | EXACT | two parsers for one format |
+| worker/aggregate | unit_reply :589 · settled :663 · create_outcome :673 · stop_step :713 · resolve :730 · stop_empty ⚠:432 (was :443) | EXACT | systemd readback |
+| task | LoopGuard::new :420 · record_reconciled_attempt :502 · observe_clock :529 | EXACT | mask, no-progress, monotonic |
+| task | begin_attempt :449-468 | THRESHOLD (EXACT order) | TASK_LIMIT, CLEANUP_RESERVE, MAX_ATTEMPTS, MAX_NO_PROGRESS |
+| task/driver | work map :133 · check map :141 · cancel checks · stop :174 | EXACT | closed matches |
+| task/driver | post-pass deadline :150 | THRESHOLD | a second deadline door (see architecture review) |
+| task/control | spec :205 · budget :255 | EXACT | local_only; tokens and currency zero |
+| task/control | criteria/list/note bounds | THRESHOLD | caps |
+| budget | Ceiling::admits :713 · Privacy::admits :769 · reserve :1250 · ⚠ceiling check in `report` :1344 (was "apply :1357") · release ⚠:1424 (was :999) · select_fallback :1506 | EXACT (+caps) | library only; no production caller |
+| store | settle_attempt :1531 · begin precondition :2612 · resolve_intent :1705 · obligation classifier ⚠`obligation_of` :2284 (was :2297) · waiting :2410 · accept :1980 · require_normal :2073 · next_dispatchable :1439 | EXACT | **state is a String; no transition fn** |
+| store/verification | record_verification :234 | EXACT | verdict → state |
+| store/terminal | finish_with_preparation :99 | EXACT | obligations settled |
+| store/recovery · reconciliation · roster | worker_settlement · evidence_available :339 · selected_pins :97 | EXACT | |
+| contracts/roster | freshness :272 · Selection::permits :343 | EXACT (+TTL) | |
+| contracts/control | admit_object :213 | EXACT | byte scanner before serde |
+| contracts/receipt | invariants::check :63-214 | EXACT | cross-field requires |
+| recovery | reconcile R01-R14 :874-1297 · lease_refusal :1109 · permits_execution :839 | EXACT | pure policy (KEEP) |
+
+## App, check and route (60 rows: EXACT 45, THRESHOLD 12, JUDGMENT 3)
+| module | site | kind | note |
+|---|---|---|---|
+| route | apply_filter R02/R03/R04 :1758-1774 · R06 :1800 · screen R13 :1857 · guard_baseline :1939 · decide R09/R10/R12 :2096 · config admitted :1443 | EXACT | pure |
+| route | R05 availability :1779 · R07 deadline :1812 · R08 quality :1824 | THRESHOLD | hand-declared figures |
+| route | R11 ranking :1925/:2110 | JUDGMENT | ranks on hand-typed figures (J5: measure, not Jev) |
+| app/routing | join/code :177 · preview :252 | EXACT | preview is the only live caller of route |
+| roster | query_snapshot :576 | EXACT | a second eligibility door |
+| app/dispatcher | backup_due :245 · headroom :289/:316 · budget_decision :299 | THRESHOLD | 15 min/8 tasks; 96/256 GiB; 128 GiB |
+| app/dispatcher | ensure_fresh :540 · classify :689 · open_refused :820 | EXACT | |
+| app/runtime | prepare :1103 · capture_share :914 · after_ready :2480 · execute/verify :2134/:2226 · accept :2336 | EXACT | |
+| app/runtime | CHECK_TEARDOWN :268 | THRESHOLD | grace |
+| app/live_verifier | checked :294 | EXACT | **the ledger verdict (a second authority)** |
+| app/workload | evaluate/classify :395/:556 | EXACT | |
+| app/workload | classify stderr arm :556 | JUDGMENT | any stderr byte fails (J7) |
+| app/u64_receipt | verdict_of :72 (unwired) · decide_over :1576 · admit :1729 | EXACT | |
+| app/u64_receipt | diagnostics_of :91 | JUDGMENT | stderr empty or not (J6: rustc JSON, not Jev) |
+| check/decision | decide/causes/identities/cases/process/oracle/evidence/timing :370-895 | EXACT | severity lattice, fail-closed |
+| check/u64_oracle · consistency · collector | evaluate :199 · validate :222 · reviewed_case :519 · finalize_with :303 | EXACT | |
+| app/repair | apply/apply_candidate inventory :176/:290 | EXACT | |
+| app/repair | class bounds :~310 | THRESHOLD | bytes, changed lines |
+| app/startup | classify :113 · presence ⚠:207 (was :173) · task_history :1049 | EXACT | |
+| app/startup | OPEN_ATTEMPT_LIMIT/CLEANUP_BATCH/WORKSPACE_REMOVAL_BUDGET | THRESHOLD | |
+| app/coordinator | health_of :199 · Manifest::active :98 | EXACT | |
+| app/backup_target | device_decision :731 | EXACT | pure over mountinfo and topology |
+| app/class_profile | screen :432 (NotInstalled admits) · compose :482 | EXACT | |
+| app/native_provider | compose :160 · install/open :315/:433 | EXACT | |
+| app/control_socket | admit_peer :326 | EXACT | authority |
+| app/control_socket | Admission::admit :375 | THRESHOLD | 100/s, burst 32, cap 8 |
+| actions | admit ⚠`actions/control.rs:343` · replay_expired ⚠`actions/control.rs:313` (were cited in actions.rs: doc comments) | EXACT | |
+| actions/tasks | cursor lifetimes, MAX_QUERY_BYTES | THRESHOLD | |
+| app/tasks | resume_key :197 · resolve_fault :266 | EXACT | |
+| app/plan | pinned :362 · compiler_version :722 · check :862 | EXACT | |
+| acquisition bounds (graph, collector, route, routing, profile, backup, oracle, patch) | caps | THRESHOLD | safety limits, not calibration |
+
+## K3, K5 and integrations (50 rows: EXACT 29, THRESHOLD 14, JUDGMENT 7)
+| module | site | kind | note |
+|---|---|---|---|
+| cohort | assign :742 · conflicts_with :544 · report :843 · rebrief guard :889 · join :954 | EXACT | |
+| cohort | bounds :742 · rebrief limit :882 | THRESHOLD | 64 / 8 |
+| cohort | reported outcome and dissent :843→:954 | JUDGMENT | self-label trusted, evidence unread (J8) |
+| context | omission chain :1082 · is_gap/compare/consumers | EXACT | |
+| context | assemble :1032 · depth :1082 · caps ⚠`MAX_*` :329-361 (was :968, `fn insert`) | THRESHOLD | |
+| context | budget selection :1118 | JUDGMENT | first-fit, no relevance (J9) |
+| notify | admits :373 · subscribe :945 · compact/restore :1143 | EXACT | |
+| notify | retryable :426 · wake :1094 · enqueue :904 | THRESHOLD | |
+| notify | record attempt category :1005 | JUDGMENT | caller maps a transport failure (J11, not Jev) |
+| herdr | from_engine :615 · submit :847 · observe :904 · present/reconnect :956 | EXACT | |
+| service | useful/health · inspect ladder :408 · local probe verdict ⚠`service/local_probe.rs:174` · admit_recipe ⚠`service/local_probe.rs:277` · prepare_probe ⚠`service/probe.rs:130` (service.rs lines are anchor comments) | EXACT | |
+| service | validate ⚠`service/observations.rs:93` (service.rs:93 is a comment) · TTL :494 | THRESHOLD | |
+| service | UsefulResult for non-exact classes :11-40 | JUDGMENT | no producer (J12) |
+| numerical | validate :794 · classify ⚠`numerical/process.rs:143` (numerical.rs:143 is a comment) | EXACT | |
+| numerical | report tolerance :733 | THRESHOLD | 1e-12, 8·ε |
+| julia | derive_join/conservation Cohesion.jl:657/824 | EXACT | a second copy of cohort::join |
+| julia | cohesion comparison ⚠:921 (was :752, the `cohesion()` entry) | JUDGMENT | descriptive only (J14, not Jev) |
+| skills | discover/revise :155/:293 · load scope/hash :249 | EXACT | |
+| skills | budget inclusion :230/:263 | JUDGMENT | first-fit (J10) |
+| workflows | validate :116 · dispatch/reconcile :335/:449 | EXACT | |
+| workflows | resume ready set :241 · observe error map :377 | THRESHOLD | retry_on ignored |
+| workflows | join verified :269 | JUDGMENT | free-text criteria judged outside (J13) |
+| pi | register + Calls :128/:175 | EXACT | |
+| bash | deadline default :264 | THRESHOLD | **silent clamp and fallback** |
+| bash | chain step verdict :790 | EXACT | |
+| deploy | problems/quiescence/target_refusal :84/:112/⚠:121 (was :44, the OWNED regex) | EXACT | |

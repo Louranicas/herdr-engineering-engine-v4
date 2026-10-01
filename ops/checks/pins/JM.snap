@@ -1,0 +1,91 @@
+# Decision points and Jev candidates: HEE-v3 at b5367bc, for v4 planning (2026-10-01, louranicas-2c)
+
+**Status: PLANNING ONLY.** HOLD in force (Luke 2026-10-01: no code until "start coding"; v4 pivot). Nothing here is built.
+
+**Method:**
+- Three read-only agents enumerated every production decision point, git show/grep only.
+- Spot-checks by louranicas-2c: candidates.rs:220-236 fence parser; namespace.rs:1364 `from_secs(5)`; native.rs:1636 `has_tool_proposals: false`.
+
+**Rules applied** (every candidate must pass all of them):
+- **Jev documentation, re-read live 2026-10-01:**
+  - "build a normal software workflow and insert System One only where AI is needed";
+  - one typed Choice/Score/Noul per atomic judgment, answers combined in code;
+  - Choice paired with an existence Noul;
+  - calibration is group-level;
+  - jaggedness jev-1.13 (last reviewed 2026-09-17): no math or counts, no dates, no numeric proximity, no hostile-state trust, no generation.
+- **jev.vault L1-L10:** code gate first; advisory before enforcing; a labelled evaluation before unattended use; `UNMEASURED` on outage.
+- **SCOPE (FINAL.md §3 JEV scope box and the Engine Data Grant, deferred 2026-09-20):** HEE source, diffs, logs, reports and task context never go to Jev; question text is fixed and pre-registered. An engine-data candidate is designable but **held for Luke's scoped grant**.
+
+## 1 · The map
+| Kind | Count | Meaning | Jev? |
+|---|---|---|---|
+| EXACT | 145 | correctness, invariant, security and authority rules over typed or kernel-authored input | **Never.** Code owns exact rules (FINAL §2). |
+| THRESHOLD | 42 | tunable constants (limits, reserves, TTLs, grace, rate) | **Never Jev.** Numbers belong to code (jaggedness 2). Calibrate from measurement. |
+| JUDGMENT | 14 | reads unstructured or semantic input, or ranks on soft criteria | Candidates. Table 2. |
+
+## 2 · The 14 engine JUDGMENT sites, dispositioned
+| # | Site (b5367bc) | What is judged now | Disposition | Documented pattern | Question shape (pre-registered) |
+|---|---|---|---|---|---|
+| J1 | candidates.rs:220-236 `grammar` fence parse | column-0 ``` count over model text | **Code first, then Jev (grant).** Harden the parser (language tags, indented fences); Jev takes only the ambiguous remainder. | Structure recovery; SDE cascade (verify step) | Existence Noul "contains exactly one complete source file"; Choice {plain file, fenced file, prose plus code, several files, no code, other} |
+| J2 | candidates.rs:403-452 `judge` | provider error, tool flag, grammar; no plausibility check | **Jev (grant), advisory,** before spending a class check (MAX_ATTEMPTS 3). Byte-identical-to-base stays code. | SDE cascade: per-field Noul P(wrong) with an any-flag gate | Nouls: "addresses the stated intent", "is a whole library file, not a fragment"; combined in code (any-flag) |
+| J3 | candidates.rs:158-176 `render` history | fixed template (verdict, count, refusal) | **Jev (grant).** Choose which failure lines to feed back. | Line-by-line search; re-ranking | Per-line Noul "explains why the check failed", ranked in code, top-k under the prompt bound |
+| J4 | candidates.rs:237 trim-empty | `trim().is_empty()` | **Not Jev.** Exact. | none | none |
+| J5 | route.rs:1925/2110 R11 ranking | lexicographic over hand-typed cost/quality/latency | **Not Jev.** The figures are numbers (jaggedness 2). Replace them with measured figures in code. | none | none |
+| J6 | u64_receipt.rs:91 `diagnostics_of` | stderr empty or not | **Not Jev.** rustc `--error-format=json` gives exact counts ("use code when you can"). | none | none |
+| J7 | workload.rs:556 stderr arm | any stderr byte fails the producer | **Code first** (panic marker, exit status); **Jev (grant) residual, advisory only.** The oracle keeps the verdict. | Classification using confidence | Choice {benign warning, panic, test failure, environment, other} |
+| J8 | cohort.rs:843→954 outcome and dissent | the child's label is trusted; evidence never read | **Jev (grant), advisory.** Never closes an obligation. | Double-checking citations | Noul "the evidence supports the reported outcome"; Noul "the dissent gives a reason not already in the brief" |
+| J9 | context.rs:1118 selection | declaration-order first-fit | **Jev (grant).** Relevance per source; order and budget stay in code. | Classifying RAG passages; re-ranking | Per-source Noul "needed for the brief", with an existence Noul first; code packs by p under the budget |
+| J10 | skills/load_skill.py:230,263 | manifest-order first-fit | **Jev (grant).** Same shape as J9. | Skill suggestion | Choice over skills plus {none}; Noul per reference |
+| J11 | notify.rs:1005 failure category | caller maps a transport error | **Not Jev.** Typed transport errors; map them in code. | none | none |
+| J12 | service/observations.rs:11-40 usefulness (daemon, remote endpoint, neural operator) | no producer | **Jev (grant), advisory.** The expected-output contract stays code. | LLM guardrails; classification using confidence | Score "useful for its declared purpose" (3-5 described levels) plus Noul "responded to the probe at all" |
+| J13 | workflows/validate_procedure.py:269 `verified` | a bool from outside | **Jev (grant), advisory per criterion.** Acceptance authority stays with the verifier. | Parallel questions; composite scoring | One Noul per acceptance criterion, combined in code (all); never replaces the verifier |
+| J14 | julia/Cohesion.jl:752 comparison | descriptive deltas | **Not Jev.** Numbers. | none | none |
+
+**Tally (corrected 2026-10-01):** Jev (grant) **9**: J1, J2, J3, J7, J8, J9, J10, J12, J13 (J1 and J7 code first). Not Jev **5**: J4, J5, J6, J11, J14. The first version said 8/6: a counting error, caught by the jev.vault writer. The strongest value is J1 + J2 + J3 (the candidate loop: every wrong refusal or weak candidate costs one of three attempts).
+
+## 3 · Agent-side decisions (Claude's work on the codebase)
+| # | Decision | Status | Scope |
+|---|---|---|---|
+| A1 | Read gate: must this non-engine file be read? | **Installed** (reflex, p ≥ 0.70) | Allowed: vaults, handovers are refused by jev-boundary if engine-marked |
+| A2 | Subagent model/effort routing | **Installed** (escalation-only) | Engine-marked briefs are refused (observed today: "UNMEASURED: not sent") |
+| A3 | Done-claim verifier (Stop) | **Installed** | Skips engine work by design |
+| A4 | Upstream-doc drift: does a live public doc page contradict the vault note? | **Candidate now.** Public text plus a habitat note. Observed today: rate limits changed 1,200/min → 40/s; the vault said 11 jaggedness items, the page lists 9. | Allowed |
+| A5 | Gate-red triage (environment vs defect), mutant equivalence, finding severity, finding dedup | **Held (grant).** State is engine logs and code. | Engine data |
+| A6 | Peer liveness | **Not Jev.** herdr status is a typed enum; decide in code. | none |
+
+## 4 · Architecture for v4: how Jev enters the engine, if Luke grants it
+All of this is in scope and best practice; none of it is built.
+1. **Port, not dependency (K1 contracts).** A `judge` module holds the typed `Question{Noul|Choice|Score}` and `Answer` types plus `QuestionSet{id, version, digest}`. Question sets are committed, pre-registered artifacts (never derived from task text), pinned by digest like class profiles.
+2. **One egress door (K2 worker).**
+   - A `judge` adapter speaking `POST api.typesafe.ai/v1/systemone` through a pinned client (like native's pinned curl).
+   - Model pinned `jev-1.13.0`, never the `jev-latest` alias.
+   - Request and response bounded (32k state; 255 choices; 2-10 levels).
+   - The caller's deadline passed through (no created time limits); 429/529 exponential backoff inside that deadline.
+   - Typed decode; the API key in a 0600 custody file.
+   - Egress from `serve` only; the candidate namespace stays network-less.
+3. **Typed data boundary in the engine.**
+   - Every state field carries a `DataClass` {public, synthetic, projection, local_private}.
+   - The one egress door refuses any class the grant record does not name for that question set, by name.
+   - This mirrors habitat `jev-boundary`, but as types.
+4. **Every call is ledgered (K1 store):** an append-only `judgments` table holding question-set digest, state digest (never the state), model id, answers with p, tokens and cost. It feeds calibration and replay (L9: print what it cost and replaced).
+5. **Advice, never authority, by construction.**
+   - Consumers receive `Advised<T>{decision: T (code), advice: Option<Answer>, agreed: bool}`.
+   - Code decides; advice is recorded (shadow mode).
+   - A question set may *gate* only after an admission record exists: labelled set, per-family threshold on p (no porting across families), negative control, an any-flag or all rule stated.
+   - Outage or refusal is `UNMEASURED`, and the code decision stands.
+6. **Budget (K1 budget, wired in v4).** Each call reserves and reports tokens as currency microunits through the budget ledger; RC01's `external request cap 0` refuses until changed.
+7. **Cluster placement:**
+   - K1: types, ledger, budget;
+   - K2: adapter;
+   - K4 (numerical): admission and calibration statistics;
+   - K3: J8/J9/J10/J13 consumers;
+   - K2/K6: J1/J2/J3/J7 consumers in the candidate loop;
+   - K5: herdr shows advice, labelled as advice;
+   - K6: an operator action `judge.inspect` (question sets, admission state, shadow agreement).
+
+## 5 · What deployment of Jev in the engine needs, all Luke's
+1. **A scoped Engine Data Grant:** which question sets (by id) may send which DataClass. Today's instructions are planning scope, not this grant.
+2. **Legal:** TypeSafe's DPA governs retention (not public on the legal page); ZDR is enterprise-only. Decide whether engine data requires ZDR.
+3. **RC01 cost mode:** `offline_fixture` (external request cap 0) → a paid profile with a finite cap (D07).
+4. **Network egress** from `serve` (none today).
+5. **Labelled evaluation sets** per question set, before any gating.

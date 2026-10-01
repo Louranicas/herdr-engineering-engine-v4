@@ -1,0 +1,11 @@
+{
+  "name": "hee4-mermaid-render",
+  "version": "1.0.0",
+  "private": true,
+  "description": "HEE v4 ops check: render every mermaid block in the v4 vault in headless chromium. Planning tooling, not engine code.",
+  "license": "UNLICENSED",
+  "dependencies": {
+    "mermaid": "11.17.2",
+    "playwright": "1.62.1"
+  }
+}

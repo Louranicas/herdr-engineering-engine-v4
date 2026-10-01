@@ -1,0 +1,31 @@
+# repin — after editing a file the module cards cite (KEY from ops/checks/module_funnel.py LEGEND:
+# AT, UM, DEC, ...), map every KEY:n cite to the edited file, rewrite the cites, pin, then run the
+# funnel. Run with: habitat-runbook run repin --directory runbooks -v KEY=DEC
+name = "repin"
+purpose = "Map KEY cites from the pinned snapshot to the edited file, repin, and re-run the module funnel"
+cwd = "/var/home/Louranicas/herdr-engineering-engine-v4"
+
+[[precondition]]
+check = "python3 -c 'import sys; sys.path.insert(0, \"ops/checks\"); from module_funnel import LEGEND; print(\"key_known\" if \"{{KEY}}\" in LEGEND else \"key_unknown\")'"
+expect = "key_known"
+message = "KEY is not a LEGEND key in ops/checks/module_funnel.py"
+
+[[precondition]]
+check = "test -f ops/checks/pins/{{KEY}}.snap && echo snapshot_present"
+expect = "snapshot_present"
+message = "KEY has no pinned snapshot: use cite_pins.py pin KEY for a first pin, not repin"
+
+[[step]]
+name = "repin"
+just = "repin {{KEY}}"
+expect = "repin verdict=PASS"
+
+# Read-back: the KEY pin is fresh and no cite is left unmapped.
+[[step]]
+name = "pins-fresh"
+run = "python3 ops/checks/cite_pins.py status"
+expect = "stale=0 unpinned=0 snapshot_mismatch=0 unmapped_cites=0"
+
+[verify]
+run = "python3 ops/checks/module_funnel.py"
+contains = "verdict=PASS checks_failed=0"

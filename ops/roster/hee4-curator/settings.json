@@ -1,0 +1,43 @@
+{
+  "disableAllHooks": true,
+  "permissions": {
+    "defaultMode": "dontAsk",
+    "allow": [
+      "Read(//var/home/Louranicas/herdr-engineering-engine-v4/**)",
+      "Read(//var/home/Louranicas/hee4-evidence/**)",
+      "Read(//var/mnt/STORAGE-10TB/fedora-obsidian-vaults/herdr-engineering-engine-v4.vault/**)",
+      "Glob",
+      "Grep",
+      "Agent",
+      "Edit(//var/mnt/STORAGE-10TB/fedora-obsidian-vaults/herdr-engineering-engine-v4.vault/10 Ultramap/Ultramap.md)",
+      "Edit(//var/mnt/STORAGE-10TB/fedora-obsidian-vaults/herdr-engineering-engine-v4.vault/20 Deployment Atlas/Deployment Atlas.md)",
+      "Edit(//var/mnt/STORAGE-10TB/fedora-obsidian-vaults/herdr-engineering-engine-v4.vault/Curator/Log.md)",
+      "Edit(//var/home/Louranicas/hee4-evidence/roster/hee4-curator/**)",
+      "Bash(mempalace mine /var/mnt/STORAGE-10TB/fedora-obsidian-vaults/herdr-engineering-engine-v4.vault --dry-run)",
+      "Bash(mempalace mine /var/mnt/STORAGE-10TB/fedora-obsidian-vaults/herdr-engineering-engine-v4.vault)",
+      "Bash(mempalace search:*)"
+    ],
+    "deny": [
+      "Bash(git push:*)",
+      "Bash(git commit:*)",
+      "Bash(cargo:*)",
+      "Bash(kill:*)",
+      "Bash(pkill:*)",
+      "Bash(systemctl:*)",
+      "Bash(rm:*)",
+      "Edit(//var/home/Louranicas/herdr-engineering-engine-v4/migrated/**)",
+      "Edit(//var/home/Louranicas/herdr-engineering-engine-v4/**)",
+      "Read(//var/home/Louranicas/.claude/**)",
+      "Read(//home/Louranicas/.claude/**)",
+      "Read(~/.claude/**)",
+      "Read(//var/home/herdr-engineering-engine-v3/**)",
+      "Read(//run/host/var/home/herdr-engineering-engine-v3/**)",
+      "Read(//var/home/Louranicas/hee3-evidence/**)",
+      "Read(//var/home/Louranicas/.cache/hee3-worktrees/**)",
+      "Read(//var/home/Louranicas/.cache/hee3-implementation/**)",
+      "Read(//var/home/Louranicas/.local/lib/herdr-engineering-engine-v3/**)",
+      "Read(//var/mnt/STORAGE-10TB/fedora-obsidian-vaults/herdr-engineering-engine-v3.vault/**)",
+      "Read(//var/home/Louranicas/handoffs/HEE3_*)"
+    ]
+  }
+}

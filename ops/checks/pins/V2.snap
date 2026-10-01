@@ -1,0 +1,182 @@
+# V2 — adversarial verification of the HEE v4 design documents
+
+**Verifier:** read-only subagent, 2026-10-01 (~08:00 AEST). **Subject:** `design/ULTRAMAP.md`, `design/DEPLOYMENT_ATLAS.md`,
+`design/JEV_QUESTION_RESPONSES.md`, `learnings/PROCESS-LEARNINGS.md` (all under `~/hee4-evidence/`).
+**Method:** v3 read only through `git -C /run/host/var/home/herdr-engineering-engine-v3 show|grep|ls-tree b5367bc`
+(`rev-parse b5367bc` = `origin/main` = `b5367bca71a4…`); evidence files read at the cited line; host probes read-only via
+`flatpak-spawn --host`. No cargo, no build, no write except this file. Same-lineage verifier: this is not independent review.
+
+## Verdict: PASS_WITH_GAPS
+
+Facts are strong: 101 of 107 sampled claims hold. The designs disagree with each other on crate numbering, runtime paths,
+the dependency checker and the phase that owns the verdict authority. Two of the ULTRAMAP's crate boundaries cannot be
+enforced by the compiler as drawn.
+
+| Document | Sampled | CONFIRMED | REFUTED | UNVERIFIABLE |
+|---|---|---|---|---|
+| ULTRAMAP | 34 | 32 | 2 | 0 |
+| DEPLOYMENT_ATLAS | 34 | 33 | 1 | 0 |
+| JEV_QUESTION_RESPONSES | 18 | 15 | 3 (line cites) | 0 |
+| PROCESS-LEARNINGS | 21 | 19 | 0 | 2 |
+| **Total** | **107** | **99** | **6** | **2** |
+
+## 1 · Claim checks
+
+### ULTRAMAP (v3 source at b5367bc)
+CONFIRMED:
+- C1 `repair_pending` written at `store.rs:1536` (the `let state=` line contains it), UPDATE tasks at `:1539`.
+- `store/verification.rs:248` `Failed => "repair_pending"`.
+- `store.rs:2637` `INSERT INTO attempts … 'running'`. `queued` is never written: every hit is a read or a CHECK
+  (`store.rs:2300`, `store/recovery.rs:297,458,597,624`, `store/terminal.rs:133`, `herdr.rs:617`, `migrations/001.sql:912,951`).
+- C2: exactly two `INSERT INTO outbox` (`store.rs:2024`, `store/terminal.rs:219`).
+- `pending_delivery`/`acknowledge_delivery` (`store.rs:2032,2054`) have 0 callers in `src/`.
+- Cancellation held twice (`store.rs:2239-2245`); `actions.rs:485` `mutates()`; `:504` `owner: Owner`.
+- `INSERT INTO operations` at exactly 4 sites (`store.rs:1254,1651,1802`; `store/roster.rs:271`); `replayed_*` at `1268/1281/1294`.
+- `actions/control.rs:418` `UNSERVED: [...; 12]`; `:479` `match action.id`; 12 unserved + 9 served = 21, matches §4b.
+- `worker/process.rs:547` `Command::new`; `dispatcher.rs:245,289,299,316` are the four pure decisions.
+- `native.rs:1074` readlink push; `store.rs:1236` and `coordinator.rs:53` both `1_048_576`.
+- `main.rs:459` `compose_native`; `notify.rs:514` `witness`; `:845` `struct Outbox`; `principal.rs:51` `recipient`.
+- `route.rs:2074` `evaluate_fallback`; `recovery.rs:308` AttemptState; `:338` TaskState, which has 12 variants.
+- `aggregate.rs:514` `main_pid`; `runtime.rs` is 3,814 lines; `store/roster.rs:615` capacity is `MAX_HISTORY`, which is
+  `4096` at `contracts/roster.rs:9`.
+- Hops `control_socket.rs:246,299`, `contracts/control.rs:1166`, `actions/control.rs:265`, `app/tasks.rs:571`,
+  `store.rs:1439`, `runtime.rs:937`, `driver.rs:114`.
+- JM tallies are 145 EXACT, 42 THRESHOLD and 14 JUDGMENT.
+- Jev (grant) is J1-3, J7-10 and J12-13 = 9; not-Jev is J4, 5, 6, 11 and 14 = 5.
+
+REFUTED:
+- **P4 / MA:11 cite `check/decision.rs:46,97,120`.** Those lines are the `Unavailable` variant of three different enums
+  (IdentityState, CheckerFact and OracleFact). The hard-wiring is at `src/app/u64_receipt.rs:136-145` `identities()`,
+  where Collector, Locks and Standards are fixed to `None`. The claim holds; the cite does not.
+- **§3a hop 18 `store.rs:1457`.** `cancellation: state == "cancellation_requested"` is at `:1458`. DECISIONS D-U5 has it right.
+
+### DEPLOYMENT_ATLAS (host probes at about 08:00, plus the files cited)
+CONFIRMED:
+- Host: `command -v cc gcc` rc=1. `libamdhip64.so.7` is absent on the host and present in the toolbox.
+- The musl rust-std is installed. `/var/home` has 397G free, STORAGE-10TB has 7.6T free, `/tmp` is tmpfs 41G.
+- 9 releases, 264M; `current` points to `38f3dfd2…`.
+- `control.lock` is dated 2026-09-30 08:28 with no socket. The v3 state root and the v3 backups dir are both absent.
+- `ollama.service` ExecStart is `toolbox run … ollama serve`, MainPID=1899. No engine unit is in `list-unit-files`.
+- The `hee3-backup.timer` next run is 10-02 01:36. glibc is 2.43 on both sides.
+- CD:62, 66-67, 71-73, 108 and 155 ("Luke owns commissioning and backup custody").
+- IR:42, 186-189, 211-216 and 562-564.
+- DR:1405, 1770-1772, 1804, 1828, 1840, 1869, 1875 (`flows=20 l2=3 host=1 reasoned=17`), 1883, 1887-1889 and 1897-1900.
+- DR:1427 is off by one: the claim is at :1426.
+
+REFUTED (stale):
+- **A1** says the v4 root is "not a git repo", holds `docs/ gates/ plan/` (empty) and has "104 files".
+- Now `.git` exists (V4-4, no commits), the three dirs hold files, and `migrated/` holds 103 manifest files + 2 = 105
+  (`sha256sum -c` rc=0).
+
+### JEV_QUESTION_RESPONSES
+CONFIRMED:
+- F-A: `jev-boundary markers` → markers=52, roots=6, 0 contain hee4 or v4. The synthetic v4 line piped to `jev-boundary text` → rc=0.
+- F-B: this session had `not_sent=29 no_claim=15 block_fail=5`, and all 5 `block_fail` rows came from cwd `/var/home/Louranicas`.
+  Their claim heads include "Main is pushed. GitHub `main` is now `b5367bc`". **So the leak is real, not only suspected:**
+  engine report text reached the verifier's Jev call.
+- F-D: the first 165 rows are `not_sent 80 / no_claim 51 / rerun 20 / block_fail 10 / report_pass 4`. The file now has 172 rows.
+- F-E: recall `cards`=0, and `task_truncated`=55. The router has set=5; the log now holds 71 rows and read 65 at writing,
+  a plausible drift.
+- FINAL:86-87; Engine Data Grant:18,22; Assimilating:17,20,22,24,59 (`$task` interpolated) and 135.
+
+REFUTED: line cites, each off by one.
+- `Confidence.md:34` → the text is at :35.
+- Jaggedness rows 2, 3, 8 and 9 are cited at :15/:16/:21/:22 → they are at :16/:17/:22/:23.
+
+### PROCESS-LEARNINGS
+CONFIRMED:
+- SA:12 (311 commits, 2 of 20 after 46 landings), SA:29-35 (11 h 53 m; 0.11×), SA:38 (0 tags), SA:46, SA:48 (89/119, 87 literals).
+- SA:57 and CA:74: 105 runs, 38.6 machine-h, 19/105 = 18% measured nothing, 0 confirmed product defects. SA:59, SA:61.
+- CA:85-91: 4,412 lines / 444,728 B, and R23 cost 659,219 tokens.
+- NWOW:17-23: ≈80 min, ≈0 defects, 842/868 plants killed, 4 of 10 publications failed, 74 of 86 commits, 11/64 runs, 5→4→3 HIGHs.
+- Handoffs: 21 `HEE3_*` files, 714,986 B, 6 HANDOVER and 11 RESTART.
+- MEM: size-workflows 8-10 and 22 (98→18, 49/49); mutation-target-dir 14-15 (21/57); recapture 11-14 (2 h 40 min, 6 commands).
+- JU:44-45 (58,762 anchor lines, 2,403 in Cargo.toml, 30 files); JU:66.
+- DR:1540 (RA6), DR:1580 (92.3%, 18-44 min, 4/20), DR:1629 (296423514112 B), DR:1809-1811 (178 mutants, 21 survivors, ≈17 real).
+
+UNVERIFIABLE:
+- `just friction` retry_rate=0.0184 was not re-run.
+- L8 "2 of those 11 voided by edits (NWOW:88)": NWOW:88 describes the S3 reflex and does not state 2/11.
+
+## 2 · Cross-document consistency
+
+| # | Item | Finding |
+|---|---|---|
+| X1 | Crate names and count (8) | **Inconsistent.** ULTRAMAP, DECISIONS D-U3 and CHARTER use K0 contracts, K0h host and K1-K6 (8 crates). ATLAS P0 says "cluster crates **K1-K6**", P1 says "**K1 contracts**", and P3 says "**K2**: one spawn door". The ULTRAMAP puts the spawn door in K0h and makes K1 core. ATLAS uses VC's old six-cluster numbering. |
+| X2 | Runtime dir | **Three spellings.** ULTRAMAP §4a keeps `$XDG_RUNTIME_DIR/habitat-engine/control.sock` "verbatim". ATLAS D3 and §3.1 use `$XDG_RUNTIME_DIR/hee4/`. DECISIONS V4-5 uses `$XDG_RUNTIME_DIR/habitat-engine-v4/`. |
+| X3 | Dependency-law checker | **Contradiction.** ULTRAMAP §2 says `module-deps.toml` "becomes unnecessary as a checker", because crates plus a planted-`use` E0432/E0433 control are enough. ATLAS P0 builds `tools/check-module-deps` with a planted-edge control (DR:1889). |
+| X4 | Phase names P0-P9 | Consistent within ATLAS and CHARTER. **Name collision:** ULTRAMAP P1-P15 are principles, and JEV doc P0/P1/P2 are Jev prerequisites. "P0" means three things across the set. |
+| X5 | D-U1..D-U5 | Wording agrees between ULTRAMAP §6d and DECISIONS. ULTRAMAP's D-U2 "Alternative" cell holds the reason, not an alternative. **D-U1 has no phase:** ATLAS P1 re-opens it ("decided now"), no phase builds `events.subscribe`/`Reply::Stream`, and the predicted done-line omits it. |
+| X6 | Held-for-Luke | CHARTER §7 ⚑ has push, tag push, grants, unit enable and **reclaiming disk**. ATLAS H-1..H-16 has no disk reclaim and no curator scheduling (CHARTER §6 ⚑, V4-3). CHARTER has no commissioning (H-4), TH-DEV/loopback (H-9), journal (H-7), O-15/O-18 or H-16. There is no single list. |
+| X7 | Jev tallies | **Consistent:** 9 grant and 5 not-Jev (JM:44, corrected). No stale "8" in the four subject docs. |
+| X8 | HOLD | Consistent wording (DR:1897-1900). ATLAS P0's entry gate puts `git init` behind "start coding", but V4-4 already ran `git init -b main`. ATLAS is stale against DECISIONS. |
+
+## 3 · DAG, flow map and module placement
+
+- **Acyclic: yes.** K0 ← K0h ← {K2, K4, K5}, K0 ← {K1, K3}, and K6 → all.
+- **The v3 edges it must cut** (derived from `use crate::` across `src/` at b5367bc) are:
+  - `actions→task`, `context→budget`, `numerical→worker`, `service→store`, `service→worker`, `task→recovery`, `worker→actions`,
+  - plus the `app→*` edges.
+- Each of these is either addressed in §2 or lands inside one crate.
+- **Gap, MED:** `app/live_verifier.rs` → K4 is not dispositioned. It imports `crate::worker::aggregate`, `worker::namespace`,
+  `worker::resources` (lines 26-28) and `crate::store` (line 25). K4 may depend only on K0 and K0h, so `aggregate` and
+  `namespace` would have to move to K0h, or live_verifier stays in K6 behind a port. Neither is written.
+- **Gap, MED:** K0h holds both the spawn door and the **egress** door (D-U4), and K2, K4 and K5 depend on K0h. Any of them
+  can call egress without passing K6's `DataClass` check, so P12 and "egress only from serve" are a convention, not
+  compiler-enforced. That is the failure P1 exists to remove. **Fix:** put egress in its own crate that only K6 depends on,
+  or require a grant token that only K6 can construct.
+- **LOW:** K3 notify is "pure policy over K1 rows", but K3 cannot import K1. The row types must live in K0, and that is unstated.
+- **Module placement:** all 23 MA modules are placed. None is unplaced.
+  - Six are split across homes by design:
+    - actions → K0 catalogue + K6 registry;
+    - recovery → K0 enums + K1;
+    - roster → K2 policy + K1 rows;
+    - notify → K3 + K1 outbox;
+    - julia → K4 decoders + `julia/`;
+    - worker → K2 + K0h + tools to K0.
+  - bash, deploy and pi_extension are outside the DAG.
+  - "Exactly one" fails for those six. A per-file placement table would make the splits checkable.
+
+## 4 · Phase order and read-backs
+
+- **MED, verdict authority lands after its first use.** ULTRAMAP P4 says "one verdict authority = decide". ATLAS puts it
+  in **P5**, but P4's host record (the F06 spine) already goes check → accept. So P4 accepts through the dropped
+  live_verifier source, or through `decide`, which cannot PASS (Collector, Locks and Standards are Unavailable). **Fix:**
+  move `verdict_of(decide)` and the three identity sources into P3, or make P4's record depend on it.
+- No other phase needs a crate built later, because P1 builds K6 as a skeleton.
+- **Read-backs:** D1-D6, D8 and D10 each name a runnable command.
+  - D7 is a rehearsal record, which is acceptable.
+  - **D9 (MED)** filters on a "serve MainPID cgroup recorded at admission". No such column is in the ULTRAMAP §5a
+    `tasks` row, so the read-back reads a field the design never writes. Add it to §5a or re-state D9.
+  - **D5 (MED):** the ULTRAMAP interface map (§4a: `serve | commission | <action>`) has no `restore`, `rollback` or
+    `prune-backups` verb, but ATLAS D5 and §6 read back through them.
+
+## 5 · Over-engineering (the brake)
+
+- **MED:**
+  - ATLAS P0 `tools/check-module-deps` duplicates what the ULTRAMAP says the compiler decides (X3). It is a second door.
+  - PL L16 `rules.toml` + an `ast`/`syn` census of enforcement sites is a source-census detector, the shape that PL L13
+    and F128 show receding. No reader or moving number is named.
+  - PL L2 diff-scoped step skipping re-creates a hand-declared input world (`subject_globs`). A wrong glob is a silent
+    skip (a false pass), which is the failure the memory `hee3-gate-declared-inputs` records. It needs a control that
+    plants a src change under a mis-globbed step.
+- **LOW:**
+  - PL L21 leases with heartbeats (the cost is UNMEASURED, and no number is named).
+  - ULTRAMAP `judge.inspect`, `judgments` table and question-set types are designed ahead of a grant that may never come.
+  - JEV doc Q1/Q2/Q5 are new advisory hooks. They do carry a retire rule, a code-baseline column and moving numbers,
+    so they pass the brake. They are operator-side and outside the v4 charter scope; home them in jev.vault.
+
+## 6 · Fix list (ordered)
+
+1. Renumber ATLAS P0, P1 and P3 to the 8-crate K0/K0h/K1-K6 scheme, and drop `check-module-deps` or say why the
+   compiler control is not enough (X1, X3).
+2. Pick one runtime dir and write it in ULTRAMAP §4a, ATLAS D3 and §3.1, and V4-5 (X2).
+3. Move the verdict authority before P4 (§4).
+4. Disposition live_verifier's worker and store imports (§3).
+5. Split egress from spawn, or make it K6-only (§3).
+6. Give D-U1 a phase or withdraw it (X5).
+7. Add the admission cgroup column for D9, and the restore, rollback and prune verbs to ULTRAMAP §4a (§4).
+8. Merge CHARTER §7 and ATLAS §5 into one held list with one home (X6).
+9. Refresh ATLAS A1 (X8).
+10. Fix the 2 ULTRAMAP cites and the 5 Jev off-by-one line cites.
+11. Rename the Jev prerequisites and the ULTRAMAP principles so "P0" is unambiguous (X4).

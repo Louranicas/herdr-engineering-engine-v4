@@ -1,0 +1,320 @@
+# HEE v4 ULTRAMAP: target architecture, derived from measured v3 findings
+
+**Status: PLANNING ONLY.** Luke's HOLD (DR "HOLD: no coding until Luke says 'start coding'", 2026-10-01) is in force. Nothing here is built, and nothing here authorizes building.
+**Measured basis:** v3 tree `b5367bc` (= origin/main), read via `git show`/`git grep` only; no cargo, no build, no run. Written 2026-10-01 by one same-lineage agent. **Not independently reviewed.**
+
+Abbreviations for the input sources (cite as `AR:#`, `MA:#` and so on; the number is a row or line in that file; ~~all under the v3 evidence store~~ each tag below names its v4 read-only copy under `~/hee4-evidence/reference/`, pinned by that dir's `MANIFEST.sha256` and read with `~/hee4-evidence/reference/ERRATA-v3-evidence-b5367bc.md`, except VC, which has no copy *(rev 2026-10-01 V7/V8/V9/V10-fix, V7 F11)*):
+
+| Tag | Source |
+|---|---|
+| AR | `~/hee4-evidence/reference/v3-evidence-b5367bc/architecture-review-b5367bc.md` (was v3 `T28/`; *(rev 2026-10-01 V7/V8/V9/V10-fix, V7 F11)*) (rows 1-23 = module table; "SYS" = system-level list). **In this file `AR:n` means AR module-table row n; in the module cards `AR:n` means line n of the AR file** (card legend in `ops/checks/module_funnel.py`, pinned by `cite_pins.py`) *(rev 2026-10-01 ratified V4-55, DC-04)* |
+| MA | `~/hee4-evidence/reference/v3-evidence-b5367bc/module-audit-b5367bc.md` (was v3 `T28/`; *(rev 2026-10-01 V7/V8/V9/V10-fix, V7 F11)*) |
+| IM | `~/hee4-evidence/reference/v3-evidence-b5367bc/interface-map-b5367bc.md` (was v3 `T28/`; *(rev 2026-10-01 V7/V8/V9/V10-fix, V7 F11)*) (§1-§9) |
+| CM | `~/hee4-evidence/reference/v3-evidence-b5367bc/cluster-map-b5367bc.md` (was v3 `T28/`; *(rev 2026-10-01 V7/V8/V9/V10-fix, V7 F11)*) |
+| JM | `~/hee4-evidence/reference/v3-evidence-b5367bc/jev-decision-map-b5367bc.md` (was v3 `T28/`; *(rev 2026-10-01 V7/V8/V9/V10-fix, V7 F11)*) (J1-J14, §4 architecture) |
+| RT | `~/hee4-evidence/reference/v3-evidence-b5367bc/route-to-v010-b5367bc.md` (was v3 `T28/`; *(rev 2026-10-01 V7/V8/V9/V10-fix, V7 F11)*) (slices S1-S12) |
+| RR | `~/hee4-evidence/reference/v3-evidence-b5367bc/review-range-7ed3728-dfb32d5.md` (was v3 `T28/`; *(rev 2026-10-01 V7/V8/V9/V10-fix, V7 F11)*) (finding ids) |
+| VC | v3 vault `Connections/Cluster Map.md` (six-cluster design; no v4 copy: provenance text under V4-9) |
+| DR | `~/hee4-evidence/reference/v3-records/DECISION-REGISTER-20260928.md` (2026-10-01 sections, lines 1877-1903; read-only copy of v3 `T00-plan-20260926/`, taken 2026-10-01 11:57 after the source's 07:18 edit; *(rev 2026-10-01 V7/V8/V9/V10-fix, V9 drift vector 4)*) |
+| `path:N` | v3 source at `b5367bc`, verified by me this session unless marked *(cited)* |
+
+**Corrections to the inputs, found while mapping (FACT, this session):**
+- C1. AR SYS "MED: `queued` and `repair_pending` are readable but nothing writes them" is **half wrong.** `repair_pending` IS written: `store.rs:1536` (settle, `UPDATE tasks` at :1539) and `store/verification.rs:248` (verdict Failed). Only `queued` is never written, for tasks or attempts: `INSERT INTO attempts` writes `'running'` (`store.rs:2637`), and every `"queued"` hit is a read (`store.rs:2300`, `store/recovery.rs:297,458,597,624`, `store/terminal.rs:133`, `herdr.rs:617`).
+- C2. AR SYS says the outbox is inserted "on every acceptance" (`store.rs:2024`). There is a **second** insert site on every terminal stop (`store/terminal.rs:219`). v4 must cover both.
+- C3. The AR tracer's per-hop `file:line` list (21 inbound + 8 outbound) was **not persisted** in T28; only its conclusions are. §3 below re-derives the hops from the tree. The hop count matches the tracer's; whether the hop *boundaries* match is unknown.
+- C4. Every later correction to the v3 inputs (cluster map 7 edges not 6, worker/tools.rs "no production caller" not "test-only", and the rest) has one home: `~/hee4-evidence/reference/ERRATA-v3-evidence-b5367bc.md` *(rev 2026-10-01, V4-18)*.
+
+**Revision 2026-10-01 (after verification V2, `~/hee4-evidence/verification/V2-design.md`).** Decisions V4-11…V4-17 (`~/herdr-engineering-engine-v4/plan/DECISIONS.md`) are applied below; each changed spot carries "(rev 2026-10-01, V4-nn)". **Naming:** in this file `P1`-`P15` are *principles*; a deployment phase is always written "phase Pn" and means the ATLAS phase (phase P0 = Scaffold). *(rev 2026-10-01, V2 X4)*
+
+---
+
+## 1 · Principles (each one forced by a finding)
+
+| # | Principle | Finding that forces it |
+|---|---|---|
+| P1 | **Clusters are crates.** The compiler enforces the dependency law. There is no convention and no comment-link. | CM: 1 crate, 17 flat mods, 0 cluster checks in gate, **7 undeclared edges incl. worker→actions (K2→K6 inversion)** (CM's text says 6; its own table lists 7, service→worker omitted from Stage 2; ERRATA) *(rev 2026-10-01, V4-18)*; DR:1887 deferred the split to post-tag, so v4 is where it lands |
+| P2 | **State machines are types.** Every durable state is a contracts enum, and one pure `transition(State, Event) -> Result<State, Illegal>` exists per machine. The store writes only what `transition` returns. | AR:1 task state is a `String` written at ≥9 sites with no transition fn; §5c lists the v3 write sites |
+| P3 | **One cancellation source.** | AR:1 cancellation held twice (`tasks.cancellation` flag + state `cancellation_requested`, `store.rs:2239-2245`) |
+| P4 | **One verdict authority.** The ledger verdict is `verdict_of(check::decide)`. Nothing else produces a verdict. | AR:3 / MA:11 ledger takes live_verifier's verdict; `decide` cannot PASS (3 identities — Collector, Locks, Standards — hard-wired `None`/Unavailable in `app/u64_receipt.rs:136-145` `identities()`; the earlier cite `check/decision.rs:46,97,120` names the `Unavailable` variants, not the wiring *(rev 2026-10-01, V2 fix 10)*). Lands in **phase P3**, before phase P4's first host record *(rev 2026-10-01, V4-13)* |
+| P5 | **One door per rule.** Every bound, limit and vocabulary has exactly one definition site, and every other site reads it. | AR:5 run limit spelled 4× (`mod.rs:713/737`, `native.rs:394`, `process.rs:541`) *(cited)*; frame limit literal at `store.rs:1236` + `coordinator.rs:53`; AR:21 bash clamps what the engine refuses; AR:8/9/16/17 duplicate outboxes, join engines, omission vocabularies and shape checks. Measured by the one-door census, which prints `duplicate_sites=N`; the gate is its reader *(rev 2026-10-01, V4-17)* |
+| P6 | **Ports live in contracts.** A cluster exposes a trait in `hee4-contracts`, and app wires the implementation. No cluster reaches into another's state. | CM: service→store (writes directly), worker→actions; AR:6 "return a validated observation for app to commit" |
+| P7 | **Policy/IO split (F95).** Every decision is a pure fn over values, and the I/O shell is thin. | Already proven in v3: `dispatcher.rs:245,289,299,316` (`backup_due`, `headroom`, `budget_decision`, `headroom_decision`); RR build-01 (move rule (a)/(b) policy out of `observe()`); AR:6 LocalProbe Option-soup |
+| P8 | **Acquisition is bounded, and the derived set is bounded too.** | RR security-2 (`native.rs:1074` fd readlink bytes unbounded); DR:1892 roster observations capped at 4096 **globally, never pruned** (`store/roster.rs:615`, `contracts/roster.rs:9`) *(cited)*; AR:16 unbounded Permit; MA:2 EventCursorV1 unbounded |
+| P9 | **One idempotent-operation primitive.** Replay is derived from `Effect::mutates()` (`actions.rs:485`). | AR SYS rec 2; `INSERT INTO operations` at 4 sites (`store.rs:1254,1651,1802`, `store/roster.rs:271`) + 3 `replayed_*` fns (`store.rs:1268,1281,1294`) |
+| P10 | **Dispatch by owner registry.** Dispatch never goes through a string match. | AR:20 + SYS rec 1: `actions/control.rs:479` `match action.id`, `UNSERVED` list `:418`, 3 lists must agree; `Owner` already exists on every `Action` (`actions.rs:504`) |
+| P11 | **Every written row has a reader in production, or it is not written.** | AR SYS HIGH: outbox inserted (C2: 2 sites) and never delivered (`pending_delivery`/`acknowledge_delivery` `store.rs:2032,2054`: 0 production callers); budget Ledger 0 callers (AR:4) |
+| P12 | **Advisory typed judgment (Jev) is a port behind a `DataClass` boundary.** Advice is never authority. | JM §4: 14 JUDGMENT vs 145 EXACT + 42 THRESHOLD sites; `Advised<T>{decision, advice, agreed}`; engine data held for Luke's grant (JM §5) |
+| P13 | **One spawn door and one egress door**, each in its own crate: spawn in `hee4-host` (K0h), egress in `hee4-egress` (K0e), which only `hee4-app` (K6) may depend on *(rev 2026-10-01, V4-12)*. | IM §6: `process.rs:547` is the one spawn door, but numerical→worker and service→worker edges (CM) exist only to reach it |
+| P14 | **Every gate input comes from the world it certifies** (host records are declared gate inputs). | RR build-01/tests-8 (the gate pinned `host=0` on a copy without `evidence/host/`) |
+| P15 | **Catalogues are pinned by content, not count.** | AR SYS MED (JSON schema vs CATALOGUE pinned by count only); AR:11 two tool-projection authorities |
+
+---
+
+## 2 · Crate / cluster map
+
+**Grouping decision (revised from VC's six; 9 crates, rev 2026-10-01, V4-12).** Three additions, each argued from the evidence:
+- **K0 `hee4-contracts` splits out of K1.** VC and CM agree that *every module's declared dependency is `contracts` only*. As a leaf crate it is the only thing every cluster may import. It also holds the row types K3 notify policy reads (K3 cannot import K1) *(rev 2026-10-01, V2 §3 LOW)*.
+- **K0h `hee4-host` is new.** It holds the one spawn door, the pinned-binary clients and bounded readers. Today numerical→worker and service→worker exist only to reach `worker::process` (CM, IM §6).
+- **K0e `hee4-egress` is new** *(rev 2026-10-01, V4-12; supersedes D-U4)*. It holds the one network-egress door (the Jev/TypeSafe client). Only K6 depends on it, so no cluster crate can call out without passing K6's `DataClass` check; P12 and "egress only from `serve`" become compiler-enforced. (The earlier draft put egress in K0h beside curl; V2 showed K2/K4/K5 → K0h could then reach egress. JM §4.2 placed it "K2 worker"; both are superseded.)
+
+**Dependency law (strict DAG, compiler-enforced):**
+```
+K0 contracts  ←  K0h host  ←  { K2 worker, K4 evidence, K5 habitat }
+K0 contracts  ←  { K1 core, K3 cohesion }
+K0 contracts  ←  K0e egress  ←  K6 app only                       (rev 2026-10-01, V4-12)
+K6 app  →  K0, K0h, K0e, K1, K2, K3, K4, K5      (the only crate that sees more than one cluster)
+No Kn (1..5) depends on another Kn; nothing but K6 depends on K0e.
+```
+
+| Crate | Cluster | Members (v3 modules → v4) | Owns (state / authority) | Allowed deps | Absorbs (v3 finding → v4 shape) |
+|---|---|---|---|---|---|
+| `hee4-contracts` | K0 | contracts, the state enums from recovery (`recovery.rs:308-370`), the action catalogue data (`actions.rs` `Action`/`Owner`/`Effect`), `judge` types, `DataClass`, all bounds | **No state.** Owns every wire type, every durable-state enum, every limit constant (`rc01`), the ~~21-id~~ 22-id catalogue (21 + `judge.inspect`, held; *rev 2026-10-01 ratified V4-55, DC-09*) and question-set types | ~~serde only~~ serde, serde_json, sha2 (all on the v3 lock; *rev 2026-10-01 ratified V4-55, DC-08*) | AR:14 generate Deserialize+Validate from one field list; AR:19 `TaskStateV1`; AR:5 limits into `rc01`; AR:11 tool projection emitted from here as JSON; MA:2 bound `EventCursorV1`; P15 catalogue content digest; JM §4.1 `Question{Noul,Choice,Score}`, `QuestionSet{id,version,digest}` |
+| `hee4-host` | K0h | worker::process (spawn door), bounded readers, pinned clients: curl (loopback ollama only), busctl, systemd-run, bwrap; `Clock` impl; worker `aggregate`/`namespace` I/O the K6 live-verifier adapter needs | No durable state. Owns **the only spawn**, and pins binary digests *(rev 2026-10-01, V4-12: egress moved to K0e)* | K0 | IM §5-6 (5 programs, 1 door); AR:18 `ProcessReport::settled()` + one hasher (from numerical/service copies); RR security-2 byte-bound fd readlinks |
+| `hee4-egress` *(rev 2026-10-01, V4-12)* | K0e | judge egress adapter (TypeSafe `POST /v1/systemone`) | No durable state. Owns **the only network egress** | K0 | JM §4.2 pinned `jev-1.13.0`, 0600 key, caller deadline, egress only from `serve`; depended on by K6 alone, so the `DataClass` check cannot be bypassed |
+| `hee4-core` | K1 | task, store, budget, recovery | **All durable state** (§5): the ledger, objects, outbox, operations, roster rows, cohort/step/judgment tables. Owns `transition()` and the one charge door | K0 | AR:1 one pure `transition`, one cancellation source, verdict names once; AR:4 store settles through `budget::Ledger` (the 3 SQL sites become 1); AR SYS rec 2 one idempotent-op primitive; AR:15 `guard.declared()`/`may_accept()`, `Generation::FIRST`; AR:23 recovery KEEP; MA:4 restore + persist `restored_from`, one cursor door; AR:8 notify's outbox moves here (store = single owner, `Principal::recipient` `principal.rs:51` is the key); DR:1892 roster retention + per-principal cap; RT S6 backup/2 (count + chained page digest, keyset paging) |
+| `hee4-worker` | K2 | roster (policy), route, worker (native, namespace, aggregate, inference, pi) | No durable state (roster rows are persisted by K1 via app). Owns eligibility (one door), routing policy, candidate execution | K0, K0h | AR:5 `native/{profile,daemon,endpoint,transport,ollama}` (*rev 2026-10-01 ratified V4-60, DC-10: the raw `/proc` holder scan, S-9, is K0h's; K2 `native/endpoint` keeps only the policy over it*), phase-enum observer, `tools.rs` moves to K0 catalogue (**removes worker→actions**); AR:12 one eligibility door, one TTL policy; AR:13 typed rule per step kind, split `route/config.rs`; RT S1 N6d retirements; RT S11 `evaluate_fallback` (`route.rs:2074`, test-only callers) wired in dispatch |
+| `hee4-cohesion` | K3 | cohort, context, notify (policy only), skills (Rust loader), workflows (join vocabulary) | No durable state. Owns **one** Join/Blocked vocabulary, **one** Omission vocabulary, delivery policy | K0 | AR:7 re-key onto attempt identity, `Report` enum with non-empty dissent; AR:8 notify = pure policy over K1 rows (2 outboxes → 1; `witness` `notify.rs:514` deleted or given a caller); AR:9 one join engine emitted as schema, cancelled dependency blocks; AR:16 BTreeSets, `MAX_PERMIT`; AR:17 shared `_shape()`, per-bound refusals; CM context→budget becomes cost types in K0 |
+| `hee4-evidence` | K4 | check, numerical, julia decoders, judge admission/calibration statistics | No durable state. **The one verdict authority** (`decide` → `verdict_of`), built in **phase P3** *(rev 2026-10-01, V4-13)* | K0, K0h | AR:3 ledger = `verdict_of(decide)`, seal Decision+Observed, U64 class content becomes ~~a `Class` port implemented in K6~~ a `ClassFacts` value (K0 type) that K6 `u64-class` computes and the adapter passes to `decide`, no trait (*rev 2026-10-01 ratified V4-61, DC-39*); the three identity sources (Collector, Locks, Standards) wired so `decide` can PASS; `live_verifier` does **not** move here: it needs worker and store (`app/live_verifier.rs:25-28`), so it stays a K6 adapter that runs the stages and hands observations to `decide` *(rev 2026-10-01, V4-13)*; AR:10 Rust decoders + closed code set, one schema generating both sides; AR:18 pin the julia depot; MA:20-21 uncertainty + memory bound or declared absent; JM §4.7 admission stats |
+| `hee4-habitat` | K5 | service, herdr | No durable state (health facts are persisted by K1 via app). Owns probe policy and the herdr projection | K0, K0h | AR:6 return a validated observation (**removes service→store**), one `bind()`, LocalProbe enum, **delete `service/systemd.rs`**; AR:19 bounded frame decoder, version check; JM J12 usefulness Score (advisory, grant) |
+| `hee4-app` | K6 | app (split), actions (registry + control), control socket, main, integrations projection | Composition only. Owns wiring, the owner registry, the socket, the startup/commission sequence, the `DataClass` check before K0e (K6 reads the grant record and calls K0e's `clear`, the only constructor of `Cleared`, before `ask`; *rev 2026-10-01 ratified V4-66, DC-13*), and the live-verifier adapter | all (the only dependant of K0e) | AR:2 `runtime.rs` 3,814 lines → `runtime::{ports,lifecycle,settle,publish}`; `main` = argv → `app::serve(Config)` (`compose_native` `main.rs:459` and the duplicated Dispatcher literal move to app); Clock threaded through; AR:20 owner registry, take `Dispatch`, delete `cli`; AR SYS rec 4 `Reply::Stream`; AR:2 cycles runtime↔live_verifier/candidates/plan break because `live_verifier` becomes an adapter that produces observations only, and the verdict comes from K4 `decide` *(rev 2026-10-01, V4-13)* |
+| *(outside the crate DAG)* | — | `integrations/bash`, `integrations/pi`, `julia/`, `deploy/` | Generated or pinned artifacts only | read K0's emitted schema | AR:21 bash reads bounds from schema and **refuses** >60 s (no clamp), Python out of heredocs; AR:11 Pi generator enumerates K0's JSON + `duplicate_tool` refusal; AR:22 real Quadlet or `.stub`, manifest fields measured from cargo; RT S9 manifest records linker/CRT/libgcc/link argv (RR build-03/04) |
+
+**Binaries:** `hee4` (K6; v3 `habitat-engine`), `hee4-namespace-shim` (K2; v3 `hee-namespace-shim`, `src/bin/namespace_shim.rs`, `namespace_shim.rs:226,291-296`) *(rev 2026-10-01, V4-11)*.
+
+**The gate step that proves P1:** a planted cross-cluster `use` must fail `cargo check` with E0432/E0433 naming the planted path. That control asserts on the diagnostic, not on a non-zero exit (CLAUDE.md F96). CM Stage-1's `module-deps.toml` becomes unnecessary as a checker, and **no `tools/check-module-deps` is built**: cargo workspace dependencies are the one door *(rev 2026-10-01, V4-17)*. Cluster membership has one home: the `[workspace] members` list plus each crate's `[dependencies]`. A second planted control proves the K0e rule: a `use hee4_egress` in any crate but K6 must fail the same way *(rev 2026-10-01, V4-12)*.
+
+---
+
+## 3 · Flow map
+
+### 3a · Inbound command path (v3 baseline, 21 hops, re-derived at b5367bc; see C3)
+
+| # | v3 hop | v3 `file:line` | v4 change |
+|---|---|---|---|
+| 1 | `habitat-engine <action>` CLI client connects | `main.rs:1147,1175` *(IM)* | K6; binary `hee4` *(rev 2026-10-01, V4-11)* |
+| 2 | serve: custody flock, bind 0700/0600 | `control_socket.rs:246,299` | **REUSE verbatim** |
+| 3 | accept loop | `control_socket.rs:626,640` | unchanged |
+| 4 | peer uid (SO_PEERCRED) | `control_socket.rs:314` | unchanged |
+| 5 | admit peer → Principal | `control_socket.rs:326,708` | unchanged |
+| 6 | per-principal rate bucket | `control_socket.rs:355,375` | limit constant read from K0 (P5) |
+| 7 | connection cap | `control_socket.rs:537,751` | unchanged |
+| 8 | `serve_connection` reads one frame | `control_socket.rs:454` | **Reply::Stream arm** added (loop writes N frames until close/cursor end) |
+| 9 | `actions::control::serve_composed` | `actions/control.rs:265` | K6 |
+| 10 | `wire::receive` (≤1 MiB, version 1) | `contracts/control.rs:1166` | K0; RT S4 fuzz test (Scanner-accept ⇒ serde-accept) kept |
+| 11 | replay-expired check | `actions/control.rs:282,313` | **→ K1 idempotent-op primitive** (P9) |
+| 12 | admit: catalogue lookup + precondition | `actions/control.rs:343,364` | lookup by content-pinned catalogue (P15) |
+| 13 | `dispatch` string match | `actions/control.rs:469,479` | **→ owner registry** `Registry::get(action.owner)` → `&dyn OwnerPort`; UNSERVED list deleted (unserved = no registry entry = refusal by name) |
+| 14 | `task::control::submission` parse | `task/control.rs:100` | K1, parse derived from the one field list (AR:14) |
+| 15 | `StoreTasks::submit` | `app/tasks.rs:571` | K6 port impl, thin |
+| 16 | `Store::submit` bound + insert tasks row + operations row | `store.rs:1234,1249,1254` | bound read from K0 (the `1_048_576` literal at :1236 dies); **operations via the primitive**; state from `transition(∅, Admit)` |
+| 17 | dispatcher waits | `dispatcher.rs:896`, `tasks.rs:114` | unchanged |
+| 18 | `next_dispatchable` | `store.rs:1439` | Dispatchable carries a typed `TaskState`, not `state == "cancellation_requested"` (`store.rs:1458`; was cited :1457 *(rev 2026-10-01, V2 fix 10)*) |
+| 19 | `runtime::drive` → `task::driver::run` | `runtime.rs:937`, `driver.rs:114` | `runtime::lifecycle`; driver uses the guard (AR:15) |
+| 20 | begin attempt (`admitted\|repair_pending → running`) | `runtime.rs:2024`, `store.rs:2612,2637,2642` | `transition(Begin)`; roster observation → **retained, per-principal** (DR:1892) |
+| 21 | execute → verify → accept (`native::execute`, check, `store.accept`, outbox insert) | `runtime.rs:2134,2226,2336`, `native.rs:1523`, `store.rs:1961,2024` | execute via K2 + K0h; **verify via K4 `decide` only (P4)**: the K6 live-verifier adapter runs the stages and hands observations to `decide`, landed in phase P3 *(rev 2026-10-01, V4-13)*; accept via `transition(Accept)`; outbox insert kept **and now read** (3b.6) |
+
+### 3b · Outbound observation path (v3 baseline, 8 hops)
+
+| # | v3 hop | v3 `file:line` | v4 change |
+|---|---|---|---|
+| 1 | `task.get` / `task.list` parse | `task/control.rs:525,384` | K1, unchanged |
+| 2 | `StoreTasks::get` / `list` | `app/tasks.rs:642,730` | K6 port impl |
+| 3 | `Store::get` / `get_by_key` | `store.rs:1345,1327` | state read as `TaskState` enum, not String |
+| 4 | evidence view | `app/tasks.rs:415,555` | unchanged |
+| 5 | `delivery_of(state, pending, given_up)` | `app/tasks.rs:701,971` | reads a **real** delivered count, so "pending forever" ends |
+| 6 | outbox / `events_after` (unserved) | `store.rs:1363,2032,2054` | **served** by `events.subscribe` → K3 delivery policy over K1 rows → `acknowledge_delivery` has a caller; lands in **phase P5** with the outbox reader *(rev 2026-10-01, V4-14)* |
+| 7 | reply frame | `actions/control.rs:300` | `Reply::Frame` or `Reply::Stream` |
+| 8 | client prints; bash/Pi consume | `main.rs:1175`, `hee3:155` *(IM)* | bash refuses over-limit deadlines instead of clamping (AR:21) |
+
+### 3c · New v4 flows (no v3 hop exists)
+
+| Flow | Path |
+|---|---|
+| Judgment (held for grant) | ~~K3/K2 consumer~~ the K6 module that owns the decision (candidates, workload, repair; *rev 2026-10-01 ratified V4-66, DC-45*) → `Advised<T>` port (K0) → K6 checks `DataClass` against the grant record → K0e egress *(rev 2026-10-01, V4-12)* → K1 `judgments` row (question-set digest, state digest, model, p, tokens) → budget charge through the one charge door. Outage → `UNMEASURED`, and the code decision stands (JM §4.3-4.6) |
+| Service observation | K5 probe (pure policy over K0h I/O) → validated `Observation` → K6 commits via K1 (replaces the direct service→store write, AR:6) |
+| Roster install | deploy/installer → a K1 internal operation kind (`Owner::Deploy`) (*rev 2026-10-01 ratified V4-62, DC-40: at phase P3 only the native-provider's own record is composed through this kind; the general installer is v4.1*), **not** under the wire id `roster.update` (AR SYS HIGH: `native_provider.rs:273` pre-populates that action's idempotency space) |
+
+*(rev 2026-10-01 jev-fit)* NF-JUDGE placement: the Jev fit per decision lives in vault `50 Jev/Jev Fit Map` §3 (the single home of the 51 intersections; query `hee4db highway --jev`).
+
+---
+
+## 4 · Interface map (v4)
+
+### 4a · Sockets and CLI (REUSE; IM §1, §3)
+| Interface | v4 |
+|---|---|
+| `$XDG_RUNTIME_DIR/hee4/control.sock` 0600 in 0700 dir + `control.lock` flock | custody code verbatim (`control_socket.rs:50-59,146,242,303`); the dir is renamed from v3's `habitat-engine/` so a v3 leftover `control.lock` cannot collide *(rev 2026-10-01, V4-11; supersedes "rename only if the unit name changes" and V4-5's `habitat-engine-v4/`)* |
+| no TCP listener | kept (IM §4: `TcpListener` only in tests) |
+| `hee4 serve \| commission <s> \| <action>` | v3 verbs verbatim under the new binary name, from `app::serve(Config)` *(rev 2026-10-01, V4-11)* |
+| `hee4 restore --into <dir> <backup-id>` *(new)* | restore a backup into a fresh generation, then recovery to `complete`; read back by ATLAS D5 *(rev 2026-10-01, V4-15)* |
+| `hee4 release install \| rollback \| prune` *(new)* | content-addressed install, atomic rollback of `current`, retention prune as a pure policy with a dry-run; read back by ATLAS D1 and §6 *(rev 2026-10-01, V4-15)* |
+| `hee4 …` bash wrapper (v3 `hee3`), Pi extension | generated from K0 emitted schema (P5, P15) *(rev 2026-10-01, V4-11)* |
+
+### 4b · Control API: 21 actions (IM §2), plus 1 new
+| Action | v3 | v4 scope | Reason |
+|---|---|---|---|
+| health, tools.list, tools.inspect | served | **v4.0** | served in v3 |
+| task.preview, submit, get, list, cancel, resolve | served | **v4.0** | served; F15 socket proof RT S3 |
+| events.subscribe | refused (B20) | **v4.0, phase P5, on the done-line** *(rev 2026-10-01, V4-14)* | Outbox rows are written on every accept/stop (C2). Serving them (P11) closes AR SYS HIGH ×2 (outbox, Reply::Stream). Decided by V4-14 (was D-U1, which had no phase); the "delete both inserts" alternative is withdrawn. |
+| roster.list, roster.inspect | refused (C01) | v4.1 | read-only; RT S11 pairs C01 with B15 post-tag |
+| roster.update, roster.disable | refused | v4.1 | mutating; installer decoupled from the id first (§3c) |
+| service.inspect, service.probe, service.action | refused (C02/C03) | v4.2 | MA:22 service NOT FINISHED; needs op key + runner |
+| thread.get, thread.list | refused (C06) | v4.2 | MA:18 cohort NOT FINISHED; needs K1 durable owner (migration) |
+| analysis.request, analysis.get | refused (C04) | v4.2 | MA:20-21; production needs O-15 (Luke) |
+| judge.inspect *(new)* | — | held | JM §4.7; only after Luke's Engine Data Grant. Owner `Owner::Judge`, not registered while held, so it is refused by name (*rev 2026-10-01 ratified V4-56, DC-24*) |
+
+### 4c · External calls (spawn and loopback through `hee4-host`; network egress only through `hee4-egress`, rev 2026-10-01, V4-12)
+| Call | Door | v4 status |
+|---|---|---|
+| ollama `127.0.0.1:11434` GET version/tags/ps, POST generate, via pinned `/usr/bin/curl` | K0h curl client | REUSE (`native.rs:1328-1431`); the production curl path comes from `native.toml` config — `native_provider.rs:505` is a `#[cfg(test)]` fixture `HOST` const, not a pin *(rev 2026-10-01, V4-18 errata)*; curl 180/5 s literal → K0 constant |
+| endpoint holder identity (/proc/net/tcp + fd scan) | K0h | REUSE + byte-bound readlinks (RR security-2) + unreadable co-holder refusal (RR security-1) |
+| `busctl` StartTransientUnit / StopUnit / get-property | K0h | REUSE (`aggregate.rs:16-18,206,337-349`), digest-pinned (`class_profile.rs:166`) |
+| `systemd-run` transient scopes | K0h | REUSE (`resources.rs:135`) |
+| `bwrap` candidate sandbox + `hee4-namespace-shim` *(rev 2026-10-01 V7/V8/V9/V10-fix, V7 F24: was the v3 spelling `hee-namespace-shim`; V4-11)* | K0h (spawn) / ~~K4 (check run)~~ K6 live-verifier adapter (check run; V4-13) *(rev 2026-10-01 open-tasks CN-29: authority-consistent correction; DC-01 is settled by DEC V4-13, not a new decision)* | REUSE; network-less namespace unchanged |
+| julia `bin/analysis.jl` | K0h spawn, K4 caller | v4.2 (test callers only today, IM §6) |
+| TypeSafe `POST api.typesafe.ai/v1/systemone` (Jev) | K0e egress *(rev 2026-10-01, V4-12)* | **HELD for Luke's grant** (JM §5: grant, DPA/ZDR, RC01 cost mode, egress, labelled sets) |
+| systemd Manager unit/scope for native daemon | — | **DROPPED** (RT S1 N6d retirement) |
+
+### 4d · Files (IM §8)
+| Path | Owner | v4 |
+|---|---|---|
+| `~/.local/state/hee4/` `active.json`, `generations/<g>/ledger.sqlite3`, `objects/sha256/`, `attempts/` | K1 | same layout, new root name (v3 state is never read by v4; no migration from v3, decision D-U2) *(rev 2026-10-01, V4-11)* |
+| `~/.config/hee4/` grants, routing, classes, native.toml, backup.json, **judge/** (question sets, grant record, 0600 key) | K6 config loader | + `judge/` held *(rev 2026-10-01, V4-11)* |
+| `~/.local/lib/hee4/releases/<manifest-sha256>/` + `current` | `hee4 release` (deploy) | content-addressed install REUSE (`install-release:182,214-215`) *(rev 2026-10-01, V4-11, V4-15)* |
+| systemd user unit `~/.config/systemd/user/hee4.service` | deploy | owed (v3 HO-07 / RT S7; IM §9: no unit) *(rev 2026-10-01, V4-11)* |
+
+---
+
+## 5 · State map
+
+### 5a · Durable tables (all owned by K1 `hee4-core::store`; v3 `migrations/001-008.sql`)
+| Table | v3 origin | Single writer (v4) | Reader(s) | v4 change |
+|---|---|---|---|---|
+| migration_history, ledger_meta (`mode`) | 001 | store::schema | recovery | v4 starts a fresh migration series at 001 |
+| tasks (`state`, `cancellation`, budget cols) | 001, 004 | store via `transition` | task.get/list, dispatcher, herdr, ATLAS D9 | `state` from `TaskState`; **`cancellation` column removed**, cancellation lives in the state (P3); `queued` removed from CHECK (C1); **new `serve_cgroup` column** written at admission from `/proc/self/cgroup` of the admitting `serve`, read by the D9 "used" read-back *(rev 2026-10-01, V4-15)* |
+| attempts (`state`, `effect`, `cleanup`) | 001, 006 | store via `attempt::transition` | recovery, runtime | `queued` removed (C1) |
+| attempt_bindings, attempt_records, attempt_paths | 005-008 | store | receipt, recovery | keep |
+| operations | 001→003 | **the idempotent-op primitive only** | replay | one insert site (P9); installer rows under `Owner::Deploy` (§3c) |
+| events | 001 | store | outbox, recovery | keep |
+| artifacts, acceptances, acceptance_objects | 001, 006 | store | task.get | keep |
+| outbox (`delivered`) | 001 | store (2 insert sites → 1 fn) | **events.subscribe** (new) | delivered/ack now reached (P11) |
+| verifications | 001, 006 | store, value = `verdict_of(decide)` | recovery, task.get | P4 |
+| task_stops, task_dispositions | 001, 003 | store::terminal / resolve | task.get | keep |
+| roster_records, _revisions, _observations, _instances, _instance_history, _pins, _cancel_causes | 001 | store::roster (via app from K2) | K2 eligibility | **retention + per-principal cap** (DR:1892); one TTL policy |
+| *(new)* cohort_threads, cohort_reports, dissent_log | — | store (via app from K3) | thread.get/list | v4.2; AR:7 durable owner, append-only dissent |
+| *(new)* workflow_steps | — | store | workflows | v4.2; AR:9 step-record table |
+| *(new)* service_facts | — | store (via app from K5) | health, service.* | v4.2; AR:6 health rebuildable after restart |
+| *(new)* judgments | — | store | calibration (K4), judge.inspect | held; JM §4.4 append-only, digests not state |
+
+### 5b · Enums (all defined in K0 `hee4-contracts`; one definition each)
+| Enum | v3 definition(s) | v4 |
+|---|---|---|
+| TaskState (12 → 11) | `recovery.rs:338` + string CHECK (001:912) + `herdr.rs:617` match | one enum; `queued` dropped |
+| AttemptState / Effect / Cleanup | `recovery.rs:308-335` + CHECK (001:951) | one enum each |
+| Verdict | `recovery.rs` `Verdict` + `VerificationVerdict` + `VerdictV1State` (`receipt/records.rs:101`) | one enum; AR:1 "verdict names spelled twice" |
+| Mode | `recovery.rs` | keep |
+| ProviderState, InstanceState | `native.rs:508`, `contracts/roster.rs:388` | move native's to K0 |
+| Disposition, ObligationKind | 003 CHECK | enum |
+| Join/Blocked, Omission, Report | cohort + workflows (2 vocab), context + skills (2 vocab) | one each (AR:7,9,16); a wire-visible enum is defined in K0, a K3-internal one in K3 (*rev 2026-10-01 ratified V4-56, DC-14*) |
+| DataClass {public, synthetic, projection, local_private} | — | new (JM §4.3) |
+
+### 5c · TaskState transitions (v3 write sites → v4 `transition(State, Event)`)
+| From | Event | To | v3 write site |
+|---|---|---|---|
+| ∅ | Admit | admitted | `store.rs:1249-1252` |
+| admitted, repair_pending | Begin | running | `store.rs:2612,2642` |
+| running | Settle{settled, ready} | verifying \| repair_pending | `store.rs:1536` |
+| running | Settle{unsettled} | effect_unknown (blocked stays blocked) | `store.rs:1536` |
+| ~~running (cancel requested)~~ cancellation_requested (*rev 2026-10-01 ratified V4-57, DC-07(b): Cancel on `running` already moved the task here; the attempt keeps running under the attempt machine*) | Settle{settled} | cancellation_requested (self-edge) | `store.rs:1536` |
+| verifying | Verdict{Passed} | verifying (awaits accept) | `store/verification.rs:247` |
+| verifying | Verdict{Failed} | repair_pending | `store/verification.rs:248` |
+| verifying | Verdict{Invalid\|Error\|Timeout} | failed | `store/verification.rs:249-250` |
+| verifying | Verdict{unreconciled} | effect_unknown | `store/verification.rs:241-242` |
+| verifying | Accept | accepted | `store.rs:2019` |
+| any non-waiting | Cancel | cancellation_requested | `store.rs:2244` |
+| effect_unknown, blocked | Cancel | *same* (flag only today, `store.rs:2239`) | v4: `CancelRequested` becomes a **field of the waiting variant** (`EffectUnknown{cancel: bool}`), so there is one source (P3) |
+| ~~any~~ any non-terminal (*rev 2026-10-01 ratified V4-57, DC-07(a)*) | Resolve{quarantine} | blocked | `store.rs:1755,1765` |
+| ~~any~~ any non-terminal (*rev 2026-10-01 ratified V4-57, DC-07(a)*) | Resolve{abandon} | abandoned \| cancelled | `store.rs:1788` → `terminal::close` |
+| admitted, ~~queued~~, repair_pending, ~~failed~~, verifying, cancellation_requested (*rev 2026-10-01 ratified V4-57, DC-06, DC-34: `queued` no longer exists; Stop on terminal `failed` is `Illegal`; admitted, repair_pending and verifying → failed; cancellation_requested → cancelled*) | Stop | failed \| cancelled | `store/terminal.rs:133-136,210-214` |
+| — | startup reconcile | per recovery policy | `store/recovery.rs` (REUSE) |
+
+Terminal: accepted, failed, cancelled, abandoned. Every other pair is `Illegal`, and a property test enumerates all 11×|Event| pairs against this table. The table's source is this list of v3 write sites, which is **not independent of the code** (CLAUDE.md F113). The independent check is the v3 ledger's own CHECK constraints plus recorded v3 event logs. *(rev 2026-10-01 ratified V4-57, DC-37)* The one legality home is K1 `task::machine::transition` / `attempt_transition` (no K0 transition table). The constraints are copied read-only to `~/hee4-evidence/reference/v3-records/v3-migration-00{1,2,3}.sql`. The pairs derived from them are in vault `16 System Maps/State and Transition Map` §2c. They decide what the schema can decide: the target sets, one closing record per task, one verdict per attempt and one unsettled attempt per task. A CHECK cannot relate two rows, so the remaining pairs rest on this table and the terminal line. No recorded v3 event log exists in v4, so that half is UNMEASURED.
+
+---
+
+## 6 · Drop / defer / reuse
+
+### 6a · DROPPED (with reason)
+| Item | Reason / finding |
+|---|---|
+| `service/systemd.rs` | dead comments (AR:6) |
+| `native::Systemd`, `aggregate::main_pid` (`aggregate.rs:514`), Manager arms, native.toml `[daemon] unit/scope` | RT S1 N6d retirement |
+| `actions/control.rs` `UNSERVED` list + string `match` | replaced by the owner registry (P10) |
+| `Action.cli` field | never read (AR:20) |
+| `worker/tools.rs` (as a worker module; its catalogue projection moves to K0) | compiled into the lib (`pub mod tools;`) with **no production caller** — not "test-only" as AR says *(rev 2026-10-01, V4-18 errata)*; creates the K2→K6 inversion (AR:5, CM) |
+| second outbox in `notify` (`Outbox` `notify.rs:845`) + public `witness` without caller | one owner = store (AR:8) |
+| second join engine (workflows' own vocabulary) | AR:9 |
+| `TaskState::Queued`, `AttemptState::Queued` | never written (C1) |
+| `tasks.cancellation` column | P3 |
+| live_verifier as a verdict source | P4. It survives as a K6 adapter producing observations for `decide` (phase P3) *(rev 2026-10-01, V4-13)* |
+| wrapper deadline clamp (`hee3`) | AR:21: the wrapper clamps where the engine refuses |
+| declared `retry` in workflows | "implement or drop" (AR:9). Dropped until a flow needs it |
+| `julia Cohesion` pin | unreachable (AR:10); unpinned |
+| budget `Ledger` as an uncalled library | wired as the one charge door instead (AR:4 option 1) |
+
+### 6b · DEFERRED (with trigger)
+| Item | To | Trigger / owner |
+|---|---|---|
+| roster.*, B15 fallback | v4.1 | RT S11 order |
+| service.*, thread.*, analysis.*, cohort durability, workflow steps, numerical uncertainty | v4.2 | MA NOT FINISHED rows 17-22 |
+| Jev in engine (J1-J3, J7-J10, J12-J13) | held | Luke: Engine Data Grant, DPA/ZDR, RC01 paid profile, egress, labelled sets (JM §5) |
+| lane X cross-lineage review | held | Luke's permission rule (DR tail) |
+| DG1-b/d/e, O-15, O-18, every push | held | CLAUDE.local.md gate 1 |
+| real Quadlet (`worker.container` has 0 directives) | ship as `.stub` until needed | AR:22 |
+
+### 6c · REUSED verbatim (KEEP / FINISHED / sound findings)
+| Item | Evidence |
+|---|---|
+| recovery policy (pure) | AR:23 KEEP; enums move to K0 only |
+| worker process lifecycle (limits door, native execute, one settle, readback not redispatch, custody) | MA:1 FINISHED (no mutants record in tree, so re-run mutation in v4) |
+| control socket custody, peer admission, rate bucket, drain | IM §1; MA:13 serve/drain through main |
+| contracts frame bound + version refusal + socket/in-process parity | MA:2 |
+| store upgrade behind a verified backup, atomic cut points (`cut_point!`) | MA:4 |
+| route policy (pure, independent known answers) | AR:13, MA:6 |
+| dispatcher `classify` into 3 steps, `backup_due`/`headroom`/`budget_decision` pure decisions | `dispatcher.rs:245-316,689` (P7 exemplars) |
+| content-addressed release install | IM §8, MA:16 |
+| one accept loop, one serve path, every written state emitted verbatim by task.get | AR SYS "Coherent" |
+| bash wrapper semantics + shellcheck control | MA:15 |
+
+### 6d · Decisions made here (reversible, for Luke's review)
+| id | Decision | Alternative |
+|---|---|---|
+| D-U1 | `events.subscribe` + `Reply::Stream` in v4.0 — **decided by V4-14: phase P5, on the done-line** *(rev 2026-10-01, V4-14)* | delete outbox inserts until served (withdrawn) |
+| D-U2 | v4 state root is fresh; no v3 ledger migration | reason: RT §1.2 — no in-service v3 store exists, so nothing is stranded. Alternative: import the v3 ledger (rejected) *(rev 2026-10-01, V2 X5)* |
+| D-U3 | 8 crates (K0 + K0h added to VC's six) — **superseded by V4-12: 9 crates (K0e added)** *(rev 2026-10-01, V4-12)* | six crates with contracts inside K1: rejected, because every cluster would then depend on K1 |
+| D-U4 | Jev egress in K0h, not K2 — **superseded by V4-12: egress in its own crate K0e, depended on only by K6** *(rev 2026-10-01, V4-12)* | JM §4.2 "K2"; K0h (V2: K2/K4/K5 could reach it) |
+| D-U5 | cancellation encoded in the state variant | keep flag + state: rejected by P3 |
+
+---
+
+## 7 · Design detail: elaboration, not authority *(rev 2026-10-01, the design set)*
+Per-module logic and flows, schematics, and the API, socket, command, loop and flow maps live in the v4 vault design set. **This ULTRAMAP stays the authority.** Where a design note and this file disagree, this file wins, and the disagreement goes to the design conflict register.
+- **Entry:** [Module Design Index](obsidian://open?vault=herdr-engineering-engine-v4.vault&file=15%20Module%20Design%2F00%20-%20Module%20Design%20Index): 53 modules mapped to their design sections and cards, and the design conflict register ~~of 22 distinct conflicts DC-01…DC-22~~ (DC-01…DC-44, 44 rows on 2026-10-01; `hee4db q 'SELECT status_class, count(*) FROM design_conflicts GROUP BY 1'`) *(rev 2026-10-01 alignment)*; later DC-01…DC-46, all RESOLVED by V4-55…V4-66 *(rev 2026-10-01 funnel audit)*.
+- **Elaborations by section:**
+  - §2 crate map → `16 System Maps/System Schematic`
+  - §3 flows → `End-to-End Flow Traces` (E2E-01…12)
+  - §4a/§4c → `Socket and IPC Map` (S-1…S-11) and `Command Map`
+  - §4b → `API Map` (22 actions)
+  - §5 → `State and Transition Map`
+  - §6 → `Anti-Bloat Budget`
+  - runtime loops → `Workflow and Loop Map` (RL-1…11, DW-1…7)
+- **Per-module working procedure and lessons** *(rev 2026-10-01)*: repo `.claude/skills/hee4-module-slice` (DW-1, after "start coding") and `.claude/skills/hee4-lessons` (AP/EX/D/L/spells by trigger); index `.claude/README.md`; restart `~/handoffs/HEE4_RESTART.md`.
+- **Shared vocabulary:** [MODULE-DESIGN-BRIEF.md](file:///var/home/Louranicas/hee4-evidence/design/MODULE-DESIGN-BRIEF.md).
+- **Amendments the design set proposes to this file, awaiting ratification (H-27):** *(rev 2026-10-01 alignment: generated; replaces the hand-written list, which named DC-06…DC-09 and a struck DC-01)*
+  Generated by `hee4db highway --um-amendments --md`: every open row of the design conflict register (vault `15 Module Design/00 - Module Design Index`) whose Conflict or Status text cites "UM §" or "UM-P". That one rule is shared by the generator and `hee4db check` (`check=alignment_um`). Do not edit between the markers; change the register, run `hee4db ingest`, regenerate. Closed rows (e.g. DC-01, applied under V4-13) drop out.
+
+<!-- hee4db:um-amendments:begin -->
+<!-- hee4db:um-amendments:end -->
+  *(rev 2026-10-01 ratified V4-55…V4-66)* The generator prints no rows: every register row is RESOLVED, and the amendments it listed are applied in place above, each marked with its V4 id.
+
+  Until ratified, the text above governs as written.

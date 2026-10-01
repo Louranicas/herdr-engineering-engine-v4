@@ -1,0 +1,45 @@
+# drill — on the HOST: the corpus backup rehearsal (habitat-corpus-backup --dry-run, writes nothing)
+# then the restore drill (habitat-corpus-drill, which takes a REAL snapshot first). The drill's own
+# cleanup trap cannot remove a restored read-only directory, so the recipe lists /tmp/corpus-drill-*
+# before and after, and removes ONLY the directories that appeared during this drill, each by its
+# exact path, after chmod -R u+w. Pre-existing directories are never touched.
+# Rehearsal only: just drill dry.
+# Known defect in habitat-corpus-backup (measured 2026-10-01, not fixed here): its --dry-run exits 1
+# because rsync -X + --link-dest + --dry-run cannot open uncreated destination dirs (code 23 per
+# source). The recipe judges the rehearsal on verdict=DRY-RUN would_transfer>0 with only code-23
+# failures; any other rsync code fails it.
+name = "drill"
+purpose = "Host corpus backup rehearsal and restore drill, then remove only this drill's left-over scratch dir"
+cwd = "/var/home/Louranicas/herdr-engineering-engine-v4"
+
+[[precondition]]
+check = "test -d /var/mnt/STORAGE-10TB/habitat-corpus-backup && echo backup_root"
+expect = "backup_root"
+message = "STORAGE-10TB or its habitat-corpus-backup root is not mounted"
+
+[[precondition]]
+check = "test -x ~/.local/bin/habitat-corpus-backup && test -x ~/.local/bin/habitat-corpus-drill && echo tools"
+expect = "tools"
+message = "habitat-corpus-backup or habitat-corpus-drill is not installed in ~/.local/bin"
+
+[[precondition]]
+check = "if [ -f /run/.containerenv ]; then flatpak-spawn --host true && echo host_reachable; else echo host_reachable; fi"
+expect = "host_reachable"
+message = "in the toolbox and flatpak-spawn --host does not reach the host"
+
+[[step]]
+name = "drill"
+just = "drill"
+expect = "drill verdict=PASS"
+timeout = 3600
+
+# Read-back: no corpus-drill scratch directory from the last two hours is left on the host.
+[[step]]
+name = "no-new-scratch"
+run = "flatpak-spawn --host bash -c 'n=$(find /tmp -maxdepth 1 -name \"corpus-drill-*\" -mmin -120 | wc -l); echo recent_drill_scratch=$n; test $n -eq 0 && echo no_recent_drill_scratch'"
+expect = "no_recent_drill_scratch"
+
+# The drill pinned and restored a real generation: the backup's current pointer resolves.
+[verify]
+run = "flatpak-spawn --host readlink -f /var/mnt/STORAGE-10TB/habitat-corpus-backup/current"
+contains = "/var/mnt/STORAGE-10TB/habitat-corpus-backup/"

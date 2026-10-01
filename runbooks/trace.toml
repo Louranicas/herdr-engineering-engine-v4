@@ -1,0 +1,24 @@
+# trace — the end-to-end funnel trace over every module (vault index -> card -> design section ->
+# system maps -> phases -> H items -> DCs -> migrated paths -> highway), ops/checks/funnel_trace.py.
+name = "trace"
+purpose = "Trace every module through all ten funnel hops"
+cwd = "/var/home/Louranicas/herdr-engineering-engine-v4"
+
+[[precondition]]
+check = "test -d '/var/mnt/STORAGE-10TB/fedora-obsidian-vaults/herdr-engineering-engine-v4.vault/15 Module Design' && echo mounted"
+expect = "mounted"
+message = "the v4 vault is not mounted: the trace reads the Module Design Index and system maps"
+
+[[precondition]]
+check = "hee4db stale"
+expect = "stale_sources=0"
+message = "the ops DB is stale: run hee4db ingest first (the highway hop reads it)"
+
+[[step]]
+name = "trace"
+just = "trace"
+expect = "misses=0 verdict=PASS"
+
+[verify]
+run = "python3 ~/hee4-evidence/verification/funnel-audit-20261001/trace.py"
+contains = "misses=0 verdict=PASS"

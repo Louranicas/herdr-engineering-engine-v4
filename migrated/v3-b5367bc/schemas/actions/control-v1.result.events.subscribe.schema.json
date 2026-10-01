@@ -1,0 +1,1255 @@
+{
+  "$comment": "Validate this per-action result with the retained request action, request_id and exact request_sha256. Runtime equates duplicated operation IDs/generations and validates readback correlation, effect truth and action-specific returned state. A typed result is not task/module acceptance.",
+  "$defs": {
+    "ActionId": {
+      "enum": [
+        "tools.list",
+        "tools.inspect",
+        "task.preview",
+        "task.submit",
+        "task.get",
+        "task.list",
+        "task.cancel",
+        "task.resolve",
+        "thread.get",
+        "thread.list",
+        "roster.list",
+        "roster.inspect",
+        "roster.update",
+        "roster.disable",
+        "service.inspect",
+        "service.probe",
+        "service.action",
+        "analysis.request",
+        "analysis.get",
+        "events.subscribe",
+        "health"
+      ],
+      "type": "string"
+    },
+    "AnalysisSelectorV1": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "analysis_id": {
+              "$ref": "#/$defs/UuidV4"
+            }
+          },
+          "required": [
+            "analysis_id"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "idempotency_key": {
+              "$ref": "#/$defs/UuidV4"
+            },
+            "source_action": {
+              "enum": [
+                "analysis.request"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "source_action",
+            "idempotency_key"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "BodyRequest_analysis_get": {
+      "additionalProperties": false,
+      "properties": {
+        "selector": {
+          "$ref": "#/$defs/AnalysisSelectorV1"
+        }
+      },
+      "required": [
+        "selector"
+      ],
+      "type": "object"
+    },
+    "BodyRequest_health": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "BodyRequest_roster_inspect": {
+      "additionalProperties": false,
+      "properties": {
+        "selector": {
+          "$ref": "#/$defs/RosterSelectorV1"
+        }
+      },
+      "required": [
+        "selector"
+      ],
+      "type": "object"
+    },
+    "BodyRequest_roster_list": {
+      "additionalProperties": false,
+      "properties": {
+        "capability": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$comment": "ASCII includes controls; RC03 does not select a printable-only subset.",
+              "maxLength": 128,
+              "minLength": 1,
+              "not": {
+                "pattern": "[^\\u0000-\\u007f]"
+              },
+              "type": "string"
+            }
+          ]
+        },
+        "include_disabled": {
+          "type": "boolean"
+        },
+        "kinds": {
+          "items": {
+            "enum": [
+              "agent",
+              "model",
+              "service"
+            ],
+            "type": "string"
+          },
+          "maxItems": 3,
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "locality": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "enum": [
+                "local",
+                "remote",
+                "hybrid"
+              ],
+              "type": "string"
+            }
+          ]
+        },
+        "page": {
+          "$ref": "#/$defs/PageInV1"
+        }
+      },
+      "required": [
+        "kinds",
+        "capability",
+        "locality",
+        "include_disabled",
+        "page"
+      ],
+      "type": "object"
+    },
+    "BodyRequest_service_inspect": {
+      "additionalProperties": false,
+      "properties": {
+        "operation": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/ServiceOperationSelectorV1"
+            }
+          ]
+        },
+        "service_id": {
+          "$ref": "#/$defs/UuidV4"
+        }
+      },
+      "required": [
+        "service_id",
+        "operation"
+      ],
+      "type": "object"
+    },
+    "BodyRequest_task_get": {
+      "additionalProperties": false,
+      "properties": {
+        "evidence": {
+          "enum": [
+            "none",
+            "summary",
+            "refs"
+          ],
+          "type": "string"
+        },
+        "selector": {
+          "$ref": "#/$defs/TaskSelectorV1"
+        }
+      },
+      "required": [
+        "selector",
+        "evidence"
+      ],
+      "type": "object"
+    },
+    "BodyRequest_task_list": {
+      "additionalProperties": false,
+      "properties": {
+        "page": {
+          "$ref": "#/$defs/PageInV1"
+        },
+        "parent_task_id": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/UuidV4"
+            }
+          ]
+        },
+        "states": {
+          "items": {
+            "$ref": "#/$defs/TaskStateV1"
+          },
+          "maxItems": 12,
+          "minItems": 0,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "task_class": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$comment": "ASCII includes controls; RC03 does not select a printable-only subset.",
+              "maxLength": 64,
+              "minLength": 1,
+              "not": {
+                "pattern": "[^\\u0000-\\u007f]"
+              },
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "required": [
+        "states",
+        "task_class",
+        "parent_task_id",
+        "page"
+      ],
+      "type": "object"
+    },
+    "BodyRequest_thread_get": {
+      "additionalProperties": false,
+      "properties": {
+        "expected_brief_revision": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/U64Decimal"
+            }
+          ]
+        },
+        "thread_id": {
+          "$ref": "#/$defs/UuidV4"
+        }
+      },
+      "required": [
+        "thread_id",
+        "expected_brief_revision"
+      ],
+      "type": "object"
+    },
+    "BodyRequest_thread_list": {
+      "additionalProperties": false,
+      "properties": {
+        "page": {
+          "$ref": "#/$defs/PageInV1"
+        },
+        "states": {
+          "items": {
+            "$ref": "#/$defs/ThreadStateV1"
+          },
+          "maxItems": 6,
+          "minItems": 0,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "task_id": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/UuidV4"
+            }
+          ]
+        }
+      },
+      "required": [
+        "task_id",
+        "states",
+        "page"
+      ],
+      "type": "object"
+    },
+    "BodyRequest_tools_inspect": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/ActionId"
+        },
+        "version": {
+          "const": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "action",
+        "version"
+      ],
+      "type": "object"
+    },
+    "BodyRequest_tools_list": {
+      "additionalProperties": false,
+      "properties": {
+        "page": {
+          "$ref": "#/$defs/PageInV1"
+        },
+        "query": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$comment": "Runtime must validate UTF-8 and 0..256 encoded bytes, reject unpaired surrogate code units, and avoid normalization. JSON Schema length counts Unicode code points, not bytes; maxLength is only a necessary upper bound.",
+              "maxLength": 256,
+              "minLength": 0,
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "required": [
+        "query",
+        "page"
+      ],
+      "type": "object"
+    },
+    "BodyResult_events_subscribe": {
+      "$comment": "Correlated request cursor null requires a complete visible snapshot with length <= bootstrap_limit. Snapshot is optional for resume; this structural schema cannot inspect the request.",
+      "additionalProperties": false,
+      "properties": {
+        "high_water_cursor": {
+          "$ref": "#/$defs/EventCursorV1"
+        },
+        "snapshot": {
+          "items": {
+            "$ref": "#/$defs/SnapshotHeadV1"
+          },
+          "maxItems": 256,
+          "minItems": 0,
+          "type": "array"
+        },
+        "subscription_id": {
+          "$ref": "#/$defs/UuidV4"
+        }
+      },
+      "required": [
+        "subscription_id",
+        "high_water_cursor"
+      ],
+      "type": "object"
+    },
+    "EventCursorV1": {
+      "$comment": "Runtime checks epoch, retention, expiry, principal visibility and the server-computed sorted filter digest; this selector supplies no authority.",
+      "additionalProperties": false,
+      "properties": {
+        "epoch": {
+          "$ref": "#/$defs/UuidV4"
+        },
+        "expires_unix_ms": {
+          "$ref": "#/$defs/U64Decimal"
+        },
+        "filter_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "issued_unix_ms": {
+          "$ref": "#/$defs/U64Decimal"
+        },
+        "sequence": {
+          "$ref": "#/$defs/U64Decimal"
+        },
+        "visibility_revision": {
+          "$ref": "#/$defs/U64Decimal"
+        }
+      },
+      "required": [
+        "epoch",
+        "sequence",
+        "filter_sha256",
+        "visibility_revision",
+        "issued_unix_ms",
+        "expires_unix_ms"
+      ],
+      "type": "object"
+    },
+    "Generation": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/U64Decimal"
+        },
+        {
+          "not": {
+            "const": "0"
+          }
+        }
+      ]
+    },
+    "PageCursorV1": {
+      "additionalProperties": false,
+      "properties": {
+        "after_key": {
+          "$comment": "ASCII includes controls; RC03 does not select a printable-only subset.",
+          "maxLength": 256,
+          "minLength": 1,
+          "not": {
+            "pattern": "[^\\u0000-\\u007f]"
+          },
+          "type": "string"
+        },
+        "expires_unix_ms": {
+          "$ref": "#/$defs/U64Decimal"
+        },
+        "filter_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "snapshot_revision": {
+          "$ref": "#/$defs/U64Decimal"
+        }
+      },
+      "required": [
+        "snapshot_revision",
+        "after_key",
+        "filter_sha256",
+        "expires_unix_ms"
+      ],
+      "type": "object"
+    },
+    "PageInV1": {
+      "additionalProperties": false,
+      "properties": {
+        "cursor": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/PageCursorV1"
+            }
+          ]
+        },
+        "limit": {
+          "maximum": 100,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "limit",
+        "cursor"
+      ],
+      "type": "object"
+    },
+    "ReadbackSelectorV1": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "action": {
+              "const": "tools.list",
+              "type": "string"
+            },
+            "action_version": {
+              "const": 1,
+              "type": "integer"
+            },
+            "body": {
+              "$ref": "#/$defs/BodyRequest_tools_list"
+            }
+          },
+          "required": [
+            "action",
+            "action_version",
+            "body"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "action": {
+              "const": "tools.inspect",
+              "type": "string"
+            },
+            "action_version": {
+              "const": 1,
+              "type": "integer"
+            },
+            "body": {
+              "$ref": "#/$defs/BodyRequest_tools_inspect"
+            }
+          },
+          "required": [
+            "action",
+            "action_version",
+            "body"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "action": {
+              "const": "task.get",
+              "type": "string"
+            },
+            "action_version": {
+              "const": 1,
+              "type": "integer"
+            },
+            "body": {
+              "$ref": "#/$defs/BodyRequest_task_get"
+            }
+          },
+          "required": [
+            "action",
+            "action_version",
+            "body"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "action": {
+              "const": "task.list",
+              "type": "string"
+            },
+            "action_version": {
+              "const": 1,
+              "type": "integer"
+            },
+            "body": {
+              "$ref": "#/$defs/BodyRequest_task_list"
+            }
+          },
+          "required": [
+            "action",
+            "action_version",
+            "body"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "action": {
+              "const": "thread.get",
+              "type": "string"
+            },
+            "action_version": {
+              "const": 1,
+              "type": "integer"
+            },
+            "body": {
+              "$ref": "#/$defs/BodyRequest_thread_get"
+            }
+          },
+          "required": [
+            "action",
+            "action_version",
+            "body"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "action": {
+              "const": "thread.list",
+              "type": "string"
+            },
+            "action_version": {
+              "const": 1,
+              "type": "integer"
+            },
+            "body": {
+              "$ref": "#/$defs/BodyRequest_thread_list"
+            }
+          },
+          "required": [
+            "action",
+            "action_version",
+            "body"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "action": {
+              "const": "roster.list",
+              "type": "string"
+            },
+            "action_version": {
+              "const": 1,
+              "type": "integer"
+            },
+            "body": {
+              "$ref": "#/$defs/BodyRequest_roster_list"
+            }
+          },
+          "required": [
+            "action",
+            "action_version",
+            "body"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "action": {
+              "const": "roster.inspect",
+              "type": "string"
+            },
+            "action_version": {
+              "const": 1,
+              "type": "integer"
+            },
+            "body": {
+              "$ref": "#/$defs/BodyRequest_roster_inspect"
+            }
+          },
+          "required": [
+            "action",
+            "action_version",
+            "body"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "action": {
+              "const": "service.inspect",
+              "type": "string"
+            },
+            "action_version": {
+              "const": 1,
+              "type": "integer"
+            },
+            "body": {
+              "$ref": "#/$defs/BodyRequest_service_inspect"
+            }
+          },
+          "required": [
+            "action",
+            "action_version",
+            "body"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "action": {
+              "const": "analysis.get",
+              "type": "string"
+            },
+            "action_version": {
+              "const": 1,
+              "type": "integer"
+            },
+            "body": {
+              "$ref": "#/$defs/BodyRequest_analysis_get"
+            }
+          },
+          "required": [
+            "action",
+            "action_version",
+            "body"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "action": {
+              "const": "health",
+              "type": "string"
+            },
+            "action_version": {
+              "const": 1,
+              "type": "integer"
+            },
+            "body": {
+              "$ref": "#/$defs/BodyRequest_health"
+            }
+          },
+          "required": [
+            "action",
+            "action_version",
+            "body"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "RosterSelectorV1": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "record_id": {
+              "$ref": "#/$defs/UuidV4"
+            }
+          },
+          "required": [
+            "record_id"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "idempotency_key": {
+              "$ref": "#/$defs/UuidV4"
+            },
+            "source_action": {
+              "enum": [
+                "roster.update",
+                "roster.disable"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "source_action",
+            "idempotency_key"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ServiceOperationSelectorV1": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "operation_id": {
+              "$ref": "#/$defs/UuidV4"
+            }
+          },
+          "required": [
+            "operation_id"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "idempotency_key": {
+              "$ref": "#/$defs/UuidV4"
+            },
+            "source_action": {
+              "enum": [
+                "service.probe",
+                "service.action"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "source_action",
+            "idempotency_key"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Sha256": {
+      "maxLength": 71,
+      "minLength": 71,
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "SnapshotHeadV1": {
+      "oneOf": [
+        {
+          "$comment": "Runtime equates resource identity/generation and readback target. Delivery identifies its owning task; recovery identifies the engine instance and revision.",
+          "additionalProperties": false,
+          "properties": {
+            "generation": {
+              "$ref": "#/$defs/Generation"
+            },
+            "readback": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/ReadbackSelectorV1"
+                },
+                {
+                  "properties": {
+                    "action": {
+                      "const": "task.get",
+                      "type": "string"
+                    }
+                  }
+                }
+              ]
+            },
+            "resource": {
+              "const": "task",
+              "type": "string"
+            },
+            "resource_id": {
+              "$ref": "#/$defs/UuidV4"
+            }
+          },
+          "required": [
+            "resource",
+            "resource_id",
+            "generation",
+            "readback"
+          ],
+          "type": "object"
+        },
+        {
+          "$comment": "Runtime equates resource identity/generation and readback target. Delivery identifies its owning task; recovery identifies the engine instance and revision.",
+          "additionalProperties": false,
+          "properties": {
+            "generation": {
+              "$ref": "#/$defs/Generation"
+            },
+            "readback": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/ReadbackSelectorV1"
+                },
+                {
+                  "properties": {
+                    "action": {
+                      "const": "task.get",
+                      "type": "string"
+                    }
+                  }
+                }
+              ]
+            },
+            "resource": {
+              "const": "delivery",
+              "type": "string"
+            },
+            "resource_id": {
+              "$ref": "#/$defs/UuidV4"
+            }
+          },
+          "required": [
+            "resource",
+            "resource_id",
+            "generation",
+            "readback"
+          ],
+          "type": "object"
+        },
+        {
+          "$comment": "Runtime equates resource identity/generation and readback target. Delivery identifies its owning task; recovery identifies the engine instance and revision.",
+          "additionalProperties": false,
+          "properties": {
+            "generation": {
+              "$ref": "#/$defs/Generation"
+            },
+            "readback": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/ReadbackSelectorV1"
+                },
+                {
+                  "properties": {
+                    "action": {
+                      "const": "thread.get",
+                      "type": "string"
+                    }
+                  }
+                }
+              ]
+            },
+            "resource": {
+              "const": "thread",
+              "type": "string"
+            },
+            "resource_id": {
+              "$ref": "#/$defs/UuidV4"
+            }
+          },
+          "required": [
+            "resource",
+            "resource_id",
+            "generation",
+            "readback"
+          ],
+          "type": "object"
+        },
+        {
+          "$comment": "Runtime equates resource identity/generation and readback target. Delivery identifies its owning task; recovery identifies the engine instance and revision.",
+          "additionalProperties": false,
+          "properties": {
+            "generation": {
+              "$ref": "#/$defs/Generation"
+            },
+            "readback": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/ReadbackSelectorV1"
+                },
+                {
+                  "properties": {
+                    "action": {
+                      "const": "roster.inspect",
+                      "type": "string"
+                    }
+                  }
+                }
+              ]
+            },
+            "resource": {
+              "const": "roster",
+              "type": "string"
+            },
+            "resource_id": {
+              "$ref": "#/$defs/UuidV4"
+            }
+          },
+          "required": [
+            "resource",
+            "resource_id",
+            "generation",
+            "readback"
+          ],
+          "type": "object"
+        },
+        {
+          "$comment": "Runtime equates resource identity/generation and readback target. Delivery identifies its owning task; recovery identifies the engine instance and revision.",
+          "additionalProperties": false,
+          "properties": {
+            "generation": {
+              "$ref": "#/$defs/Generation"
+            },
+            "readback": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/ReadbackSelectorV1"
+                },
+                {
+                  "properties": {
+                    "action": {
+                      "const": "service.inspect",
+                      "type": "string"
+                    }
+                  }
+                }
+              ]
+            },
+            "resource": {
+              "const": "service",
+              "type": "string"
+            },
+            "resource_id": {
+              "$ref": "#/$defs/UuidV4"
+            }
+          },
+          "required": [
+            "resource",
+            "resource_id",
+            "generation",
+            "readback"
+          ],
+          "type": "object"
+        },
+        {
+          "$comment": "Runtime equates resource identity/generation and readback target. Delivery identifies its owning task; recovery identifies the engine instance and revision.",
+          "additionalProperties": false,
+          "properties": {
+            "generation": {
+              "$ref": "#/$defs/Generation"
+            },
+            "readback": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/ReadbackSelectorV1"
+                },
+                {
+                  "properties": {
+                    "action": {
+                      "const": "analysis.get",
+                      "type": "string"
+                    }
+                  }
+                }
+              ]
+            },
+            "resource": {
+              "const": "analysis",
+              "type": "string"
+            },
+            "resource_id": {
+              "$ref": "#/$defs/UuidV4"
+            }
+          },
+          "required": [
+            "resource",
+            "resource_id",
+            "generation",
+            "readback"
+          ],
+          "type": "object"
+        },
+        {
+          "$comment": "Runtime equates resource identity/generation and readback target. Delivery identifies its owning task; recovery identifies the engine instance and revision.",
+          "additionalProperties": false,
+          "properties": {
+            "generation": {
+              "$ref": "#/$defs/Generation"
+            },
+            "readback": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/ReadbackSelectorV1"
+                },
+                {
+                  "properties": {
+                    "action": {
+                      "const": "health",
+                      "type": "string"
+                    }
+                  }
+                }
+              ]
+            },
+            "resource": {
+              "const": "recovery",
+              "type": "string"
+            },
+            "resource_id": {
+              "$ref": "#/$defs/UuidV4"
+            }
+          },
+          "required": [
+            "resource",
+            "resource_id",
+            "generation",
+            "readback"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "TaskSelectorV1": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "task_id": {
+              "$ref": "#/$defs/UuidV4"
+            }
+          },
+          "required": [
+            "task_id"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "idempotency_key": {
+              "$ref": "#/$defs/UuidV4"
+            },
+            "source_action": {
+              "enum": [
+                "task.submit"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "source_action",
+            "idempotency_key"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "TaskStateV1": {
+      "enum": [
+        "admitted",
+        "queued",
+        "running",
+        "verifying",
+        "repair_pending",
+        "cancellation_requested",
+        "blocked",
+        "accepted",
+        "failed",
+        "cancelled",
+        "abandoned",
+        "effect_unknown"
+      ],
+      "type": "string"
+    },
+    "ThreadStateV1": {
+      "enum": [
+        "planned",
+        "assigned",
+        "running",
+        "joining",
+        "blocked",
+        "settled"
+      ],
+      "type": "string"
+    },
+    "U64Decimal": {
+      "$comment": "Canonical decimal string, numeric range 0..18446744073709551615 inclusive.",
+      "maxLength": 20,
+      "minLength": 1,
+      "not": {
+        "pattern": "[^0-9]"
+      },
+      "pattern": "^(?:0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]{1}|1844674407370955161[0-4]|18446744073709551615)$",
+      "type": "string"
+    },
+    "UuidV4": {
+      "maxLength": 36,
+      "minLength": 36,
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "type": "string"
+    }
+  },
+  "$id": "urn:hee3:control:1:result:events.subscribe",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "effect": {
+            "const": "pending",
+            "type": "string"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "operation_id": {
+            "$ref": "#/$defs/UuidV4"
+          },
+          "readback": {
+            "$ref": "#/$defs/ReadbackSelectorV1"
+          }
+        }
+      }
+    }
+  ],
+  "properties": {
+    "body": {
+      "$ref": "#/$defs/BodyResult_events_subscribe"
+    },
+    "effect": {
+      "enum": [
+        "none",
+        "committed",
+        "pending"
+      ],
+      "type": "string"
+    },
+    "kind": {
+      "const": "result",
+      "type": "string"
+    },
+    "observed_generation": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/Generation"
+        }
+      ]
+    },
+    "operation_id": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/UuidV4"
+        }
+      ]
+    },
+    "protocol": {
+      "const": "hee3.control",
+      "type": "string"
+    },
+    "readback": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/ReadbackSelectorV1"
+        }
+      ]
+    },
+    "replayed": {
+      "type": "boolean"
+    },
+    "request_id": {
+      "$ref": "#/$defs/UuidV4"
+    },
+    "request_sha256": {
+      "$ref": "#/$defs/Sha256"
+    },
+    "version": {
+      "const": 1,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "protocol",
+    "version",
+    "kind",
+    "request_id",
+    "request_sha256",
+    "replayed",
+    "effect",
+    "operation_id",
+    "observed_generation",
+    "readback",
+    "body"
+  ],
+  "title": "HEE3-Control/1 events.subscribe v1 result schema",
+  "type": "object"
+}

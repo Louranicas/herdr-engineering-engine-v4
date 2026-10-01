@@ -1,0 +1,50 @@
+# regen — the sequence after an edit to the design conflict register (vault 15 Module Design/00 -
+# Module Design Index) or any other derived source: ingest, regenerate the three generated blocks
+# (ATLAS §9 table, ULTRAMAP §7 between the hee4db:um-amendments markers, the vault Module Readiness
+# note), repin AT and UM, ingest again, check. Idempotent: a second run changes no byte
+# (proved 2026-10-01: sha256 of 84 files identical across two runs).
+name = "regen"
+purpose = "Regenerate ATLAS §9, ULTRAMAP §7 and the readiness note from hee4db, repin AT/UM, re-ingest and check"
+cwd = "/var/home/Louranicas/herdr-engineering-engine-v4"
+
+[[precondition]]
+check = "test -d '/var/mnt/STORAGE-10TB/fedora-obsidian-vaults/herdr-engineering-engine-v4.vault/00 Hub' && echo mounted"
+expect = "mounted"
+message = "the v4 vault is not mounted: the readiness note and the register live there"
+
+[[precondition]]
+check = "test \"$(grep -c '^## 9 · Phase entry' ~/hee4-evidence/design/DEPLOYMENT_ATLAS.md)\" = 1 && echo atlas_anchor_ok"
+expect = "atlas_anchor_ok"
+message = "ATLAS must carry exactly one '## 9 · Phase entry' heading (the table regen.py replaces)"
+
+[[precondition]]
+check = "test \"$(grep -c 'hee4db:um-amendments:begin' ~/hee4-evidence/design/ULTRAMAP.md)\" = 1 && test \"$(grep -c 'hee4db:um-amendments:end' ~/hee4-evidence/design/ULTRAMAP.md)\" = 1 && echo um_markers_ok"
+expect = "um_markers_ok"
+message = "ULTRAMAP must carry exactly one begin and one end hee4db:um-amendments marker"
+
+[[precondition]]
+check = "python3 ops/checks/cite_pins.py status"
+expect = "unmapped_cites=0"
+message = "a cite is already unmapped (KEY:?n): fix it by hand before repinning (cite_pins.py --help)"
+
+[[step]]
+name = "regen"
+just = "regen"
+expect = "regen verdict=PASS steps=9/9"
+timeout = 900
+
+# Read-back 1: nothing the derived tables index changed after the last ingest.
+[[step]]
+name = "stale-clean"
+run = "hee4db stale"
+expect = "stale_sources=0 absent=0 new_files=0"
+
+# Read-back 2: every generated block already equals its generator (a rerun would write nothing).
+[[step]]
+name = "blocks-idempotent"
+run = "python3 ops/checks/regen.py --check"
+expect = "changed=0"
+
+[verify]
+run = "hee4db check"
+contains = "hee4db check verdict=PASS"

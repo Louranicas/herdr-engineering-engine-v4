@@ -1,0 +1,49 @@
+# Architecture and code-logic review at b5367bc (2026-10-01, louranicas-2c)
+Seven read-only agents (6 module groups + 1 end-to-end tracer), git show/grep only, nothing built or run. Spot-checks by louranicas-2c, all held except one cited line: notify recipient format; roster 4096 cap and per-attempt write; run-limit spellings; runtime.rs 3,814 lines and its cycle; worker.container 0 directives; store `state: String` ×3 and no transition fn; outbox never delivered; Reply {Close, Frame}; store.rs:1236 literal; hee3 deadline clamp. Not confirmed: store.rs:2601 as the flag-read site. Companion maps: `module-audit-b5367bc.md`, `interface-map-b5367bc.md`, `cluster-map-b5367bc.md`.
+
+| # | Module | Rec | Key architecture findings | Target shape |
+|---|---|---|---|---|
+| 1 | store | **REFACTOR** | Task state is a String written at ≥9 sites, with no transition function (illegal transitions representable); cancellation held twice (flag + state); verdict names spelled twice; charge ≤ reservation enforced at 3 sites; the ledger keyed by wire action ids | Move the state enums to contracts; one pure `transition(State, Event)`; one cancellation source; rustfmt the transaction bodies |
+| 2 | app | **REFACTOR** | runtime.rs is 3,814 lines and the hub of cycles (runtime ↔ live_verifier/candidates/plan); main.rs holds policy (compose_native, a duplicated Dispatcher literal); the Clock seam stops at the dispatcher | `runtime::{ports, lifecycle, settle, publish}`; thread Clock through; main = argv → `app::serve(Config)` |
+| 3 | check | **REFACTOR** | Two verdict authorities: the ledger takes live_verifier's, the receipt's decide can never PASS (3 identities hard-wired Unavailable); Decision and Observed not bound; U64 class content inside the generic checker | One verdict: ledger = `verdict_of(decide)`; seal Decision+Observed; class content to an app-side class module |
+| 4 | budget | **REFACTOR** | The conserving Ledger has 0 production callers; real accounting is store SQL at 3 sites | Store settles through Ledger (one charge door), or delete Ledger and keep the value types |
+| 5 | worker | **REFACTOR** | native.rs mixes ~7 concerns; tools.rs (test-only) creates the worker→actions inversion; NamespaceObserver is ~10 flags; run limit spelled 4× (mod.rs:713 1,200,000 ms; :737 900,000 ms; native.rs:394 15 min; process.rs:541 20 min) plus curl 180/5 s (native.rs:1300) | `native/{profile,daemon,endpoint,transport,ollama}`; move tools to actions; phase-enum observer; limits in contracts::rc01 |
+| 6 | service | **REFACTOR** | Writes the store directly, and any caller can assert Useful health; profile binding written 3×; health not rebuildable after restart; LocalProbe is an Option-soup state machine; systemd.rs is dead comments | Return a validated observation for app to commit; one `bind()`; persist facts or their digest; LocalProbe enum; delete systemd.rs |
+| 7 | cohort | **REFACTOR** | No durable owner; thread identity ≠ store attempt identity; dependencies recorded but not enforced; dissent reason lost on rebrief | Re-key onto attempt identity; Report enum with non-empty dissent; append-only dissent log; store-backed restore |
+| 8 | notify | **REFACTOR** | Two outboxes; recipient format incompatible (UUIDv4 vs store "uid:role", verified); two cursor/sequence models; witness public, no caller | Store = single owner; notify = pure policy over rows; store's recipient key, sequence and EventCursorV1 |
+| 9 | workflows | **REFACTOR** | Second join engine (different vocabulary from cohort); no durable procedure state; retry declared, never applied; cancelled dependency unblocks dependents | One Rust Join/Blocked vocabulary emitted as schema; step-record table; implement or drop retry |
+| 10 | julia | **REFACTOR** | Cohesion pinned but unreachable; re-implements cohort::join and budget conservation; wrapping UInt64 sum; no shared versioned schema | Split or unpin Cohesion; Rust decoders + closed code set; one schema generating both sides' constants |
+| 11 | pi_extension | **REFACTOR** | Two tool-projection authorities (Rust tools.rs vs the Pi generator over all 21 ids) | Projection in actions::tools emitted as JSON that the Pi generator enumerates; duplicate_tool refusal |
+| 12 | roster | **HARDEN** | **Suspected release blocker:** observations capped at 4,096 globally, never pruned, one row per attempt (runtime.rs:1327) and per service probe; two eligibility rules; two staleness policies | Ledgered retention keeping referenced rows + per-principal cap (slice S1b); one eligibility door; one TTL policy |
+| 13 | route | **HARDEN** | Pure and sound; Step accepts any Rule; config validated twice; 2,165-line file | Typed rule per step kind; keep the admitted policy; split route/config.rs |
+| 14 | contracts | **HARDEN** | 62 RC04 records spell fields 3×, and the validate() copy isn't compiler-checked; the attempt limit is decided twice | Generate Deserialize + Validate from one field list (macro) |
+| 15 | task | **HARDEN** | The driver repeats the criteria mask and the deadline check the guard owns | `guard.declared()` / `guard.may_accept()`; `Generation::FIRST` |
+| 16 | context | **HARDEN** | Second omission vocabulary in skills; O(n²) walk; unbounded Permit; depth checked before permit | One Omission vocabulary; BTreeSets; MAX_PERMIT |
+| 17 | skills | **HARDEN** | Weaker shape check than workflows (two doors); wrong refusal names for bounds; schema re-read per call | Share _shape(); per-bound refusals; load the schema once |
+| 18 | numerical | **HARDEN** | Settle check and pinned-hash loop copied from service; dependency depot unpinned | `ProcessReport::settled()` + one hasher in worker; pin the depot |
+| 19 | herdr | **HARDEN** | Task states as strings; no decoder or version check; module doc overstates authority | TaskStateV1 in contracts; bounded frame decoder; bound every Snapshot field |
+| 20 | actions | **HARDEN** | Dispatch on strings with 3 lists that must agree; the Dispatch token is dropped before use; the `cli` field is never read | Dispatch by an Owner registry (see system rec 1); take Dispatch; derive or delete cli |
+| 21 | bash | **HARDEN** | Bounds retyped; **clamps the deadline where the engine refuses**; two Python programs in heredocs | Read bounds from the schema; refuse over 60 s; move the Python to .py files |
+| 22 | deploy | **HARDEN** | worker.container has 0 directives; 3 manifest fields certify the script's own values | Real Quadlet or `.stub`; measure features/flags from cargo |
+| 23 | recovery | **KEEP** | A sound pure policy module | Hand its state enums to contracts (with the store refactor) |
+
+Totals: REFACTOR 11 · HARDEN 11 · KEEP 1.
+
+## System-level (end-to-end tracer; 21 inbound + 8 outbound hops, `file:line` for each hop)
+- **HIGH: the outbox is written and never delivered.** store.rs:2024 inserts on every acceptance; pending_delivery/acknowledge_delivery have 0 production callers (verified); task.get's `delivery` reads "pending" forever.
+- **HIGH: streaming cannot be expressed at the transport.** `Reply` is {Close, Frame} (verified), and the connection loop serves one frame per request, so `events.subscribe` needs a contract change, not just a handler.
+- **HIGH: roster revisions are recorded under the unserved `roster.update`'s name** by the installer, which pre-populates that action's idempotency space.
+- **MED: duplicate doors across the path.** The frame limit is a literal in store.rs:1236 and coordinator.rs:53; the wrapper clamps deadlines the engine refuses (verified); two catalogues (the JSON schema vs CATALOGUE) are pinned by a count only; two ledger inventories.
+- **MED: states `queued` and `repair_pending` are readable (wire enum, herdr) but nothing writes them.** *(CORRECTED 2026-10-01: `repair_pending` IS written; only `queued` has no writer. See Correction below.)*
+- **Coherent:** one accept loop, one serve path, one dispatch; every state the store writes is emitted verbatim by task.get.
+
+**System recommendations:**
+1. **REFACTOR:** dispatch by `Action.owner` through a typed registry (replaces the string match, UNSERVED and the internal arm).
+2. **REFACTOR:** one idempotent-operation primitive in store; derive replay from `Effect::mutates()`.
+3. **HARDEN:** one TaskState enum everywhere; write or delete queued/repair_pending.
+4. **REFACTOR:** decide the outbox (a delivery path plus `Reply::Stream`, or remove the insert until served).
+5. **HARDEN:** point every bound at its contract constant; pin the catalogue by content.
+
+## Correction (2026-10-01, from the v4 ultramap agent's tree check)
+- "States `queued` and `repair_pending` are readable but nothing writes them" is **wrong for `repair_pending`**: it is written at `store.rs:1536` and `store/verification.rs:248`. Only **`queued`** has no writer.
+- The outbox has a **second insert site**, `store/terminal.rs:219`, besides `store.rs:2024`. The "written, never delivered" finding stands for both.

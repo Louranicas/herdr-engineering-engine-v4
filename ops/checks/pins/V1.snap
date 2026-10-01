@@ -1,0 +1,95 @@
+# V1 — adversarial verification of the HEE v4 planning repo (2026-10-01)
+
+Subject: /var/home/Louranicas/herdr-engineering-engine-v4 (not a git repo: no commit, so no tree sha; files named below).
+Excluded: docs/ANTIPATTERNS.md, docs/EXEMPLARS.md, docs/DRIFT_AND_OVERENGINEERING.md.
+v3 read only through `git -C /run/host/var/home/herdr-engineering-engine-v3 show|grep|ls-tree b5367bc`.
+
+**Verdict: PASS_WITH_GAPS.** The migrated bytes and the counts hold. The curator cannot do its job as configured, and the dependency column in MIGRATION.md is wrong in places.
+
+## 1 Migration fidelity — PASS
+- `rev-parse b5367bc origin/main main` → all three are `b5367bca71a4…`.
+- 103 payload files; MANIFEST.sha256 has 103 lines; the manifest path set equals the file set (diff empty).
+- `sha256sum -c MANIFEST.sha256 --quiet` → rc=0.
+- A loop over all 103 files compared the sha256 of `git show b5367bc:<p>` with the file's sha256 → `ok=103 bad=0`. No file is empty, so an empty `git show` cannot false-pass.
+- Directory completeness: for src/actions, src/contracts, src/numerical, src/task, integrations/bash, schemas/actions, schemas/receipts, skills and deploy, `ls-tree -r` at b5367bc was diffed against the local `find`. All 9 diffs are empty.
+- Per-module files and lines: recomputed from `wc -l`, all 11 rows match (90,298 lines in total).
+  - contracts=20/20,947 is reached only by assigning t28_control.rs and control_schema.py to contracts. Both test the control-v1 schemas, which are counted under actions. This is a labelling choice, not an error.
+
+## 2 Referenced paths — PASS
+All 19 probed paths exist (`test -e`), including every T28 file, the design/*.md files, the vault, Curator/Log.md, the backlinks.py script, the decision register, tools/check-flow-scoreboard and /run/host/usr/bin/toolbox.
+Cited lines at b5367bc:
+- store.rs:2024 is the outbox INSERT.
+- store/terminal.rs:218-219 is the outbox INSERT.
+- store.rs:1458 is `cancellation: state == "cancellation_requested"`.
+V4-1: both paths are the same btrfs fs (`c2b8fcb467ab8656`) on the same luks-97a2… device. ops README: `crond` reads `active`, and `crontab -l` prints `no crontab for Louranicas`.
+
+## 3 Consistency
+- Consistent:
+  - 23 = 11 REFACTOR + 11 HARDEN + 1 KEEP (arch-review:30 `Totals: REFACTOR 11 · HARDEN 11 · KEEP 1`), and the module names match.
+  - 8 crates = K0, K0h, K1..K6.
+  - D-U1..5 match ULTRAMAP §6d:282-286.
+  - V4-5 matches ATLAS A3; V4-6 matches A5; V4-8 matches A4 (P2/P6, 9 releases, 264 MB).
+  - P0–P9 match ATLAS:222.
+  - PROCESS-LEARNINGS counts: 27 L-rows and 16 K-rows (K1..K16).
+  - The HOLD and "not scheduled" wording agree across README:3,12; CHARTER §2, §6; V4-0, V4-3; ops README:1.
+- Inconsistent:
+  - MED: MIGRATION.md:9 puts contracts in "K1 core". ULTRAMAP:53,66 and D-U3 put it in K0 `hee4-contracts`.
+  - LOW: MIGRATION.md:18-19 put bash and deploy in K6. ULTRAMAP:74 puts them "outside the crate DAG".
+  - MED: README:16-18 carries a generated `CURATOR:BEGIN state` block in repo source. That is the antipattern gates/REQUIREMENTS.md rank 2 forbids ("no generated blocks in source; state computed on read"). No curator path can refresh it either: hee4-curator.md:16-18 and settings.json allow no write to the repo. hee4-curator.md:23 still lists "README State" as a target.
+  - LOW: hee4-curator.md:3,7 say "runs headless from cron / run by cron", which contradicts "defined, not scheduled".
+  - LOW: docs/INDEX.md does not list ~/hee4-evidence/design/DECISION_POINTS-b5367bc.md or ~/hee4-evidence/decisions/.
+
+## 4 Dependency claims (grep `crate::` / `habitat_engine::`)
+- Source imports:
+  - task → recovery (task/control.rs:26) is true.
+  - context → budget (:325) is true.
+  - numerical → worker (process.rs:4) is true.
+  - herdr → contracts only is true.
+  - actions → task and contracts is true.
+- MED: the "Depends on" column lists consumers as dependencies.
+  - roster.rs imports only `crate::contracts::roster` (:302). store/roster.rs and app/routing.rs consume roster; they are not its dependencies.
+  - route.rs imports only contracts (:312-313). app/routing.rs:29 consumes route.
+- MED: test-level dependencies on unmigrated modules go unmentioned:
+  - t03_contract → worker
+  - t06_receipt_import → app, check, store
+  - t28_control → store
+  - t16_herdr → recovery (the herdr row says "none")
+  - t28_actions → worker
+  - t01_contracts.rs:13 `include_str!("../docs/contract-decisions.md")`: docs/ is not migrated and not named.
+  - src/numerical/process.rs:417, a unit test in library source, uses `include_bytes!` on tests/fixtures/t21/J01.json. It is covered by the generic fixtures sentence at MIGRATION:25, but it is compile-time, not only a test.
+- LOW: the provenance command at MIGRATION.md:27 uses the host path. Inside the toolbox that path is an empty directory; it needs `/run/host`.
+
+## 5 Curator
+- Frontmatter:
+  - name, `model: claude-sonnet-5-5` and tools are valid.
+  - The model id resolved in the 2026-09-30T21:24Z selfcheck (a report was produced).
+  - The CLI flags `--agent`, `--max-budget-usd`, `--settings`, `--permission-mode dontAsk` and `--no-session-persistence` all exist in `claude --help`.
+- run-curator.sh:
+  - flock is correct.
+  - `rc` survives the `{ } >>log` group, because a brace group is not a subshell. Probe: `{ (exit 7); rc=$?; } >>/dev/null; exit ${rc:-1}` → `outer_rc=7`.
+- HIGH: the "typed exit" at run-curator.sh:2 is false.
+  - `rc` is claude's exit status, not the verdict. The one real run printed `curator verdict=FAIL` in its report and `rc=0` in its log.
+  - Cron will read a FAIL as success (F138).
+  - Fix: after the run, grep the report for the last `^curator verdict=` line. Map PASS→0, PASS_WITH_GAPS→10 and FAIL→11. Exit 12 when the line is absent.
+- HIGH: step 1 cannot run under settings.json even after the ops README fix, which only swaps Write→Edit. Commands that match no rule:
+  - `| tail -2` (hee4-curator.md:22) has no Bash(tail).
+  - `(cd migrated/v3-b5367bc && sha256sum -c …)` has no Bash(cd).
+  - `python3 tools/check-flow-scoreboard` is relative, so it needs cwd = v3. The runner cds to V4 (run-curator.sh:19).
+  - `ls ~/handoffs/HEE3_HANDOVER_* | sort | tail -1` (hee4-curator.md:13) has no sort or tail.
+  - `python3 ~/fedora-arena/…/backlinks.py` (hee4-curator.md:24) uses `~`, but the rule at settings.json:18 is spelled with an absolute path.
+  - The selfcheck's Bash denial happened with the current settings.json in place: mtime 07:24:38+10 is before the run start at 21:24:47Z. So "allow-list delivery" (ops README:2) is an unproven diagnosis; command coverage is the suspected cause.
+  - Fix: rewrite step 1 as allow-listed single commands:
+    - `sha256sum -c /abs/…/MANIFEST.sha256` run from the absolute directory, or pass `--quiet` with a cwd set by the runner;
+    - `python3 /run/host/var/home/herdr-engineering-engine-v3/tools/check-flow-scoreboard` (the tool resolves ROOT from `__file__`);
+    - drop the `tail`/`sort` pipes and let the agent read the full output;
+    - use absolute paths everywhere.
+  - Then re-run the selfcheck and require `manifest=OK`.
+- MED (suspected, not probed): some allowed rules can write outside the stated paths.
+  - `Bash(find:*)` admits `find … -delete`, `-exec` and `-fprint`.
+  - The `git -C … log:*` and `show:*` rules admit `--output=<any path>`.
+  - The `git -C … grep:*` rule admits `-O<cmd>`, which runs an arbitrary command.
+  - Fix: add deny rules for `find * -delete`, `-exec`, `-fprint`, `--output` and `-O`, or replace `find` with Glob.
+- LOW: CURATOR-block confinement is prose only. The Edit allow covers the whole vault, and the escalated Opus agent inherits the same write rules. The report name also differs between the runner (report-STAMP-MODE.md) and hee4-curator.md:26 (`<UTC>.md`).
+
+## 6 gates/REQUIREMENTS.md — PASS
+PROCESS-LEARNINGS.md:88-104 was diffed against REQUIREMENTS.md:5-21. The only difference is the heading prefix `3 · `, so the table is not truncated or garbled.

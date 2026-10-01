@@ -1,0 +1,31 @@
+# verify — every existing HEE v4 check in order, all of them, then ONE verdict. The recipe never
+# stops at the first red step: it collects every exit code and refuses as one unit.
+name = "verify"
+purpose = "Run cite pins, module funnel (+control), hee4db check, DB control, funnel trace and mermaid render; one verdict"
+cwd = "/var/home/Louranicas/herdr-engineering-engine-v4"
+
+[[precondition]]
+check = "test -d '/var/mnt/STORAGE-10TB/fedora-obsidian-vaults/herdr-engineering-engine-v4.vault' && echo mounted"
+expect = "mounted"
+message = "the v4 vault on STORAGE-10TB is not mounted: the DB check, trace and render read it"
+
+[[precondition]]
+check = "command -v hee4db >/dev/null && command -v node >/dev/null && echo tools"
+expect = "tools"
+message = "hee4db (~/.local/bin symlink to ops/db/hee4db) or node is not on PATH"
+
+[[precondition]]
+check = "test -f ~/.cache/hee4-render/node_modules/mermaid/package.json && echo render_modules"
+expect = "render_modules"
+message = "pinned render modules absent: see ops/checks/render/README.md (npm ci --offline into ~/.cache/hee4-render)"
+
+[[step]]
+name = "verify"
+just = "verify"
+expect = "verify verdict=PASS"   # PASS only when every step passed (rev 2026-10-02 V4-74: no step-count literal, AP-28)
+timeout = 900
+
+# Read-back: the derived index the check measured still describes the files on disk.
+[verify]
+run = "hee4db stale"
+contains = "stale_sources=0 absent=0 new_files=0"

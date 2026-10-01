@@ -1,0 +1,7702 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:hee3:receipt:1",
+  "title": "hee3.receipt/1 closed receipt and inventory schema bundle",
+  "$comment": "Candidate contract artifact, not a published compatibility identity. RC04 revision 4 owns the fixed types and reference addressing. The default entry point is ReceiptV1; named referenced objects and append envelopes validate through their exact addressable $defs entry.",
+  "x-hee3-authority": {
+    "decision": "RC04",
+    "readiness_revision": 4
+  },
+  "x-hee3-bundle-complete": true,
+  "x-hee3-open-decisions": [],
+  "x-hee3-runtime-obligations": [
+    "Validate compact exact UTF-8 JSON bytes: no BOM/trailing LF/duplicate keys/nonfinite numbers; cap manifest at 1048576 bytes before parsing.",
+    "Enforce UTF-8 byte lengths and reject unpaired surrogates; JSON Schema string lengths count Unicode code points, not encoded bytes.",
+    "Enforce integer token spelling if required by RC03; JSON Schema integer values cannot distinguish parsed 1 from 1.0 or 1e0.",
+    "Resolve every Ref using its schema_id, exact digest and byte count from protected custody, without following candidate-controlled paths.",
+    "Recompute all counts from complete typed inventories and pages, detect omissions/duplicates, and enforce one primary owner per credited case.",
+    "Correlate exact seed/result/fixture/oracle/profile identities before and after collection, including patch scope, immutable source and raw logs.",
+    "Check selected mandatory cases, expected producer outcome, independent oracle truth, diagnostic explanations, and meaningful nonempty credit.",
+    "Check deadlines, clock ordering, resources, cancellation, settled cleanup, empty descendants and absence of unresolved material obligations. Wall/cleanup cutoffs share invocation start_monotonic_ns; cleanup cutoffs agree and are <=wall_ms, never reset on retry, and are bounded by the minimum of the predeclared cutoff, wall_ms and intent_elapsed_ms+10000.",
+    "Retain finalized evidence and append separately finalized review and availability observations; never mutate historical receipt bytes. A missing availability observation resolves prior manifest bytes/shape without requiring its missing historical transitive payloads to exist.",
+    "PASS_CANDIDATE is structurally eligible for separate review only; schema validation neither implements a protected collector nor admits a module."
+  ],
+  "$ref": "#/$defs/ReceiptV1",
+  "$defs": {
+    "Id": {
+      "type": "string",
+      "minLength": 36,
+      "maxLength": 36,
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "U64": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 20,
+      "pattern": "^(?:0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|18446744073709550[0-9]{3}|18446744073709551[0-5][0-9]{2}|1844674407370955160[0-9]{1}|1844674407370955161[0-4]|18446744073709551615)$",
+      "not": {
+        "pattern": "[^0-9]"
+      }
+    },
+    "Generation": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/U64"
+        },
+        {
+          "not": {
+            "const": "0"
+          }
+        }
+      ]
+    },
+    "Sha": {
+      "type": "string",
+      "minLength": 71,
+      "maxLength": 71,
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "Text": {
+      "type": "string",
+      "maxLength": 4096,
+      "$comment": "Necessary code-point bound only. Runtime must enforce valid UTF-8 and <=4096 encoded bytes."
+    },
+    "Name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "not": {
+        "pattern": "[^\\u0000-\\u007f]"
+      },
+      "$comment": "RC04 says ASCII, not printable-only ASCII."
+    },
+    "Count": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4294967295
+    },
+    "Bool": {
+      "type": "boolean"
+    },
+    "Ref": {
+      "type": "object",
+      "properties": {
+        "artifact_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "sha256": {
+          "$ref": "#/$defs/Sha"
+        },
+        "byte_length": {
+          "$ref": "#/$defs/Count"
+        },
+        "media_type": {
+          "$ref": "#/$defs/Name"
+        },
+        "schema_id": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Name"
+            },
+            {
+              "enum": [
+                "hee3.raw/1",
+                "hee3.receipt/1:ArtifactPageV1",
+                "hee3.receipt/1:ArtifactV1",
+                "hee3.receipt/1:ArtifactsV1",
+                "hee3.receipt/1:AssumptionPageV1",
+                "hee3.receipt/1:AssumptionV1",
+                "hee3.receipt/1:AvailabilityReceiptV1",
+                "hee3.receipt/1:AvailabilityV1",
+                "hee3.receipt/1:BuildProfileV1",
+                "hee3.receipt/1:CampaignPageV1",
+                "hee3.receipt/1:CampaignV1",
+                "hee3.receipt/1:CasePageV1",
+                "hee3.receipt/1:CaseV1",
+                "hee3.receipt/1:CasesV1",
+                "hee3.receipt/1:CleanupContractV1",
+                "hee3.receipt/1:DependencyPageV1",
+                "hee3.receipt/1:DependencyV1",
+                "hee3.receipt/1:DiagnosticPageV1",
+                "hee3.receipt/1:DiagnosticV1",
+                "hee3.receipt/1:DiagnosticsV1",
+                "hee3.receipt/1:EffectPageV1",
+                "hee3.receipt/1:EffectV1",
+                "hee3.receipt/1:EnvironmentPageV1",
+                "hee3.receipt/1:EnvironmentV1",
+                "hee3.receipt/1:ExpectationV1",
+                "hee3.receipt/1:ExpectedProducerV1",
+                "hee3.receipt/1:FindingPageV1",
+                "hee3.receipt/1:FindingV1",
+                "hee3.receipt/1:GrantPageV1",
+                "hee3.receipt/1:GrantV1",
+                "hee3.receipt/1:HostV1",
+                "hee3.receipt/1:IdentityV1",
+                "hee3.receipt/1:InvocationV1",
+                "hee3.receipt/1:LanguageFlagsPageV1",
+                "hee3.receipt/1:LanguageFlagsV1",
+                "hee3.receipt/1:LimitsV1",
+                "hee3.receipt/1:LockPageV1",
+                "hee3.receipt/1:LockV1",
+                "hee3.receipt/1:MissingObjectPageV1",
+                "hee3.receipt/1:MissingObjectV1",
+                "hee3.receipt/1:MutantPageV1",
+                "hee3.receipt/1:MutantV1",
+                "hee3.receipt/1:MutationV1",
+                "hee3.receipt/1:ObligationPageV1",
+                "hee3.receipt/1:ObligationV1",
+                "hee3.receipt/1:ObservationsV1",
+                "hee3.receipt/1:OracleResultV1",
+                "hee3.receipt/1:ProducerV1",
+                "hee3.receipt/1:ReceiptV1",
+                "hee3.receipt/1:ResourcePageV1",
+                "hee3.receipt/1:ResourceV1",
+                "hee3.receipt/1:ReviewReceiptV1",
+                "hee3.receipt/1:ReviewV1",
+                "hee3.receipt/1:StandardPageV1",
+                "hee3.receipt/1:StandardV1",
+                "hee3.receipt/1:SubjectFilePageV1",
+                "hee3.receipt/1:SubjectFileV1",
+                "hee3.receipt/1:SubjectV1",
+                "hee3.receipt/1:SubjectsV1",
+                "hee3.receipt/1:ToolPageV1",
+                "hee3.receipt/1:ToolV1",
+                "hee3.receipt/1:VerdictV1"
+              ]
+            }
+          ]
+        }
+      },
+      "required": [
+        "artifact_id",
+        "sha256",
+        "byte_length",
+        "media_type",
+        "schema_id"
+      ],
+      "additionalProperties": false,
+      "$comment": "EvidenceRefV1 from RC03. Shape validation does not resolve or authenticate it."
+    },
+    "MaybeId": {
+      "type": "object",
+      "properties": {
+        "value": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "unavailable_reason": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Text"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "value",
+        "unavailable_reason"
+      ],
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "value": {
+              "not": {
+                "type": "null"
+              }
+            },
+            "unavailable_reason": {
+              "type": "null"
+            }
+          }
+        },
+        {
+          "properties": {
+            "value": {
+              "type": "null"
+            },
+            "unavailable_reason": {
+              "$ref": "#/$defs/Text"
+            }
+          }
+        }
+      ]
+    },
+    "MaybeCount": {
+      "type": "object",
+      "properties": {
+        "value": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Count"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "unavailable_reason": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Text"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "value",
+        "unavailable_reason"
+      ],
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "value": {
+              "not": {
+                "type": "null"
+              }
+            },
+            "unavailable_reason": {
+              "type": "null"
+            }
+          }
+        },
+        {
+          "properties": {
+            "value": {
+              "type": "null"
+            },
+            "unavailable_reason": {
+              "$ref": "#/$defs/Text"
+            }
+          }
+        }
+      ]
+    },
+    "MaybeRef": {
+      "type": "object",
+      "properties": {
+        "value": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Ref"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "unavailable_reason": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Text"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "value",
+        "unavailable_reason"
+      ],
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "value": {
+              "not": {
+                "type": "null"
+              }
+            },
+            "unavailable_reason": {
+              "type": "null"
+            }
+          }
+        },
+        {
+          "properties": {
+            "value": {
+              "type": "null"
+            },
+            "unavailable_reason": {
+              "$ref": "#/$defs/Text"
+            }
+          }
+        }
+      ]
+    },
+    "MaybeText": {
+      "type": "object",
+      "properties": {
+        "value": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Text"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "unavailable_reason": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Text"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "value",
+        "unavailable_reason"
+      ],
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "value": {
+              "not": {
+                "type": "null"
+              }
+            },
+            "unavailable_reason": {
+              "type": "null"
+            }
+          }
+        },
+        {
+          "properties": {
+            "value": {
+              "type": "null"
+            },
+            "unavailable_reason": {
+              "$ref": "#/$defs/Text"
+            }
+          }
+        }
+      ]
+    },
+    "MaybeReviewV1": {
+      "type": "object",
+      "properties": {
+        "value": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/ReviewV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "unavailable_reason": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Text"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "value",
+        "unavailable_reason"
+      ],
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "value": {
+              "not": {
+                "type": "null"
+              }
+            },
+            "unavailable_reason": {
+              "type": "null"
+            }
+          }
+        },
+        {
+          "properties": {
+            "value": {
+              "type": "null"
+            },
+            "unavailable_reason": {
+              "$ref": "#/$defs/Text"
+            }
+          }
+        }
+      ]
+    },
+    "IdentityV1": {
+      "type": "object",
+      "properties": {
+        "run_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "task_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "attempt_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "generation": {
+          "$ref": "#/$defs/Generation"
+        },
+        "module_id": {
+          "$ref": "#/$defs/Name"
+        },
+        "criterion_ids": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Name"
+          },
+          "maxItems": 256
+        },
+        "profile_id": {
+          "$ref": "#/$defs/Name"
+        },
+        "parent_run": {
+          "$ref": "#/$defs/MaybeId"
+        }
+      },
+      "required": [
+        "run_id",
+        "task_id",
+        "attempt_id",
+        "generation",
+        "module_id",
+        "criterion_ids",
+        "profile_id",
+        "parent_run"
+      ],
+      "additionalProperties": false
+    },
+    "SubjectsV1": {
+      "type": "object",
+      "properties": {
+        "seed_subject": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Ref"
+            },
+            {
+              "properties": {
+                "schema_id": {
+                  "const": "hee3.receipt/1:SubjectV1"
+                }
+              }
+            }
+          ]
+        },
+        "result_subject": {
+          "type": "object",
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "allOf": [
+                    {
+                      "$ref": "#/$defs/Ref"
+                    },
+                    {
+                      "properties": {
+                        "schema_id": {
+                          "const": "hee3.receipt/1:SubjectV1"
+                        }
+                      }
+                    }
+                  ]
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "unavailable_reason": {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "value",
+            "unavailable_reason"
+          ],
+          "additionalProperties": false,
+          "oneOf": [
+            {
+              "properties": {
+                "value": {
+                  "not": {
+                    "type": "null"
+                  }
+                },
+                "unavailable_reason": {
+                  "type": "null"
+                }
+              }
+            },
+            {
+              "properties": {
+                "value": {
+                  "type": "null"
+                },
+                "unavailable_reason": {
+                  "$ref": "#/$defs/Text"
+                }
+              }
+            }
+          ]
+        },
+        "seed_to_result_patch": {
+          "type": "object",
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/Payload"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "unavailable_reason": {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "value",
+            "unavailable_reason"
+          ],
+          "additionalProperties": false,
+          "oneOf": [
+            {
+              "properties": {
+                "value": {
+                  "not": {
+                    "type": "null"
+                  }
+                },
+                "unavailable_reason": {
+                  "type": "null"
+                }
+              }
+            },
+            {
+              "properties": {
+                "value": {
+                  "type": "null"
+                },
+                "unavailable_reason": {
+                  "$ref": "#/$defs/Text"
+                }
+              }
+            }
+          ]
+        },
+        "fixtures": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Ref"
+            },
+            {
+              "properties": {
+                "schema_id": {
+                  "const": "hee3.receipt/1:SubjectV1"
+                }
+              }
+            }
+          ]
+        },
+        "oracle": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Ref"
+            },
+            {
+              "properties": {
+                "schema_id": {
+                  "const": "hee3.receipt/1:SubjectV1"
+                }
+              }
+            }
+          ]
+        },
+        "harness": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Ref"
+            },
+            {
+              "properties": {
+                "schema_id": {
+                  "const": "hee3.receipt/1:SubjectV1"
+                }
+              }
+            }
+          ]
+        },
+        "collector": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Ref"
+            },
+            {
+              "properties": {
+                "schema_id": {
+                  "const": "hee3.receipt/1:SubjectV1"
+                }
+              }
+            }
+          ]
+        },
+        "launcher": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Ref"
+            },
+            {
+              "properties": {
+                "schema_id": {
+                  "const": "hee3.receipt/1:SubjectV1"
+                }
+              }
+            }
+          ]
+        },
+        "locks": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Ref"
+            },
+            {
+              "properties": {
+                "schema_id": {
+                  "const": "hee3.receipt/1:LockPageV1"
+                }
+              }
+            }
+          ]
+        },
+        "toolchain": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Ref"
+            },
+            {
+              "properties": {
+                "schema_id": {
+                  "const": "hee3.receipt/1:ToolPageV1"
+                }
+              }
+            }
+          ]
+        },
+        "target_features_build_profile": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Ref"
+            },
+            {
+              "properties": {
+                "schema_id": {
+                  "const": "hee3.receipt/1:BuildProfileV1"
+                }
+              }
+            }
+          ]
+        },
+        "standards": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Ref"
+            },
+            {
+              "properties": {
+                "schema_id": {
+                  "const": "hee3.receipt/1:StandardPageV1"
+                }
+              }
+            }
+          ]
+        },
+        "isolation_profile": {
+          "$ref": "#/$defs/Payload"
+        }
+      },
+      "required": [
+        "seed_subject",
+        "result_subject",
+        "seed_to_result_patch",
+        "fixtures",
+        "oracle",
+        "harness",
+        "collector",
+        "launcher",
+        "locks",
+        "toolchain",
+        "target_features_build_profile",
+        "standards",
+        "isolation_profile"
+      ],
+      "additionalProperties": false
+    },
+    "InvocationV1": {
+      "type": "object",
+      "properties": {
+        "argv": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Text"
+          },
+          "maxItems": 256
+        },
+        "cwd_logical": {
+          "$ref": "#/$defs/Name"
+        },
+        "environment": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Ref"
+            },
+            {
+              "properties": {
+                "schema_id": {
+                  "const": "hee3.receipt/1:EnvironmentPageV1"
+                }
+              }
+            }
+          ]
+        },
+        "grants": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Ref"
+            },
+            {
+              "properties": {
+                "schema_id": {
+                  "const": "hee3.receipt/1:GrantPageV1"
+                }
+              }
+            }
+          ]
+        },
+        "expected": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Ref"
+            },
+            {
+              "properties": {
+                "schema_id": {
+                  "const": "hee3.receipt/1:ExpectationV1"
+                }
+              }
+            }
+          ]
+        },
+        "oracle_id": {
+          "$ref": "#/$defs/Name"
+        },
+        "limits": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Ref"
+            },
+            {
+              "properties": {
+                "schema_id": {
+                  "const": "hee3.receipt/1:LimitsV1"
+                }
+              }
+            }
+          ]
+        },
+        "allowed_effects": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Ref"
+            },
+            {
+              "properties": {
+                "schema_id": {
+                  "const": "hee3.receipt/1:EffectPageV1"
+                }
+              }
+            }
+          ]
+        },
+        "cleanup_contract": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Ref"
+            },
+            {
+              "properties": {
+                "schema_id": {
+                  "const": "hee3.receipt/1:CleanupContractV1"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "required": [
+        "argv",
+        "cwd_logical",
+        "environment",
+        "grants",
+        "expected",
+        "oracle_id",
+        "limits",
+        "allowed_effects",
+        "cleanup_contract"
+      ],
+      "additionalProperties": false
+    },
+    "ObservationsV1": {
+      "type": "object",
+      "properties": {
+        "host": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Ref"
+            },
+            {
+              "properties": {
+                "schema_id": {
+                  "const": "hee3.receipt/1:HostV1"
+                }
+              }
+            }
+          ]
+        },
+        "start_unix_ms": {
+          "$ref": "#/$defs/U64"
+        },
+        "end_unix_ms": {
+          "$ref": "#/$defs/U64"
+        },
+        "start_monotonic_ns": {
+          "$ref": "#/$defs/U64"
+        },
+        "end_monotonic_ns": {
+          "$ref": "#/$defs/U64"
+        },
+        "cutoff_unix_ms": {
+          "$ref": "#/$defs/U64"
+        },
+        "resources": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Ref"
+            },
+            {
+              "properties": {
+                "schema_id": {
+                  "const": "hee3.receipt/1:ResourcePageV1"
+                }
+              }
+            }
+          ]
+        },
+        "producer": {
+          "$ref": "#/$defs/ProducerV1"
+        },
+        "cancellation": {
+          "type": "string",
+          "enum": [
+            "not_requested",
+            "requested",
+            "unknown"
+          ]
+        },
+        "cleanup": {
+          "type": "string",
+          "enum": [
+            "not_started",
+            "pending",
+            "settled",
+            "failed",
+            "unknown"
+          ]
+        },
+        "unresolved_obligations": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Ref"
+            },
+            {
+              "properties": {
+                "schema_id": {
+                  "const": "hee3.receipt/1:ObligationPageV1"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "required": [
+        "host",
+        "start_unix_ms",
+        "end_unix_ms",
+        "start_monotonic_ns",
+        "end_monotonic_ns",
+        "cutoff_unix_ms",
+        "resources",
+        "producer",
+        "cancellation",
+        "cleanup",
+        "unresolved_obligations"
+      ],
+      "additionalProperties": false
+    },
+    "ProducerV1": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": [
+            "exited",
+            "signalled",
+            "not_started",
+            "unknown"
+          ]
+        },
+        "exit_code": {
+          "$ref": "#/$defs/MaybeCount"
+        },
+        "signal": {
+          "$ref": "#/$defs/MaybeCount"
+        },
+        "timeout": {
+          "$ref": "#/$defs/Bool"
+        },
+        "stdout": {
+          "type": "object",
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/Payload"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "unavailable_reason": {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "value",
+            "unavailable_reason"
+          ],
+          "additionalProperties": false,
+          "oneOf": [
+            {
+              "properties": {
+                "value": {
+                  "not": {
+                    "type": "null"
+                  }
+                },
+                "unavailable_reason": {
+                  "type": "null"
+                }
+              }
+            },
+            {
+              "properties": {
+                "value": {
+                  "type": "null"
+                },
+                "unavailable_reason": {
+                  "$ref": "#/$defs/Text"
+                }
+              }
+            }
+          ]
+        },
+        "stderr": {
+          "type": "object",
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/Payload"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "unavailable_reason": {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "value",
+            "unavailable_reason"
+          ],
+          "additionalProperties": false,
+          "oneOf": [
+            {
+              "properties": {
+                "value": {
+                  "not": {
+                    "type": "null"
+                  }
+                },
+                "unavailable_reason": {
+                  "type": "null"
+                }
+              }
+            },
+            {
+              "properties": {
+                "value": {
+                  "type": "null"
+                },
+                "unavailable_reason": {
+                  "$ref": "#/$defs/Text"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "required": [
+        "status",
+        "exit_code",
+        "signal",
+        "timeout",
+        "stdout",
+        "stderr"
+      ],
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "status": {
+              "const": "exited"
+            },
+            "exit_code": {
+              "properties": {
+                "value": {
+                  "not": {
+                    "type": "null"
+                  }
+                }
+              }
+            },
+            "signal": {
+              "properties": {
+                "value": {
+                  "type": "null"
+                }
+              }
+            }
+          }
+        },
+        {
+          "properties": {
+            "status": {
+              "const": "signalled"
+            },
+            "exit_code": {
+              "properties": {
+                "value": {
+                  "type": "null"
+                }
+              }
+            },
+            "signal": {
+              "properties": {
+                "value": {
+                  "not": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "properties": {
+            "status": {
+              "type": "string",
+              "enum": [
+                "not_started",
+                "unknown"
+              ]
+            },
+            "exit_code": {
+              "properties": {
+                "value": {
+                  "type": "null"
+                }
+              }
+            },
+            "signal": {
+              "properties": {
+                "value": {
+                  "type": "null"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "CasesV1": {
+      "type": "object",
+      "properties": {
+        "inventory": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Ref"
+            },
+            {
+              "properties": {
+                "schema_id": {
+                  "const": "hee3.receipt/1:CasePageV1"
+                }
+              }
+            }
+          ]
+        },
+        "discovered": {
+          "$ref": "#/$defs/Count"
+        },
+        "selected": {
+          "$ref": "#/$defs/Count"
+        },
+        "executed": {
+          "$ref": "#/$defs/Count"
+        },
+        "passed": {
+          "$ref": "#/$defs/Count"
+        },
+        "failed": {
+          "$ref": "#/$defs/Count"
+        },
+        "skipped": {
+          "$ref": "#/$defs/Count"
+        },
+        "ignored": {
+          "$ref": "#/$defs/Count"
+        },
+        "broken": {
+          "$ref": "#/$defs/Count"
+        },
+        "timed_out": {
+          "$ref": "#/$defs/Count"
+        },
+        "invalid": {
+          "$ref": "#/$defs/Count"
+        },
+        "excluded": {
+          "$ref": "#/$defs/Count"
+        },
+        "unmeasured": {
+          "$ref": "#/$defs/Count"
+        },
+        "primary_credit": {
+          "$ref": "#/$defs/Count"
+        }
+      },
+      "required": [
+        "inventory",
+        "discovered",
+        "selected",
+        "executed",
+        "passed",
+        "failed",
+        "skipped",
+        "ignored",
+        "broken",
+        "timed_out",
+        "invalid",
+        "excluded",
+        "unmeasured",
+        "primary_credit"
+      ],
+      "additionalProperties": false,
+      "$comment": "Counts require complete inventory recomputation; aggregate arithmetic is not validated."
+    },
+    "DiagnosticsV1": {
+      "type": "object",
+      "properties": {
+        "baseline": {
+          "$ref": "#/$defs/Bool"
+        },
+        "warning_count": {
+          "$ref": "#/$defs/Count"
+        },
+        "error_count": {
+          "$ref": "#/$defs/Count"
+        },
+        "by_tool": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Ref"
+            },
+            {
+              "properties": {
+                "schema_id": {
+                  "const": "hee3.receipt/1:DiagnosticPageV1"
+                }
+              }
+            }
+          ]
+        },
+        "stdout_truncated": {
+          "$ref": "#/$defs/Bool"
+        },
+        "stderr_truncated": {
+          "$ref": "#/$defs/Bool"
+        },
+        "mismatch": {
+          "$ref": "#/$defs/MaybeText"
+        }
+      },
+      "required": [
+        "baseline",
+        "warning_count",
+        "error_count",
+        "by_tool",
+        "stdout_truncated",
+        "stderr_truncated",
+        "mismatch"
+      ],
+      "additionalProperties": false
+    },
+    "ArtifactsV1": {
+      "type": "object",
+      "properties": {
+        "inventory": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Ref"
+            },
+            {
+              "properties": {
+                "schema_id": {
+                  "const": "hee3.receipt/1:ArtifactPageV1"
+                }
+              }
+            }
+          ]
+        },
+        "count": {
+          "$ref": "#/$defs/Count"
+        },
+        "total_bytes": {
+          "$ref": "#/$defs/U64"
+        },
+        "finalized": {
+          "$ref": "#/$defs/Bool"
+        }
+      },
+      "required": [
+        "inventory",
+        "count",
+        "total_bytes",
+        "finalized"
+      ],
+      "additionalProperties": false
+    },
+    "MutationV1": {
+      "type": "object",
+      "properties": {
+        "campaigns": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Ref"
+            },
+            {
+              "properties": {
+                "schema_id": {
+                  "const": "hee3.receipt/1:CampaignPageV1"
+                }
+              }
+            }
+          ]
+        },
+        "campaign_count": {
+          "$ref": "#/$defs/Count"
+        },
+        "distinct_mutants": {
+          "$ref": "#/$defs/Count"
+        },
+        "caught": {
+          "$ref": "#/$defs/Count"
+        },
+        "survived": {
+          "$ref": "#/$defs/Count"
+        },
+        "timed_out": {
+          "$ref": "#/$defs/Count"
+        },
+        "unviable": {
+          "$ref": "#/$defs/Count"
+        },
+        "equivalent": {
+          "$ref": "#/$defs/Count"
+        },
+        "excluded": {
+          "$ref": "#/$defs/Count"
+        },
+        "unmeasured": {
+          "$ref": "#/$defs/Count"
+        }
+      },
+      "required": [
+        "campaigns",
+        "campaign_count",
+        "distinct_mutants",
+        "caught",
+        "survived",
+        "timed_out",
+        "unviable",
+        "equivalent",
+        "excluded",
+        "unmeasured"
+      ],
+      "additionalProperties": false,
+      "$comment": "Mutant executions are never behavioral-case credits. Campaign sufficiency is runtime."
+    },
+    "ReviewV1": {
+      "type": "object",
+      "properties": {
+        "reviewer": {
+          "$ref": "#/$defs/Text"
+        },
+        "effective_model": {
+          "$ref": "#/$defs/MaybeText"
+        },
+        "action": {
+          "$ref": "#/$defs/Name"
+        },
+        "subject_sha256": {
+          "$ref": "#/$defs/Sha"
+        },
+        "shared_assumptions": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Ref"
+            },
+            {
+              "properties": {
+                "schema_id": {
+                  "const": "hee3.receipt/1:AssumptionPageV1"
+                }
+              }
+            }
+          ]
+        },
+        "findings": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Ref"
+            },
+            {
+              "properties": {
+                "schema_id": {
+                  "const": "hee3.receipt/1:FindingPageV1"
+                }
+              }
+            }
+          ]
+        },
+        "disposition": {
+          "$ref": "#/$defs/Name"
+        },
+        "residual_obligations": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Ref"
+            },
+            {
+              "properties": {
+                "schema_id": {
+                  "const": "hee3.receipt/1:ObligationPageV1"
+                }
+              }
+            }
+          ]
+        },
+        "pre_fix_evidence": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Ref"
+          },
+          "maxItems": 256
+        },
+        "post_fix_evidence": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Ref"
+          },
+          "maxItems": 256
+        }
+      },
+      "required": [
+        "reviewer",
+        "effective_model",
+        "action",
+        "subject_sha256",
+        "shared_assumptions",
+        "findings",
+        "disposition",
+        "residual_obligations",
+        "pre_fix_evidence",
+        "post_fix_evidence"
+      ],
+      "additionalProperties": false
+    },
+    "VerdictV1": {
+      "type": "object",
+      "properties": {
+        "state": {
+          "type": "string",
+          "enum": [
+            "PASS_CANDIDATE",
+            "FAIL",
+            "INVALID",
+            "ERROR",
+            "TIMEOUT",
+            "CANCELLED",
+            "UNMEASURED"
+          ]
+        },
+        "oracle_result": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Ref"
+            },
+            {
+              "properties": {
+                "schema_id": {
+                  "const": "hee3.receipt/1:OracleResultV1"
+                }
+              }
+            }
+          ]
+        },
+        "intended_detector": {
+          "$ref": "#/$defs/Name"
+        },
+        "benign_pair": {
+          "$ref": "#/$defs/MaybeId"
+        },
+        "reasons": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Text"
+          },
+          "maxItems": 256
+        }
+      },
+      "required": [
+        "state",
+        "oracle_result",
+        "intended_detector",
+        "benign_pair",
+        "reasons"
+      ],
+      "additionalProperties": false
+    },
+    "AvailabilityV1": {
+      "type": "object",
+      "properties": {
+        "observed_unix_ms": {
+          "$ref": "#/$defs/U64"
+        },
+        "state": {
+          "type": "string",
+          "enum": [
+            "complete",
+            "incomplete",
+            "missing"
+          ]
+        },
+        "missing_objects": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Ref"
+            },
+            {
+              "properties": {
+                "schema_id": {
+                  "const": "hee3.receipt/1:MissingObjectPageV1"
+                }
+              }
+            }
+          ]
+        },
+        "retention_policy": {
+          "const": "retain-v1"
+        }
+      },
+      "required": [
+        "observed_unix_ms",
+        "state",
+        "missing_objects",
+        "retention_policy"
+      ],
+      "additionalProperties": false
+    },
+    "ReceiptV1": {
+      "type": "object",
+      "properties": {
+        "protocol": {
+          "const": "hee3.receipt"
+        },
+        "version": {
+          "type": "integer",
+          "const": 1
+        },
+        "serialization": {
+          "const": "json-exact-v1"
+        },
+        "schema_sha256": {
+          "$ref": "#/$defs/Sha"
+        },
+        "identity": {
+          "$ref": "#/$defs/IdentityV1"
+        },
+        "subjects": {
+          "$ref": "#/$defs/SubjectsV1"
+        },
+        "invocation": {
+          "$ref": "#/$defs/InvocationV1"
+        },
+        "observations": {
+          "$ref": "#/$defs/ObservationsV1"
+        },
+        "cases": {
+          "$ref": "#/$defs/CasesV1"
+        },
+        "diagnostics": {
+          "$ref": "#/$defs/DiagnosticsV1"
+        },
+        "artifacts": {
+          "$ref": "#/$defs/ArtifactsV1"
+        },
+        "mutation": {
+          "$ref": "#/$defs/MutationV1"
+        },
+        "review": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/MaybeReviewV1"
+            },
+            {
+              "properties": {
+                "value": {
+                  "type": "null"
+                }
+              }
+            }
+          ]
+        },
+        "verdict": {
+          "$ref": "#/$defs/VerdictV1"
+        },
+        "availability": {
+          "$ref": "#/$defs/AvailabilityV1"
+        }
+      },
+      "required": [
+        "protocol",
+        "version",
+        "serialization",
+        "schema_sha256",
+        "identity",
+        "subjects",
+        "invocation",
+        "observations",
+        "cases",
+        "diagnostics",
+        "artifacts",
+        "mutation",
+        "review",
+        "verdict",
+        "availability"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "verdict": {
+                "properties": {
+                  "state": {
+                    "const": "PASS_CANDIDATE"
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "subjects": {
+                "properties": {
+                  "result_subject": {
+                    "properties": {
+                      "value": {
+                        "not": {
+                          "type": "null"
+                        }
+                      }
+                    }
+                  },
+                  "seed_to_result_patch": {
+                    "properties": {
+                      "value": {
+                        "not": {
+                          "type": "null"
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              "observations": {
+                "properties": {
+                  "producer": {
+                    "properties": {
+                      "status": {
+                        "const": "exited"
+                      },
+                      "timeout": {
+                        "const": false
+                      },
+                      "stdout": {
+                        "properties": {
+                          "value": {
+                            "not": {
+                              "type": "null"
+                            }
+                          }
+                        }
+                      },
+                      "stderr": {
+                        "properties": {
+                          "value": {
+                            "not": {
+                              "type": "null"
+                            }
+                          }
+                        }
+                      }
+                    }
+                  },
+                  "cancellation": {
+                    "const": "not_requested"
+                  },
+                  "cleanup": {
+                    "const": "settled"
+                  }
+                }
+              },
+              "cases": {
+                "properties": {
+                  "selected": {
+                    "minimum": 1
+                  },
+                  "executed": {
+                    "minimum": 1
+                  }
+                }
+              },
+              "diagnostics": {
+                "properties": {
+                  "stdout_truncated": {
+                    "const": false
+                  },
+                  "stderr_truncated": {
+                    "const": false
+                  },
+                  "mismatch": {
+                    "properties": {
+                      "value": {
+                        "type": "null"
+                      }
+                    }
+                  }
+                },
+                "if": {
+                  "properties": {
+                    "baseline": {
+                      "const": true
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "warning_count": {
+                      "const": 0
+                    },
+                    "error_count": {
+                      "const": 0
+                    }
+                  }
+                }
+              },
+              "artifacts": {
+                "properties": {
+                  "finalized": {
+                    "const": true
+                  }
+                }
+              },
+              "availability": {
+                "properties": {
+                  "state": {
+                    "const": "complete"
+                  }
+                }
+              }
+            }
+          },
+          "$comment": "Necessary structural guards only. A deliberate negative control may have a nonzero expected exit; runtime verifies that exact outcome and isolated fault diagnostics. Aggregate inventories and cleanup truth need separate validation. Exhaustive outcome totals may include unselected/nonmandatory rows; selected mandatory rows must pass, which is checked after inventory resolution. No module admission claim."
+        }
+      ]
+    },
+    "Payload": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/Ref"
+        },
+        {
+          "properties": {
+            "schema_id": {
+              "const": "hee3.raw/1"
+            }
+          }
+        }
+      ]
+    },
+    "Reason": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/Text"
+        },
+        {
+          "minLength": 1
+        }
+      ]
+    },
+    "RelPath": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/Reason"
+        },
+        {
+          "not": {
+            "pattern": "(^/|//|\\u0000|/$(?![\\s\\S])|(^|/)\\.{1,2}(/|$(?![\\s\\S])))"
+          }
+        }
+      ],
+      "$comment": "Descriptive UTF-8 inventory path only; never candidate import authority. UTF-8 byte cap, sorted order, aliases and file custody require runtime checks."
+    },
+    "MaybeSha": {
+      "type": "object",
+      "properties": {
+        "value": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Sha"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "unavailable_reason": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Text"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "value",
+        "unavailable_reason"
+      ],
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "value": {
+              "not": {
+                "type": "null"
+              }
+            },
+            "unavailable_reason": {
+              "type": "null"
+            }
+          }
+        },
+        {
+          "properties": {
+            "value": {
+              "type": "null"
+            },
+            "unavailable_reason": {
+              "$ref": "#/$defs/Text"
+            }
+          }
+        }
+      ]
+    },
+    "MaybeU64": {
+      "type": "object",
+      "properties": {
+        "value": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "unavailable_reason": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Text"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "value",
+        "unavailable_reason"
+      ],
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "value": {
+              "not": {
+                "type": "null"
+              }
+            },
+            "unavailable_reason": {
+              "type": "null"
+            }
+          }
+        },
+        {
+          "properties": {
+            "value": {
+              "type": "null"
+            },
+            "unavailable_reason": {
+              "$ref": "#/$defs/Text"
+            }
+          }
+        }
+      ]
+    },
+    "MaybeName": {
+      "type": "object",
+      "properties": {
+        "value": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Name"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "unavailable_reason": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Text"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "value",
+        "unavailable_reason"
+      ],
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "value": {
+              "not": {
+                "type": "null"
+              }
+            },
+            "unavailable_reason": {
+              "type": "null"
+            }
+          }
+        },
+        {
+          "properties": {
+            "value": {
+              "type": "null"
+            },
+            "unavailable_reason": {
+              "$ref": "#/$defs/Text"
+            }
+          }
+        }
+      ]
+    },
+    "ExpectedProducerV1": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": [
+            "exited",
+            "signalled"
+          ]
+        },
+        "exit_code": {
+          "$ref": "#/$defs/MaybeCount"
+        },
+        "signal": {
+          "$ref": "#/$defs/MaybeCount"
+        }
+      },
+      "required": [
+        "status",
+        "exit_code",
+        "signal"
+      ],
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "status": {
+              "const": "exited"
+            },
+            "exit_code": {
+              "properties": {
+                "value": {
+                  "not": {
+                    "type": "null"
+                  }
+                }
+              }
+            },
+            "signal": {
+              "properties": {
+                "value": {
+                  "type": "null"
+                }
+              }
+            }
+          }
+        },
+        {
+          "properties": {
+            "status": {
+              "const": "signalled"
+            },
+            "exit_code": {
+              "properties": {
+                "value": {
+                  "type": "null"
+                }
+              }
+            },
+            "signal": {
+              "properties": {
+                "value": {
+                  "not": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "CaseV1": {
+      "type": "object",
+      "properties": {
+        "case_id": {
+          "$ref": "#/$defs/Name"
+        },
+        "primary_module_id": {
+          "$ref": "#/$defs/Name"
+        },
+        "criterion_ids": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Name"
+          },
+          "maxItems": 256
+        },
+        "fixture_sha256": {
+          "$ref": "#/$defs/Sha"
+        },
+        "oracle_id": {
+          "$ref": "#/$defs/Name"
+        },
+        "expected": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Ref"
+            },
+            {
+              "properties": {
+                "schema_id": {
+                  "const": "hee3.receipt/1:ExpectationV1"
+                }
+              }
+            }
+          ]
+        },
+        "mandatory": {
+          "$ref": "#/$defs/Bool"
+        },
+        "excluded": {
+          "$ref": "#/$defs/Bool"
+        },
+        "selected": {
+          "$ref": "#/$defs/Bool"
+        },
+        "executed": {
+          "$ref": "#/$defs/Bool"
+        },
+        "outcome": {
+          "type": "string",
+          "enum": [
+            "passed",
+            "failed",
+            "skipped",
+            "ignored",
+            "broken",
+            "timeout",
+            "invalid",
+            "unmeasured"
+          ]
+        },
+        "producer_exit_or_signal": {
+          "$ref": "#/$defs/ProducerV1"
+        },
+        "detector_id": {
+          "$ref": "#/$defs/Name"
+        },
+        "benign_pair_id": {
+          "$ref": "#/$defs/MaybeId"
+        },
+        "raw_evidence_refs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Ref"
+          },
+          "maxItems": 256
+        },
+        "reason": {
+          "$ref": "#/$defs/Text"
+        }
+      },
+      "required": [
+        "case_id",
+        "primary_module_id",
+        "criterion_ids",
+        "fixture_sha256",
+        "oracle_id",
+        "expected",
+        "mandatory",
+        "excluded",
+        "selected",
+        "executed",
+        "outcome",
+        "producer_exit_or_signal",
+        "detector_id",
+        "benign_pair_id",
+        "raw_evidence_refs",
+        "reason"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "mandatory": {
+                "const": true
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "selected": {
+                "const": true
+              },
+              "excluded": {
+                "const": false
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "executed": {
+                "const": true
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "selected": {
+                "const": true
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "excluded": {
+                "const": true
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "selected": {
+                "const": false
+              },
+              "executed": {
+                "const": false
+              },
+              "outcome": {
+                "const": "unmeasured"
+              },
+              "reason": {
+                "$ref": "#/$defs/Reason"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "selected": {
+                "const": false
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "outcome": {
+                "const": "unmeasured"
+              },
+              "reason": {
+                "$ref": "#/$defs/Reason"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "not": {
+                  "const": "passed"
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "reason": {
+                "$ref": "#/$defs/Reason"
+              }
+            }
+          }
+        }
+      ],
+      "$comment": "Mandatory selection is frozen before observation. A resolved PASS inventory needs meaningful mandatory rows, each executed/passed; case shape alone cannot establish oracle truth or distinct primary case credit."
+    },
+    "SubjectV1": {
+      "type": "object",
+      "properties": {
+        "subject_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "files": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Ref"
+            },
+            {
+              "properties": {
+                "schema_id": {
+                  "const": "hee3.receipt/1:SubjectFilePageV1"
+                }
+              }
+            }
+          ]
+        },
+        "tree_sha256": {
+          "$ref": "#/$defs/Sha"
+        },
+        "dirty_patch": {
+          "type": "object",
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/Payload"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "unavailable_reason": {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "value",
+            "unavailable_reason"
+          ],
+          "additionalProperties": false,
+          "oneOf": [
+            {
+              "properties": {
+                "value": {
+                  "not": {
+                    "type": "null"
+                  }
+                },
+                "unavailable_reason": {
+                  "type": "null"
+                }
+              }
+            },
+            {
+              "properties": {
+                "value": {
+                  "type": "null"
+                },
+                "unavailable_reason": {
+                  "$ref": "#/$defs/Text"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "required": [
+        "subject_id",
+        "files",
+        "tree_sha256",
+        "dirty_patch"
+      ],
+      "additionalProperties": false
+    },
+    "SubjectFileV1": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/RelPath"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "file",
+            "directory",
+            "symlink",
+            "submodule",
+            "other"
+          ]
+        },
+        "content": {
+          "type": "object",
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/Payload"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "unavailable_reason": {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "value",
+            "unavailable_reason"
+          ],
+          "additionalProperties": false,
+          "oneOf": [
+            {
+              "properties": {
+                "value": {
+                  "not": {
+                    "type": "null"
+                  }
+                },
+                "unavailable_reason": {
+                  "type": "null"
+                }
+              }
+            },
+            {
+              "properties": {
+                "value": {
+                  "type": "null"
+                },
+                "unavailable_reason": {
+                  "$ref": "#/$defs/Text"
+                }
+              }
+            }
+          ]
+        },
+        "executable": {
+          "$ref": "#/$defs/Bool"
+        },
+        "link_target": {
+          "$ref": "#/$defs/MaybeText"
+        },
+        "origin": {
+          "type": "string",
+          "enum": [
+            "authored",
+            "generated",
+            "excluded"
+          ]
+        },
+        "exclusion_reason": {
+          "$ref": "#/$defs/MaybeText"
+        }
+      },
+      "required": [
+        "path",
+        "kind",
+        "content",
+        "executable",
+        "link_target",
+        "origin",
+        "exclusion_reason"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "executable": {
+                "const": true
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "kind": {
+                "const": "file"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "file"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "content": {
+                "properties": {
+                  "value": {
+                    "not": {
+                      "type": "null"
+                    }
+                  }
+                }
+              },
+              "link_target": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "directory"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "content": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              },
+              "link_target": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "symlink"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "link_target": {
+                "properties": {
+                  "value": {
+                    "not": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "origin": {
+                "const": "excluded"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "exclusion_reason": {
+                "properties": {
+                  "value": {
+                    "$ref": "#/$defs/Reason"
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "LockV1": {
+      "type": "object",
+      "properties": {
+        "lock_id": {
+          "$ref": "#/$defs/Name"
+        },
+        "ecosystem": {
+          "$ref": "#/$defs/Name"
+        },
+        "path": {
+          "$ref": "#/$defs/RelPath"
+        },
+        "content": {
+          "$ref": "#/$defs/Payload"
+        },
+        "dependencies": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Ref"
+            },
+            {
+              "properties": {
+                "schema_id": {
+                  "const": "hee3.receipt/1:DependencyPageV1"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "required": [
+        "lock_id",
+        "ecosystem",
+        "path",
+        "content",
+        "dependencies"
+      ],
+      "additionalProperties": false
+    },
+    "DependencyV1": {
+      "type": "object",
+      "properties": {
+        "dependency_id": {
+          "$ref": "#/$defs/Name"
+        },
+        "name": {
+          "$ref": "#/$defs/Name"
+        },
+        "version": {
+          "$ref": "#/$defs/Name"
+        },
+        "source": {
+          "$ref": "#/$defs/Text"
+        },
+        "checksum": {
+          "$ref": "#/$defs/MaybeSha"
+        },
+        "locked_by": {
+          "$ref": "#/$defs/Payload"
+        }
+      },
+      "required": [
+        "dependency_id",
+        "name",
+        "version",
+        "source",
+        "checksum",
+        "locked_by"
+      ],
+      "additionalProperties": false
+    },
+    "ToolV1": {
+      "type": "object",
+      "properties": {
+        "tool_id": {
+          "$ref": "#/$defs/Name"
+        },
+        "executable": {
+          "$ref": "#/$defs/Payload"
+        },
+        "executable_path": {
+          "$ref": "#/$defs/Text"
+        },
+        "version": {
+          "$ref": "#/$defs/Text"
+        },
+        "version_output": {
+          "$ref": "#/$defs/Payload"
+        },
+        "target": {
+          "$ref": "#/$defs/Name"
+        }
+      },
+      "required": [
+        "tool_id",
+        "executable",
+        "executable_path",
+        "version",
+        "version_output",
+        "target"
+      ],
+      "additionalProperties": false
+    },
+    "BuildProfileV1": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "$ref": "#/$defs/Name"
+        },
+        "features": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Name"
+          },
+          "maxItems": 256
+        },
+        "default_features": {
+          "$ref": "#/$defs/Bool"
+        },
+        "build_profile": {
+          "$ref": "#/$defs/Name"
+        },
+        "language_flags": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Ref"
+            },
+            {
+              "properties": {
+                "schema_id": {
+                  "const": "hee3.receipt/1:LanguageFlagsPageV1"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "required": [
+        "target",
+        "features",
+        "default_features",
+        "build_profile",
+        "language_flags"
+      ],
+      "additionalProperties": false
+    },
+    "LanguageFlagsV1": {
+      "type": "object",
+      "properties": {
+        "language": {
+          "$ref": "#/$defs/Name"
+        },
+        "argv": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Text"
+          },
+          "maxItems": 256
+        }
+      },
+      "required": [
+        "language",
+        "argv"
+      ],
+      "additionalProperties": false
+    },
+    "StandardV1": {
+      "type": "object",
+      "properties": {
+        "standard_id": {
+          "$ref": "#/$defs/Name"
+        },
+        "revision": {
+          "$ref": "#/$defs/Name"
+        },
+        "document": {
+          "$ref": "#/$defs/Payload"
+        }
+      },
+      "required": [
+        "standard_id",
+        "revision",
+        "document"
+      ],
+      "additionalProperties": false
+    },
+    "EnvironmentV1": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Name"
+            },
+            {
+              "not": {
+                "pattern": "[\\u0000=]"
+              }
+            }
+          ]
+        },
+        "value": {
+          "$ref": "#/$defs/MaybeText"
+        },
+        "secret_handle": {
+          "$ref": "#/$defs/MaybeId"
+        }
+      },
+      "required": [
+        "name",
+        "value",
+        "secret_handle"
+      ],
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "properties": {
+            "value": {
+              "properties": {
+                "value": {
+                  "not": {
+                    "type": "null"
+                  }
+                }
+              }
+            },
+            "secret_handle": {
+              "properties": {
+                "value": {
+                  "type": "null"
+                }
+              }
+            }
+          }
+        },
+        {
+          "properties": {
+            "value": {
+              "properties": {
+                "value": {
+                  "type": "null"
+                }
+              }
+            },
+            "secret_handle": {
+              "properties": {
+                "value": {
+                  "not": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "GrantV1": {
+      "type": "object",
+      "properties": {
+        "grant_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "scope_sha256": {
+          "$ref": "#/$defs/Sha"
+        },
+        "issuer_id": {
+          "$ref": "#/$defs/Name"
+        },
+        "grant": {
+          "$ref": "#/$defs/Payload"
+        }
+      },
+      "required": [
+        "grant_id",
+        "scope_sha256",
+        "issuer_id",
+        "grant"
+      ],
+      "additionalProperties": false
+    },
+    "ExpectationV1": {
+      "type": "object",
+      "properties": {
+        "oracle_id": {
+          "$ref": "#/$defs/Name"
+        },
+        "oracle_class": {
+          "type": "string",
+          "enum": [
+            "contract",
+            "reference",
+            "round_trip_invariant",
+            "metamorphic",
+            "differential"
+          ]
+        },
+        "specification": {
+          "$ref": "#/$defs/Payload"
+        },
+        "expected_producer": {
+          "$ref": "#/$defs/ExpectedProducerV1"
+        },
+        "expected_oracle": {
+          "const": "satisfied"
+        },
+        "intended_detector": {
+          "$ref": "#/$defs/Name"
+        },
+        "shared_assumptions": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Ref"
+            },
+            {
+              "properties": {
+                "schema_id": {
+                  "const": "hee3.receipt/1:AssumptionPageV1"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "required": [
+        "oracle_id",
+        "oracle_class",
+        "specification",
+        "expected_producer",
+        "expected_oracle",
+        "intended_detector",
+        "shared_assumptions"
+      ],
+      "additionalProperties": false
+    },
+    "LimitsV1": {
+      "type": "object",
+      "properties": {
+        "wall_ms": {
+          "$ref": "#/$defs/U64"
+        },
+        "memory_bytes": {
+          "$ref": "#/$defs/U64"
+        },
+        "memory_swap_bytes": {
+          "$ref": "#/$defs/U64"
+        },
+        "scratch_bytes": {
+          "$ref": "#/$defs/U64"
+        },
+        "stdout_bytes": {
+          "$ref": "#/$defs/U64"
+        },
+        "stderr_bytes": {
+          "$ref": "#/$defs/U64"
+        },
+        "artifact_bytes": {
+          "$ref": "#/$defs/U64"
+        },
+        "external_requests": {
+          "$ref": "#/$defs/U64"
+        },
+        "external_cost_microunits": {
+          "$ref": "#/$defs/U64"
+        },
+        "term_grace_ms": {
+          "$ref": "#/$defs/U64"
+        },
+        "cleanup_deadline_ms": {
+          "$ref": "#/$defs/U64"
+        },
+        "cpu_quota_percent": {
+          "$ref": "#/$defs/Count"
+        },
+        "tasks_max": {
+          "$ref": "#/$defs/Count"
+        },
+        "compiler_jobs": {
+          "$ref": "#/$defs/Count"
+        },
+        "julia_threads": {
+          "$ref": "#/$defs/Count"
+        },
+        "blas_threads": {
+          "$ref": "#/$defs/Count"
+        },
+        "currency": {
+          "$ref": "#/$defs/MaybeName"
+        }
+      },
+      "required": [
+        "wall_ms",
+        "memory_bytes",
+        "memory_swap_bytes",
+        "scratch_bytes",
+        "stdout_bytes",
+        "stderr_bytes",
+        "artifact_bytes",
+        "external_requests",
+        "external_cost_microunits",
+        "term_grace_ms",
+        "cleanup_deadline_ms",
+        "cpu_quota_percent",
+        "tasks_max",
+        "compiler_jobs",
+        "julia_threads",
+        "blas_threads",
+        "currency"
+      ],
+      "additionalProperties": false,
+      "$comment": "RC01/RC02/RC05 profile-specific limits, positivity and currency correlation are runtime."
+    },
+    "EffectV1": {
+      "type": "object",
+      "properties": {
+        "effect_id": {
+          "$ref": "#/$defs/Name"
+        },
+        "grant_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "owner_id": {
+          "$ref": "#/$defs/Name"
+        },
+        "scope": {
+          "$ref": "#/$defs/Text"
+        },
+        "specification": {
+          "$ref": "#/$defs/Payload"
+        }
+      },
+      "required": [
+        "effect_id",
+        "grant_id",
+        "owner_id",
+        "scope",
+        "specification"
+      ],
+      "additionalProperties": false
+    },
+    "CleanupContractV1": {
+      "type": "object",
+      "properties": {
+        "owner_id": {
+          "$ref": "#/$defs/Name"
+        },
+        "term_grace_ms": {
+          "$ref": "#/$defs/U64"
+        },
+        "deadline_ms": {
+          "$ref": "#/$defs/U64"
+        },
+        "require_empty_descendants": {
+          "$ref": "#/$defs/Bool"
+        },
+        "obligations": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Ref"
+            },
+            {
+              "properties": {
+                "schema_id": {
+                  "const": "hee3.receipt/1:ObligationPageV1"
+                }
+              }
+            }
+          ]
+        },
+        "readback_specification": {
+          "$ref": "#/$defs/Payload"
+        }
+      },
+      "required": [
+        "owner_id",
+        "term_grace_ms",
+        "deadline_ms",
+        "require_empty_descendants",
+        "obligations",
+        "readback_specification"
+      ],
+      "additionalProperties": false
+    },
+    "HostV1": {
+      "type": "object",
+      "properties": {
+        "os": {
+          "$ref": "#/$defs/Name"
+        },
+        "release": {
+          "$ref": "#/$defs/Name"
+        },
+        "architecture": {
+          "$ref": "#/$defs/Name"
+        },
+        "kernel": {
+          "$ref": "#/$defs/Text"
+        },
+        "boot_id": {
+          "$ref": "#/$defs/Name"
+        },
+        "logical_cpus": {
+          "$ref": "#/$defs/Count"
+        },
+        "memory_bytes": {
+          "$ref": "#/$defs/U64"
+        },
+        "facts": {
+          "$ref": "#/$defs/Payload"
+        }
+      },
+      "required": [
+        "os",
+        "release",
+        "architecture",
+        "kernel",
+        "boot_id",
+        "logical_cpus",
+        "memory_bytes",
+        "facts"
+      ],
+      "additionalProperties": false
+    },
+    "ResourceV1": {
+      "type": "object",
+      "properties": {
+        "metric": {
+          "$ref": "#/$defs/Name"
+        },
+        "unit": {
+          "$ref": "#/$defs/Name"
+        },
+        "value": {
+          "$ref": "#/$defs/MaybeU64"
+        },
+        "limit": {
+          "$ref": "#/$defs/MaybeU64"
+        },
+        "limit_event": {
+          "$ref": "#/$defs/Bool"
+        },
+        "evidence": {
+          "$ref": "#/$defs/Ref"
+        }
+      },
+      "required": [
+        "metric",
+        "unit",
+        "value",
+        "limit",
+        "limit_event",
+        "evidence"
+      ],
+      "additionalProperties": false
+    },
+    "ObligationV1": {
+      "type": "object",
+      "properties": {
+        "obligation_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "owner_id": {
+          "$ref": "#/$defs/Name"
+        },
+        "scope": {
+          "$ref": "#/$defs/Text"
+        },
+        "material": {
+          "$ref": "#/$defs/Bool"
+        },
+        "state": {
+          "type": "string",
+          "enum": [
+            "open",
+            "settled",
+            "unknown"
+          ]
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Ref"
+          },
+          "maxItems": 256
+        },
+        "reason": {
+          "$ref": "#/$defs/Text"
+        }
+      },
+      "required": [
+        "obligation_id",
+        "owner_id",
+        "scope",
+        "material",
+        "state",
+        "evidence",
+        "reason"
+      ],
+      "additionalProperties": false
+    },
+    "DiagnosticV1": {
+      "type": "object",
+      "properties": {
+        "tool_id": {
+          "$ref": "#/$defs/Name"
+        },
+        "baseline": {
+          "$ref": "#/$defs/Bool"
+        },
+        "warning_count": {
+          "$ref": "#/$defs/Count"
+        },
+        "error_count": {
+          "$ref": "#/$defs/Count"
+        },
+        "stdout": {
+          "$ref": "#/$defs/Payload"
+        },
+        "stderr": {
+          "$ref": "#/$defs/Payload"
+        },
+        "stdout_truncated": {
+          "$ref": "#/$defs/Bool"
+        },
+        "stderr_truncated": {
+          "$ref": "#/$defs/Bool"
+        },
+        "producer": {
+          "$ref": "#/$defs/ProducerV1"
+        }
+      },
+      "required": [
+        "tool_id",
+        "baseline",
+        "warning_count",
+        "error_count",
+        "stdout",
+        "stderr",
+        "stdout_truncated",
+        "stderr_truncated",
+        "producer"
+      ],
+      "additionalProperties": false
+    },
+    "ArtifactV1": {
+      "type": "object",
+      "properties": {
+        "object": {
+          "$ref": "#/$defs/Ref"
+        },
+        "role": {
+          "$ref": "#/$defs/Name"
+        },
+        "required": {
+          "$ref": "#/$defs/Bool"
+        },
+        "truncated": {
+          "$ref": "#/$defs/Bool"
+        },
+        "availability": {
+          "type": "string",
+          "enum": [
+            "available",
+            "missing"
+          ]
+        },
+        "reason": {
+          "$ref": "#/$defs/Text"
+        }
+      },
+      "required": [
+        "object",
+        "role",
+        "required",
+        "truncated",
+        "availability",
+        "reason"
+      ],
+      "additionalProperties": false
+    },
+    "CampaignV1": {
+      "type": "object",
+      "properties": {
+        "campaign_id": {
+          "$ref": "#/$defs/Name"
+        },
+        "language": {
+          "type": "string",
+          "enum": [
+            "rust",
+            "julia"
+          ]
+        },
+        "family_id": {
+          "$ref": "#/$defs/Name"
+        },
+        "tool": {
+          "$ref": "#/$defs/Payload"
+        },
+        "config": {
+          "$ref": "#/$defs/Payload"
+        },
+        "baseline_receipt": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Ref"
+            },
+            {
+              "properties": {
+                "schema_id": {
+                  "const": "hee3.receipt/1:ReceiptV1"
+                }
+              }
+            }
+          ]
+        },
+        "mutants": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Ref"
+            },
+            {
+              "properties": {
+                "schema_id": {
+                  "const": "hee3.receipt/1:MutantPageV1"
+                }
+              }
+            }
+          ]
+        },
+        "planned_mutants": {
+          "$ref": "#/$defs/Count"
+        }
+      },
+      "required": [
+        "campaign_id",
+        "language",
+        "family_id",
+        "tool",
+        "config",
+        "baseline_receipt",
+        "mutants",
+        "planned_mutants"
+      ],
+      "additionalProperties": false
+    },
+    "MutantV1": {
+      "type": "object",
+      "properties": {
+        "mutant_id": {
+          "$ref": "#/$defs/Name"
+        },
+        "campaign_id": {
+          "$ref": "#/$defs/Name"
+        },
+        "baseline_subject_sha256": {
+          "$ref": "#/$defs/Sha"
+        },
+        "diff": {
+          "$ref": "#/$defs/Payload"
+        },
+        "expected_detector": {
+          "$ref": "#/$defs/Name"
+        },
+        "observed_detector": {
+          "$ref": "#/$defs/MaybeName"
+        },
+        "outcome": {
+          "type": "string",
+          "enum": [
+            "caught",
+            "survived",
+            "timeout",
+            "unviable",
+            "reviewed-equivalent",
+            "excluded",
+            "unmeasured"
+          ]
+        },
+        "executed": {
+          "$ref": "#/$defs/Bool"
+        },
+        "reason": {
+          "$ref": "#/$defs/Text"
+        },
+        "raw_evidence_refs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Ref"
+          },
+          "maxItems": 256
+        },
+        "review_ref": {
+          "type": "object",
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "allOf": [
+                    {
+                      "$ref": "#/$defs/Ref"
+                    },
+                    {
+                      "properties": {
+                        "schema_id": {
+                          "const": "hee3.receipt/1:ReviewV1"
+                        }
+                      }
+                    }
+                  ]
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "unavailable_reason": {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "value",
+            "unavailable_reason"
+          ],
+          "additionalProperties": false,
+          "oneOf": [
+            {
+              "properties": {
+                "value": {
+                  "not": {
+                    "type": "null"
+                  }
+                },
+                "unavailable_reason": {
+                  "type": "null"
+                }
+              }
+            },
+            {
+              "properties": {
+                "value": {
+                  "type": "null"
+                },
+                "unavailable_reason": {
+                  "$ref": "#/$defs/Text"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "required": [
+        "mutant_id",
+        "campaign_id",
+        "baseline_subject_sha256",
+        "diff",
+        "expected_detector",
+        "observed_detector",
+        "outcome",
+        "executed",
+        "reason",
+        "raw_evidence_refs",
+        "review_ref"
+      ],
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "type": "string",
+                "enum": [
+                  "caught",
+                  "survived",
+                  "timeout",
+                  "reviewed-equivalent"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "diff": {
+                "properties": {
+                  "byte_length": {
+                    "minimum": 1
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "caught"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "executed": {
+                "const": true
+              },
+              "observed_detector": {
+                "properties": {
+                  "value": {
+                    "not": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "reviewed-equivalent"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "review_ref": {
+                "properties": {
+                  "value": {
+                    "not": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "anyOf": [
+              {
+                "properties": {
+                  "executed": {
+                    "const": false
+                  }
+                }
+              },
+              {
+                "properties": {
+                  "outcome": {
+                    "type": "string",
+                    "enum": [
+                      "survived",
+                      "reviewed-equivalent",
+                      "excluded",
+                      "unviable",
+                      "unmeasured"
+                    ]
+                  }
+                }
+              }
+            ]
+          },
+          "then": {
+            "properties": {
+              "reason": {
+                "$ref": "#/$defs/Reason"
+              }
+            }
+          }
+        }
+      ],
+      "$comment": "Runtime binds caught detector equality and exact nonempty diff. A review_ref resolves ReviewV1 with action=mutation_disposition and subject_sha256=diff.sha256."
+    },
+    "AssumptionV1": {
+      "type": "object",
+      "properties": {
+        "assumption_id": {
+          "$ref": "#/$defs/Name"
+        },
+        "shared_with": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Name"
+          },
+          "maxItems": 256
+        },
+        "statement": {
+          "$ref": "#/$defs/Reason"
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Ref"
+          },
+          "maxItems": 256
+        }
+      },
+      "required": [
+        "assumption_id",
+        "shared_with",
+        "statement",
+        "evidence"
+      ],
+      "additionalProperties": false
+    },
+    "FindingV1": {
+      "type": "object",
+      "properties": {
+        "finding_id": {
+          "$ref": "#/$defs/Name"
+        },
+        "owner_id": {
+          "$ref": "#/$defs/Name"
+        },
+        "scope": {
+          "$ref": "#/$defs/Text"
+        },
+        "material": {
+          "$ref": "#/$defs/Bool"
+        },
+        "disposition": {
+          "type": "string",
+          "enum": [
+            "open",
+            "fixed",
+            "accepted_residual",
+            "not_reproduced",
+            "out_of_scope"
+          ]
+        },
+        "rationale": {
+          "$ref": "#/$defs/Reason"
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Ref"
+          },
+          "maxItems": 256
+        },
+        "pre_fix_evidence": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Ref"
+          },
+          "maxItems": 256
+        },
+        "post_fix_evidence": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Ref"
+          },
+          "maxItems": 256
+        }
+      },
+      "required": [
+        "finding_id",
+        "owner_id",
+        "scope",
+        "material",
+        "disposition",
+        "rationale",
+        "evidence",
+        "pre_fix_evidence",
+        "post_fix_evidence"
+      ],
+      "additionalProperties": false
+    },
+    "OracleResultV1": {
+      "type": "object",
+      "properties": {
+        "oracle_id": {
+          "$ref": "#/$defs/Name"
+        },
+        "expected": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Ref"
+            },
+            {
+              "properties": {
+                "schema_id": {
+                  "const": "hee3.receipt/1:ExpectationV1"
+                }
+              }
+            }
+          ]
+        },
+        "result": {
+          "type": "string",
+          "enum": [
+            "satisfied",
+            "violated",
+            "unavailable",
+            "error"
+          ]
+        },
+        "detector_id": {
+          "$ref": "#/$defs/MaybeName"
+        },
+        "raw_evidence_refs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Ref"
+          },
+          "maxItems": 256
+        },
+        "reason": {
+          "$ref": "#/$defs/Text"
+        }
+      },
+      "required": [
+        "oracle_id",
+        "expected",
+        "result",
+        "detector_id",
+        "raw_evidence_refs",
+        "reason"
+      ],
+      "additionalProperties": false
+    },
+    "MissingObjectV1": {
+      "type": "object",
+      "properties": {
+        "artifact_id": {
+          "$ref": "#/$defs/Id"
+        },
+        "expected_sha256": {
+          "$ref": "#/$defs/Sha"
+        },
+        "expected_byte_length": {
+          "$ref": "#/$defs/Count"
+        },
+        "expected_schema_id": {
+          "$ref": "#/$defs/Name"
+        },
+        "reason": {
+          "$ref": "#/$defs/Reason"
+        }
+      },
+      "required": [
+        "artifact_id",
+        "expected_sha256",
+        "expected_byte_length",
+        "expected_schema_id",
+        "reason"
+      ],
+      "additionalProperties": false,
+      "$comment": "Expected identity of unavailable bytes, not a resolving Ref or an import grant."
+    },
+    "CasePageV1": {
+      "type": "object",
+      "properties": {
+        "page_index": {
+          "$ref": "#/$defs/Count"
+        },
+        "page_count": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Count"
+            },
+            {
+              "minimum": 1
+            }
+          ]
+        },
+        "row_count": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Count"
+            },
+            {
+              "maximum": 256
+            }
+          ]
+        },
+        "total_rows": {
+          "$ref": "#/$defs/Count"
+        },
+        "rows": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CaseV1"
+          },
+          "maxItems": 256
+        },
+        "next": {
+          "type": "object",
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "allOf": [
+                    {
+                      "$ref": "#/$defs/Ref"
+                    },
+                    {
+                      "properties": {
+                        "schema_id": {
+                          "const": "hee3.receipt/1:CasePageV1"
+                        }
+                      }
+                    }
+                  ]
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "unavailable_reason": {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "value",
+            "unavailable_reason"
+          ],
+          "additionalProperties": false,
+          "oneOf": [
+            {
+              "properties": {
+                "value": {
+                  "not": {
+                    "type": "null"
+                  }
+                },
+                "unavailable_reason": {
+                  "type": "null"
+                }
+              }
+            },
+            {
+              "properties": {
+                "value": {
+                  "type": "null"
+                },
+                "unavailable_reason": {
+                  "$ref": "#/$defs/Text"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "required": [
+        "page_index",
+        "page_count",
+        "row_count",
+        "total_rows",
+        "rows",
+        "next"
+      ],
+      "additionalProperties": false,
+      "$comment": "Runtime verifies <=1 MiB exact bytes, index/count/length arithmetic, complete acyclic same-type chain, no repeated page/row identities and no omitted rows.",
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "next": {
+                "properties": {
+                  "unavailable_reason": {
+                    "const": "end_of_inventory"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "page_count": {
+                "const": 1
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "page_index": {
+                "const": 0
+              },
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "total_rows": {
+                "const": 0
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "page_index": {
+                "const": 0
+              },
+              "page_count": {
+                "const": 1
+              },
+              "row_count": {
+                "const": 0
+              },
+              "rows": {
+                "maxItems": 0
+              },
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "row_count": {
+                "minimum": 1
+              },
+              "rows": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      ]
+    },
+    "SubjectFilePageV1": {
+      "type": "object",
+      "properties": {
+        "page_index": {
+          "$ref": "#/$defs/Count"
+        },
+        "page_count": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Count"
+            },
+            {
+              "minimum": 1
+            }
+          ]
+        },
+        "row_count": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Count"
+            },
+            {
+              "maximum": 256
+            }
+          ]
+        },
+        "total_rows": {
+          "$ref": "#/$defs/Count"
+        },
+        "rows": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SubjectFileV1"
+          },
+          "maxItems": 256
+        },
+        "next": {
+          "type": "object",
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "allOf": [
+                    {
+                      "$ref": "#/$defs/Ref"
+                    },
+                    {
+                      "properties": {
+                        "schema_id": {
+                          "const": "hee3.receipt/1:SubjectFilePageV1"
+                        }
+                      }
+                    }
+                  ]
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "unavailable_reason": {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "value",
+            "unavailable_reason"
+          ],
+          "additionalProperties": false,
+          "oneOf": [
+            {
+              "properties": {
+                "value": {
+                  "not": {
+                    "type": "null"
+                  }
+                },
+                "unavailable_reason": {
+                  "type": "null"
+                }
+              }
+            },
+            {
+              "properties": {
+                "value": {
+                  "type": "null"
+                },
+                "unavailable_reason": {
+                  "$ref": "#/$defs/Text"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "required": [
+        "page_index",
+        "page_count",
+        "row_count",
+        "total_rows",
+        "rows",
+        "next"
+      ],
+      "additionalProperties": false,
+      "$comment": "Runtime verifies <=1 MiB exact bytes, index/count/length arithmetic, complete acyclic same-type chain, no repeated page/row identities and no omitted rows.",
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "next": {
+                "properties": {
+                  "unavailable_reason": {
+                    "const": "end_of_inventory"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "page_count": {
+                "const": 1
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "page_index": {
+                "const": 0
+              },
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "total_rows": {
+                "const": 0
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "page_index": {
+                "const": 0
+              },
+              "page_count": {
+                "const": 1
+              },
+              "row_count": {
+                "const": 0
+              },
+              "rows": {
+                "maxItems": 0
+              },
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "row_count": {
+                "minimum": 1
+              },
+              "rows": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      ]
+    },
+    "LockPageV1": {
+      "type": "object",
+      "properties": {
+        "page_index": {
+          "$ref": "#/$defs/Count"
+        },
+        "page_count": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Count"
+            },
+            {
+              "minimum": 1
+            }
+          ]
+        },
+        "row_count": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Count"
+            },
+            {
+              "maximum": 256
+            }
+          ]
+        },
+        "total_rows": {
+          "$ref": "#/$defs/Count"
+        },
+        "rows": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/LockV1"
+          },
+          "maxItems": 256
+        },
+        "next": {
+          "type": "object",
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "allOf": [
+                    {
+                      "$ref": "#/$defs/Ref"
+                    },
+                    {
+                      "properties": {
+                        "schema_id": {
+                          "const": "hee3.receipt/1:LockPageV1"
+                        }
+                      }
+                    }
+                  ]
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "unavailable_reason": {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "value",
+            "unavailable_reason"
+          ],
+          "additionalProperties": false,
+          "oneOf": [
+            {
+              "properties": {
+                "value": {
+                  "not": {
+                    "type": "null"
+                  }
+                },
+                "unavailable_reason": {
+                  "type": "null"
+                }
+              }
+            },
+            {
+              "properties": {
+                "value": {
+                  "type": "null"
+                },
+                "unavailable_reason": {
+                  "$ref": "#/$defs/Text"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "required": [
+        "page_index",
+        "page_count",
+        "row_count",
+        "total_rows",
+        "rows",
+        "next"
+      ],
+      "additionalProperties": false,
+      "$comment": "Runtime verifies <=1 MiB exact bytes, index/count/length arithmetic, complete acyclic same-type chain, no repeated page/row identities and no omitted rows.",
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "next": {
+                "properties": {
+                  "unavailable_reason": {
+                    "const": "end_of_inventory"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "page_count": {
+                "const": 1
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "page_index": {
+                "const": 0
+              },
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "total_rows": {
+                "const": 0
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "page_index": {
+                "const": 0
+              },
+              "page_count": {
+                "const": 1
+              },
+              "row_count": {
+                "const": 0
+              },
+              "rows": {
+                "maxItems": 0
+              },
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "row_count": {
+                "minimum": 1
+              },
+              "rows": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      ]
+    },
+    "DependencyPageV1": {
+      "type": "object",
+      "properties": {
+        "page_index": {
+          "$ref": "#/$defs/Count"
+        },
+        "page_count": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Count"
+            },
+            {
+              "minimum": 1
+            }
+          ]
+        },
+        "row_count": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Count"
+            },
+            {
+              "maximum": 256
+            }
+          ]
+        },
+        "total_rows": {
+          "$ref": "#/$defs/Count"
+        },
+        "rows": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DependencyV1"
+          },
+          "maxItems": 256
+        },
+        "next": {
+          "type": "object",
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "allOf": [
+                    {
+                      "$ref": "#/$defs/Ref"
+                    },
+                    {
+                      "properties": {
+                        "schema_id": {
+                          "const": "hee3.receipt/1:DependencyPageV1"
+                        }
+                      }
+                    }
+                  ]
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "unavailable_reason": {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "value",
+            "unavailable_reason"
+          ],
+          "additionalProperties": false,
+          "oneOf": [
+            {
+              "properties": {
+                "value": {
+                  "not": {
+                    "type": "null"
+                  }
+                },
+                "unavailable_reason": {
+                  "type": "null"
+                }
+              }
+            },
+            {
+              "properties": {
+                "value": {
+                  "type": "null"
+                },
+                "unavailable_reason": {
+                  "$ref": "#/$defs/Text"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "required": [
+        "page_index",
+        "page_count",
+        "row_count",
+        "total_rows",
+        "rows",
+        "next"
+      ],
+      "additionalProperties": false,
+      "$comment": "Runtime verifies <=1 MiB exact bytes, index/count/length arithmetic, complete acyclic same-type chain, no repeated page/row identities and no omitted rows.",
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "next": {
+                "properties": {
+                  "unavailable_reason": {
+                    "const": "end_of_inventory"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "page_count": {
+                "const": 1
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "page_index": {
+                "const": 0
+              },
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "total_rows": {
+                "const": 0
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "page_index": {
+                "const": 0
+              },
+              "page_count": {
+                "const": 1
+              },
+              "row_count": {
+                "const": 0
+              },
+              "rows": {
+                "maxItems": 0
+              },
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "row_count": {
+                "minimum": 1
+              },
+              "rows": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      ]
+    },
+    "ToolPageV1": {
+      "type": "object",
+      "properties": {
+        "page_index": {
+          "$ref": "#/$defs/Count"
+        },
+        "page_count": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Count"
+            },
+            {
+              "minimum": 1
+            }
+          ]
+        },
+        "row_count": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Count"
+            },
+            {
+              "maximum": 256
+            }
+          ]
+        },
+        "total_rows": {
+          "$ref": "#/$defs/Count"
+        },
+        "rows": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ToolV1"
+          },
+          "maxItems": 256
+        },
+        "next": {
+          "type": "object",
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "allOf": [
+                    {
+                      "$ref": "#/$defs/Ref"
+                    },
+                    {
+                      "properties": {
+                        "schema_id": {
+                          "const": "hee3.receipt/1:ToolPageV1"
+                        }
+                      }
+                    }
+                  ]
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "unavailable_reason": {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "value",
+            "unavailable_reason"
+          ],
+          "additionalProperties": false,
+          "oneOf": [
+            {
+              "properties": {
+                "value": {
+                  "not": {
+                    "type": "null"
+                  }
+                },
+                "unavailable_reason": {
+                  "type": "null"
+                }
+              }
+            },
+            {
+              "properties": {
+                "value": {
+                  "type": "null"
+                },
+                "unavailable_reason": {
+                  "$ref": "#/$defs/Text"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "required": [
+        "page_index",
+        "page_count",
+        "row_count",
+        "total_rows",
+        "rows",
+        "next"
+      ],
+      "additionalProperties": false,
+      "$comment": "Runtime verifies <=1 MiB exact bytes, index/count/length arithmetic, complete acyclic same-type chain, no repeated page/row identities and no omitted rows.",
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "next": {
+                "properties": {
+                  "unavailable_reason": {
+                    "const": "end_of_inventory"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "page_count": {
+                "const": 1
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "page_index": {
+                "const": 0
+              },
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "total_rows": {
+                "const": 0
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "page_index": {
+                "const": 0
+              },
+              "page_count": {
+                "const": 1
+              },
+              "row_count": {
+                "const": 0
+              },
+              "rows": {
+                "maxItems": 0
+              },
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "row_count": {
+                "minimum": 1
+              },
+              "rows": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      ]
+    },
+    "LanguageFlagsPageV1": {
+      "type": "object",
+      "properties": {
+        "page_index": {
+          "$ref": "#/$defs/Count"
+        },
+        "page_count": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Count"
+            },
+            {
+              "minimum": 1
+            }
+          ]
+        },
+        "row_count": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Count"
+            },
+            {
+              "maximum": 256
+            }
+          ]
+        },
+        "total_rows": {
+          "$ref": "#/$defs/Count"
+        },
+        "rows": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/LanguageFlagsV1"
+          },
+          "maxItems": 256
+        },
+        "next": {
+          "type": "object",
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "allOf": [
+                    {
+                      "$ref": "#/$defs/Ref"
+                    },
+                    {
+                      "properties": {
+                        "schema_id": {
+                          "const": "hee3.receipt/1:LanguageFlagsPageV1"
+                        }
+                      }
+                    }
+                  ]
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "unavailable_reason": {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "value",
+            "unavailable_reason"
+          ],
+          "additionalProperties": false,
+          "oneOf": [
+            {
+              "properties": {
+                "value": {
+                  "not": {
+                    "type": "null"
+                  }
+                },
+                "unavailable_reason": {
+                  "type": "null"
+                }
+              }
+            },
+            {
+              "properties": {
+                "value": {
+                  "type": "null"
+                },
+                "unavailable_reason": {
+                  "$ref": "#/$defs/Text"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "required": [
+        "page_index",
+        "page_count",
+        "row_count",
+        "total_rows",
+        "rows",
+        "next"
+      ],
+      "additionalProperties": false,
+      "$comment": "Runtime verifies <=1 MiB exact bytes, index/count/length arithmetic, complete acyclic same-type chain, no repeated page/row identities and no omitted rows.",
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "next": {
+                "properties": {
+                  "unavailable_reason": {
+                    "const": "end_of_inventory"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "page_count": {
+                "const": 1
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "page_index": {
+                "const": 0
+              },
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "total_rows": {
+                "const": 0
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "page_index": {
+                "const": 0
+              },
+              "page_count": {
+                "const": 1
+              },
+              "row_count": {
+                "const": 0
+              },
+              "rows": {
+                "maxItems": 0
+              },
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "row_count": {
+                "minimum": 1
+              },
+              "rows": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      ]
+    },
+    "StandardPageV1": {
+      "type": "object",
+      "properties": {
+        "page_index": {
+          "$ref": "#/$defs/Count"
+        },
+        "page_count": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Count"
+            },
+            {
+              "minimum": 1
+            }
+          ]
+        },
+        "row_count": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Count"
+            },
+            {
+              "maximum": 256
+            }
+          ]
+        },
+        "total_rows": {
+          "$ref": "#/$defs/Count"
+        },
+        "rows": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/StandardV1"
+          },
+          "maxItems": 256
+        },
+        "next": {
+          "type": "object",
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "allOf": [
+                    {
+                      "$ref": "#/$defs/Ref"
+                    },
+                    {
+                      "properties": {
+                        "schema_id": {
+                          "const": "hee3.receipt/1:StandardPageV1"
+                        }
+                      }
+                    }
+                  ]
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "unavailable_reason": {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "value",
+            "unavailable_reason"
+          ],
+          "additionalProperties": false,
+          "oneOf": [
+            {
+              "properties": {
+                "value": {
+                  "not": {
+                    "type": "null"
+                  }
+                },
+                "unavailable_reason": {
+                  "type": "null"
+                }
+              }
+            },
+            {
+              "properties": {
+                "value": {
+                  "type": "null"
+                },
+                "unavailable_reason": {
+                  "$ref": "#/$defs/Text"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "required": [
+        "page_index",
+        "page_count",
+        "row_count",
+        "total_rows",
+        "rows",
+        "next"
+      ],
+      "additionalProperties": false,
+      "$comment": "Runtime verifies <=1 MiB exact bytes, index/count/length arithmetic, complete acyclic same-type chain, no repeated page/row identities and no omitted rows.",
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "next": {
+                "properties": {
+                  "unavailable_reason": {
+                    "const": "end_of_inventory"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "page_count": {
+                "const": 1
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "page_index": {
+                "const": 0
+              },
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "total_rows": {
+                "const": 0
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "page_index": {
+                "const": 0
+              },
+              "page_count": {
+                "const": 1
+              },
+              "row_count": {
+                "const": 0
+              },
+              "rows": {
+                "maxItems": 0
+              },
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "row_count": {
+                "minimum": 1
+              },
+              "rows": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      ]
+    },
+    "EnvironmentPageV1": {
+      "type": "object",
+      "properties": {
+        "page_index": {
+          "$ref": "#/$defs/Count"
+        },
+        "page_count": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Count"
+            },
+            {
+              "minimum": 1
+            }
+          ]
+        },
+        "row_count": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Count"
+            },
+            {
+              "maximum": 256
+            }
+          ]
+        },
+        "total_rows": {
+          "$ref": "#/$defs/Count"
+        },
+        "rows": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/EnvironmentV1"
+          },
+          "maxItems": 256
+        },
+        "next": {
+          "type": "object",
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "allOf": [
+                    {
+                      "$ref": "#/$defs/Ref"
+                    },
+                    {
+                      "properties": {
+                        "schema_id": {
+                          "const": "hee3.receipt/1:EnvironmentPageV1"
+                        }
+                      }
+                    }
+                  ]
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "unavailable_reason": {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "value",
+            "unavailable_reason"
+          ],
+          "additionalProperties": false,
+          "oneOf": [
+            {
+              "properties": {
+                "value": {
+                  "not": {
+                    "type": "null"
+                  }
+                },
+                "unavailable_reason": {
+                  "type": "null"
+                }
+              }
+            },
+            {
+              "properties": {
+                "value": {
+                  "type": "null"
+                },
+                "unavailable_reason": {
+                  "$ref": "#/$defs/Text"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "required": [
+        "page_index",
+        "page_count",
+        "row_count",
+        "total_rows",
+        "rows",
+        "next"
+      ],
+      "additionalProperties": false,
+      "$comment": "Runtime verifies <=1 MiB exact bytes, index/count/length arithmetic, complete acyclic same-type chain, no repeated page/row identities and no omitted rows.",
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "next": {
+                "properties": {
+                  "unavailable_reason": {
+                    "const": "end_of_inventory"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "page_count": {
+                "const": 1
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "page_index": {
+                "const": 0
+              },
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "total_rows": {
+                "const": 0
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "page_index": {
+                "const": 0
+              },
+              "page_count": {
+                "const": 1
+              },
+              "row_count": {
+                "const": 0
+              },
+              "rows": {
+                "maxItems": 0
+              },
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "row_count": {
+                "minimum": 1
+              },
+              "rows": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      ]
+    },
+    "GrantPageV1": {
+      "type": "object",
+      "properties": {
+        "page_index": {
+          "$ref": "#/$defs/Count"
+        },
+        "page_count": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Count"
+            },
+            {
+              "minimum": 1
+            }
+          ]
+        },
+        "row_count": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Count"
+            },
+            {
+              "maximum": 256
+            }
+          ]
+        },
+        "total_rows": {
+          "$ref": "#/$defs/Count"
+        },
+        "rows": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/GrantV1"
+          },
+          "maxItems": 256
+        },
+        "next": {
+          "type": "object",
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "allOf": [
+                    {
+                      "$ref": "#/$defs/Ref"
+                    },
+                    {
+                      "properties": {
+                        "schema_id": {
+                          "const": "hee3.receipt/1:GrantPageV1"
+                        }
+                      }
+                    }
+                  ]
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "unavailable_reason": {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "value",
+            "unavailable_reason"
+          ],
+          "additionalProperties": false,
+          "oneOf": [
+            {
+              "properties": {
+                "value": {
+                  "not": {
+                    "type": "null"
+                  }
+                },
+                "unavailable_reason": {
+                  "type": "null"
+                }
+              }
+            },
+            {
+              "properties": {
+                "value": {
+                  "type": "null"
+                },
+                "unavailable_reason": {
+                  "$ref": "#/$defs/Text"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "required": [
+        "page_index",
+        "page_count",
+        "row_count",
+        "total_rows",
+        "rows",
+        "next"
+      ],
+      "additionalProperties": false,
+      "$comment": "Runtime verifies <=1 MiB exact bytes, index/count/length arithmetic, complete acyclic same-type chain, no repeated page/row identities and no omitted rows.",
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "next": {
+                "properties": {
+                  "unavailable_reason": {
+                    "const": "end_of_inventory"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "page_count": {
+                "const": 1
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "page_index": {
+                "const": 0
+              },
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "total_rows": {
+                "const": 0
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "page_index": {
+                "const": 0
+              },
+              "page_count": {
+                "const": 1
+              },
+              "row_count": {
+                "const": 0
+              },
+              "rows": {
+                "maxItems": 0
+              },
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "row_count": {
+                "minimum": 1
+              },
+              "rows": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      ]
+    },
+    "EffectPageV1": {
+      "type": "object",
+      "properties": {
+        "page_index": {
+          "$ref": "#/$defs/Count"
+        },
+        "page_count": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Count"
+            },
+            {
+              "minimum": 1
+            }
+          ]
+        },
+        "row_count": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Count"
+            },
+            {
+              "maximum": 256
+            }
+          ]
+        },
+        "total_rows": {
+          "$ref": "#/$defs/Count"
+        },
+        "rows": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/EffectV1"
+          },
+          "maxItems": 256
+        },
+        "next": {
+          "type": "object",
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "allOf": [
+                    {
+                      "$ref": "#/$defs/Ref"
+                    },
+                    {
+                      "properties": {
+                        "schema_id": {
+                          "const": "hee3.receipt/1:EffectPageV1"
+                        }
+                      }
+                    }
+                  ]
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "unavailable_reason": {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "value",
+            "unavailable_reason"
+          ],
+          "additionalProperties": false,
+          "oneOf": [
+            {
+              "properties": {
+                "value": {
+                  "not": {
+                    "type": "null"
+                  }
+                },
+                "unavailable_reason": {
+                  "type": "null"
+                }
+              }
+            },
+            {
+              "properties": {
+                "value": {
+                  "type": "null"
+                },
+                "unavailable_reason": {
+                  "$ref": "#/$defs/Text"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "required": [
+        "page_index",
+        "page_count",
+        "row_count",
+        "total_rows",
+        "rows",
+        "next"
+      ],
+      "additionalProperties": false,
+      "$comment": "Runtime verifies <=1 MiB exact bytes, index/count/length arithmetic, complete acyclic same-type chain, no repeated page/row identities and no omitted rows.",
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "next": {
+                "properties": {
+                  "unavailable_reason": {
+                    "const": "end_of_inventory"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "page_count": {
+                "const": 1
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "page_index": {
+                "const": 0
+              },
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "total_rows": {
+                "const": 0
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "page_index": {
+                "const": 0
+              },
+              "page_count": {
+                "const": 1
+              },
+              "row_count": {
+                "const": 0
+              },
+              "rows": {
+                "maxItems": 0
+              },
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "row_count": {
+                "minimum": 1
+              },
+              "rows": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      ]
+    },
+    "ResourcePageV1": {
+      "type": "object",
+      "properties": {
+        "page_index": {
+          "$ref": "#/$defs/Count"
+        },
+        "page_count": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Count"
+            },
+            {
+              "minimum": 1
+            }
+          ]
+        },
+        "row_count": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Count"
+            },
+            {
+              "maximum": 256
+            }
+          ]
+        },
+        "total_rows": {
+          "$ref": "#/$defs/Count"
+        },
+        "rows": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ResourceV1"
+          },
+          "maxItems": 256
+        },
+        "next": {
+          "type": "object",
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "allOf": [
+                    {
+                      "$ref": "#/$defs/Ref"
+                    },
+                    {
+                      "properties": {
+                        "schema_id": {
+                          "const": "hee3.receipt/1:ResourcePageV1"
+                        }
+                      }
+                    }
+                  ]
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "unavailable_reason": {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "value",
+            "unavailable_reason"
+          ],
+          "additionalProperties": false,
+          "oneOf": [
+            {
+              "properties": {
+                "value": {
+                  "not": {
+                    "type": "null"
+                  }
+                },
+                "unavailable_reason": {
+                  "type": "null"
+                }
+              }
+            },
+            {
+              "properties": {
+                "value": {
+                  "type": "null"
+                },
+                "unavailable_reason": {
+                  "$ref": "#/$defs/Text"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "required": [
+        "page_index",
+        "page_count",
+        "row_count",
+        "total_rows",
+        "rows",
+        "next"
+      ],
+      "additionalProperties": false,
+      "$comment": "Runtime verifies <=1 MiB exact bytes, index/count/length arithmetic, complete acyclic same-type chain, no repeated page/row identities and no omitted rows.",
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "next": {
+                "properties": {
+                  "unavailable_reason": {
+                    "const": "end_of_inventory"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "page_count": {
+                "const": 1
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "page_index": {
+                "const": 0
+              },
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "total_rows": {
+                "const": 0
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "page_index": {
+                "const": 0
+              },
+              "page_count": {
+                "const": 1
+              },
+              "row_count": {
+                "const": 0
+              },
+              "rows": {
+                "maxItems": 0
+              },
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "row_count": {
+                "minimum": 1
+              },
+              "rows": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      ]
+    },
+    "ObligationPageV1": {
+      "type": "object",
+      "properties": {
+        "page_index": {
+          "$ref": "#/$defs/Count"
+        },
+        "page_count": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Count"
+            },
+            {
+              "minimum": 1
+            }
+          ]
+        },
+        "row_count": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Count"
+            },
+            {
+              "maximum": 256
+            }
+          ]
+        },
+        "total_rows": {
+          "$ref": "#/$defs/Count"
+        },
+        "rows": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ObligationV1"
+          },
+          "maxItems": 256
+        },
+        "next": {
+          "type": "object",
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "allOf": [
+                    {
+                      "$ref": "#/$defs/Ref"
+                    },
+                    {
+                      "properties": {
+                        "schema_id": {
+                          "const": "hee3.receipt/1:ObligationPageV1"
+                        }
+                      }
+                    }
+                  ]
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "unavailable_reason": {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "value",
+            "unavailable_reason"
+          ],
+          "additionalProperties": false,
+          "oneOf": [
+            {
+              "properties": {
+                "value": {
+                  "not": {
+                    "type": "null"
+                  }
+                },
+                "unavailable_reason": {
+                  "type": "null"
+                }
+              }
+            },
+            {
+              "properties": {
+                "value": {
+                  "type": "null"
+                },
+                "unavailable_reason": {
+                  "$ref": "#/$defs/Text"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "required": [
+        "page_index",
+        "page_count",
+        "row_count",
+        "total_rows",
+        "rows",
+        "next"
+      ],
+      "additionalProperties": false,
+      "$comment": "Runtime verifies <=1 MiB exact bytes, index/count/length arithmetic, complete acyclic same-type chain, no repeated page/row identities and no omitted rows.",
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "next": {
+                "properties": {
+                  "unavailable_reason": {
+                    "const": "end_of_inventory"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "page_count": {
+                "const": 1
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "page_index": {
+                "const": 0
+              },
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "total_rows": {
+                "const": 0
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "page_index": {
+                "const": 0
+              },
+              "page_count": {
+                "const": 1
+              },
+              "row_count": {
+                "const": 0
+              },
+              "rows": {
+                "maxItems": 0
+              },
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "row_count": {
+                "minimum": 1
+              },
+              "rows": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      ]
+    },
+    "DiagnosticPageV1": {
+      "type": "object",
+      "properties": {
+        "page_index": {
+          "$ref": "#/$defs/Count"
+        },
+        "page_count": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Count"
+            },
+            {
+              "minimum": 1
+            }
+          ]
+        },
+        "row_count": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Count"
+            },
+            {
+              "maximum": 256
+            }
+          ]
+        },
+        "total_rows": {
+          "$ref": "#/$defs/Count"
+        },
+        "rows": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DiagnosticV1"
+          },
+          "maxItems": 256
+        },
+        "next": {
+          "type": "object",
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "allOf": [
+                    {
+                      "$ref": "#/$defs/Ref"
+                    },
+                    {
+                      "properties": {
+                        "schema_id": {
+                          "const": "hee3.receipt/1:DiagnosticPageV1"
+                        }
+                      }
+                    }
+                  ]
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "unavailable_reason": {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "value",
+            "unavailable_reason"
+          ],
+          "additionalProperties": false,
+          "oneOf": [
+            {
+              "properties": {
+                "value": {
+                  "not": {
+                    "type": "null"
+                  }
+                },
+                "unavailable_reason": {
+                  "type": "null"
+                }
+              }
+            },
+            {
+              "properties": {
+                "value": {
+                  "type": "null"
+                },
+                "unavailable_reason": {
+                  "$ref": "#/$defs/Text"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "required": [
+        "page_index",
+        "page_count",
+        "row_count",
+        "total_rows",
+        "rows",
+        "next"
+      ],
+      "additionalProperties": false,
+      "$comment": "Runtime verifies <=1 MiB exact bytes, index/count/length arithmetic, complete acyclic same-type chain, no repeated page/row identities and no omitted rows.",
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "next": {
+                "properties": {
+                  "unavailable_reason": {
+                    "const": "end_of_inventory"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "page_count": {
+                "const": 1
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "page_index": {
+                "const": 0
+              },
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "total_rows": {
+                "const": 0
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "page_index": {
+                "const": 0
+              },
+              "page_count": {
+                "const": 1
+              },
+              "row_count": {
+                "const": 0
+              },
+              "rows": {
+                "maxItems": 0
+              },
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "row_count": {
+                "minimum": 1
+              },
+              "rows": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      ]
+    },
+    "ArtifactPageV1": {
+      "type": "object",
+      "properties": {
+        "page_index": {
+          "$ref": "#/$defs/Count"
+        },
+        "page_count": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Count"
+            },
+            {
+              "minimum": 1
+            }
+          ]
+        },
+        "row_count": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Count"
+            },
+            {
+              "maximum": 256
+            }
+          ]
+        },
+        "total_rows": {
+          "$ref": "#/$defs/Count"
+        },
+        "rows": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ArtifactV1"
+          },
+          "maxItems": 256
+        },
+        "next": {
+          "type": "object",
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "allOf": [
+                    {
+                      "$ref": "#/$defs/Ref"
+                    },
+                    {
+                      "properties": {
+                        "schema_id": {
+                          "const": "hee3.receipt/1:ArtifactPageV1"
+                        }
+                      }
+                    }
+                  ]
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "unavailable_reason": {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "value",
+            "unavailable_reason"
+          ],
+          "additionalProperties": false,
+          "oneOf": [
+            {
+              "properties": {
+                "value": {
+                  "not": {
+                    "type": "null"
+                  }
+                },
+                "unavailable_reason": {
+                  "type": "null"
+                }
+              }
+            },
+            {
+              "properties": {
+                "value": {
+                  "type": "null"
+                },
+                "unavailable_reason": {
+                  "$ref": "#/$defs/Text"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "required": [
+        "page_index",
+        "page_count",
+        "row_count",
+        "total_rows",
+        "rows",
+        "next"
+      ],
+      "additionalProperties": false,
+      "$comment": "Runtime verifies <=1 MiB exact bytes, index/count/length arithmetic, complete acyclic same-type chain, no repeated page/row identities and no omitted rows.",
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "next": {
+                "properties": {
+                  "unavailable_reason": {
+                    "const": "end_of_inventory"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "page_count": {
+                "const": 1
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "page_index": {
+                "const": 0
+              },
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "total_rows": {
+                "const": 0
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "page_index": {
+                "const": 0
+              },
+              "page_count": {
+                "const": 1
+              },
+              "row_count": {
+                "const": 0
+              },
+              "rows": {
+                "maxItems": 0
+              },
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "row_count": {
+                "minimum": 1
+              },
+              "rows": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      ]
+    },
+    "CampaignPageV1": {
+      "type": "object",
+      "properties": {
+        "page_index": {
+          "$ref": "#/$defs/Count"
+        },
+        "page_count": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Count"
+            },
+            {
+              "minimum": 1
+            }
+          ]
+        },
+        "row_count": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Count"
+            },
+            {
+              "maximum": 256
+            }
+          ]
+        },
+        "total_rows": {
+          "$ref": "#/$defs/Count"
+        },
+        "rows": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CampaignV1"
+          },
+          "maxItems": 256
+        },
+        "next": {
+          "type": "object",
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "allOf": [
+                    {
+                      "$ref": "#/$defs/Ref"
+                    },
+                    {
+                      "properties": {
+                        "schema_id": {
+                          "const": "hee3.receipt/1:CampaignPageV1"
+                        }
+                      }
+                    }
+                  ]
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "unavailable_reason": {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "value",
+            "unavailable_reason"
+          ],
+          "additionalProperties": false,
+          "oneOf": [
+            {
+              "properties": {
+                "value": {
+                  "not": {
+                    "type": "null"
+                  }
+                },
+                "unavailable_reason": {
+                  "type": "null"
+                }
+              }
+            },
+            {
+              "properties": {
+                "value": {
+                  "type": "null"
+                },
+                "unavailable_reason": {
+                  "$ref": "#/$defs/Text"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "required": [
+        "page_index",
+        "page_count",
+        "row_count",
+        "total_rows",
+        "rows",
+        "next"
+      ],
+      "additionalProperties": false,
+      "$comment": "Runtime verifies <=1 MiB exact bytes, index/count/length arithmetic, complete acyclic same-type chain, no repeated page/row identities and no omitted rows.",
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "next": {
+                "properties": {
+                  "unavailable_reason": {
+                    "const": "end_of_inventory"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "page_count": {
+                "const": 1
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "page_index": {
+                "const": 0
+              },
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "total_rows": {
+                "const": 0
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "page_index": {
+                "const": 0
+              },
+              "page_count": {
+                "const": 1
+              },
+              "row_count": {
+                "const": 0
+              },
+              "rows": {
+                "maxItems": 0
+              },
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "row_count": {
+                "minimum": 1
+              },
+              "rows": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      ]
+    },
+    "MutantPageV1": {
+      "type": "object",
+      "properties": {
+        "page_index": {
+          "$ref": "#/$defs/Count"
+        },
+        "page_count": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Count"
+            },
+            {
+              "minimum": 1
+            }
+          ]
+        },
+        "row_count": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Count"
+            },
+            {
+              "maximum": 256
+            }
+          ]
+        },
+        "total_rows": {
+          "$ref": "#/$defs/Count"
+        },
+        "rows": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MutantV1"
+          },
+          "maxItems": 256
+        },
+        "next": {
+          "type": "object",
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "allOf": [
+                    {
+                      "$ref": "#/$defs/Ref"
+                    },
+                    {
+                      "properties": {
+                        "schema_id": {
+                          "const": "hee3.receipt/1:MutantPageV1"
+                        }
+                      }
+                    }
+                  ]
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "unavailable_reason": {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "value",
+            "unavailable_reason"
+          ],
+          "additionalProperties": false,
+          "oneOf": [
+            {
+              "properties": {
+                "value": {
+                  "not": {
+                    "type": "null"
+                  }
+                },
+                "unavailable_reason": {
+                  "type": "null"
+                }
+              }
+            },
+            {
+              "properties": {
+                "value": {
+                  "type": "null"
+                },
+                "unavailable_reason": {
+                  "$ref": "#/$defs/Text"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "required": [
+        "page_index",
+        "page_count",
+        "row_count",
+        "total_rows",
+        "rows",
+        "next"
+      ],
+      "additionalProperties": false,
+      "$comment": "Runtime verifies <=1 MiB exact bytes, index/count/length arithmetic, complete acyclic same-type chain, no repeated page/row identities and no omitted rows.",
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "next": {
+                "properties": {
+                  "unavailable_reason": {
+                    "const": "end_of_inventory"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "page_count": {
+                "const": 1
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "page_index": {
+                "const": 0
+              },
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "total_rows": {
+                "const": 0
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "page_index": {
+                "const": 0
+              },
+              "page_count": {
+                "const": 1
+              },
+              "row_count": {
+                "const": 0
+              },
+              "rows": {
+                "maxItems": 0
+              },
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "row_count": {
+                "minimum": 1
+              },
+              "rows": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      ]
+    },
+    "AssumptionPageV1": {
+      "type": "object",
+      "properties": {
+        "page_index": {
+          "$ref": "#/$defs/Count"
+        },
+        "page_count": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Count"
+            },
+            {
+              "minimum": 1
+            }
+          ]
+        },
+        "row_count": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Count"
+            },
+            {
+              "maximum": 256
+            }
+          ]
+        },
+        "total_rows": {
+          "$ref": "#/$defs/Count"
+        },
+        "rows": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AssumptionV1"
+          },
+          "maxItems": 256
+        },
+        "next": {
+          "type": "object",
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "allOf": [
+                    {
+                      "$ref": "#/$defs/Ref"
+                    },
+                    {
+                      "properties": {
+                        "schema_id": {
+                          "const": "hee3.receipt/1:AssumptionPageV1"
+                        }
+                      }
+                    }
+                  ]
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "unavailable_reason": {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "value",
+            "unavailable_reason"
+          ],
+          "additionalProperties": false,
+          "oneOf": [
+            {
+              "properties": {
+                "value": {
+                  "not": {
+                    "type": "null"
+                  }
+                },
+                "unavailable_reason": {
+                  "type": "null"
+                }
+              }
+            },
+            {
+              "properties": {
+                "value": {
+                  "type": "null"
+                },
+                "unavailable_reason": {
+                  "$ref": "#/$defs/Text"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "required": [
+        "page_index",
+        "page_count",
+        "row_count",
+        "total_rows",
+        "rows",
+        "next"
+      ],
+      "additionalProperties": false,
+      "$comment": "Runtime verifies <=1 MiB exact bytes, index/count/length arithmetic, complete acyclic same-type chain, no repeated page/row identities and no omitted rows.",
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "next": {
+                "properties": {
+                  "unavailable_reason": {
+                    "const": "end_of_inventory"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "page_count": {
+                "const": 1
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "page_index": {
+                "const": 0
+              },
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "total_rows": {
+                "const": 0
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "page_index": {
+                "const": 0
+              },
+              "page_count": {
+                "const": 1
+              },
+              "row_count": {
+                "const": 0
+              },
+              "rows": {
+                "maxItems": 0
+              },
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "row_count": {
+                "minimum": 1
+              },
+              "rows": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      ]
+    },
+    "FindingPageV1": {
+      "type": "object",
+      "properties": {
+        "page_index": {
+          "$ref": "#/$defs/Count"
+        },
+        "page_count": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Count"
+            },
+            {
+              "minimum": 1
+            }
+          ]
+        },
+        "row_count": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Count"
+            },
+            {
+              "maximum": 256
+            }
+          ]
+        },
+        "total_rows": {
+          "$ref": "#/$defs/Count"
+        },
+        "rows": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/FindingV1"
+          },
+          "maxItems": 256
+        },
+        "next": {
+          "type": "object",
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "allOf": [
+                    {
+                      "$ref": "#/$defs/Ref"
+                    },
+                    {
+                      "properties": {
+                        "schema_id": {
+                          "const": "hee3.receipt/1:FindingPageV1"
+                        }
+                      }
+                    }
+                  ]
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "unavailable_reason": {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "value",
+            "unavailable_reason"
+          ],
+          "additionalProperties": false,
+          "oneOf": [
+            {
+              "properties": {
+                "value": {
+                  "not": {
+                    "type": "null"
+                  }
+                },
+                "unavailable_reason": {
+                  "type": "null"
+                }
+              }
+            },
+            {
+              "properties": {
+                "value": {
+                  "type": "null"
+                },
+                "unavailable_reason": {
+                  "$ref": "#/$defs/Text"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "required": [
+        "page_index",
+        "page_count",
+        "row_count",
+        "total_rows",
+        "rows",
+        "next"
+      ],
+      "additionalProperties": false,
+      "$comment": "Runtime verifies <=1 MiB exact bytes, index/count/length arithmetic, complete acyclic same-type chain, no repeated page/row identities and no omitted rows.",
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "next": {
+                "properties": {
+                  "unavailable_reason": {
+                    "const": "end_of_inventory"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "page_count": {
+                "const": 1
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "page_index": {
+                "const": 0
+              },
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "total_rows": {
+                "const": 0
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "page_index": {
+                "const": 0
+              },
+              "page_count": {
+                "const": 1
+              },
+              "row_count": {
+                "const": 0
+              },
+              "rows": {
+                "maxItems": 0
+              },
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "row_count": {
+                "minimum": 1
+              },
+              "rows": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      ]
+    },
+    "MissingObjectPageV1": {
+      "type": "object",
+      "properties": {
+        "page_index": {
+          "$ref": "#/$defs/Count"
+        },
+        "page_count": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Count"
+            },
+            {
+              "minimum": 1
+            }
+          ]
+        },
+        "row_count": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Count"
+            },
+            {
+              "maximum": 256
+            }
+          ]
+        },
+        "total_rows": {
+          "$ref": "#/$defs/Count"
+        },
+        "rows": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/MissingObjectV1"
+          },
+          "maxItems": 256
+        },
+        "next": {
+          "type": "object",
+          "properties": {
+            "value": {
+              "oneOf": [
+                {
+                  "allOf": [
+                    {
+                      "$ref": "#/$defs/Ref"
+                    },
+                    {
+                      "properties": {
+                        "schema_id": {
+                          "const": "hee3.receipt/1:MissingObjectPageV1"
+                        }
+                      }
+                    }
+                  ]
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "unavailable_reason": {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/Text"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "value",
+            "unavailable_reason"
+          ],
+          "additionalProperties": false,
+          "oneOf": [
+            {
+              "properties": {
+                "value": {
+                  "not": {
+                    "type": "null"
+                  }
+                },
+                "unavailable_reason": {
+                  "type": "null"
+                }
+              }
+            },
+            {
+              "properties": {
+                "value": {
+                  "type": "null"
+                },
+                "unavailable_reason": {
+                  "$ref": "#/$defs/Text"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "required": [
+        "page_index",
+        "page_count",
+        "row_count",
+        "total_rows",
+        "rows",
+        "next"
+      ],
+      "additionalProperties": false,
+      "$comment": "Runtime verifies <=1 MiB exact bytes, index/count/length arithmetic, complete acyclic same-type chain, no repeated page/row identities and no omitted rows.",
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "next": {
+                "properties": {
+                  "unavailable_reason": {
+                    "const": "end_of_inventory"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "page_count": {
+                "const": 1
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "page_index": {
+                "const": 0
+              },
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "total_rows": {
+                "const": 0
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "page_index": {
+                "const": 0
+              },
+              "page_count": {
+                "const": 1
+              },
+              "row_count": {
+                "const": 0
+              },
+              "rows": {
+                "maxItems": 0
+              },
+              "next": {
+                "properties": {
+                  "value": {
+                    "type": "null"
+                  }
+                }
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "row_count": {
+                "minimum": 1
+              },
+              "rows": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      ]
+    },
+    "ReviewReceiptV1": {
+      "type": "object",
+      "properties": {
+        "protocol": {
+          "const": "hee3.receipt.review"
+        },
+        "version": {
+          "type": "integer",
+          "const": 1
+        },
+        "receipt": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Ref"
+            },
+            {
+              "properties": {
+                "schema_id": {
+                  "const": "hee3.receipt/1:ReceiptV1"
+                }
+              }
+            }
+          ]
+        },
+        "review": {
+          "$ref": "#/$defs/ReviewV1"
+        }
+      },
+      "required": [
+        "protocol",
+        "version",
+        "receipt",
+        "review"
+      ],
+      "additionalProperties": false,
+      "$comment": "Append separately; review.subject_sha256 must equal the referenced prior receipt digest."
+    },
+    "AvailabilityReceiptV1": {
+      "type": "object",
+      "properties": {
+        "protocol": {
+          "const": "hee3.receipt.availability"
+        },
+        "version": {
+          "type": "integer",
+          "const": 1
+        },
+        "receipt": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Ref"
+            },
+            {
+              "properties": {
+                "schema_id": {
+                  "const": "hee3.receipt/1:ReceiptV1"
+                }
+              }
+            }
+          ]
+        },
+        "availability": {
+          "$ref": "#/$defs/AvailabilityV1"
+        }
+      },
+      "required": [
+        "protocol",
+        "version",
+        "receipt",
+        "availability"
+      ],
+      "additionalProperties": false,
+      "$comment": "Append a new observation; do not replace or mutate prior receipt bytes."
+    }
+  }
+}

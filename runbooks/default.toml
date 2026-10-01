@@ -1,0 +1,18 @@
+# default — list the recipes. Schema: habitat-runbook (fields name, purpose, cwd, [[precondition]], [[step]], [verify]).
+name = "default"
+purpose = "List the HEE v4 ops recipes"
+cwd = "/var/home/Louranicas/herdr-engineering-engine-v4"
+
+[[precondition]]
+check = "command -v just >/dev/null && just --version"
+expect = "just 1."
+message = "just is not on PATH (expected just 1.57 in the toolbox)"
+
+[[step]]
+name = "list"
+just = "default"
+expect = "Available recipes:"
+
+[verify]
+run = "just --summary"
+contains = "verify"

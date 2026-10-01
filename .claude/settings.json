@@ -1,0 +1,52 @@
+{
+  "permissions": {
+    "deny": [
+      "Edit(//var/home/herdr-engineering-engine-v3/**)",
+      "Edit(//run/host/var/home/herdr-engineering-engine-v3/**)",
+      "Edit(//var/home/Louranicas/hee3-evidence/**)",
+      "Edit(//var/home/Louranicas/.cache/hee3-worktrees/**)",
+      "Edit(//var/home/Louranicas/.cache/hee3-implementation/**)",
+      "Edit(//var/home/Louranicas/.local/lib/herdr-engineering-engine-v3/**)",
+      "Bash(hee3-gate:*)",
+      "Bash(hee3-recapture:*)"
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/hee4-session-start.sh\"",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/hee4-regen-nudge.sh\"",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/hee4-v3-guard.sh\"",
+            "timeout": 2
+          }
+        ]
+      }
+    ]
+  }
+}

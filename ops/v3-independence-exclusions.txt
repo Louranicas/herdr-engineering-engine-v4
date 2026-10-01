@@ -1,0 +1,30 @@
+# <home>:<path or shell glob> | reason. home is one of repo (~/herdr-engineering-engine-v4), evidence (~/hee4-evidence), vault (the v4 vault); the path is relative to that home and matches the file or anything under it.
+# Every exclusion must carry a reason (V4-9); a row without one, or without a known home, excludes nothing and is counted. Anything not listed must have v3_refs=0.
+# Read by ops/roster/hee4-curator/measure.sh (CN-05, 2026-10-01: three homes, path-shaped v3 pattern). A file-level row hides any LATER ref in that file too: re-read the file when its row is touched.
+repo:CLAUDE.md | names v3 paths only to FORBID them (the fence)
+repo:ops/roster/hee4-curator/measure.sh | holds the independence check's own search pattern
+repo:ops/v3-independence-exclusions.txt | this list names nothing but itself
+repo:migrated/ | staged verbatim v3 HARDEN modules, kept as indicated (V4-10)
+repo:.claude/agents/hee4-workflow-curator.md | names v3 homes only to FORBID them (scope line)
+repo:.claude/agents/hee4-curator.md | names `~/.cache/hee3-*` only to FORBID touching it (the Never line)
+repo:ops/checks/pins/*.snap | verbatim cite-pin snapshots of evidence lines that quote v3 paths as citations (V4-23); no process reads a v3 path through them
+repo:ops/roster/*/settings.json | roster permissions name v3 paths only to DENY Read on them (V4-26)
+repo:.claude/settings.json | project permissions name v3 paths only to DENY Edit on them and deny hee3-gate (drift fence, 2026-10-01; read back with a scratch deny probe)
+repo:ops/db/hee4db | holds migrate-habitat's V3_MARKERS: the pattern that REFUSES importing v3-pointing habitat rows (V4-9)
+repo:*__pycache__/ | Python bytecode cache, not a source; a .pyc constant-folds module_funnel.py's split v3 literal (V9 §2)
+repo:modules/tooling/deploy/MODULE.md | names `~/.cache/hee3-release-*` only as migrated install-release lines to STRIP (the card's strip task)
+evidence:reference/v3-evidence-b5367bc/ | read-only copies of the v3 audit files v4 cites, pinned by their MANIFEST.sha256 (CLAUDE.local, V6-fix)
+evidence:reference/v3-records/ | read-only copies of v3 decision records v4 cites, pinned by their MANIFEST.sha256
+evidence:reference/ERRATA-v3-evidence-b5367bc.md | errata for the reference copies; names the v3 tree as provenance of a past (pre-freeze) read
+evidence:verification/ | dated verification records (V1-V12, OPEN-TASKS); immutable; they name v3 paths as fence statements or provenance of pre-freeze reads; no process reads a v3 path through them
+evidence:curator/ | retired ops/curator runner records (V4-19, README there); immutable run reports
+evidence:db/hee4-ops.db | derived index of the scanned homes' own text (decisions, verifications, design notes); hee4db reads no v3 path
+evidence:db/hee4-ops-search.db | FTS sidecar derived from hee4-ops.db; same text, same reason
+evidence:design/MODULE-DESIGN-BRIEF.md | names ~/hee3-evidence only to FORBID reading it (the brief's fence line)
+evidence:learnings/FINAL-LESSONS-REVIEW.md | names ~/hee3-evidence only in a fence statement ("nothing under … was read")
+vault:15 Module Design/T tooling.md | names the v3 release dir only to FORBID pruning it (H-17)
+evidence:design/DEPLOYMENT_ATLAS.md | provenance only (2026-10-01 integrator): Sources and "repointed from" notes, measured absent-path facts (M-1001), strip targets (P0 slice) and H-17 reclaim items name v3 paths; no process reads them; v3 planning records are kept as indicated (Luke 2026-10-01)
+evidence:learnings/PROCESS-LEARNINGS.md | provenance only (2026-10-01 integrator): source keys FIN/NWOW/LR-x and two quoted v3 handovers; v3 planning records kept as indicated; no process reads them
+evidence:design/JEV_QUESTION_RESPONSES.md | provenance only (2026-10-01 integrator): one source citation of the v3 way-of-working record; no process reads it
+vault:00 Hub/00 - HEE v4 Master Index.md | one deliberate obsidian:// link to the FROZEN v3 vault, labelled historical (cross-vault navigation, not a dependency)
+vault:00 Hub/Review - Gap Analysis and Recommendations 2026-10-01.md | a fence statement only ("nothing under ~/hee3-evidence was opened")

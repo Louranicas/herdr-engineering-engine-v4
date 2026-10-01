@@ -1,0 +1,906 @@
+#!/usr/bin/env bash
+# Thin Bash entry point for HEE3-IF-bash.
+#
+# A wrapper, and nothing more: it builds a request, hands it to the producer, and reports the
+# producer's verdict unchanged. It schedules nothing, retries nothing on its own authority,
+# duplicates no policy, and grants no action -- an action this wrapper can name is one the
+# engine already admits, and one it cannot name simply does not run.
+#
+# Three rules are the whole point of the file:
+#
+#   * No eval, and no re-parsing of untrusted strings. Arguments travel in arrays from argv
+#     to exec. A value containing a space, a quote, a newline, `$(...)` or a semicolon is a
+#     value; there is no path by which it becomes syntax.
+#   * The producer's exit status survives every pipe. A pipeline reports the LAST command's
+#     status, so `producer | tee log` is green whenever `tee` succeeds -- which is always.
+#     Every pipeline here is read through PIPESTATUS, and the producer's element is the
+#     verdict.
+#   * A missing producer is a failure, never an empty success. A wrapper that prints nothing
+#     and exits 0 because the thing it wraps was absent is the worst outcome available.
+#
+# Exit codes: 0 producer succeeded; 2 usage; 3 missing producer or catalogue, or a
+# dependency/version mismatch; 4 bounds; 5 chain timeout;
+# 6 chain output contract; 7 the engine answered with a typed error record, printed unchanged
+# (the producer's own EXIT_REFUSED, passed through, so success and refusal differ by code alone);
+# 128+n cancelled by signal n; otherwise the producer's own code, passed through unchanged. A code alone cannot tell a producer's 5 from a chain timeout --
+# the chain's final `summary` record on stdout is the decisive verdict, and names which.
+set -euo pipefail
+
+readonly HEE3_WRAPPER_VERSION=1
+# The protocol this wrapper speaks. A catalogue whose request definitions name another is a
+# dependency/version mismatch, refused by name at every door -- not a request built from
+# whatever the catalogue says and left for the engine to reject.
+readonly CONTROL_PROTOCOL=hee3.control
+readonly CONTROL_VERSION=1
+readonly MAX_ARGS=64
+readonly MAX_VALUE_BYTES=8192
+readonly MAX_OUTPUT_BYTES=1048576
+
+readonly EXIT_USAGE=2
+readonly EXIT_NO_PRODUCER=3
+readonly EXIT_BOUNDS=4
+readonly EXIT_TIMEOUT=5
+readonly EXIT_CONTRACT=6
+
+# Chain bounds. A chain is at most MAX_STEPS ordinary invocations, so its output is bounded by
+# MAX_STEPS times MAX_OUTPUT_BYTES plus the records around them.
+readonly MAX_STEPS=16
+readonly MAX_SPEC_BYTES=65536
+readonly MAX_CHAIN_MS=3600000
+readonly GRACE_MS=2000      # TERM to KILL, and KILL to giving up, each
+readonly CHECK_MS=3000      # one step's --check: a local encode (~0.1 s), never a producer call
+readonly SLICE_MS=100       # how often a waiting chain looks for a cancellation
+
+# Diagnostics go to stderr, results to stdout. A caller that redirects one must still be able
+# to read the other; merging them is how a parser ends up reading a warning as a result.
+fail() {
+    local code=$1
+    shift
+    printf 'hee3: %s\n' "$*" >&2
+    exit "$code"
+}
+
+usage() {
+    cat <<'USAGE'
+hee3 <action> [argument ...]       invoke one admitted action
+hee3 --actions                     list the actions this wrapper can name
+hee3 --check <action> [argument ...]
+                                   print the request that would be sent; send nothing
+hee3 chain <spec.json | ->         run a declared sequence of actions, in order
+hee3 --inspect <action>            that action's arguments and the producer it needs
+hee3 --version                     wrapper version and producer diagnostics
+hee3 --pin                         the digest of this wrapper and its catalogue, which a
+                                   chain holds every step to
+
+Arguments build a control-v1 request for the action:
+  name=value         body field, this literal text
+  name:=JSON         body field, this JSON value (object, array, number, true/false, null)
+  @idempotency_key=UUID  @precondition:=JSON   required where the action requires them
+Values are never re-parsed as shell, so spaces, quotes, newlines, $(...) and ; are data;
+a :=JSON value is parsed strictly as JSON and as nothing else.
+Set HEE3_PRODUCER to the producer executable, HEE3_GRANT_ID and HEE3_SCOPE_SHA256 to the
+authority the request is made under, and optionally HEE3_TIMEOUT_MS (deadline, at most 60 s).
+The producer runs with only PATH, HOME, XDG_RUNTIME_DIR, LC_ALL, HEE3_CHAIN_STEP and
+HEE3_TIMEOUT_MS of the caller's environment.
+USAGE
+}
+
+# The action vocabulary comes from the schema that defines it. A list maintained here would
+# agree with the engine only while somebody kept it agreeing.
+readonly CATALOGUE="${HEE3_CATALOGUE:-$(dirname -- "${BASH_SOURCE[0]}")/../../schemas/actions/control-v1.schema.json}"
+
+actions() {
+    [[ -r $CATALOGUE ]] || fail "$EXIT_NO_PRODUCER" "action catalogue is unreadable: $CATALOGUE"
+    local names status
+    # Read through PIPESTATUS even here: a python that dies mid-stream must not look like an
+    # empty catalogue, which would make every action name "unknown" rather than report the
+    # real fault.
+    # Python arrives through a quoted heredoc, as the chain runner's does: nothing in it can
+    # expand, and a JSON key such as `$defs` is plainly data rather than a shell word.
+    # Exit 2 is the one refusal the reader names itself: a request definition speaking another
+    # protocol or version, described on stdout.
+    names=$(python3 - "$CATALOGUE" "$CONTROL_PROTOCOL" "$CONTROL_VERSION" <<'PY'
+import json, sys
+catalogue, protocol, version = sys.argv[1], sys.argv[2], int(sys.argv[3])
+with open(catalogue, encoding="utf-8") as handle:
+    definitions = json.load(handle)["$defs"]
+requests = [name for name in sorted(definitions) if name.startswith("Request_")]
+# A catalogue with no request definition was compared against nothing, and a comparison that
+# did not happen is not agreement.
+if not requests:
+    print(f"the catalogue declares no Request_* definition; "
+          f"this wrapper speaks {json.dumps(protocol)}/{version}")
+    sys.exit(2)
+for name in requests:
+    fields = definitions[name].get("properties", {})
+    found = (fields.get("protocol", {}).get("const"), fields.get("version", {}).get("const"))
+    # type(): True == 1 in Python, and a version of `true` is not version 1.
+    if found[0] != protocol or type(found[1]) is not int or found[1] != version:
+        print(f"{name} speaks {json.dumps(found[0])}/{json.dumps(found[1])}; "
+              f"this wrapper speaks {json.dumps(protocol)}/{version}")
+        sys.exit(2)
+print("\n".join(definitions["ActionId"]["enum"]))
+PY
+) || status=$?
+    status=${status:-0}
+    (( status != 2 )) || fail "$EXIT_NO_PRODUCER" "dependency/version mismatch: $names"
+    (( status == 0 )) || fail "$EXIT_NO_PRODUCER" "could not read the action catalogue (rc=$status)"
+    [[ -n $names ]] || fail "$EXIT_NO_PRODUCER" "the action catalogue is empty"
+    printf '%s\n' "$names"
+}
+
+is_admitted() {
+    local wanted=$1 name names
+    # Not `done < <(actions)`: a process substitution's exit status is lost, so an unreadable
+    # or mismatched catalogue became "unknown action" (exit 2) instead of its own refusal.
+    # `|| exit` because a caller's `||` suspends set -e inside this function.
+    names=$(actions) || exit "$?"
+    while IFS= read -r name; do
+        [[ $name == "$wanted" ]] && return 0
+    done <<<"$names"
+    return 1
+}
+
+# The tuple a chain pins: the digest of the catalogue and of this file, read through stdin so
+# that sha256sum cannot escape an unusual file name into its output.
+pin() {
+    local file digest joined=
+    for file in "$CATALOGUE" "${BASH_SOURCE[0]}"; do
+        digest=$(sha256sum <"$file") || fail "$EXIT_NO_PRODUCER" "cannot digest $file"
+        joined+=${joined:+:}${digest%% *}
+    done
+    printf '%s\n' "$joined"
+}
+
+producer() {
+    local path=${HEE3_PRODUCER:-}
+    [[ -n $path ]] || fail "$EXIT_NO_PRODUCER" "HEE3_PRODUCER is unset; there is no producer to invoke"
+    [[ -x $path ]] || fail "$EXIT_NO_PRODUCER" "producer is not executable: $path"
+    # The producer runs under `env -i`, which reads a NAME=value word as an assignment: it
+    # would print its environment and exit 0 without running the producer at all.
+    [[ $path != *=* ]] || fail "$EXIT_NO_PRODUCER" "producer path contains '=': $path"
+    printf '%s' "$path"
+}
+
+# Build the request with python's json writer rather than string concatenation: a value
+# containing a quote or a backslash must be encoded, and hand-built JSON is where that goes
+# wrong silently.
+#
+# The request is a control-v1 `Request_<action>` (review N1: the first version sent a shape
+# no definition accepts). Everything the schema fixes -- protocol, version, kind,
+# action_version, and whether this action requires or forbids an idempotency key or a
+# precondition -- is read from that definition in the same catalogue the action list comes
+# from, so the wrapper cannot drift from it. What only the caller can know arrives as:
+#
+#   name=value       a body field whose value is this literal string
+#   name:=JSON       a body field whose value is this JSON (objects, arrays, numbers, null)
+#   @idempotency_key=UUID   @precondition:=JSON   the two envelope fields a caller supplies
+#   HEE3_GRANT_ID, HEE3_SCOPE_SHA256    the authority; refused by name when either is unset
+#   HEE3_TIMEOUT_MS  the budget; the deadline is now plus it, never more than 60 s ahead
+#
+# The body is not validated here: that needs a schema engine this stdlib-only builder does
+# not have, and the engine validates every request it receives. JSON values are parsed
+# strictly -- a duplicated key or a non-finite number is refused, never silently resolved.
+build_request() {
+    local action=$1
+    shift
+    python3 - "$CATALOGUE" "$action" "$@" <<'PY'
+import json, os, sys, time, uuid
+
+MAX_AHEAD_MS, DEFAULT_MS = 60000, 30000
+catalogue, action, pairs = sys.argv[1], sys.argv[2], sys.argv[3:]
+
+
+def refuse(message):
+    sys.exit(message)
+
+
+def unique(items):
+    seen = {}
+    for key, value in items:
+        if key in seen:
+            raise ValueError(f"key {key!r} appears twice")
+        seen[key] = value
+    return seen
+
+
+def strict(name, text):
+    def constant(token):
+        raise ValueError(f"non-finite number {token}")
+    try:
+        return json.loads(text, object_pairs_hook=unique, parse_constant=constant)
+    except ValueError as error:
+        refuse(f"{name}:= is not strict JSON: {error}")
+
+
+with open(catalogue, encoding="utf-8") as handle:
+    definitions = json.load(handle)["$defs"]
+definition = definitions.get("Request_" + action.replace(".", "_"))
+if definition is None:
+    refuse("the catalogue has no request definition for " + action)
+fields = definition["properties"]
+
+
+def nullable(field):
+    shape = fields[field]
+    return shape.get("type") == "null" or any(
+        option.get("type") == "null" for option in shape.get("oneOf", ()))
+
+
+def only_null(field):
+    return fields[field].get("type") == "null"
+
+
+body, envelope = {}, {}
+for pair in pairs:
+    if "=" not in pair:
+        refuse("argument is not name=value or name:=JSON: " + repr(pair))
+    name, _, value = pair.partition("=")
+    typed = name.endswith(":")
+    name = name[:-1] if typed else name
+    target = envelope if name.startswith("@") else body
+    name = name[1:] if name.startswith("@") else name
+    if not name:
+        refuse("argument has an empty name: " + repr(pair))
+    if target is envelope and name not in ("idempotency_key", "precondition"):
+        refuse(f"@{name} is not an envelope field a caller supplies; "
+               "only @idempotency_key and @precondition are")
+    if name in target:
+        refuse("argument named twice: " + repr(name))
+    target[name] = strict(name, value) if typed else value
+
+grant, scope = os.environ.get("HEE3_GRANT_ID", ""), os.environ.get("HEE3_SCOPE_SHA256", "")
+for variable, value in (("HEE3_GRANT_ID", grant), ("HEE3_SCOPE_SHA256", scope)):
+    if not value:
+        refuse(f"{variable} is unset; a request carries the authority it is made under")
+
+for field in ("idempotency_key", "precondition"):
+    if field in envelope and only_null(field):
+        refuse(f"{action} takes no {field}")
+    if field not in envelope and not nullable(field):
+        refuse(f"{action} requires @{field}")
+
+budget = os.environ.get("HEE3_TIMEOUT_MS", "")
+ahead = int(budget) if budget.isdigit() and int(budget) > 0 else DEFAULT_MS
+now = time.time_ns() // 1_000_000
+
+request = {
+    "protocol": fields["protocol"]["const"],
+    "version": fields["version"]["const"],
+    "kind": fields["kind"]["const"],
+    "request_id": str(uuid.uuid4()),
+    "action": fields["action"]["const"],
+    "action_version": fields["action_version"]["const"],
+    "idempotency_key": envelope.get("idempotency_key"),
+    "deadline_unix_ms": str(now + min(ahead, MAX_AHEAD_MS)),
+    "authority": {"grant_id": grant, "scope_sha256": scope},
+    "precondition": envelope.get("precondition"),
+    "body": body,
+}
+# RC03 section 3: one COMPACT object. json.dump's default separators add a space after every
+# comma and colon, and a strict receiver closes such a frame without a reply.
+json.dump(request, sys.stdout, sort_keys=True, ensure_ascii=False, allow_nan=False,
+          separators=(",", ":"))
+sys.stdout.write("\n")
+PY
+}
+
+# The one door every request passes: bounds, admission, encoding. `invoke` sends what this
+# prints; `--check` prints it and sends nothing; `chain` asks it about every step before the
+# first step runs. A second copy of these rules in the chain runner would agree with this one
+# only while somebody kept it agreeing.
+check_request() {
+    local action=$1
+    shift
+    # A chain's steps run under the tuple its check phase admitted, or not at all.
+    if [[ -n ${HEE3_PIN_SHA256:-} ]]; then
+        local now
+        now=$(pin) || exit "$?"
+        [[ $now == "$HEE3_PIN_SHA256" ]] || fail "$EXIT_NO_PRODUCER" \
+            "the catalogue or the wrapper changed since the chain was checked (pinned $HEE3_PIN_SHA256, now $now)"
+    fi
+    (( $# <= MAX_ARGS )) || fail "$EXIT_BOUNDS" "$# arguments against a limit of $MAX_ARGS"
+    local pair
+    for pair in "$@"; do
+        (( ${#pair} <= MAX_VALUE_BYTES )) ||
+            fail "$EXIT_BOUNDS" "an argument is ${#pair} bytes against a limit of $MAX_VALUE_BYTES"
+    done
+    is_admitted "$action" || fail "$EXIT_USAGE" "unknown action: $action"
+    build_request "$action" "$@" || fail "$EXIT_USAGE" "could not build the request"
+}
+
+# A cancelling signal during an invocation: forward TERM to the producer, wait for it to end,
+# then exit 128+n. TERM whatever arrived, because an asynchronous command in a non-interactive
+# shell ignores INT, so forwarding INT would reach nothing. The producer is the last job
+# started, so `$!` names it from the moment it exists -- a variable assigned after `&` would
+# leave a window in which a signal found it unset. Before the producer starts, `$!` is head
+# (which TERM ends) or unset.
+#
+# The wait carries no budget of its own, deliberately: the wrapper does not report a
+# cancellation while its producer still runs, and a producer that ignores TERM is ended by
+# whoever supervises the wrapper -- the chain escalates to KILL on the step's whole group.
+cancel() {
+    # `|| true` on both: under set -e, a producer already gone (kill fails, wait reports 127)
+    # or one that exits non-zero would end the wrapper with THAT status instead of 128+n.
+    if [[ -n ${!-} ]]; then
+        kill -TERM "$!" 2>/dev/null || true
+        wait "$!" || true
+    fi
+    exit "$1"
+}
+
+invoke() {
+    local action=$1
+    shift
+    local request bin status=0
+    # `fail` inside `$(...)` exits only the substitution's subshell, so its code is carried
+    # out explicitly; `|| status=$?` keeps `set -e` from discarding which refusal it was.
+    request=$(check_request "$action" "$@") || status=$?
+    (( status == 0 )) || exit "$status"
+    bin=$(producer)
+
+    # The producer's stdout is bounded by head, in the stream, so an unbounded producer is
+    # stopped rather than merely truncated after the fact.
+    #
+    # The producer runs in the BACKGROUND and this shell waits for it. Bash runs a trap only
+    # after a foreground command ends, so a producer in the foreground never heard a TERM sent
+    # to this wrapper's pid alone: the wrapper waited on, the producer ran until its own
+    # timeout. `wait` is interrupted by a trapped signal, and the trap forwards it (review 7.3).
+    # The producer's status is `wait`'s, read from its own pid: it is never the last command
+    # of a pipeline, so head's zero -- head exits 0 whether the producer succeeded, failed, or
+    # was killed for exceeding the bound -- cannot stand in for it. The two meet at a FIFO.
+    local scratch
+    scratch=$(mktemp -d) || fail "$EXIT_BOUNDS" "could not create a scratch directory"
+    # EXIT rather than RETURN, with the three cancelling signals turned into exits: bash runs
+    # no trap at all when an untrapped signal kills it, so a cancelled invocation used to
+    # leave its scratch directory behind. 128+n keeps "killed by a signal" legible to the
+    # caller.
+    # shellcheck disable=SC2064  # the path is expanded now, deliberately: $scratch is local.
+    trap "rm -rf -- '$scratch'" EXIT
+    trap 'cancel 129' HUP
+    trap 'cancel 130' INT
+    trap 'cancel 143' TERM
+    printf '%s' "$request" >"$scratch/request"
+    mkfifo -- "$scratch/stdout" || fail "$EXIT_BOUNDS" "could not create the output pipe"
+
+    # The environment is an allowlist: what the producer reads (XDG_RUNTIME_DIR, HOME), what
+    # makes it runnable with stable output (PATH, LC_ALL), and what a chain hands its step.
+    # A name the caller did not set stays unset rather than arriving empty.
+    local -a inherited=()
+    local name
+    for name in PATH HOME XDG_RUNTIME_DIR LC_ALL HEE3_CHAIN_STEP HEE3_TIMEOUT_MS; do
+        [[ ! -v $name ]] || inherited+=("$name=${!name}")
+    done
+
+    set +e
+    head -c "$MAX_OUTPUT_BYTES" <"$scratch/stdout" >"$scratch/out" &
+    local reader=$!
+    # stdout is opened first: were the request's redirection to fail, the FIFO has still been
+    # opened and closed, so head sees end-of-file rather than waiting for a writer forever.
+    # The producer is the LAST job started, which is what lets `cancel` name it as `$!`.
+    # `--` first, so a producer path beginning with `-` is never read as an option of env's.
+    # Belt and braces today: bash always sets PATH, so an assignment precedes the path anyway.
+    env -i -- "${inherited[@]}" "$bin" "$action" >"$scratch/stdout" <"$scratch/request" &
+    wait "$!"
+    status=$?
+    wait "$reader"
+    set -e
+
+    # `cat` the file rather than $(...) it: command substitution strips trailing newlines,
+    # so a producer emitting two would have had one silently removed. A wrapper that edits
+    # its producer's bytes is not reporting the producer's result.
+    cat -- "$scratch/out"
+    # A final newline only when the producer did not end with one, so a shell reading this
+    # gets a terminated line without the bytes being changed when they already were.
+    if [[ -s $scratch/out ]] && [[ $(tail -c 1 -- "$scratch/out" | od -An -tu1 | tr -d ' ') != 10 ]]; then
+        printf '\n'
+    fi
+    if (( status != 0 )); then
+        printf 'hee3: producer exited %s for action %s\n' "$status" "$action" >&2
+    fi
+    return "$status"
+}
+
+# A chain is a declared, ordered list of steps; each step is one ordinary invocation of THIS
+# file, so every rule above -- bounds, admission, literal encoding, PIPESTATUS -- applies to
+# it through the same code rather than a copy. The runner adds only what a sequence needs:
+#
+#   * every step is checked through `--check` before the first one runs, so a refusal at
+#     step 3 cannot arrive after step 1 has had its effect;
+#   * a step's input is a named string field of an EARLIER step's declared JSON output,
+#     passed on as one literal `name=value` argument -- never spliced into a command;
+#   * one budget bounds the whole chain, a step may declare a smaller one, and the budget in
+#     force is handed to the step as HEE3_TIMEOUT_MS;
+#   * each step runs in its own process group, so a timeout or a cancellation stops the
+#     producer and anything it started, not just the wrapper in front of it;
+#   * the first step that fails ends the chain, its own status is the chain's status, and
+#     the steps after it are named as not run rather than left to be inferred.
+#
+# It schedules nothing: no retries, no parallelism, no step the spec did not name.
+chain() {
+    (( $# == 1 )) || fail "$EXIT_USAGE" "chain takes exactly one spec path, or - for stdin"
+    # Refused here, before anything is read or checked: a chain whose first step would exit 3
+    # is a chain that should not have started.
+    producer >/dev/null
+    local runner
+    runner=$(cat <<'PY'
+import itertools, json, os, re, signal, subprocess, sys, time
+
+(wrapper, spec_path, max_steps, max_spec_bytes, max_chain_ms, max_args, exit_usage,
+ exit_timeout, exit_contract, grace_ms, check_ms, slice_ms) = sys.argv[1:13]
+(max_steps, max_spec_bytes, max_chain_ms, max_args, exit_usage, exit_timeout, exit_contract,
+ grace_ms, check_ms, slice_ms) = map(int, (max_steps, max_spec_bytes, max_chain_ms, max_args,
+                                           exit_usage, exit_timeout, exit_contract, grace_ms,
+                                           check_ms, slice_ms))
+ID_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789_-")
+MAX_ID = 64
+STATE = {"proc": None, "signal": None}
+
+
+def say(message):
+    print(f"hee3: chain: {message}", file=sys.stderr, flush=True)
+
+
+def refuse(message, code=exit_usage):
+    say(message)
+    sys.exit(code)
+
+
+# Cancellation. The handler never raises: an exception thrown from a signal handler lands at
+# an arbitrary bytecode, including inside the cleanup that is meant to answer it. It records
+# the signal and forwards TERM to the running step's process group; the loop that waits on
+# the step polls the record, so the wait is bounded by one slice, not by the step's budget.
+def on_signal(signum, _frame):
+    if STATE["signal"] is not None:
+        return
+    STATE["signal"] = signum
+    if STATE["proc"] is not None:
+        signal_group(STATE["proc"], signal.SIGTERM)
+
+
+def signal_group(proc, sig):
+    try:
+        os.killpg(proc.pid, sig)
+    except ProcessLookupError:
+        pass
+
+
+for _sig in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+    signal.signal(_sig, on_signal)
+
+
+def settle(proc):
+    """TERM has been sent. Wait the grace, then KILL the group and wait once more.
+
+    Bounded both times: a descendant that left the group and holds the pipe open must not
+    turn a timeout into a hang. Returns (stdout, settled)."""
+    for escalate in (False, True):
+        if escalate:
+            signal_group(proc, signal.SIGKILL)
+        try:
+            return proc.communicate(timeout=grace_ms / 1000)[0], True
+        except subprocess.TimeoutExpired:
+            continue
+    return b"", False
+
+
+def run_child(argv, budget_s, env):
+    deadline = time.monotonic() + budget_s
+    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, env=env,
+                            start_new_session=True)
+    STATE["proc"] = proc
+    # A signal that arrived while Popen was forking found no process to forward to.
+    if STATE["signal"] is not None:
+        signal_group(proc, signal.SIGTERM)
+    outcome, out = "done", b""
+    while True:
+        if STATE["signal"] is not None:
+            outcome = "cancelled"
+            break
+        left = deadline - time.monotonic()
+        if left <= 0:
+            outcome = "timeout"
+            break
+        try:
+            out = proc.communicate(timeout=min(slice_ms / 1000, left))[0]
+            break
+        except subprocess.TimeoutExpired:
+            continue
+    STATE["proc"] = None
+    settled = True
+    if outcome != "done":
+        signal_group(proc, signal.SIGTERM)
+        out, settled = settle(proc)
+    return outcome, proc.returncode, out or b"", settled
+
+
+def status_of(returncode):
+    if returncode is None:
+        return None
+    return returncode if returncode >= 0 else 128 - returncode
+
+
+# The spec. Acquired with its bound: read one byte past the limit, never the whole input
+# first and a length check after.
+def acquire(path):
+    try:
+        if path == "-":
+            data = sys.stdin.buffer.read(max_spec_bytes + 1)
+        else:
+            with open(path, "rb") as handle:
+                data = handle.read(max_spec_bytes + 1)
+    except OSError as error:
+        refuse(f"cannot read the spec {path}: {error.strerror}")
+    if len(data) > max_spec_bytes:
+        refuse(f"the spec is over {max_spec_bytes} bytes")
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        refuse("the spec is not UTF-8")
+
+
+def unique_keys(pairs):
+    seen = {}
+    for key, value in pairs:
+        if key in seen:
+            raise ValueError(f"key {key!r} appears twice")
+        seen[key] = value
+    return seen
+
+
+def reject_constant(name):
+    raise ValueError(f"non-finite number {name}")
+
+
+def parse(text):
+    # A duplicated key is two answers to one question; json.loads keeps the last silently.
+    return json.loads(text, object_pairs_hook=unique_keys, parse_constant=reject_constant)
+
+
+def exact_keys(value, where, required, optional=()):
+    if not isinstance(value, dict):
+        refuse(f"{where} is not an object")
+    missing = [key for key in required if key not in value]
+    if missing:
+        refuse(f"{where} lacks {', '.join(missing)}")
+    unknown = sorted(set(value) - set(required) - set(optional))
+    if unknown:
+        refuse(f"{where} has unknown key(s) {', '.join(unknown)}")
+
+
+def milliseconds(value, where, ceiling):
+    # type(), not isinstance(): True is an int, and a budget of `true` is not a budget.
+    if type(value) is not int or not 1 <= value <= ceiling:
+        refuse(f"{where} must be an integer from 1 to {ceiling}")
+    return value
+
+
+def argument_name(name, where):
+    # `=` inside a name would be re-split by the request builder into a different name and
+    # value. That is the encoding this runner performs, so the rule is this runner's.
+    if not isinstance(name, str) or not name or "=" in name:
+        refuse(f"{where}: argument name {name!r} must be a non-empty string without '='")
+    # A trailing ':' would reach the builder as `name:=`, the typed form of another name.
+    if name.endswith(":"):
+        refuse(f"{where}: argument name {name!r} must not end in ':'")
+
+
+def pair(name, value):
+    """One argument for the request door: text as `name=value`, any other JSON as `name:=JSON`.
+
+    A control-v1 body is typed (task.get's selector is an object), so a step's argument may
+    be any JSON value; the builder parses `:=` strictly, and this is its only encoder here.
+    """
+    if isinstance(value, str):
+        return f"{name}={value}"
+    return f"{name}:=" + json.dumps(value, ensure_ascii=False, allow_nan=False,
+                                   separators=(",", ":"))
+
+
+# BASH-G2: RFC 6901. A provided field or an input whose name begins with "/" is a JSON Pointer;
+# any other name is the top-level member it names, exactly as before pointers existed.
+MISSING = object()
+
+
+def pointer(text, where):
+    """The reference tokens `text` names: split on "/", then "~1" -> "/" and "~0" -> "~", in that
+    order (RFC 6901 section 4), so "~01" is the key "~1". A bare name is one token."""
+    if not text.startswith("/"):
+        return [text]
+    raw = text[1:].split("/")
+    if any(re.search("~(?![01])", token) for token in raw):
+        refuse(f"{where}: {text!r} is not an RFC 6901 pointer: ~ must be followed by 0 or 1")
+    return [token.replace("~1", "/").replace("~0", "~") for token in raw]
+
+
+def resolve(document, tokens):
+    """The value `tokens` reach in `document`, or MISSING. An array index is decimal with no
+    leading zero; "-" (the element after the last) and any index past the end name nothing."""
+    node = document
+    for token in tokens:
+        if isinstance(node, dict) and token in node:
+            node = node[token]
+        elif (isinstance(node, list) and re.fullmatch("0|[1-9][0-9]*", token)
+              and int(token) < len(node)):
+            node = node[int(token)]
+        else:
+            return MISSING
+    return node
+
+
+def input_pairs(step, value_of):
+    """The request door's arguments for a step's inputs: a bare name is `name=value`; pointer
+    targets are grouped under their top-level member and sent as one `member:=JSON`. One
+    builder for the static check (empty values) and for the run, so the two cannot differ."""
+    pairs, members = [], {}
+    for name, source in step["inputs"].items():
+        value, tokens = value_of(source), targets[step["id"]][name]
+        if not name.startswith("/"):
+            pairs.append(f"{name}={value}")
+        elif len(tokens) == 1:
+            members[tokens[0]] = value
+        else:
+            node = members.setdefault(tokens[0], {})
+            for token in tokens[1:-1]:
+                node = node.setdefault(token, {})
+            node[tokens[-1]] = value
+    return pairs + [pair(member, value) for member, value in members.items()]
+
+
+try:
+    spec = parse(acquire(spec_path))
+except ValueError as error:
+    refuse(f"the spec is not valid JSON: {error}")
+exact_keys(spec, "the spec", ("protocol", "version", "timeout_ms", "steps"))
+if spec["protocol"] != "hee3.chain":
+    refuse(f"protocol must be hee3.chain, not {spec['protocol']!r}")
+if type(spec["version"]) is not int or spec["version"] != 1:
+    refuse(f"version {spec['version']!r} is not supported; this wrapper reads version 1")
+chain_ms = milliseconds(spec["timeout_ms"], "timeout_ms", max_chain_ms)
+steps = spec["steps"]
+if not isinstance(steps, list) or not 1 <= len(steps) <= max_steps:
+    refuse(f"steps must be a list of 1 to {max_steps} steps")
+
+declared = {}
+targets = {}
+for index, step in enumerate(steps):
+    where = f"step {index}"
+    exact_keys(step, where, ("id", "action"),
+               ("arguments", "inputs", "output", "provides", "timeout_ms"))
+    sid = step["id"]
+    if (not isinstance(sid, str) or not 1 <= len(sid) <= MAX_ID
+            or not set(sid) <= ID_CHARS):
+        refuse(f"{where}: id must be 1 to {MAX_ID} of [a-z0-9_-]")
+    if sid in declared:
+        refuse(f"{where}: id {sid!r} is used twice")
+    where = f"step {sid!r}"
+    if not isinstance(step["action"], str):
+        refuse(f"{where}: action must be a string")
+    arguments = step.setdefault("arguments", {})
+    if not isinstance(arguments, dict):
+        refuse(f"{where}: arguments must be an object")
+    for name in arguments:
+        argument_name(name, where)
+    output = step.setdefault("output", "text")
+    if output not in ("text", "json"):
+        refuse(f"{where}: output must be text or json")
+    provides = step.setdefault("provides", [])
+    if (not isinstance(provides, list) or len(provides) > max_args
+            or not all(isinstance(field, str) and field for field in provides)
+            or len(set(provides)) != len(provides)):
+        refuse(f"{where}: provides must be a list of at most {max_args} distinct field names")
+    if provides and output != "json":
+        refuse(f"{where}: only a json output can provide fields")
+    for field in provides:
+        pointer(field, where)
+    inputs = step.setdefault("inputs", {})
+    if not isinstance(inputs, dict):
+        refuse(f"{where}: inputs must be an object")
+    targets[sid] = {}
+    for name, source in inputs.items():
+        argument_name(name, where)
+        tokens = pointer(name, where)
+        argument_name(tokens[0], where)
+        if tokens[0] in arguments:
+            refuse(f"{where}: {tokens[0]!r} is both a literal argument and an input")
+        targets[sid][name] = tokens
+        exact_keys(source, f"{where} input {name!r}", ("step", "field"))
+        if not isinstance(source["step"], str) or not isinstance(source["field"], str):
+            refuse(f"{where}: input {name!r} step and field must be strings")
+        origin = declared.get(source["step"])
+        if origin is None:
+            refuse(f"{where}: input {name!r} names {source['step']!r}, which is not an "
+                   "earlier step")
+        if source["field"] not in origin["provides"]:
+            refuse(f"{where}: input {name!r} reads {source['field']!r}, which step "
+                   f"{source['step']!r} does not declare in provides")
+    # Two targets where one lies inside the other would write one member twice.
+    for (a, first), (b, second) in itertools.combinations(sorted(targets[sid].items()), 2):
+        if first[:len(second)] == second or second[:len(first)] == first:
+            refuse(f"{where}: inputs {a!r} and {b!r} overlap")
+    if "timeout_ms" in step:
+        milliseconds(step["timeout_ms"], f"{where}: timeout_ms", chain_ms)
+    declared[sid] = step
+
+def check(argv, what):
+    """One local read of the wrapper, bounded like every check; its stdout if it succeeded."""
+    outcome, returncode, out, _ = run_child(argv, check_ms / 1000, dict(os.environ))
+    if STATE["signal"] is not None:
+        refuse("cancelled before any step ran", 128 + STATE["signal"])
+    if outcome != "done":
+        refuse(f"checking {what} did not finish in {check_ms} ms")
+    if returncode != 0:
+        refuse(f"{what} was refused before any step ran",
+               status_of(returncode))
+    return out
+
+
+# Every step through the one door before any step runs. An input's value is not known yet,
+# so its argument is checked by name with an empty value; its size is checked again, by the
+# same door, when the step runs.
+for step in steps:
+    check(["bash", wrapper, "--check", step["action"],
+           *(pair(name, value) for name, value in step["arguments"].items()),
+           *input_pairs(step, lambda source: "")], f"step {step['id']!r}")
+
+# The tuple those checks admitted -- the digest of the catalogue and the wrapper, from the
+# wrapper's own `--pin` -- is handed to every step as HEE3_PIN_SHA256, and the request door
+# refuses a step whose files no longer match it. A change after the checks cannot reach a step.
+os.environ["HEE3_PIN_SHA256"] = check(["bash", wrapper, "--pin"], "the pin").decode().strip()
+
+
+def emit(record):
+    try:
+        sys.stdout.write(json.dumps(record, sort_keys=True, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+    except BrokenPipeError:
+        # Nobody is reading the results, so no later step's result can be delivered either.
+        sys.stderr.write("hee3: chain: stdout closed; stopping\n")
+        os._exit(141)
+
+
+ran = []
+
+
+def finish(outcome, status, failed=None, detail=None, limit=None):
+    summary = {"kind": "summary", "outcome": outcome, "status": status, "ran": ran,
+               "not_run": [step["id"] for step in steps[len(ran):]],
+               "failed_step": failed}
+    if detail is not None:
+        summary["detail"] = detail
+    if limit is not None:
+        summary["limit"] = limit
+    emit(summary)
+    if outcome != "ok":
+        say(f"{outcome} at step {failed!r}: {detail}" if failed else f"{outcome}: {detail}")
+    sys.exit(status)
+
+
+chain_deadline = time.monotonic() + chain_ms / 1000
+produced = {}
+for index, step in enumerate(steps):
+    sid = step["id"]
+    if STATE["signal"] is not None:
+        finish("cancelled", 128 + STATE["signal"], detail="cancelled between steps")
+    left = chain_deadline - time.monotonic()
+    if left <= 0:
+        finish("timeout", exit_timeout, sid, "the chain budget was spent before this step",
+               "chain")
+    step_s = step.get("timeout_ms", chain_ms) / 1000
+    budget, limit = (step_s, "step") if step_s < left else (left, "chain")
+    pairs = [pair(name, value) for name, value in step["arguments"].items()]
+    pairs += input_pairs(step, lambda source: produced[source["step"]][source["field"]])
+    env = dict(os.environ, HEE3_CHAIN_STEP=sid,
+               HEE3_TIMEOUT_MS=str(max(1, int(budget * 1000))))
+    ran.append(sid)
+    outcome, returncode, out, settled = run_child(["bash", wrapper, step["action"], *pairs],
+                                                  budget, env)
+    record = {"kind": "step", "index": index, "step": sid, "action": step["action"],
+              "status": status_of(returncode)}
+    if not settled:
+        record["settled"] = False
+    try:
+        record["stdout"], utf8 = out.decode("utf-8"), True
+    except UnicodeDecodeError:
+        record["stdout"], utf8 = out.decode("utf-8", errors="replace"), False
+    # A signal outranks what the step did after it: a step that died of the TERM we
+    # forwarded is a cancelled step, not a failing producer.
+    if STATE["signal"] is not None:
+        record["outcome"] = "cancelled"
+        emit(record)
+        finish("cancelled", 128 + STATE["signal"], sid,
+               f"signal {signal.Signals(STATE['signal']).name}")
+    if outcome == "timeout":
+        record["outcome"] = "timeout"
+        emit(record)
+        finish("timeout", exit_timeout, sid,
+               f"no result within {int(budget * 1000)} ms", limit)
+    status = record["status"]
+    if status != 0:
+        record["outcome"] = "failed"
+        emit(record)
+        finish("failed", status, sid, f"producer exited {status}")
+    if not utf8:
+        record["outcome"] = "contract"
+        emit(record)
+        finish("contract", exit_contract, sid, "stdout is not UTF-8")
+    if step["output"] == "json":
+        try:
+            result = parse(record["stdout"])
+        except ValueError as error:
+            record["outcome"] = "contract"
+            emit(record)
+            finish("contract", exit_contract, sid, f"declared json output is not JSON: {error}")
+        values = {field: resolve(result, pointer(field, f"step {sid!r}"))
+                  for field in step["provides"]}
+        if step["provides"]:
+            missing = [field for field, value in values.items() if not isinstance(value, str)]
+            if missing:
+                record["outcome"] = "contract"
+                emit(record)
+                finish("contract", exit_contract, sid,
+                       f"declared field(s) absent or not a string: {', '.join(missing)}")
+        record["result"] = result
+        produced[sid] = values
+    record["outcome"] = "ok"
+    emit(record)
+
+finish("ok", 0)
+PY
+)
+    exec python3 -c "$runner" "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/$(basename -- "${BASH_SOURCE[0]}")" "$1" \
+        "$MAX_STEPS" "$MAX_SPEC_BYTES" "$MAX_CHAIN_MS" "$MAX_ARGS" \
+        "$EXIT_USAGE" "$EXIT_TIMEOUT" "$EXIT_CONTRACT" "$GRACE_MS" "$CHECK_MS" "$SLICE_MS"
+}
+
+inspect() {
+    local action=$1
+    is_admitted "$action" || fail "$EXIT_USAGE" "unknown action: $action"
+    printf 'action: %s\n' "$action"
+    printf 'wrapper_version: %s\n' "$HEE3_WRAPPER_VERSION"
+    printf 'catalogue: %s\n' "$CATALOGUE"
+    if [[ -n ${HEE3_PRODUCER:-} && -x ${HEE3_PRODUCER:-} ]]; then
+        printf 'producer: %s\n' "$HEE3_PRODUCER"
+    else
+        # A diagnostic, not a refusal: inspecting what an action needs is exactly what a
+        # caller does when the producer is missing.
+        printf 'producer: ABSENT (set HEE3_PRODUCER)\n'
+    fi
+    printf 'max_args: %s\nmax_value_bytes: %s\nmax_output_bytes: %s\n' \
+        "$MAX_ARGS" "$MAX_VALUE_BYTES" "$MAX_OUTPUT_BYTES"
+}
+
+main() {
+    (( $# >= 1 )) || { usage >&2; exit "$EXIT_USAGE"; }
+    case $1 in
+        --help|-h) usage; exit 0 ;;
+        --version)
+            # The catalogue is read BEFORE anything is printed, and its refusal is carried
+            # out: inside printf's argument its failure was lost, and an unreadable catalogue
+            # printed `catalogue_actions: 0` and exited 0.
+            local names
+            local -a listed
+            names=$(actions) || exit "$?"
+            mapfile -t listed <<<"$names"
+            printf 'wrapper_version: %s\n' "$HEE3_WRAPPER_VERSION"
+            printf 'control_protocol: %s/%s\n' "$CONTROL_PROTOCOL" "$CONTROL_VERSION"
+            printf 'producer: %s\n' "${HEE3_PRODUCER:-ABSENT}"
+            printf 'catalogue_actions: %s\n' "${#listed[@]}"
+            exit 0 ;;
+        --pin) (( $# == 1 )) || fail "$EXIT_USAGE" "--pin takes no arguments"
+            pin; exit 0 ;;
+        --actions) actions; exit 0 ;;
+        --inspect)
+            (( $# == 2 )) || fail "$EXIT_USAGE" "--inspect takes exactly one action"
+            inspect "$2"; exit 0 ;;
+        --check)
+            (( $# >= 2 )) || fail "$EXIT_USAGE" "--check takes an action and its arguments"
+            shift
+            check_request "$@"; exit 0 ;;
+        chain) shift; chain "$@" ;;
+        -*) fail "$EXIT_USAGE" "unknown option: $1" ;;
+    esac
+    invoke "$@"
+}
+
+main "$@"

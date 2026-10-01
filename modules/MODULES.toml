@@ -1,0 +1,1063 @@
+# HEE v4 module funnel manifest (machine-readable; one [[module]] per card). Planning only: HOLD (V4-0).
+# Human guide: modules/README.md. Fields beyond the brief: anti, h, v4, errata.
+
+[[module]]
+name = "contracts"
+crate = "hee4-contracts"
+cluster = "K0"
+v3_origin = ["contracts"]
+flag = "PARTIAL"
+recommendation = "HARDEN"
+phases = ["P0", "P1", "P5", "P6"]
+depends_on = []
+migrated_paths = ["migrated/v3-b5367bc/src/contracts.rs", "migrated/v3-b5367bc/src/contracts", "migrated/v3-b5367bc/schemas/receipts", "migrated/v3-b5367bc/tests/t01_contracts.rs", "migrated/v3-b5367bc/tests/t03_contract.rs", "migrated/v3-b5367bc/tests/t05_codec.rs", "migrated/v3-b5367bc/tests/t06_receipts.rs", "migrated/v3-b5367bc/tests/t06_receipt_import.rs", "migrated/v3-b5367bc/tests/t28_control.rs", "migrated/v3-b5367bc/tests/receipt_schema.py"]
+ap = ["AP-01", "AP-04", "AP-05", "AP-14", "AP-21", "AP-26", "AP-45"]
+ex = ["EX-01", "EX-19", "EX-14", "EX-15"]
+anti = ["A-4"]
+d = ["D-09", "D-10"]
+jev = []
+h = ["H-5", "H-6"]
+v4 = ["V4-0", "V4-10", "V4-11", "V4-14", "V4-17"]
+errata = ["E3"]
+card = "modules/hee4-contracts/contracts/MODULE.md"
+
+[[module]]
+name = "state-enums"
+crate = "hee4-contracts"
+cluster = "K0"
+v3_origin = ["recovery", "store", "contracts"]
+flag = "PARTIAL"
+recommendation = "KEEP (recovery enums) / REFACTOR (store state)"
+phases = ["P0", "P1"]
+depends_on = []
+migrated_paths = ["migrated/v3-b5367bc/src/contracts.rs", "migrated/v3-b5367bc/src/herdr.rs", "migrated/v3-b5367bc/src/task/control.rs"]
+ap = ["AP-02", "AP-03", "AP-12", "AP-13", "AP-19", "AP-21"]
+ex = ["EX-05", "EX-14", "EX-06"]
+anti = ["A-1", "A-2"]
+d = ["D-10"]
+jev = []
+h = ["H-5"]
+v4 = ["V4-0", "V4-10", "D-U5"]
+errata = ["E4"]
+card = "modules/hee4-contracts/state-enums/MODULE.md"
+
+[[module]]
+name = "catalogue-data"
+crate = "hee4-contracts"
+cluster = "K0"
+v3_origin = ["actions", "worker"]
+flag = "PARTIAL"
+recommendation = "HARDEN (actions) / REFACTOR (pi_extension tool projection)"
+phases = ["P0", "P1", "P5", "P9"]
+depends_on = []
+migrated_paths = ["migrated/v3-b5367bc/src/actions.rs", "migrated/v3-b5367bc/schemas/actions", "migrated/v3-b5367bc/tests/control_schema.py", "migrated/v3-b5367bc/tests/t28_actions.rs"]
+ap = ["AP-12", "AP-28", "AP-10", "AP-11", "AP-09", "AP-01"]
+ex = ["EX-05", "EX-19"]
+anti = ["A-10"]
+d = ["D-09", "D-07"]
+jev = []
+h = ["H-5", "H-14", "H-8"]
+v4 = ["V4-0", "V4-10", "V4-11", "V4-14", "V4-17"]
+errata = ["E1", "E6", "E10", "E16"]
+card = "modules/hee4-contracts/catalogue-data/MODULE.md"
+
+[[module]]
+name = "judge-types"
+crate = "hee4-contracts"
+cluster = "K0"
+v3_origin = []
+flag = "n/a (new)"
+recommendation = "n/a (new)"
+phases = ["P0", "P9"]
+depends_on = []
+migrated_paths = []
+ap = ["AP-16", "AP-13", "AP-21", "AP-02"]
+ex = []
+anti = ["A-6"]
+d = ["D-02", "D-04"]
+jev = ["J1", "J2", "J3", "J4", "J5", "J6", "J7", "J8", "J9", "J10", "J11", "J12", "J13", "J14"]
+h = ["H-5", "H-8", "H-10", "H-11", "H-12"]
+v4 = ["V4-0"]
+errata = ["E11", "E17"]
+card = "modules/hee4-contracts/judge-types/MODULE.md"
+
+[[module]]
+name = "bounds"
+crate = "hee4-contracts"
+cluster = "K0"
+v3_origin = ["contracts", "worker", "store", "app", "bash"]
+flag = "PARTIAL"
+recommendation = "HARDEN (contracts) / REFACTOR (worker limits)"
+phases = ["P0", "P1", "P3"]
+depends_on = []
+migrated_paths = ["migrated/v3-b5367bc/src/contracts/rc01.rs", "migrated/v3-b5367bc/src/contracts/control.rs", "migrated/v3-b5367bc/integrations/bash/hee3", "migrated/v3-b5367bc/tests/t01_contracts.rs"]
+ap = ["AP-01", "AP-04", "AP-14", "AP-19", "AP-28"]
+ex = ["EX-18", "EX-20", "EX-13"]
+anti = ["A-3", "A-4", "A-9"]
+d = ["D-07"]
+jev = []
+h = ["H-5"]
+v4 = ["V4-0", "V4-11", "V4-17"]
+errata = ["E16"]
+card = "modules/hee4-contracts/bounds/MODULE.md"
+
+[[module]]
+name = "spawn"
+crate = "hee4-host"
+cluster = "K0h"
+v3_origin = ["worker"]
+flag = "FINISHED (unverified, ERRATA §2)"
+recommendation = "REFACTOR (worker) / REUSE lifecycle"
+phases = ["P0", "P3", "P4"]
+depends_on = ["hee4-contracts"]
+migrated_paths = []
+ap = ["AP-01", "AP-06", "AP-31", "AP-38", "AP-49", "AP-10"]
+ex = ["EX-07", "EX-08", "EX-09", "EX-18"]
+anti = ["A-3"]
+d = ["D-09"]
+jev = []
+h = ["H-5", "H-9"]
+v4 = ["V4-0", "V4-17"]
+errata = []
+card = "modules/hee4-host/spawn/MODULE.md"
+
+[[module]]
+name = "clients"
+crate = "hee4-host"
+cluster = "K0h"
+v3_origin = ["worker"]
+flag = "FINISHED (unverified, ERRATA §2)"
+recommendation = "REFACTOR"
+phases = ["P3", "P4", "P7"]
+depends_on = ["hee4-contracts"]
+migrated_paths = []
+ap = ["AP-04", "AP-05", "AP-06", "AP-49", "AP-21", "AP-01"]
+ex = ["EX-12", "EX-13", "EX-19"]
+anti = []
+d = ["D-09"]
+jev = []
+h = ["H-9", "H-16"]
+v4 = ["V4-0", "V4-12"]
+errata = ["E9", "E16"]
+card = "modules/hee4-host/clients/MODULE.md"
+
+[[module]]
+name = "clock"
+crate = "hee4-host"
+cluster = "K0h"
+v3_origin = ["app", "task"]
+flag = "PARTIAL"
+recommendation = "REFACTOR (app: thread Clock through)"
+phases = ["P1", "P2", "P3"]
+depends_on = ["hee4-contracts"]
+migrated_paths = ["migrated/v3-b5367bc/src/task.rs", "migrated/v3-b5367bc/src/task/driver.rs"]
+ap = ["AP-06", "AP-07", "AP-31"]
+ex = ["EX-07", "EX-11", "EX-20"]
+anti = []
+d = ["D-09"]
+jev = []
+h = []
+v4 = ["V4-0"]
+errata = []
+card = "modules/hee4-host/clock/MODULE.md"
+
+[[module]]
+name = "cgroup-io"
+crate = "hee4-host"
+cluster = "K0h"
+v3_origin = ["worker"]
+flag = "FINISHED (unverified, ERRATA §2)"
+recommendation = "REFACTOR"
+phases = ["P3", "P4", "P6"]
+depends_on = ["hee4-contracts"]
+migrated_paths = []
+ap = ["AP-01", "AP-03", "AP-49", "AP-06"]
+ex = ["EX-08", "EX-09", "EX-18"]
+anti = ["A-3"]
+d = ["D-09"]
+jev = []
+h = ["H-9", "H-3"]
+v4 = ["V4-0", "V4-13", "V4-15", "V4-17"]
+errata = ["E16"]
+card = "modules/hee4-host/cgroup-io/MODULE.md"
+
+[[module]]
+name = "judge-egress"
+crate = "hee4-egress"
+cluster = "K0e"
+v3_origin = []
+flag = "n/a (new)"
+recommendation = "n/a (new)"
+phases = ["P0", "P9"]
+depends_on = ["hee4-contracts"]
+migrated_paths = []
+ap = ["AP-01", "AP-04", "AP-16", "AP-49", "AP-50"]
+ex = ["EX-01", "EX-19"]
+anti = []
+d = ["D-09"]
+jev = ["J1", "J2", "J3", "J7", "J8", "J9", "J10", "J12", "J13"]
+h = ["H-5", "H-8", "H-10", "H-11", "H-12"]
+v4 = ["V4-0", "V4-12", "D-U4"]
+errata = []
+card = "modules/hee4-egress/judge-egress/MODULE.md"
+
+[[module]]
+name = "task"
+crate = "hee4-core"
+cluster = "K1"
+v3_origin = ["task"]
+flag = "PARTIAL"
+recommendation = "HARDEN"
+phases = ["P1", "P2", "P5"]
+depends_on = ["hee4-contracts"]
+migrated_paths = ["migrated/v3-b5367bc/src/task.rs", "migrated/v3-b5367bc/src/task/control.rs", "migrated/v3-b5367bc/src/task/driver.rs", "migrated/v3-b5367bc/tests/t01_task.rs", "migrated/v3-b5367bc/tests/t06_driver.rs"]
+ap = ["AP-01", "AP-02", "AP-07", "AP-19", "AP-31", "AP-45"]
+ex = ["EX-06", "EX-14", "EX-15"]
+anti = []
+d = ["D-03", "D-11"]
+jev = []
+h = []
+v4 = ["V4-0", "V4-10", "V4-11", "V4-17"]
+errata = []
+card = "modules/hee4-core/task/MODULE.md"
+
+[[module]]
+name = "store"
+crate = "hee4-core"
+cluster = "K1"
+v3_origin = ["store"]
+flag = "PARTIAL"
+recommendation = "REFACTOR"
+phases = ["P1", "P2", "P5", "P6"]
+depends_on = ["hee4-contracts"]
+migrated_paths = []
+ap = ["AP-01", "AP-02", "AP-04", "AP-09", "AP-13", "AP-19", "AP-32", "AP-45", "AP-49"]
+ex = ["EX-02", "EX-03", "EX-14", "EX-16"]
+anti = ["A-1", "A-2", "A-4"]
+d = ["D-01", "D-09"]
+jev = []
+h = ["H-4", "H-12"]
+v4 = ["V4-0", "V4-6", "V4-8", "V4-11", "V4-14", "V4-15", "V4-17", "D-U2", "D-U5"]
+errata = ["E4", "E5", "E8", "E16"]
+card = "modules/hee4-core/store/MODULE.md"
+
+[[module]]
+name = "budget"
+crate = "hee4-core"
+cluster = "K1"
+v3_origin = ["budget"]
+flag = "NOT FINISHED"
+recommendation = "REFACTOR"
+phases = ["P3", "P9"]
+depends_on = ["hee4-contracts"]
+migrated_paths = []
+ap = ["AP-01", "AP-09", "AP-13", "AP-15"]
+ex = ["EX-02", "EX-19"]
+anti = ["A-8"]
+d = ["D-01", "D-09", "D-10"]
+jev = []
+h = ["H-8", "H-11"]
+v4 = ["V4-0", "V4-17"]
+errata = ["E16"]
+card = "modules/hee4-core/budget/MODULE.md"
+
+[[module]]
+name = "recovery"
+crate = "hee4-core"
+cluster = "K1"
+v3_origin = ["recovery"]
+flag = "PARTIAL"
+recommendation = "KEEP"
+phases = ["P1", "P2", "P7"]
+depends_on = ["hee4-contracts"]
+migrated_paths = []
+ap = ["AP-02", "AP-06", "AP-18", "AP-24", "AP-45"]
+ex = ["EX-04", "EX-05", "EX-06"]
+anti = []
+d = ["D-09", "D-10"]
+jev = []
+h = ["H-7"]
+v4 = ["V4-0"]
+errata = ["E2", "E4"]
+card = "modules/hee4-core/recovery/MODULE.md"
+
+[[module]]
+name = "cohort"
+crate = "hee4-cohesion"
+cluster = "K3"
+v3_origin = ["cohort"]
+flag = "NOT FINISHED"
+recommendation = "REFACTOR"
+phases = ["P9"]
+depends_on = ["hee4-contracts"]
+migrated_paths = []
+ap = ["AP-01", "AP-03", "AP-13", "AP-16"]
+ex = ["EX-04", "EX-05"]
+anti = []
+d = ["D-09", "D-11"]
+jev = ["J8"]
+h = ["H-8", "H-10", "H-11"]
+v4 = ["V4-0"]
+errata = ["E10"]
+card = "modules/hee4-cohesion/cohort/MODULE.md"
+
+[[module]]
+name = "context"
+crate = "hee4-cohesion"
+cluster = "K3"
+v3_origin = ["context"]
+flag = "PARTIAL"
+recommendation = "HARDEN"
+phases = ["P9"]
+depends_on = ["hee4-contracts"]
+migrated_paths = ["migrated/v3-b5367bc/src/context.rs", "migrated/v3-b5367bc/tests/t11_context.rs"]
+ap = ["AP-01", "AP-04", "AP-11", "AP-16", "AP-45"]
+ex = ["EX-05", "EX-13", "EX-18"]
+anti = []
+d = ["D-09"]
+jev = ["J9"]
+h = ["H-8"]
+v4 = ["V4-0", "V4-10", "V4-11"]
+errata = ["E16"]
+card = "modules/hee4-cohesion/context/MODULE.md"
+
+[[module]]
+name = "notify"
+crate = "hee4-cohesion"
+cluster = "K3"
+v3_origin = ["notify"]
+flag = "NOT FINISHED"
+recommendation = "REFACTOR"
+phases = ["P5", "P9"]
+depends_on = ["hee4-contracts"]
+migrated_paths = []
+ap = ["AP-01", "AP-06", "AP-09", "AP-13", "AP-31"]
+ex = ["EX-06", "EX-19"]
+anti = []
+d = ["D-01", "D-09"]
+jev = ["J11"]
+h = []
+v4 = ["V4-0", "V4-14", "D-U1"]
+errata = ["E5", "E10"]
+card = "modules/hee4-cohesion/notify/MODULE.md"
+
+[[module]]
+name = "skills"
+crate = "hee4-cohesion"
+cluster = "K3"
+v3_origin = ["skills"]
+flag = "PARTIAL"
+recommendation = "HARDEN"
+phases = ["P9"]
+depends_on = ["hee4-contracts"]
+migrated_paths = ["migrated/v3-b5367bc/skills/load_skill.py", "migrated/v3-b5367bc/skills/generate_skill_schema.py", "migrated/v3-b5367bc/skills/skill-v1.schema.json", "migrated/v3-b5367bc/skills/README.md", "migrated/v3-b5367bc/skills/README.stub.md", "migrated/v3-b5367bc/skills/examples/receipt-reading/skill.json", "migrated/v3-b5367bc/skills/examples/receipt-reading/references/reading-a-receipt.md", "migrated/v3-b5367bc/tests/skill_schema.py"]
+ap = ["AP-01", "AP-16", "AP-19", "AP-26", "AP-45"]
+ex = ["EX-01", "EX-05"]
+anti = []
+d = ["D-07"]
+jev = ["J10"]
+h = ["H-8"]
+v4 = ["V4-0", "V4-10", "V4-11"]
+errata = ["E3"]
+card = "modules/hee4-cohesion/skills/MODULE.md"
+
+[[module]]
+name = "workflows"
+crate = "hee4-cohesion"
+cluster = "K3"
+v3_origin = ["workflows"]
+flag = "PARTIAL"
+recommendation = "REFACTOR"
+phases = ["P9"]
+depends_on = ["hee4-contracts"]
+migrated_paths = []
+ap = ["AP-01", "AP-02", "AP-13", "AP-16"]
+ex = ["EX-04", "EX-05"]
+anti = []
+d = ["D-08", "D-09"]
+jev = ["J13"]
+h = ["H-8"]
+v4 = ["V4-0"]
+errata = ["E3"]
+card = "modules/hee4-cohesion/workflows/MODULE.md"
+
+[[module]]
+name = "roster"
+crate = "hee4-worker"
+cluster = "K2"
+v3_origin = ["roster"]
+flag = "PARTIAL"
+recommendation = "HARDEN"
+phases = ["P2", "P3", "P9"]
+depends_on = ["hee4-contracts", "hee4-host"]
+migrated_paths = ["migrated/v3-b5367bc/src/roster.rs", "migrated/v3-b5367bc/src/contracts/roster.rs", "migrated/v3-b5367bc/tests/t05_roster.rs"]
+ap = ["AP-04", "AP-01", "AP-12", "AP-13", "AP-19"]
+ex = ["EX-05", "EX-13", "EX-04"]
+anti = []
+d = ["D-09", "D-01"]
+jev = []
+h = ["H-1"]
+v4 = ["V4-0", "V4-2", "V4-10", "V4-11", "V4-17"]
+errata = ["E10"]
+card = "modules/hee4-worker/roster/MODULE.md"
+
+[[module]]
+name = "route"
+crate = "hee4-worker"
+cluster = "K2"
+v3_origin = ["route"]
+flag = "PARTIAL"
+recommendation = "HARDEN"
+phases = ["P1", "P9"]
+depends_on = ["hee4-contracts", "hee4-host"]
+migrated_paths = ["migrated/v3-b5367bc/src/route.rs", "migrated/v3-b5367bc/tests/t09_route.rs"]
+ap = ["AP-26", "AP-29", "AP-22", "AP-08", "AP-21", "AP-16", "AP-09"]
+ex = ["EX-10", "EX-06"]
+anti = []
+d = ["D-10", "D-01"]
+jev = ["J5"]
+h = ["H-1"]
+v4 = ["V4-0", "V4-2", "V4-9", "V4-10", "V4-11", "V4-17"]
+errata = []
+card = "modules/hee4-worker/route/MODULE.md"
+
+[[module]]
+name = "native"
+crate = "hee4-worker"
+cluster = "K2"
+v3_origin = ["worker"]
+flag = "FINISHED"
+recommendation = "REFACTOR"
+phases = ["P3", "P4", "P7"]
+depends_on = ["hee4-contracts", "hee4-host"]
+migrated_paths = []
+ap = ["AP-01", "AP-04", "AP-08", "AP-05", "AP-21", "AP-18"]
+ex = ["EX-12", "EX-13", "EX-05"]
+anti = []
+d = ["D-10", "D-16"]
+jev = []
+h = ["H-9", "H-16"]
+v4 = ["V4-0", "V4-11", "V4-17"]
+errata = ["E9"]
+card = "modules/hee4-worker/native/MODULE.md"
+
+[[module]]
+name = "namespace"
+crate = "hee4-worker"
+cluster = "K2"
+v3_origin = ["worker"]
+flag = "FINISHED"
+recommendation = "REFACTOR"
+phases = ["P3", "P4", "P9"]
+depends_on = ["hee4-contracts", "hee4-host"]
+migrated_paths = []
+ap = ["AP-01", "AP-03", "AP-10", "AP-31", "AP-49"]
+ex = ["EX-18", "EX-09", "EX-08"]
+anti = ["A-3"]
+d = ["D-09"]
+jev = []
+h = ["H-9", "H-14"]
+v4 = ["V4-0", "V4-11", "V4-13"]
+errata = []
+card = "modules/hee4-worker/namespace/MODULE.md"
+
+[[module]]
+name = "aggregate-policy"
+crate = "hee4-worker"
+cluster = "K2"
+v3_origin = ["worker"]
+flag = "FINISHED"
+recommendation = "REFACTOR"
+phases = ["P3", "P4"]
+depends_on = ["hee4-contracts", "hee4-host"]
+migrated_paths = []
+ap = ["AP-01", "AP-49", "AP-06", "AP-26", "AP-21"]
+ex = ["EX-07", "EX-18", "EX-11"]
+anti = []
+d = ["D-09"]
+jev = []
+h = ["H-9"]
+v4 = ["V4-0", "V4-11", "V4-17"]
+errata = ["E16"]
+card = "modules/hee4-worker/aggregate-policy/MODULE.md"
+
+[[module]]
+name = "inference"
+crate = "hee4-worker"
+cluster = "K2"
+v3_origin = ["worker"]
+flag = "FINISHED"
+recommendation = "REFACTOR"
+phases = ["P3"]
+depends_on = ["hee4-contracts", "hee4-host"]
+migrated_paths = []
+ap = ["AP-09", "AP-01"]
+ex = []
+anti = []
+d = ["D-05", "D-03"]
+jev = []
+h = []
+v4 = ["V4-0"]
+errata = []
+card = "modules/hee4-worker/inference/MODULE.md"
+
+[[module]]
+name = "pi-adapter"
+crate = "hee4-worker"
+cluster = "K2"
+v3_origin = ["worker", "pi_extension"]
+flag = "NOT FINISHED"
+recommendation = "REFACTOR"
+phases = ["P9"]
+depends_on = ["hee4-contracts", "hee4-host"]
+migrated_paths = []
+ap = ["AP-10", "AP-11", "AP-12"]
+ex = []
+anti = ["A-10"]
+d = ["D-09", "D-05"]
+jev = []
+h = ["H-11", "H-12"]
+v4 = ["V4-0", "V4-12"]
+errata = ["E6", "E1"]
+card = "modules/hee4-worker/pi-adapter/MODULE.md"
+
+[[module]]
+name = "service"
+crate = "hee4-habitat"
+cluster = "K5"
+v3_origin = ["service"]
+flag = "NOT FINISHED"
+recommendation = "REFACTOR"
+phases = ["P9"]
+depends_on = ["hee4-contracts", "hee4-host"]
+migrated_paths = []
+ap = ["AP-03", "AP-09", "AP-11", "AP-01", "AP-16"]
+ex = ["EX-17", "EX-08", "EX-04"]
+anti = ["A-7"]
+d = ["D-09"]
+jev = ["J12"]
+h = ["H-1", "H-8", "H-10", "H-11"]
+v4 = ["V4-0", "V4-17"]
+errata = ["E1", "E16"]
+card = "modules/hee4-habitat/service/MODULE.md"
+
+[[module]]
+name = "herdr"
+crate = "hee4-habitat"
+cluster = "K5"
+v3_origin = ["herdr"]
+flag = "PARTIAL"
+recommendation = "HARDEN"
+phases = ["P1", "P9"]
+depends_on = ["hee4-contracts", "hee4-host"]
+migrated_paths = ["migrated/v3-b5367bc/src/herdr.rs", "migrated/v3-b5367bc/tests/t16_herdr.rs", "migrated/v3-b5367bc/deploy/herdr/README.stub.md"]
+ap = ["AP-02", "AP-04", "AP-15", "AP-13"]
+ex = ["EX-01", "EX-05", "EX-19"]
+anti = []
+d = ["D-09"]
+jev = []
+h = ["H-1"]
+v4 = ["V4-0", "V4-2", "V4-9", "V4-10", "V4-11"]
+errata = ["E4"]
+card = "modules/hee4-habitat/herdr/MODULE.md"
+
+[[module]]
+name = "check"
+crate = "hee4-evidence"
+cluster = "K4"
+v3_origin = ["check", "app/u64_receipt (verdict_of)"]
+flag = "PARTIAL"
+recommendation = "REFACTOR"
+phases = ["P3", "P5"]
+depends_on = ["hee4-contracts", "hee4-host"]
+migrated_paths = []
+ap = ["AP-01", "AP-22", "AP-29", "AP-18", "AP-21", "AP-13", "AP-23"]
+ex = ["EX-17", "EX-06"]
+anti = ["A-5"]
+d = ["D-09", "D-10"]
+jev = ["J6"]
+h = []
+v4 = ["V4-0", "V4-11", "V4-13"]
+errata = ["E15"]
+card = "modules/hee4-evidence/check/MODULE.md"
+
+[[module]]
+name = "numerical"
+crate = "hee4-evidence"
+cluster = "K4"
+v3_origin = ["numerical"]
+flag = "NOT FINISHED"
+recommendation = "HARDEN"
+phases = ["P9"]
+depends_on = ["hee4-contracts", "hee4-host"]
+migrated_paths = ["migrated/v3-b5367bc/src/numerical.rs", "migrated/v3-b5367bc/src/numerical/process.rs", "migrated/v3-b5367bc/tests/t21_analysis.rs", "migrated/v3-b5367bc/tests/t21_process.rs"]
+ap = ["AP-01", "AP-11", "AP-21", "AP-19", "AP-06", "AP-31"]
+ex = ["EX-07", "EX-20"]
+anti = []
+d = ["D-01", "D-14"]
+jev = ["J14"]
+h = ["H-14"]
+v4 = ["V4-0", "V4-10", "V4-11"]
+errata = ["E1", "E16"]
+card = "modules/hee4-evidence/numerical/MODULE.md"
+
+[[module]]
+name = "julia-decoders"
+crate = "hee4-evidence"
+cluster = "K4"
+v3_origin = ["julia"]
+flag = "NOT FINISHED"
+recommendation = "REFACTOR"
+phases = ["P9"]
+depends_on = ["hee4-contracts", "hee4-host"]
+migrated_paths = []
+ap = ["AP-01", "AP-21", "AP-26", "AP-14", "AP-13", "AP-45"]
+ex = ["EX-05", "EX-01"]
+anti = []
+d = ["D-08", "D-10"]
+jev = ["J14"]
+h = ["H-14"]
+v4 = ["V4-0", "V4-11"]
+errata = ["E12"]
+card = "modules/hee4-evidence/julia-decoders/MODULE.md"
+
+[[module]]
+name = "judge-admission"
+crate = "hee4-evidence"
+cluster = "K4"
+v3_origin = []
+flag = "n/a (new)"
+recommendation = "n/a (new)"
+phases = ["P9"]
+depends_on = ["hee4-contracts", "hee4-host"]
+migrated_paths = []
+ap = ["AP-16", "AP-21", "AP-22", "AP-29", "AP-24", "AP-42"]
+ex = ["EX-17", "EX-05"]
+anti = []
+d = ["D-04", "D-15", "D-01"]
+jev = ["J1", "J2", "J3", "J4", "J5", "J6", "J7", "J8", "J9", "J10", "J11", "J12", "J13", "J14"]
+h = ["H-8", "H-10", "H-11", "H-12"]
+v4 = ["V4-0", "V4-11", "V4-12"]
+errata = ["E11", "E17"]
+card = "modules/hee4-evidence/judge-admission/MODULE.md"
+
+[[module]]
+name = "bash"
+crate = "tooling"
+cluster = "outside"
+v3_origin = ["bash"]
+flag = "PARTIAL"
+recommendation = "HARDEN"
+phases = ["P1", "P5"]
+depends_on = []
+migrated_paths = ["migrated/v3-b5367bc/integrations/bash/hee3", "migrated/v3-b5367bc/integrations/bash/README.md", "migrated/v3-b5367bc/integrations/bash/README.stub.md", "migrated/v3-b5367bc/tests/bash_wrapper.py"]
+ap = ["AP-14", "AP-01", "AP-41", "AP-29", "AP-39", "AP-22"]
+ex = ["EX-01"]
+anti = ["A-9"]
+d = ["D-07"]
+jev = []
+h = []
+v4 = ["V4-0", "V4-10", "V4-11"]
+errata = []
+card = "modules/tooling/bash/MODULE.md"
+
+[[module]]
+name = "pi-extension"
+crate = "tooling"
+cluster = "outside"
+v3_origin = ["pi_extension"]
+flag = "NOT FINISHED"
+recommendation = "REFACTOR"
+phases = ["P9"]
+depends_on = []
+migrated_paths = []
+ap = ["AP-01", "AP-12", "AP-27", "AP-10", "AP-22", "AP-20"]
+ex = ["EX-19"]
+anti = ["A-10"]
+d = ["D-09"]
+jev = []
+h = ["H-11"]
+v4 = ["V4-0", "V4-11"]
+errata = ["E6"]
+card = "modules/tooling/pi-extension/MODULE.md"
+
+[[module]]
+name = "julia"
+crate = "tooling"
+cluster = "outside"
+v3_origin = ["julia"]
+flag = "NOT FINISHED"
+recommendation = "REFACTOR"
+phases = ["P9"]
+depends_on = []
+migrated_paths = []
+ap = ["AP-01", "AP-13", "AP-21", "AP-04"]
+ex = []
+anti = []
+d = ["D-05"]
+jev = ["J14"]
+h = ["H-14"]
+v4 = ["V4-0"]
+errata = ["E12"]
+card = "modules/tooling/julia/MODULE.md"
+
+[[module]]
+name = "deploy"
+crate = "tooling"
+cluster = "outside"
+v3_origin = ["deploy"]
+flag = "PARTIAL"
+recommendation = "HARDEN"
+phases = ["P0", "P4", "P6", "P7", "P8"]
+depends_on = []
+migrated_paths = ["migrated/v3-b5367bc/deploy/install-release", "migrated/v3-b5367bc/deploy/worker.container", "migrated/v3-b5367bc/deploy/README.stub.md", "migrated/v3-b5367bc/deploy/herdr/README.stub.md"]
+ap = ["AP-49", "AP-10", "AP-27", "AP-50", "AP-14", "AP-01"]
+ex = ["EX-16", "EX-11"]
+anti = []
+d = ["D-16", "D-01"]
+jev = []
+h = ["H-1", "H-2", "H-3", "H-4", "H-5", "H-6", "H-7", "H-9", "H-12", "H-17"]
+v4 = ["V4-0", "V4-6", "V4-7", "V4-10", "V4-11", "V4-15"]
+errata = ["E16"]
+card = "modules/tooling/deploy/MODULE.md"
+
+[[module]]
+name = "runtime"
+crate = "hee4-app"
+cluster = "K6"
+v3_origin = ["app"]
+flag = "PARTIAL"
+recommendation = "REFACTOR"
+phases = ["P1", "P3", "P5"]
+depends_on = ["hee4-contracts", "hee4-host", "hee4-egress", "hee4-core", "hee4-worker", "hee4-cohesion", "hee4-evidence", "hee4-habitat"]
+migrated_paths = []
+ap = ["AP-08", "AP-06", "AP-01", "AP-13", "AP-04", "AP-31"]
+ex = ["EX-02", "EX-07"]
+anti = ["A-5"]
+d = ["D-09", "D-05", "D-11"]
+jev = []
+h = ["H-5", "H-9", "H-8", "H-10", "H-11", "H-12"]
+v4 = ["V4-0", "V4-11", "V4-13", "V4-14"]
+errata = ["E5", "E15"]
+card = "modules/hee4-app/runtime/MODULE.md"
+
+[[module]]
+name = "dispatcher"
+crate = "hee4-app"
+cluster = "K6"
+v3_origin = ["app"]
+flag = "PARTIAL"
+recommendation = "REFACTOR"
+phases = ["P2", "P3", "P5", "P9"]
+depends_on = ["hee4-contracts", "hee4-core", "hee4-worker"]
+migrated_paths = []
+ap = ["AP-06", "AP-01", "AP-19", "AP-31", "AP-08"]
+ex = ["EX-20", "EX-07", "EX-11"]
+anti = []
+d = ["D-09", "D-01"]
+jev = []
+h = ["H-4", "H-12"]
+v4 = ["V4-6"]
+errata = []
+card = "modules/hee4-app/dispatcher/MODULE.md"
+
+[[module]]
+name = "control-socket"
+crate = "hee4-app"
+cluster = "K6"
+v3_origin = ["app"]
+flag = "PARTIAL"
+recommendation = "REFACTOR (custody REUSE verbatim)"
+phases = ["P1", "P5", "P6"]
+depends_on = ["hee4-contracts"]
+migrated_paths = []
+ap = ["AP-04", "AP-01", "AP-31", "AP-49"]
+ex = ["EX-01", "EX-15"]
+anti = []
+d = ["D-06"]
+jev = []
+h = ["H-6", "H-15"]
+v4 = ["V4-11", "V4-14"]
+errata = []
+card = "modules/hee4-app/control-socket/MODULE.md"
+
+[[module]]
+name = "actions"
+crate = "hee4-app"
+cluster = "K6"
+v3_origin = ["actions"]
+flag = "PARTIAL"
+recommendation = "HARDEN"
+phases = ["P1", "P2", "P5", "P9"]
+depends_on = ["hee4-contracts", "hee4-core"]
+migrated_paths = ["migrated/v3-b5367bc/src/actions.rs", "migrated/v3-b5367bc/src/actions/control.rs", "migrated/v3-b5367bc/schemas/actions/", "migrated/v3-b5367bc/tests/t28_actions.rs", "migrated/v3-b5367bc/tests/t28_control.rs", "migrated/v3-b5367bc/tests/control_schema.py"]
+ap = ["AP-12", "AP-07", "AP-09", "AP-01", "AP-28", "AP-10"]
+ex = ["EX-05", "EX-19"]
+anti = ["A-10"]
+d = ["D-09", "D-07"]
+jev = []
+h = ["H-8", "H-14"]
+v4 = ["V4-10", "V4-11", "V4-14"]
+errata = ["E1", "E6", "E10", "E16"]
+card = "modules/hee4-app/actions/MODULE.md"
+
+[[module]]
+name = "tasks"
+crate = "hee4-app"
+cluster = "K6"
+v3_origin = ["app"]
+flag = "PARTIAL"
+recommendation = "REFACTOR"
+phases = ["P2", "P5", "P7"]
+depends_on = ["hee4-contracts", "hee4-core", "hee4-worker"]
+migrated_paths = []
+ap = ["AP-02", "AP-13", "AP-19", "AP-20"]
+ex = ["EX-05", "EX-14"]
+anti = ["A-1", "A-2"]
+d = ["D-16"]
+jev = []
+h = ["H-4"]
+v4 = ["V4-15"]
+errata = []
+card = "modules/hee4-app/tasks/MODULE.md"
+
+[[module]]
+name = "startup-coordinator"
+crate = "hee4-app"
+cluster = "K6"
+v3_origin = ["app"]
+flag = "PARTIAL"
+recommendation = "REFACTOR"
+phases = ["P2", "P6", "P7"]
+depends_on = ["hee4-contracts", "hee4-core"]
+migrated_paths = []
+ap = ["AP-01", "AP-49", "AP-31", "AP-06"]
+ex = ["EX-04", "EX-16"]
+anti = ["A-4"]
+d = ["D-16"]
+jev = []
+h = ["H-4", "H-7"]
+v4 = ["V4-8", "V4-15", "D-U2"]
+errata = ["E16"]
+card = "modules/hee4-app/startup-coordinator/MODULE.md"
+
+[[module]]
+name = "backup-target"
+crate = "hee4-app"
+cluster = "K6"
+v3_origin = ["app"]
+flag = "PARTIAL"
+recommendation = "REFACTOR (device rule is EX-11)"
+phases = ["P2", "P6", "P7"]
+depends_on = ["hee4-contracts", "hee4-host"]
+migrated_paths = []
+ap = ["AP-06", "AP-10", "AP-29"]
+ex = ["EX-11", "EX-03"]
+anti = []
+d = ["D-16"]
+jev = []
+h = ["H-4", "H-15"]
+v4 = ["V4-6"]
+errata = []
+card = "modules/hee4-app/backup-target/MODULE.md"
+
+[[module]]
+name = "main"
+crate = "hee4-app"
+cluster = "K6"
+v3_origin = ["app"]
+flag = "PARTIAL"
+recommendation = "REFACTOR"
+phases = ["P0", "P1", "P4", "P6"]
+depends_on = []  # rev 2026-10-01 open-tasks CN-15: was ["hee4-app"], its own crate (V7 F27); `main` is the binary target inside K6, not a crate edge
+migrated_paths = []
+ap = ["AP-08", "AP-10", "AP-01", "AP-49"]
+ex = ["EX-16"]
+anti = ["A-5"]
+d = ["D-09"]
+jev = []
+h = ["H-5", "H-3"]
+v4 = ["V4-11", "V4-15"]
+errata = []
+card = "modules/hee4-app/main/MODULE.md"
+
+[[module]]
+name = "class-profile"
+crate = "hee4-app"
+cluster = "K6"
+v3_origin = ["app"]
+flag = "PARTIAL"
+recommendation = "REFACTOR"
+phases = ["P3", "P4"]
+depends_on = ["hee4-contracts", "hee4-host"]
+migrated_paths = []
+ap = ["AP-01", "AP-49", "AP-06", "AP-19"]
+ex = ["EX-19", "EX-16", "EX-05"]
+anti = []
+d = ["D-09", "D-01"]
+jev = []
+h = ["H-9"]
+v4 = ["V4-0", "V4-11", "V4-17"]
+errata = []
+card = "modules/hee4-app/class-profile/MODULE.md"
+
+[[module]]
+name = "native-provider"
+crate = "hee4-app"
+cluster = "K6"
+v3_origin = ["app"]
+flag = "PARTIAL"
+recommendation = "REFACTOR"
+phases = ["P3", "P4", "P7"]
+depends_on = ["hee4-contracts", "hee4-host", "hee4-core", "hee4-worker"]
+migrated_paths = []
+ap = ["AP-12", "AP-49", "AP-21", "AP-18", "AP-06", "AP-01"]
+ex = ["EX-12", "EX-13", "EX-19"]
+anti = []
+d = ["D-09"]
+jev = []
+h = ["H-9", "H-16"]
+v4 = ["V4-0", "V4-11"]
+errata = ["E9"]
+card = "modules/hee4-app/native-provider/MODULE.md"
+
+[[module]]
+name = "live-verifier-adapter"
+crate = "hee4-app"
+cluster = "K6"
+v3_origin = ["app", "check"]
+flag = "PARTIAL"
+recommendation = "REFACTOR"
+phases = ["P3"]
+depends_on = ["hee4-contracts", "hee4-host", "hee4-core", "hee4-worker", "hee4-evidence"]
+migrated_paths = []
+ap = ["AP-01", "AP-08", "AP-11", "AP-22", "AP-29", "AP-49"]
+ex = ["EX-17", "EX-08", "EX-09"]
+anti = ["A-5"]
+d = ["D-09", "D-05"]
+jev = []
+h = ["H-9", "H-14"]
+v4 = ["V4-0", "V4-13"]
+errata = ["E15"]
+card = "modules/hee4-app/live-verifier-adapter/MODULE.md"
+
+[[module]]
+name = "candidates"
+crate = "hee4-app"
+cluster = "K6"
+v3_origin = ["app"]
+flag = "PARTIAL"
+recommendation = "REFACTOR"
+phases = ["P3", "P5", "P9"]
+depends_on = ["hee4-contracts", "hee4-host", "hee4-core", "hee4-worker"]
+migrated_paths = []
+ap = ["AP-16", "AP-21", "AP-04", "AP-05", "AP-08", "AP-14"]
+ex = ["EX-05", "EX-07"]
+anti = ["A-6", "A-5"]
+d = ["D-02", "D-03"]
+jev = ["J1", "J2", "J3", "J4"]
+h = ["H-8", "H-9", "H-10", "H-11", "H-12"]
+v4 = ["V4-0"]
+errata = ["E11"]
+card = "modules/hee4-app/candidates/MODULE.md"
+
+[[module]]
+name = "workload"
+crate = "hee4-app"
+cluster = "K6"
+v3_origin = ["app"]
+flag = "PARTIAL"
+recommendation = "REFACTOR"
+phases = ["P3", "P5", "P9"]
+depends_on = ["hee4-contracts", "hee4-host", "hee4-evidence"]
+migrated_paths = []
+ap = ["AP-16", "AP-01", "AP-04", "AP-20", "AP-21"]
+ex = ["EX-05", "EX-07"]
+anti = []
+d = ["D-10"]
+jev = ["J7"]
+h = ["H-8", "H-10", "H-11"]
+v4 = ["V4-0", "V4-13"]
+errata = []
+card = "modules/hee4-app/workload/MODULE.md"
+
+[[module]]
+name = "repair"
+crate = "hee4-app"
+cluster = "K6"
+v3_origin = ["app"]
+flag = "PARTIAL"
+recommendation = "REFACTOR"
+phases = ["P5", "P7"]
+depends_on = ["hee4-contracts", "hee4-core", "hee4-worker"]
+migrated_paths = []
+ap = ["AP-02", "AP-01", "AP-04", "AP-19", "AP-14"]
+ex = ["EX-02", "EX-13"]
+anti = []
+d = ["D-01"]
+jev = ["J3"]
+h = ["H-7"]
+v4 = ["V4-0"]
+errata = ["E4"]
+card = "modules/hee4-app/repair/MODULE.md"
+
+[[module]]
+name = "plan"
+crate = "hee4-app"
+cluster = "K6"
+v3_origin = ["app"]
+flag = "PARTIAL"
+recommendation = "REFACTOR"
+phases = ["P3", "P4"]
+depends_on = ["hee4-contracts", "hee4-host"]
+migrated_paths = []
+ap = ["AP-49", "AP-27", "AP-10", "AP-08", "AP-06"]
+ex = ["EX-16", "EX-19"]
+anti = []
+d = ["D-09"]
+jev = []
+h = []
+v4 = ["V4-0"]
+errata = []
+card = "modules/hee4-app/plan/MODULE.md"
+
+[[module]]
+name = "routing"
+crate = "hee4-app"
+cluster = "K6"
+v3_origin = ["app", "route"]
+flag = "PARTIAL"
+recommendation = "REFACTOR"
+phases = ["P1", "P2", "P9"]
+depends_on = ["hee4-contracts", "hee4-worker"]
+migrated_paths = ["migrated/v3-b5367bc/src/route.rs", "migrated/v3-b5367bc/tests/t09_route.rs"]
+ap = ["AP-09", "AP-06", "AP-01", "AP-12"]
+ex = ["EX-10", "EX-20"]
+anti = []
+d = ["D-01"]
+jev = ["J5"]
+h = []
+v4 = ["V4-0", "V4-10", "V4-11"]
+errata = []
+card = "modules/hee4-app/routing/MODULE.md"
+
+[[module]]
+name = "u64-class"
+crate = "hee4-app"
+cluster = "K6"
+v3_origin = ["app", "check"]
+flag = "PARTIAL"
+recommendation = "REFACTOR"
+phases = ["P3", "P5"]
+depends_on = ["hee4-contracts", "hee4-evidence"]
+migrated_paths = []
+ap = ["AP-01", "AP-09", "AP-16", "AP-19", "AP-21", "AP-15"]
+ex = ["EX-17", "EX-20"]
+anti = ["A-8"]
+d = ["D-09"]
+jev = ["J6"]
+h = []
+v4 = ["V4-0", "V4-13"]
+errata = ["E15"]
+card = "modules/hee4-app/u64-class/MODULE.md"
+

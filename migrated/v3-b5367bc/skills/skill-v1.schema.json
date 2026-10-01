@@ -1,0 +1,232 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hee3.local/schemas/skills/skill-v1.schema.json",
+  "title": "HEE3 skill package manifest, version 1",
+  "description": "A versioned package of instructions and bounded references. A skill supplies text, never authority: nothing in this document grants an action, accepts a task, changes a task's criteria or starts anything.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "skill_id",
+    "skill_version",
+    "lifecycle",
+    "purpose",
+    "entry"
+  ],
+  "properties": {
+    "schema": {
+      "type": "string",
+      "const": "hee3.skills.skill.v1"
+    },
+    "skill_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[a-z0-9][a-z0-9._-]*$",
+      "description": "Stable identity across revisions."
+    },
+    "skill_version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Monotonic and immutable: a published revision is never edited in place, so a consumer that pinned one keeps what it pinned."
+    },
+    "lifecycle": {
+      "type": "string",
+      "enum": [
+        "draft",
+        "published",
+        "deprecated",
+        "retired"
+      ],
+      "description": "`retired` is refused at load. A deprecated skill still loads and says so, because silently dropping it would hide the drift it signals."
+    },
+    "purpose": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 8192,
+      "description": "What this skill is for, in one paragraph a reader can check."
+    },
+    "supersedes": {
+      "type": "array",
+      "maxItems": 8,
+      "uniqueItems": true,
+      "items": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "description": "Versions this one replaces, for the drift record."
+    },
+    "requires_actions": {
+      "type": "array",
+      "maxItems": 32,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "enum": [
+          "tools.list",
+          "tools.inspect",
+          "task.preview",
+          "task.submit",
+          "task.get",
+          "task.list",
+          "task.cancel",
+          "task.resolve",
+          "thread.get",
+          "thread.list",
+          "roster.list",
+          "roster.inspect",
+          "roster.update",
+          "roster.disable",
+          "service.inspect",
+          "service.probe",
+          "service.action",
+          "analysis.request",
+          "analysis.get",
+          "events.subscribe",
+          "health"
+        ]
+      },
+      "description": "Actions the instructions assume. This is a COMPATIBILITY claim, not a request: a loader intersects it with what the caller already holds and refuses when the skill names something the caller does not \u2014 it never adds one. That refusal is `authority_widening`."
+    },
+    "requires_skills": {
+      "type": "array",
+      "maxItems": 16,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/dependency"
+      }
+    },
+    "entry": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 8192,
+      "description": "The entry instructions, loaded whenever the skill is loaded."
+    },
+    "references": {
+      "type": "array",
+      "maxItems": 32,
+      "items": {
+        "$ref": "#/$defs/reference"
+      },
+      "description": "At most 32 references, each at most 65536 bytes, traversed at most 4 deep. Every bound is stated here so the loader and the manifest cannot disagree about what it is."
+    }
+  },
+  "$defs": {
+    "dependency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "skill_id",
+        "skill_version"
+      ],
+      "properties": {
+        "skill_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-z0-9][a-z0-9._-]*$",
+          "description": "A skill this one requires."
+        },
+        "skill_version": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Pinned exactly. A range would let a dependency change under a consumer that pinned this skill precisely to stop that."
+        },
+        "required": {
+          "type": "boolean",
+          "default": true
+        }
+      }
+    },
+    "reference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "reference_id",
+        "path",
+        "scope"
+      ],
+      "properties": {
+        "reference_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-z0-9][a-z0-9._-]*$",
+          "description": "Stable within this skill; named in omissions."
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "pattern": "^[A-Za-z0-9._][A-Za-z0-9._/-]*$",
+          "description": "Relative, forward-slashed, inside the package. The pattern refuses a leading slash; the loader also refuses any `..` segment, a trailing slash and a doubled separator, because a pattern that tried to express all of that would be the kind nobody can read or check."
+        },
+        "scope": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[a-z0-9][a-z0-9._-]*$",
+            "description": "A role or task scope permitted to see this."
+          },
+          "description": "A reference outside the caller's scope is OMITTED BY NAME, never silently dropped: the packet says what it did not carry and why, so a short answer cannot be mistaken for a complete one."
+        },
+        "depth": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "The content this revision was reviewed against. A reference whose bytes no longer hash to it is `stale_reference`, not a silent substitution."
+        }
+      }
+    }
+  },
+  "hee3": {
+    "lifecycle": [
+      "draft",
+      "published",
+      "deprecated",
+      "retired"
+    ],
+    "omission_reasons": [
+      "context_budget",
+      "denied_scope",
+      "stale_reference",
+      "reference_too_large"
+    ],
+    "refusals": [
+      "unsafe_path",
+      "missing_dependency",
+      "incompatible_action",
+      "unknown_action",
+      "traversal_budget",
+      "context_budget",
+      "retired_skill",
+      "version_mismatch",
+      "duplicate_reference",
+      "authority_widening",
+      "malformed_manifest",
+      "conflicting_dependency"
+    ],
+    "bounds": {
+      "max_references": 32,
+      "max_dependencies": 16,
+      "max_actions": 32,
+      "max_depth": 4,
+      "max_packet_bytes": 262144,
+      "max_reference_bytes": 65536
+    },
+    "action_catalogue": {
+      "source": "schemas/actions/control-v1.schema.json",
+      "count": 21
+    },
+    "scope": "Instructions and bounded references. Grants nothing, accepts nothing, rewrites no task criterion and widens no authority."
+  }
+}

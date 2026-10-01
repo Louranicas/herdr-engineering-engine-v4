@@ -1,0 +1,31 @@
+# Module audit at b5367bc (2026-10-01, louranicas-2c)
+
+Six read-only agents audited the modules against `HEE3_MASTER_PLAN_20260926.md` §3 "Finished" criteria, one criterion at a time, with a file:line (or an empty grep) for each. They used `git show` / `git grep` / `ls-tree` only, **nothing built or run**: MET means the code is present and reachable, not that a test passed here. Spot-checks by louranicas-2c: worker (7 lines), K1 (4 claims), K6 (#[expect] count, Pi register), service/herdr and K3 not re-checked.
+
+| # | Module | Flag | Why |
+|---|---|---|---|
+| 1 | worker | FINISHED | Every criterion met through main (limits door, native execute, one settle, readback not redispatch, custody). No mutants record in the tree. |
+| 2 | contracts | PARTIAL | Frame bound, version refusal, socket/in-process parity; EventCursorV1 unbounded, schema pinned one way, no old/new fixture pair |
+| 3 | task | PARTIAL | 6 lifecycle actions and one composer through main; B16 (lost reply → repair → verified accept) not composed |
+| 4 | store | PARTIAL | Upgrade behind a verified backup, atomic cut points; no restore, `restored_from` never persisted, two cursor doors |
+| 5 | recovery | PARTIAL | Policy complete, startup through main; restore marker always None, two cursor doors |
+| 6 | route | PARTIAL | Router and independent known answers done; production use is preview only, fallback uncalled |
+| 7 | roster | PARTIAL | Dispatch-time permit through main; two eligibility doors, 4 roster actions unserved |
+| 8 | context | PARTIAL | Bounds, coverage and compare met; no repeat cost, not called from main |
+| 9 | skills | PARTIAL | Refusal sweep met; omission sites unswept, no revision store, not called from main |
+| 10 | workflows | PARTIAL | Refusal sweep and dispatch-by-name met, F19 subset through the engine; `verified` still a bool |
+| 11 | check | PARTIAL | decide+finalize run through main as evidence; the ledger verdict is still live_verifier's, decide cannot PASS, no writer authentication |
+| 12 | herdr | PARTIAL | Client value model built; no decoder, no cancel request, not called from main |
+| 13 | app | PARTIAL | serve, dispatcher, commission, backup gate and drain through main; B16, the ACT-G12 table, the D03 fault matrix and the A18 #[expect] cleanup absent |
+| 14 | actions | PARTIAL | One 21-action catalogue, named unavailability; Pi doesn't read the tool column, 2 of the needed owner traits, no mutation gate |
+| 15 | bash | PARTIAL | All wrapper semantics, two compositions, shellcheck control; the site sweep excludes bash `fail`/builder sites |
+| 16 | deploy | PARTIAL | RA7 manifest and content-addressed install; no systemd unit (HO-07), no linker/link argv |
+| 17 | budget | NOT FINISHED | Sound library, nothing composes it; three overrun rules |
+| 18 | cohort | NOT FINISHED | In-memory refusals only; no allocation, lifecycle, persistence, paging or caller |
+| 19 | notify | NOT FINISHED | Two outboxes, public witness with no caller, not called from main |
+| 20 | numerical | NOT FINISHED | Descriptive recipe only; no uncertainty, memory bound or caller |
+| 21 | julia | NOT FINISHED | Only descriptive is reachable; cohesion unreachable |
+| 22 | service | NOT FINISHED | Read side built; the systemd adapter is comments only, no runner or op key, 3 actions unserved |
+| 23 | pi_extension | NOT FINISHED | No Rust module; register admits any action (PI-02 absent), no usage/evidence in render |
+
+Totals: FINISHED 1, PARTIAL 15, NOT FINISHED 7.

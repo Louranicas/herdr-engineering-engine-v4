@@ -1,0 +1,84 @@
+# HEE-v3: route from b5367bc to a deployed v0.1.0
+
+**Verdict: PASS_WITH_GAPS.** I checked 13 of the mappers' claims against the tree and the register, using 14 read-only commands. The mappers' substance holds. There are six corrections below. The remaining route is 10 slices to the tag, then 2 after it.
+
+**Current state (FACT):** main = origin/main = b5367bca71a4. `git tag | wc -l` = 0. `wave3/N6e-r2` = 8dcc773 and `wave3/N6e-resolver-review` = e9acebf are the only branches still in flight. There is no branch for HT2d, B15, B16, DS17 or HO-07.
+
+## 1 · Spot-checks and corrections
+
+**Confirmed (FACT, measured this run):**
+- `src/store/backup.rs`: line 21 is `OBJECT_INVENTORY_BOUND: usize = 4096`, :163 is `"hee3-store-backup/1"`, :322 refuses any other scope, :327 checks `objects.len() > 4096`.
+- `src/store/schema.rs:135` is `CURRENT == 8`. `migrations/` holds only `001.sql` to `008.sql`.
+- `src/contracts/control.rs:213` is `pub fn admit_object(payload: &[u8]) -> Result<Map<String, Value>, FrameFault>`. `git grep -il fuzz` over src, tests and tools finds 0 files.
+- `evaluate_fallback` is defined at `src/route.rs:2074`. Its only callers are in `tests/t09_route.rs` (:1962, :2277, :2292, :2629); nothing in src calls it.
+- `deploy/` holds 4 files: `README.stub.md`, `herdr/README.stub.md`, `install-release` and `worker.container`. There is no unit file.
+- `tools/check-quality:1497-1498` pins `hosts present=1 counted=0 / flows=20 l2=2 host=0 reasoned=18` under `--no-release`.
+- In `tools/check-flow-scoreboard`: :119 is F13 ("owner is O-13"), :121-122 is F15 (lands_with "the actions slice"), :125-126 is F17 (lands_with "after O-5/O-6"), and :477 is the "One row per flow" fix. The stale-record rule at :515-521 diffs `src`, `Cargo.toml` and `Cargo.lock`.
+- `src/actions/control.rs:486-510` dispatches `task.cancel`, `task.list` and `task.resolve`.
+- `b5367bc..8dcc773` changes 3 files: `src/worker/native.rs` (+42/-9), `tests/t08_native.rs` (+143), and `tools/check-quality`, where `T08_TARGET_COUNTS` goes from 36 to 38.
+- No change to `src/task/driver*` in c82e0d2..b5367bc (`driver_commits=0`). The driver.rs half of the B14c-E/RA5 re-measure trigger has not fired. I did not scan for a new `impl Runtime` elsewhere.
+
+**Corrections:**
+1. **Mapper 1's register line numbers are off by about 5 to 20** (FACT). Milestone-1 item 9 (DS17) is at DR:1404 and item 10 (HO-07) at DR:1405, not 1409/1410. "No migration needed" is at DR:1392. RA3 is at DR:1529-1532, RA4 at DR:1533-1537, RA10 at about DR:1539-1541, and S15 at DR:1702. The content they quote is correct.
+2. **The DS17 premise has not lapsed** (mapper 1 said it had). DR:1786 says T3 ran in a disposable HOME `~/.cache/hee3-t3/<run>/home` with a T3-only backup folder (FACT). A release is installed, but no in-service store exists (INTERP). So "/2 replaces /1 outright" (DR:59ff) still strands nothing. Re-check this when S6 starts.
+3. **"N6e reviewed PASS" (task text) is wrong** (FACT). No file under `~/hee3-evidence/T28` or `~/handoffs` names 8dcc773. The only N6e review is `N6e-review/review-2c-e9acebf.md:5`, which reads `PASS_WITH_GAPS (0 HIGH, 1 MED, 2 LOW)`. Its L2 (:23) is marked "accepted" but asks for "record as a named survivor, or bind structurally", and neither has been done. Mapper 3 is right.
+4. **Mapper 2's claim that t28_socket has no task.cancel/list/resolve case is confirmed** (FACT). The file has 20 cancel/resolve hits, but they are the grant `resolve(` double (:233, :343ff, :3196, :3929) and prose. None is a task action.
+5. **Mapper 1's "HO-01 DONE" should be PASS_WITH_GAPS** (INTERP from FACT). RA7 requires "rustc/cc versions and flags". Here the linker is `rust-lld` and the host has no `cc` (handover 2350 §2.5). Mapper 3's build-03 (the manifest omits the linker, CRT and libgcc) and build-04 (the link argv is not recorded) are both still open (plan.rs is unchanged since 27ac14e). That leaves a gap in RA7's "cc" field. No mapper connected the two.
+6. **Mapper 1 counted B15 among the v0.1.0 route items; that conflict is resolved below.** S15 (DR:1702-1707) is the latest ruling and names exactly three tag preconditions, each with the defect class it floors. The "deployed" definition (DR:1222) adds B16, the O-2 unit and a G11 rehearsal. B15 is in neither list. It is milestone-1 item 7 by order only, and the B16 scenario repairs through `repair::apply_candidate`, not route fallback (INTERP). **My decision, made under the delegation:** B15 is not a tag gate. It moves after the tag and pairs with C01, so that stack moves l2 by 2.
+
+## 2 · Route to a deployed v0.1.0
+
+Decisions I made under the delegation (Luke delegated every open decision on 2026-09-28):
+- **What gates the tag:** the S15 three (DS17 backup/2, HO-07, the RA10 fuzz test) plus the DR:1222 deployed definition (B16, the unit installed, the G11 rehearsal).
+- **N6e and N6d land together**, so src is perturbed once and T3 re-runs once.
+- **F15 lands as its own slice.** RA3 "rides with B16" exists so that F15 has a closer. No code couples the two (FACT: the `StoreTasks` handlers exist at `src/app/tasks.rs:730/795/850`).
+- **B16's L2 kind is a host record**, the RQ7-round-2 kind, built by extending the F06 host harness. The faulty candidate comes from task input, not a new binary seam. Reasons (INTERP): DR:1669 says "the gate world can never launch a real worker"; a provider seam in release code would be a second door that needs RA1(b) plants; and the register has no B16 L2-kind ruling (grep: 0 hits).
+
+**Expected done-line at the tag** (predicted, INTERP): `l2=5`. That is the current 3 (F06 host, recounted after S9), plus F15 (gate world), plus F07 (host record).
+
+**The brake:** FINAL prediction 1 says "two unexcused zero-delta stacks stop the line". Every slice below names its excuse or its l2 delta.
+
+| # | Slice | Closes | Size (reason) | Depends on | Brake | Held for Luke |
+|---|---|---|---|---|---|---|
+| S1 | **N6e land + N6d retirement.** Bind the L2 survivor structurally (`Endpoint{port,bound}` composed in `serve`). Retire `native::Systemd`, `aggregate::main_pid` (aggregate.rs:514), the Manager arms and native.toml `[daemon] unit/scope` (hee3.native/2). Give an oversized reply its own reason, not `Error::Json` (native.rs:663). | On main: range review tests-1, tests-2, security-2. The e9acebf L2. N6b gap M3, N6b L1 and L2 (document the exchange re-check gap). N6c LOW. | M. One module, src only. The earlier retirements and native/2 are small; the review round is the cost. | none | l2 goes 3→2 while F06's record is stale (FACT: rule at check-flow-scoreboard:515-521). Excused: it removes dead product code before the record that evidences the tag. Landing record quotes `host=` before and after. | none |
+| S2 | **HT2d: harden the host record.** `record()` refuses S3/R-exec/C0 rows (contract-04). Judge the compensating slices (-05). Re-check `source_sha` against the manifest at record time (-06). Add multi-attempt, sort, `all()`, multi-digit and vanished-unit cases (tests-3 to -7). Record sysroot and toolchain in F06.json (build-02). Bound the reads in `observe()` (HT3b L1, cfs:508/537/541). One-line reason edits for F17 ("Pi lane, post-v1", DR:1091) and F13 (O-13 ruled by DS12). | Findings listed | S/M. Python host tool plus one scoreboard tool, no src. | none; must land before S9's rerun | Excused: it removes false passes from the record whose `l2=` the tag message carries. | none |
+| S3 | **Actions slice (F15).** One t28_socket case through main: cancel before dispatch, list with a cursor, resolve by the operator. | F15 → L2 in the gate world. Gate pin moves to `l2=3 host=0 reasoned=17`. | S. The handlers exist; only the socket proof is missing. Risk: `default-release-tests-main` already runs 149-155 s of its 180 s bound (LANDING-0c3757a). Measure the step's time before landing. | none | **l2 +1** | none |
+| S4 | **RA10 fuzz test.** One seeded, std-only test (splitmix64) through `admit_object`, asserting: no panic; Scanner-accept implies serde-accept; a stated iteration budget with both numbers. Add a plant, run under `--cap-lints=warn`, showing that a Scanner/serde divergence is killed by this test. | S15 precondition 3: hostile control-socket input | S. One test and one plant. Keep it in `t28_control`, outside the 180 s step, with its wall time recorded. | none | Precondition | none |
+| S5 | **B16 system scenario.** Flow contract first, deciding the L2 kind (host record). Admit, dispatch, fail, repair, verify and accept through main. Fill the R16-G3 identity facts deferred at u64_receipt.rs:122-124. Extend f06_run/decide into an F07 host record. | F07 (host kind). F19's B16 half (C06 still owed). DR:1222 item 1. | L. A new host harness path, a new record schema row, scoreboard rule reuse, and ≤2 design rounds. | S2 (the hardened harness); runs under the 4096 bound per DS17 | **l2 +1** (counted at S9's host run) | none |
+| S6 | **DS17 backup/2.** Count plus chained page digest. Keyset paging. Named page constant. One registration door with BYTE_LIMIT and a measured object ceiling, recorded with its numbers and never widened. /1 refused by name. Re-prove the B09 verified backup and upgrade-behind-backup. Include the D1/D2 sweep. | S15 precondition 1: unrecoverable state. Removes the ~56-task ceiling before the store goes into service. | L. Store format, paging, a wall-time measurement, and a mutation run owed on the new doors (RA2 pattern, `CARGO_TARGET_DIR` unset). | S5 (DS17: "unchanged through B16's E2E proof") | Precondition | none |
+| S7 | **HO-07 user unit.** Add `deploy/herdr-engineering-engine-v3.service`: login-only, no linger, installed by copy. Read back with `is-enabled`. Verify a `/proc/<pid>/exe` digest against the manifest. Require 0 `HEE3_TEST_*` strings. Document `rustup target add x86_64-unknown-linux-musl` (LANDING-0c3757a). | S15 precondition 2: the deployed binary is not the running unit. DR:1222's "O-2 unit installed". | M. Small file, but a host act with read-backs. | S6 (the store goes into service only after /2) | Precondition | **Yes, if the classifier refuses the enable: stop and ask Luke (DR:1405).** |
+| S8 | **RA10 security lens, completed.** Re-lens the landed tip, not ac8b0ab, over `control_socket.rs`, `contracts/control.rs`, `backup_target.rs`, commission in `coordinator.rs`/`main.rs`, and the new unit file. Clear the 3 MEDIUMs left by review-r2. | RA10's second clause (DR:1541). blockR security.md:56 UNMEASURED(HO-07). | S. Read-only review, plus at most one fix commit. | S7 | Precondition (RA10) | Lane X (Daybreak) needs Luke's permission rule (DR tail: BLOCKED by classifier). Under S15 it upgrades the tag and does not block it. The same-lineage lens is enough to proceed. |
+| S9 | **Deployment rehearsal at the candidate sha.** HO-01 re-install from a cold clone of the sha. Close build-03/04 by recording linker, CRT, libgcc and link argv in the manifest (RA7's "cc"). T3 host rerun from a clean main: new F06 record, plus the F07 record. G11: rewrite `runbooks/04-release-recovery.md` (currently "planned"), including manual prune under the 128 GiB budget and release retention, then rehearse 01-05 against the installed unit. Tier-3 cold clone. RA9 seed rows re-measured and quoted. | DR:1222 items 2-3 (every flow has an L2 or a reason; the G11 rehearsal). RA7 gap. RA9. Restores host counting. | M. Mostly host acts on existing tools. The G11 doc is new. | S1-S8 | **l2 → 5 on the checkout** (F06 recounted, F07 counted) | Pushing the evidence commits needs Luke's word |
+| S10 | **Cut v0.1.0.** An annotated tag whose message carries `flows=20 l2=N evidenced=<gate-run id>`, the cold-clone line and `tree=<sha> dirty=0`, named per S01/S15. No release-tag recipe is built (S01). | FINAL prediction 2: tags 0→1 | S | S9 | Cut | **Pushing the tag is Luke's** (standing gate 1) |
+| S11 | **Post-tag: B15 + C01/C01c.** Put `evaluate_fallback` in the dispatcher (K1K2.md:437). Add the `roster: Option<&dyn RosterActions>` field (DS5-open), and delete the four UNSERVED roster rows (control.rs:428-440) in the same commit. | F03, F04 | L. Two lanes, no migration (route.md:210-217; DR corrected order). | none; can run in parallel with S5-S8 if the machine is quiet | **l2 +2** | none |
+| S12 | **Post-tag: B17 → T18 + migration 009.** The upgrade verb. 009 batches C2, the K6 one-transaction fix, B19's columns, the operations CHECK widening and `restored_from`. Includes the pre-008 upgrade path. Retires the `CURRENT == 8` tripwire deliberately. | Unblocks C03, C04, B19/B20/C08d, and via 010 C06/C07 (7-8 flows) | L. Schema plus upgrade verb plus retention. | S6 (DS17 before T18, DR:59ff) | Enabler. Excused as milestone-2 item 2. | none |
+
+After S12, milestone 2 runs in the order mapper 2 gave: B18 (F05); C04 (F12, F13; production needs O-15, which is Luke's); C03 (F20; O-4 agent-run, HO-09); C02 (F14); B19 → C08a → B20 → C08d (F10, F01); 010 → C06 → C07 (F08, F19, F09, F18); B21 (F11). F17 is declared absent in v1.
+
+**Held for Luke on this route:**
+- every push, including the tag;
+- the HO-07 enable, but only if the classifier refuses it;
+- lane X's permission rule;
+- O-15 (C04 in production only).
+
+DG1-b, DG1-d, DG1-e and O-18 are not touched on this route. O-18 stays `UNMEASURED (O-18)` in the manifest (install-release:42), which RA7 allows.
+
+## 3 · Missing from the maps
+
+1. **RA7 against build-03/04.** No mapper noticed that the manifest's missing linker and link argv falls under RA7's "cc versions and flags", which makes HO-01 PASS_WITH_GAPS rather than DONE. Now owned by S9.
+2. **B16's L2 kind has no ruling in the register** (grep over B16 lines for seam, host, provider or worker: 0 relevant hits). Mapper 2 flagged it but nobody decided it. Decided above as a host record, which is an INTERP ruling that should be recorded in the register at S5's flow contract.
+3. **Gate time budget.** S3 and S4 add tests near the 180 s partition, which already runs 149-155 s (LANDING-0c3757a). No mapper tied this to the new slices. Every slice adding t28 tests must also update the `T08_TARGET_COUNTS`/t25 count pins (memory `hee3-gate-t25-count-pin`).
+4. **The zero-delta stop rule** (FINAL:168, "Two unexcused zero-delta stacks stop the line"). S1, S2, S4, S6, S7 and S8 are all zero or negative delta, and S1 briefly drops l2 to 2. Each landing record needs a written excuse, or the line stops. Mapper 1 mentioned the rule only as a documentation item.
+5. **RA9 seed rows** (the bytes row and the `use` row with baseline 0, "quoted in each Tier-3 record"). This is UNMEASURED and no slice owned it. Now in S9.
+6. **Retention on the deployed machine.** Releases accumulate (~30 MB each, 6+ so far), and the 128 GiB backup budget is pruned by hand until T18 (DR:1804). The G11 runbook must state both before "deployed". Now in S9.
+7. **Where "the unit file" goes and what it is called.** docs/contract-decisions.md:151 names `herdr-engineering-engine-v3.service` as future work. HO-07 must reconcile with that name and with the "O-2 unit" wording at DR:1222.
+8. **The newest handover is `HEE3_HANDOVER_20260930_1400.md`, not 2350** (FACT, `ls`). Its "Next" section still lists pushing `5b1840c..dfb32d5` as pending. The register's tail records it pushed and origin now at b5367bc; the tree wins. RA4 (one resume surface quoting milestone 1 verbatim) is therefore still owed at the next handover.
+9. **Two findings carried as open that are already closed.** The scoreboard's double F06 row is fixed at cfs:477, and the HT0 "bounded musl path" gap is closed by the t3e record. Both still appear as open in handover 1400 §3.3 and LANDING-dfb32d5. Close them in the next record.
+10. **Carried as recorded, not closed, and not on the v0.1.0 path:**
+    - S17b (Deadline-under-load and noise tests);
+    - leaked lib-test temp dirs;
+    - the precount's inability to separate gate-environment reds from real ones;
+    - the B14c-1 plant battery owed under RA2 (UNMEASURED);
+    - whether the Rust topology reader itself was the subject measured at P9.
+
+Sources: `~/hee3-evidence/T00-plan-20260926/DECISION-REGISTER-20260928.md`, `~/hee3-evidence/T00-way-of-working-20260928/FINAL.md`, `~/handoffs/HEE3_HANDOVER_20260928_2350.md`, `~/handoffs/HEE3_HANDOVER_20260930_1400.md`, `~/hee3-evidence/T28/N6e-review/review-2c-e9acebf.md`, and the tree at `/run/host/var/home/herdr-engineering-engine-v3` @ b5367bc.

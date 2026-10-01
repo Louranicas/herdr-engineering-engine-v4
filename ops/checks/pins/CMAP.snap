@@ -1,0 +1,30 @@
+# Module clusters: design vs code at b5367bc (2026-10-01, louranicas-2c)
+
+**Design** (v3 vault `Connections/Cluster Map`, frozen corpus): six clusters. K1 task ownership and recovery {contracts, task, store, budget, recovery}; K2 worker routing and capability {roster, route, worker}; K3 thread context and cohesion {cohort, context, notify, skills, workflows}; K4 verification and numerical evidence {check, numerical, julia}; K5 habitat operation and presentation {service, herdr}; K6 application assembly {app, actions, bash, pi_extension}. The rules: "one composition root assembles narrow modules; dependency direction remains visible". Declared module deps (`corpus/anchors.json`): **every module depends on `contracts` only**, and `app` assembles all.
+
+**Code (measured):** a single crate. `lib.rs` declares 17 flat `pub mod`s. `[workspace]` has no members. Clusters appear only as comment links in `Cargo.toml` (for example `:47`, `:343`). **0 cluster checks in the gate** (`tools/check-quality`: no hits for cluster/K1-K6). **Clustering was not realized in code, and nothing enforces it.**
+
+## Declared vs measured dependencies (production code; #[cfg(test)] tails excluded)
+| Module (cluster) | Declared | Measured | Undeclared edge(s) |
+|---|---|---|---|
+| actions (K6) | contracts | contracts, task | **→ task** |
+| context (K3) | contracts | budget, contracts | **→ budget** |
+| numerical (K4) | contracts | contracts, worker | **→ worker** |
+| service (K5) | contracts | contracts, store, worker | **→ store, → worker** |
+| task (K1) | contracts | contracts, recovery | **→ recovery** (intra-K1) |
+| worker (K2) | contracts | actions, contracts | **→ actions (K2 → K6: upward into the assembly cluster; inverts the design)** |
+| app (K6) | all 16 | 8 | budget, cohort, context, herdr, notify, numerical, roster, service not yet composed (expected) |
+| budget, check, cohort, herdr, notify, roster, route, store | contracts | contracts | none |
+
+No cycles and no bidirectional pairs (measured). The drift is **6 undeclared edges**, 1 of them a layering inversion.
+
+## Assessment: is assimilating the clusters into the code useful?
+Yes, in stages, cheapest first. The 12 unserved actions (roster, service, cohort, notify, analysis) will each add composition edges. Without a mechanism, the undeclared-edge count only grows, and the design's "dependency direction remains visible" stays a promise.
+
+| Stage | What | Cost | When | Why |
+|---|---|---|---|---|
+| 1 | **Dependency-law gate step.** An in-tree `tools/module-deps.toml` (module → cluster → allowed deps, each exception with a reason), and a checker that derives the edges from `use crate::` in production code (the same method as this map), refusing any undeclared edge by name, with a `--control` that plants one. | S (tool + control + gate step; no code moves) | **Before route slice S3/S11 compositions** | Turns the cluster design into a mechanism at the lowest cost. Stops drift before composing the 12 actions. |
+| 2 | **Decide the 6 edges.** worker → actions: move the tool projection to where it belongs (actions projects its own catalogue into tool definitions, or both read a `contracts::tools` table), removing the upward edge. service → store: route writes through app (the composition root) or declare a narrow store trait in contracts. numerical → worker (process door), context → budget (cost types), actions → task, task → recovery: declare them with reasons. | S–M | With Stage 1 | Each edge is either removed or becomes a declared, argued exception. |
+| 3 | **Cargo workspace split along clusters** (crates k1-core, k2-worker, k3-cohesion, k4-evidence, k5-habitat, k6-app), so the compiler refuses an undeclared edge. | L (25k-line app, gate census pins, offline bundle, cold clone) | **After v0.1.0**, together with decomposing `app` | Structural beats conventional, but it moves no flow, so the brake defers it until app is decomposed anyway. |
+
+Recommendation: **adopt Stage 1 + 2 now** as a small route slice ahead of the composition slices. **Defer Stage 3** to post-tag. Keep the frozen corpus unchanged. The in-tree `module-deps.toml` becomes the owner of cluster membership (one topic, one home), and the vault note points to it.

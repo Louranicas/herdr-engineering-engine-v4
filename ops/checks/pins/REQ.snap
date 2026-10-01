@@ -1,0 +1,38 @@
+# v4 scaffolding requirements → future gate steps
+
+Source: `~/hee4-evidence/learnings/PROCESS-LEARNINGS.md` §3 (ranked by measured cost; copied 2026-10-01). Each becomes a gate step or tool **after** "start coding"; until then these are intent. The source file owns the evidence; this file owns the obligation list.
+
+## Top 10 structural scaffolding requirements for v4, ranked by measured cost
+
+| Rank | Requirement | Loops closed | Measured cost it addresses |
+|---|---|---|---|
+| 1 | **A derived, tiered, diff-scoped gate with one runner.** No count literals. Tiers declared in `gate.toml` (commit / stack / cut). The precount is generated from the gate. Dev, precount and gate share the subreaper runner. | L1, L2, L3, L5, L6 | 38.6 machine-h / 105 runs, 18% measuring nothing (SA:57); ≈80 min per landing (NWOW:17); 75% (89/119) of src commits edit the gate/t25 and 87 change a count literal (SA:48); 74 of 86 hand-edit t25 literals (NWOW:21) *(rev 2026-10-01 V7 F25: one cite per number, sources as PROCESS-LEARNINGS L1, L3 and :27)* |
+| 2 | **No publisher and no generated blocks in source.** Intent rows in the repo with a named reader; state computed on read; the version cut is a tag whose message fields are listed once, at ATLAS §1 row D10 *(rev 2026-10-01 V7/V8/V9/V10-fix, V7 F21)*. | L9, L10, L11, L25 | 18–44 min per publication; 4/20 and 4/10 failed; ≈2 h of metadata failures; 296 GB reclaimed; 30 files with false text (DR:1580, NWOW:20, DR:1629, JU:45) |
+| 3 | **A fan-out kernel.** `planned_agents=` before launch, severity admission, batched refuters, command-budgeted briefs, durable journal spill, a pre-fan-out search for same-day answers, typed receipts with witness commands. | L18, L19 | ≈9.6 M tokens with 140 agents failed; 173 killed while "completed"; 2 h 40 min stalled reviewer (MEM/size-workflows…:8-10, MEM/workflow-candidates-note:11-14) |
+| 4 | **A skeleton-first slice state machine.** `slice new` gives a one-page FLOW and a compiling skeleton; the review tool refuses an uncompiled subject and a round 3; a detector admission header (trigger, budget, reader). | L12, L13 | R23 alone 659,219 tokens; B14 4,412 design lines; B14c-E 2,319 lines ≈5.4 h (CA:85-91, SA:61) |
+| 5 | **Hermetic provisioning.** `provision` materialises every fetched input (offline crate bundle, SQLite amalgamation) from a content-addressed manifest; the gate's step 0 refuses a missing input by name in seconds. | L4 | ≈25 min × 3 undeclared-input failures; 13 tests erroring in every fresh worktree (MEM/hee3-gate-declared-inputs:11-22, WAVE1-INTEGRATION.md:67-69) |
+| 6 | **Snapshot-subject gates plus load admission.** The gate runs on its own `--detach` / `git archive` at a sha, never the live worktree. Slots are flocked. Each step prints `elapsed/budget`, and tests use logical clocks. | L7, L8 | 11/64 runs measured nothing; ≈25 min × voided gates; 50 min per load-induced timeout; t21 12 s margin (NWOW:22, MEM/no-builds-beside-a-gate:11-19) |
+| 7 | **One battery and mutation harness.** Killers resolved against `--list`; `--cap-lints=warn`; fresh-mtime restore plus `cargo clean -p`; pid file; frozen index; NOT_COMPILED/HUNG count as survivors; the mutation runner owns its target dir with a precheck plant; "owed" is not a landing state. | L14, L15 | A whole mutation run void (21/57 hand-plant fails); 21 survivors landed; `store-doors` 0 tested twice (MEM/mutation-target-dir-trap:14-15, MM:1334, FIN:25) |
+| 8 | **Leases and a charter-time permission manifest.** Machine-readable leases for main, worktrees, cargo slots and mutation. Every grant-needing act (push, off-machine send, unit enable) is enumerated and preflighted at minute 1. | L20, L21 | An irrecoverable killed run; a ~30 min push hang; lane X never ran after Luke's yes (MM:963-967, CM:251, DR:1869-1871) |
+| 9 | **One door per rule.** `rules.toml` maps rule → exactly one enforcing site, with the harm named and the scope stated. A parsed census refuses duplicate sites, and receipt workarounds are logged against the rule. | L16, L26 | 9 refusals from a scratch gate; 2 h with three documents wrong; 2 degraded suites (MM:1600-1610, MM:803-805, MM:859-865) |
+| 10 | **State as a query plus an append-only decision log.** `hee4 status` computes tree, dirty count, scoreboard and asks; the handover is `decisions.jsonl` plus asks; the append target is computed; layer denominators (`apparatus_ratio=`) are printed at every cut. | L17, L22, L24, L27 | 21 handoff files, 714,986 B *(measured now)*; a whole session on the wrong codebase; stale state in always-loaded files (MM:1554, JU:74). Hours are UNMEASURED, so this ranks last. |
+
+**Ranking basis.** Ranks 1–2 are machine-hours and hours of wall time printed in the sources. Rank 3 is tokens and agents. Ranks 4–7 are per-incident minutes multiplied by recorded recurrences. Ranks 8–10 carry real incidents whose time cost is mostly UNMEASURED; they rank below the measured costs, not below the risks they carry. The discovery layer (K1–K3) is a floor, not a ranked item: RA6 exempts it from the brake (DR:1540).
+
+## Building phase per rank *(rev 2026-10-01 V7/V8/V9/V10-fix, V7 F12)*
+
+Every rank has a phase that builds it (named in that phase's ATLAS §2 Work cell) or is deferred by the brake (`~/CLAUDE.md` §1) with the trigger that brings it in. A deferred rank is not dropped: its trigger is the situation that makes the author build it before going further.
+
+| Rank | Built in | What lands there, or the trigger |
+|---|---|---|
+| 1 | **P0** | `tools/gate` (declared inputs, diff-scoped runs print every skipped step, full gate at every landing) and the generated precount; tiers declared in `gate.toml` |
+| 2 | **P0** (lint) · **P8** (tag) | P0: the scaffold lint refusing generated `BEGIN…END` spans in `src/`, `tests/`, `migrations/` and manifests (D-08, AP-45), and the independence slice that strips v3 anchors (ATLAS P0, V4-10). P8: the annotated tag (ATLAS D10). No publisher is ever built |
+| 3 | deferred | Trigger: the first v4 review or refuter fan-out planned at more than 4 agents. The kernel's `planned_agents=` line and command-budgeted briefs land before that fan-out launches |
+| 4 | **P1** | `slice new` (one-page FLOW + compiling skeleton) for the first P1 slice; the round-3 refusal and the detector admission header (D-04) land with the first design review or detector proposed in v4 |
+| 5 | **P0** | `tools/cold-clone` + committed `tools/offline-bundle.lock`; the gate's step 0 refuses a missing input by name |
+| 6 | **P0** | the gate runs on a `git archive` export at a sha (ATLAS §4.2), flocked slots (at most 2 gates), `elapsed/budget` and `margin=` per step |
+| 7 | **P2** | `tools/mutants` (unsets `CARGO_TARGET_DIR`, refuses if set, planted-survivor precheck) for P2's first scoped `cargo mutants`; the plant battery's `--cap-lints=warn` rule from P1 (RA10 fuzz plant) |
+| 8 | **P0** (permissions) · deferred (leases) | P0: the charter-time permission manifest is the ATLAS §5 grant sweep with `grants_pending=`. Leases: trigger, the first time two sessions or worktrees write in the v4 repo at once |
+| 9 | **P0** | the one-door census `duplicate_sites=N`, read by the gate (V4-17); `rules.toml` grows one row per rule as rules are admitted |
+| 10 | **P8** (`apparatus_ratio=`) · deferred (`hee4 status`, `decisions.jsonl`) | P8: layer denominators in the tag message (D10). `hee4 status` and `decisions.jsonl`: trigger, the first v4 resume that starts from a stale state claim; until then `plan/DECISIONS.md` is the log |
+| D-01/D-11 landing tool | **P1** | the landing record quoting `flows= l2=` before and after, and the `zero_delta_streak` stop, from the first stack landing after P0 |

@@ -1,0 +1,157 @@
+# Jev for question responses — design (PLANNING ONLY)
+
+Status: **design, HOLD.** No hook, setting, script or pack was written. Luke's "start coding" gates stage S1 and
+later (§5). Written 2026-10-01 by a read-only subagent. The only file written is this one.
+
+**Scope.** The *operator-side* decisions Claude makes when answering one user turn: the shape, depth and route of
+the answer. The choices are answer now, measure first, plan, delegate or ask; solo, subagent or workflow; how much
+to read; and whether a claim must be checked before it is relayed. It is not an engine (HEE-v4) feature and grants
+nothing.
+
+**Law, restated from its sources.** Jev may see public or synthetic text, and the user's own prompt only after
+the `jev-boundary` door. It never sees HEE source, diffs, logs, reports or **task context**
+(`~/hee3-evidence/T00-way-of-working-20260928/FINAL.md:86-87`; `jev.vault/60 Habitat/Engine Data Grant.md:18,22`).
+The question text is fixed and pre-registered and never derived from a task. Code owns the control flow: Jev
+answers typed questions and code acts. The rollout order is advisory before enforcing, and a labelled set before
+anything runs unattended. A Jev outage prints `UNMEASURED`; it never prints `PASS`
+(`70 Workflows/Assimilating Jev into Claude Workflows 2026-09-29.md:20,22,24`).
+
+**Naming (rev 2026-10-01, V2 X4).** In this file `P0`, `P1` and `P2` are **Jev prerequisites** (read them as JP0-JP2: v4 door markers, fixed read-gate question, F-B ruling). They are not the ATLAS deployment phases, where P0 = Scaffold.
+
+**Placement (rev 2026-10-01 jev-fit).** The per-decision placement of every question here (Q1–Q9, plus JM A4, A6) — its grade, gates and data class — has one home: vault `50 Jev/Jev Fit Map` §3d. This file keeps the question texts and the measurement plan; query the placement with `hee4db highway --jev`.
+
+---
+
+## 0 · Findings that come before any design (measured today)
+
+| # | Finding | Evidence | Consequence |
+|---|---|---|---|
+| F-A | **The door does not know v4.** `jev-boundary markers` lists 52 markers and 0 contain `hee4` or `v4`. Its roots are all v3 or planning paths. The synthetic line `please plan the hee4 roadmap in ~/hee4-evidence/design` piped to `jev-boundary text` returned **rc=0**, which means "send". | `jev-boundary markers`, `jev-boundary text` run 2026-10-01 | Every decision below that puts prompt text in its state is **unsafe in a v4 session** until the door learns the v4 roots and markers (`~/hee4-evidence`, the v4 codebase root `~/herdr-engineering-engine-v4`, and the `hee4` runtime namespace: `~/.local/state/hee4/`, `~/.config/hee4/`, `~/.local/lib/hee4/`, `$XDG_RUNTIME_DIR/hee4/` *(rev 2026-10-01, V4-11)*). This is prerequisite P0. |
+| F-B | **Suspected leak through the Stop verifier.** 5 of the 5 `block_fail` rows for this session were sent from cwd `~` with claim heads about HEE work, for example "Main is pushed. GitHub `main` is now `b5367bc`…". The verifier's engine check keys on paths and cwd, so a *report about* engine work written from `$HOME` passes. | `~/.local/state/jev-verifier/verdicts.jsonl`: this session had `not_sent=29 no_claim=15 block_fail=5` | The scope box forbids reports and task context (FINAL.md:87). This is **suspected, not adjudicated**: whether a commit sha plus "pushed" counts as a report is Luke's call. The design must not copy the pattern. *(rev 2026-10-01, V2: verification re-read the 5 rows; engine report text did reach the verifier's Jev call, so the send is a fact. Whether it breaches the scope box is still Luke's ruling, prerequisite P2 in §5.)* |
+| F-C | **The read gate's question is built from the task.** Its instruction interpolates `"$task"` into the question string (`Assimilating…:59`), and the task comes from the charter (`:135`). That breaks "question text fixed, never derived from a task". The fix is to keep the question fixed and move the charter into `state.task_charter`. *(rev 2026-10-01 V7/V8/V9/V10-fix, V10 row 19)* **Restated against the installed hook:** this finding describes the bash quoted in the jev.vault note, not the gate that runs. The installed `~/.claude/hooks/jev-read-gate-guard.sh` (mtime 2026-09-30 15:19) defines a constant `QUESTION` at `:70` and puts the charter into **state** at `:166` (`{"task": task, "content": c}`); `grep -c '$task'` over the hook → 0 (re-read 2026-10-01). | source quoted in the note | ~~This is a redesign item for the existing gate (P1), not new work.~~ *(rev 2026-10-01 V7/V8/V9/V10-fix, V10 row 19)* JP1 is already met in code; ATLAS H-20 is closed by that read-back. No redesign item remains for the installed gate. |
+| F-D | **All 5 CONTRADICTED events this session are relay-shaped.** Each had `tests_run_count=0` and `test_exit_code=null`, and each fired on `output_contradicts` (0.63–0.84) with `gaps` mostly `undisclosed`. They are claims relayed from a push or a subagent with no check the verifier could see in the transcript. Across the whole log there were 165 rows: `not_sent 80 · no_claim 51 · rerun 20 · block_fail 10 · report_pass 4`. | verdicts.jsonl | The relay decision (Q5) targets a real, recurring shape. The rows are **unlabelled**, so the true rate of unchecked relays is UNMEASURED: some of these may be verifier false positives. |
+| F-E | **No labels exist anywhere yet.** Recall `cards` labels = 0. There are 0 falsifier labels. The router has 65 decisions (`set 5 / advise 49 / none 11`) and 0 labels. | `jev-recall/memory.json`; `Round 6…:110` | "Labelled set before unattended" is unmet for every installed Jev hook, so no new decision point can inherit a threshold from them. |
+| F-F | **The L3 preview trap.** `jev-axi filter` sends 600 chars per item by default. On one corpus it kept 0/8 true items, while grep found 8/8 in 40 ms. | `Assimilating…:17`, `:146-148` | Every state below states its byte size. No door's default acquisition is used unsized. |
+
+---
+
+## 1 · Decision points in answering a question
+
+Conventions used in the table:
+
+- The **state** is assembled by code and capped by code, and the cut is named in the state itself.
+- **Threshold** means `p` for a Noul, and the winner's probability plus its margin for a Choice. It never means
+  jev-axi's `confidence`, which is not comparable across questions (`10 Model/Confidence.md:35`; was cited :34, *rev 2026-10-01, V2 fix 10*).
+- **Pre-registered** means the text below is frozen. Any edit is a new question id and needs new labels.
+- `user_words` is the literal last human turn, copied by code. It is the only field allowed to license ASK, WORKFLOW
+  or a large n (E10-2 `state_template.user_words`; `40 Recipes/Level 10 Exemplars/E10-2-orchestration-planner.json`).
+
+| Id | Decision | Today's rule | Primitive + pre-registered question | State (code-assembled, bytes) | Boundary | Threshold | What code does | Labelled-set plan |
+|---|---|---|---|---|---|---|---|---|
+| **Q1** | Ask first, or proceed? | Claude's judgement; `~/CLAUDE.md` §7 says "ask only when two readings lead to materially different work" | Noul `ambiguity_changes_deliverable`: "Is `user_words` ambiguous in a way where different reasonable interpretations would produce a materially different deliverable (not just different implementation detail, but a different thing built)?" | `{user_words}` ≤ 4,000 chars (head, then `[cut: N of M chars]`) | `jev-boundary text` on the assembled state. Exit 3 means not sent and `UNMEASURED(not_sent)` **Non-engine sessions only** *(rev 2026-10-01 V7/V8/V9/V10-fix, V10 (b))*: a v4 prompt is task context, which §3 forbids even when the door passes it, so in a v4 or other HEE session the question is refused before assembly, as Q5 is. | Advise ASK at p ≥ 0.60 (E10-2 rule 1). Print the raw p, and mark it `~cutoff` within 0.10 (Round 4:39 graft) *(rev 2026-10-01 V7/V8/V9/V10-fix, V10 row 20)* 0.60 is a provisional starting point, UNMEASURED: the cut is derived from labels (end of §5), not from the docs' Choice-confidence lines. | Print one line, for example `JEV_RESPOND ask? p=0.71`. It never blocks. ASK stays terminal (Level 10:177) | 40 synthetic prompts plus 16 held-out written by a different head (F113). The label is Luke's own "should Claude have asked?" on real turns, recorded by `jev-label` |
+| **Q2** | Answer now, or measure first? | CLAUDE.local "state is a query, never a field"; memory `verdicts-carry-denominators` | Noul `asks_current_state`: "Does `user_words` ask about the present state of something that can change over time (whether something is running, passing, pushed, installed, current, or how many exist now), as opposed to asking for an explanation, a design, or an opinion?" | `{user_words}` ≤ 4,000 chars | same door **Non-engine sessions only** *(rev 2026-10-01 V7/V8/V9/V10-fix, V10 (b))*: a v4 prompt is task context, which §3 forbids even when the door passes it, so in a v4 or other HEE session the question is refused before assembly, as Q5 is. | Advise MEASURE_FIRST at p ≥ 0.60 *(rev 2026-10-01 V7/V8/V9/V10-fix, V10 row 20)* 0.60 is a provisional starting point, UNMEASURED: the cut is derived from labels (end of §5), not from the docs' Choice-confidence lines. | Line: `JEV_RESPOND measure-first p=…`. It names no command; code does not guess what to measure | same set. The label comes from the world: was the answer later corrected by a measurement? |
+| **Q3** | Route: answer / plan / delegate / workflow / best-of-n | E10-2 exemplar pack; **not installed** | E10-2's 7 Nouls plus Score `difficulty`. The texts are frozen *verbatim* from `E10-2-orchestration-planner.json` (`decomposable`, `conflict_risk`, `multiple_designs`, `verifier_exists`, `user_opted_workflow`, `ambiguity_changes_deliverable`, `needs_exploration`). The rule-order fix goes first: EXPLORE before BEST_OF_N (Level 10:48) | `{user_words, task_description=user_words, known_context_flags, proposed_parts:[], verifier_description}`. `known_context_flags` are code booleans (files_read>0, named_path_present), never file text. `verifier_description` comes from code: `"test suite: <cmd>"` or `""`. Total ≤ 6,000 chars | same door. In a v4 session, **refused until P0** | First-match policy from the pack (0.6 / 0.5 lines). WORKFLOW only from `user_words` | Advisory line naming the route. The size of a fan-out comes from code and an explicit ceiling, never from `difficulty` alone (E10-2 failure mode, the 246-agent incident) | Re-run E10-2's held-out set after the rule-order fix (it was 7/8, paraphrase 19/24; `decomposable` is unstable: Level 10:36,190), plus 16 response-shaped held-out cases |
+| **Q4** | How much to read before answering | **EXISTING:** read gate (PreToolUse:Read, p ≥ 0.70), `jev-scout`, `jev-ask` | Existing gate question after P1 (fixed text, charter in state). Code rule first: a literal identifier or string in the goal goes to grep with no Jev call (Level 10:45; L3) | file ≤ read-gate cap. Sizes are code's job | existing path door | 0.70 on p (measured 15/15 at 0.70 on a public set; Round 4:19) | unchanged | existing, and still unlabelled in use (F-E) |
+| **Q5** | Relay belay: does the draft relay a checked result that nobody checked? | **EXISTING partial:** the Stop verifier fires after the fact. The SubagentStop belay is only a candidate (Schematics:91,105) | Noul `relays_unverified`: "Does `draft_claims` assert that something passed, was pushed, was verified, or is done, where `evidence_in_turn` shows no command whose exit code or output supports that assertion?" | `draft_claims`: code extracts only the sentences that match a status regex, ≤ 1,500 chars. `evidence_in_turn`: code facts (`commands_run`, their exit codes, a `ls-remote_ran` boolean), ≤ 1,000 chars | **Non-engine sessions only.** A draft in an HEE session *is* a report, so it is refused before assembly, not after (F-B) | p ≥ 0.50 means advise "check before relaying" | Code prints the checkable claim's name and **the code check that would earn it** (such as `git ls-remote`). Jev chooses no command | Replay the verdicts.jsonl `block_fail` rows *by shape*, re-authored as synthetic cases (the real text never goes to Jev again), plus Luke's labels on the 30 existing flags |
+| **Q6** | Subagent model | **EXISTING** router, escalation-only (Router:116) | unchanged | unchanged | unchanged | per-type gate; floor 0.85 | unchanged | its falsifier on 2026-10-29 (Router:78) |
+| **Q7** | Which habitat rule applies to this prompt | **EXISTING** `jev-recall` (UserPromptSubmit) | unchanged | prompt ≤ 7,999 chars. **55 prompts truncated** so far (`memory.json` `task_truncated`) | door. Same F-A exposure in v4 sessions **Non-engine sessions only** *(rev 2026-10-01 V7/V8/V9/V10-fix, V10 (b))*: a v4 prompt is task context, which §3 forbids even when the door passes it, so in a v4 or other HEE session the question is refused before assembly, as Q5 is. | existing | card injected (about 94 tokens) | recall labels = 0 (F-E); precision was 10/10 once and recall fell to 0.636 on a rerun (Round 4:41) |
+| **Q8** | Report length and shape | Standard §5 plus the caller's limit ("≤ 12 lines") | **None. This is code.** Parse the requested limit from `user_words` by regex and count the lines of the draft | — | — | exact | Stop-time line: `REPORT_OVER_LIMIT lines=19 limit=12` | not needed. It is an exact check |
+| **Q9** | Done-claim check before "done" | **EXISTING** verifier E10-5 | unchanged | unchanged | must close F-B | policy unchanged | unchanged | falsifier on 2026-10-29 |
+
+**One request, not several.** Q1–Q3 are independent questions over the same `user_words`. They go in **one**
+request with the recall call (Primitives:45: two requests are the exception). That avoids a second blocking
+round trip on UserPromptSubmit, which is about 609 ms median for recall alone (Round 5 §2 table,
+`Round 5…:34`).
+
+---
+
+## 2 · Existing vs new
+
+- **EXISTING (installed):**
+  - Q4 read gate (reflex 17) plus `jev-scout` / `jev-ask`
+  - Q6 router
+  - Q7 `jev-recall`
+  - Q9 verifier
+
+  Each needs only the prerequisites P0 (v4 door) and P1 (read-gate question fixed), plus labels.
+- **EXISTING as a measured pack, NOT installed:** Q3 (E10-2).
+- **NEW:**
+  - Q1, the ask-first gate. It is E10-2's single question lifted out, re-worded onto `user_words`, so it needs new
+    labels. The 13/13 held-out in Schematics:107 was for the original wording.
+  - Q2, measure-first.
+  - Q5, the relay belay.
+  - Q8, the code-only report-shape check.
+
+---
+
+## 3 · Where Jev must NOT be used
+
+*(rev 2026-10-01 V7/V8/V9/V10-fix, V10 row 15)* **Jaggedness has 9 numbered weaknesses**, settled from the live docs (`docs.typesafe.ai/model-jaggedness/jev-1.13.md`, headings `1. Literal reading` … `9. Generation`, last reviewed 2026-09-17). Item 2, *Math and Numbers*, has three subsections (Counting, Numeric representations, Math using score); the jev.vault note's "11 items" counted two of them as items. The row numbers below are the 9 items.
+
+| Never | Why (source) | Instead |
+|---|---|---|
+| Arithmetic, counts, line counts, token totals, "is N of M complete" | Jaggedness row 2 (`10 Model/Jaggedness jev-1.13.md:16`; rows 2/3/8/9 were cited one line early, *rev 2026-10-01, V2 fix 10*). p5 `jev-ledger` **BACKED three arithmetically false claims** (Round 4:35) | code |
+| Dates, recency, "the latest handover" | Jaggedness row 3 (:17, *rev 2026-10-01*). L4: right answer at 0.32 vs 0.29, unactionable (Assimilating:18). Calibration maps port catastrophically, ECE 0.083 → 0.909 (Schematics:97) | `ls -t`, code |
+| Exact lookups: does string X appear, where is symbol Y defined | L3 and E10-7's miss at 0.81 (Level 10:45) | grep |
+| Set membership: paths, allow-lists, engine or non-engine | Schematics:98 | code, the door |
+| Anything the door marks, and **any HEE task context even when the door passes it** (F-A, F-B): v4 prompts, Claude's drafts and subagent returns in HEE sessions, commit shas, gate output | FINAL.md:87; Engine Data Grant:22 | code-only features; log `not_sent` |
+| Writing the answer (generation) | Jaggedness row 9 (:23, *rev 2026-10-01*) | Claude |
+| Deciding which command to run, or discovering dependencies over N² pairs | p4 recall 0.25/0.0 (Round 4:37) | code enumerates; Jev checks declared items |
+| Carrying one threshold across families, or across a Noul and a Choice | Jaggedness row 8 (:22); Confidence:35 *(rev 2026-10-01, V2 fix 10)* | a threshold per question id |
+| Anything that reads an approval field | Router:35 (no approval field wired) | `user_words` only |
+
+---
+
+## 4 · Measurement plan
+
+- **Cost per question.**
+  - Q1–Q3 are 8 Nouls plus 1 Score in one request, about 3–6 KB of state.
+  - Comparables: E10-2 measured $0.00093 for 9 cases and 445 ms median (pack `measured.summary`). Recall is $0.00011
+    and 609 ms per prompt, and the whole measured session is $0.00944 and 46.6 s (Round 5…:34,39).
+  - Budget: ≤ $0.0003 and ≤ 700 ms added per prompt. The hook records `usd`, `ms` and `sent_chars` through `jevlog`
+    per call. Tokens are measured by the ledger's `usage`, not by chars/4 (Round 4 critic:61).
+- **Agreement vs Claude's own choice.**
+  - In **shadow**, nothing is injected, so Claude's route is uncontaminated.
+  - Code derives Claude's actual route from the transcript: an `AskUserQuestion` call, or a turn that ends in a
+    question → ASK; any measurement command before the first answer → MEASURE_FIRST; an `Agent` call → DELEGATE;
+    a Workflow → WORKFLOW; otherwise SOLO.
+  - Code reports a 5×5 agreement matrix and sends only the disagreements to Luke to label (the world, not either head).
+- **The numbers that must move:**
+  1. The **unchecked-relay rate**: labelled-true `block_fail`/`rerun` rows per Stop that carries a claim. The
+     baseline is UNMEASURED until 20 of the 30 existing flags are labelled.
+  2. The **wrong-ask rate**: Luke labels "should have asked" or "should not have asked".
+  3. The **over-limit report rate** (Q8, code), a free baseline from existing transcripts.
+  4. **Tokens per answer**, from the transcript `usage`.
+
+  Every number keeps a **code-only baseline column** (Round 4:39): for example a `?` + `(is|are).*(running|pushed|passing)`
+  regex for Q2. **Jev must beat the code rule on held-out labels**; if it does not, ship the rule and drop the
+  Jev question.
+- **Promotion bar.** A Wilson 95% lower bound ≥ 0.85 on ≥ 10 labels per question id *(rev 2026-10-01, Jev Fit Map C4: "≥ 10 labels" is only a minimum sample, never sufficient. Computed independently, 10/10 correct gives a lower bound of 0.722. The bound itself is the gate: ≥ 0.85 needs at least **22/22** correct, and more with any error; see the counts in DECISIONS V4-52)* before any line is injected
+  unattended. This is the rule `jev-route-unlock` already implements (Round 4:17).
+- **Retire rule.** A falsifier goes in the header, dated 30 days after install. It deletes the question if any of
+  these holds:
+  - it never fired;
+  - over 30+ labelled decisions, more than 1 in 3 advisories were judged wrong;
+  - its target number did not fall against the pre-install baseline.
+
+  One review round per detector, as the brake requires (`~/CLAUDE.md` §1).
+
+---
+
+## 5 · Staged rollout (every stage after S0 needs Luke's "start coding")
+
+| Stage | What | Exit line that must print |
+|---|---|---|
+| S0 (now) | This document; question texts frozen above | — |
+| S1 | **P0** v4 markers and roots in `jev-boundary`, with a control: the synthetic v4 line → rc 3. **P1** read-gate question fixed. **P2** Luke's ruling on F-B, and the verifier refusing report-shaped claims about engine work. All three are staged diffs Luke applies, because the classifier refuses edits to steering files (Round 6:93) | `jev-boundary` control `rc=3`; `habitat-reflex verify` `unproven=0` |
+| S2 | Offline: Q1/Q2/Q3/Q5 packs through `jev-exemplar-run` on 40 synthetic cases plus 16 held-out from another head, with a paraphrase pass and adversarial cases (a spoofed opt-in, a "note to the router") | held-out ≥ 14/16, adversarial all, code-baseline column printed; else one revision, then stop |
+| S3 | Shadow hook, log only, folded into the recall call, for ≥ 50 prompts in non-engine sessions | agreement matrix, `labels=N`, `usd`, `ms p50/p95`; `UNMEASURED` rows counted |
+| S4 | Advisory: one line per turn, only for ASK, MEASURE_FIRST and relay-belay, raw p quoted | Wilson lower ≥ 0.85 per id; falsifier dated |
+| — | **Enforcement is not planned.** The shape of an answer stays Claude's decision; Jev only advises. Engine sessions stay code-only until a scoped grant | — |
+
+Related: `jev.vault/60 Habitat/HEE Decision Points and Jev Candidates 2026-10-01.md` (A1–A6, the engine-side J1–J14)
+· `80 Schematics/Jev in Claude Code - Schematics 2026-09-29.md` §4 matrix. Public pattern pages were read
+2026-10-01 through WebFetch summaries (not verbatim):
+[intent-routing](https://docs.typesafe.ai/patterns/intent-routing.md) routes to a human below 0.5 intent confidence;
+[confidence-routing](https://docs.typesafe.ai/patterns/confidence-routing.md) uses a 0.6 floor, thresholds scaled to
+stakes, and > 0.85 for high risk. ~~Those pages support the 0.60 advisory lines above for low-stakes advice.~~ *(rev 2026-10-01 V7/V8/V9/V10-fix, V10 row 20)* They do not: the 0.6 and 0.5 lines gate a **Choice `confidence`**, and Q1/Q2 read a **Noul `p`**, which has no confidence. Carrying a threshold across primitives is what §3 forbids (jaggedness item 8). **The Noul cut is derived from labels:** for each question id, the lowest p at which the Wilson lower bound on precision is ≥ 0.85 over ≥ 10 labelled cases (S4's bar). Until those labels exist, the 0.60 lines are provisional and UNMEASURED, and they stay advisory.

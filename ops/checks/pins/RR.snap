@@ -1,0 +1,37 @@
+# Range review 7ed3728..dfb32d5 (workflow wf_f8647059-f17, louranicas-2c, 2026-09-30)
+
+Pinned at `dfb32d5` (pushed `origin/main`). Four Opus 5.5 lenses (security, contract, tests, build), each followed by an adversarial verifier that tried to refute every finding against the code. Read-only: `git show` and `git grep` only, no cargo. **Same-lineage evidence** (lane X, the cross-model review, is still blocked).
+
+**Verdict: PASS_WITH_GAPS.** 25 findings: 22 CONFIRMED, 3 REFUTED. After verification: **4 MEDIUM**, 18 LOW, 0 HIGH. Full JSON: `review-range-7ed3728-dfb32d5.json`.
+
+**Headline (tests-8 = build-01, one gap seen by two lenses).** The repo's gate never measures the F06 host record. `check-quality` copies only the declared subject paths into a temp dir with no `evidence/host/` and no `.git`, and pins `flows=20 l2=2 host=0 reasoned=18` (`check-quality:1491`). So the landed claim `l2 2 -> 3` is backed by a manual scoreboard run (fc) and an independent verification (`verify-2c-F06-dfb32d5.md`), **not by the gate**. A committed F06.json that contradicts itself cannot turn the gate red. This contradicts HO01-T3 FLOW-CONTRACT ("gate declared inputs gain tests/host/ and evidence/host/"). Fix: declare `evidence/host/` a gate input, run the step where history exists (or pass the ancestry facts in as data), pin `l2=3 host=1`, and move rule (a)/(b)'s policy out of `observe()` into a pure function with control cases.
+
+| id | sev (orig→verified) | verdict | where | finding |
+|---|---|---|---|---|
+| build-01 | MEDIUM→MEDIUM | CONFIRMED | `tools/check-quality:1491` | The gate's flow-scoreboard step pins host=0 and runs on a copy with no host record and no git history, so the host branch is never checked and the l2=3 claim in dfb32d5 is unchecked |
+| contract-01 | MEDIUM→MEDIUM | CONFIRMED | `tools/check-flow-scoreboard:163` | Rule (d) checks only that a prefix and a substring appear in some line, not the passing value of each line; forward's each=n/n and execute's provider=native are never checked |
+| tests-1 | MEDIUM→MEDIUM | CONFIRMED | `src/worker/native.rs:1116` | resolve's no-walk branch (walks_descendants()==false) is never exercised; every MainPid double hard-codes true |
+| tests-8 | MEDIUM→MEDIUM | CONFIRMED | `tools/check-flow-scoreboard:344` | observe() is untested and the gate pins host=0, so the host-record L2 route (the 'l2 2 -> 3' claim) is measured by nothing |
+| build-02 | LOW→LOW | CONFIRMED | `tests/host/f06_run.py:270` | The F06 host run takes any --sysroot as the candidate toolchain; it neither checks it against rust-toolchain.toml 1.98.0 nor records it in F06.json |
+| build-03 | LOW→LOW | CONFIRMED | `deploy/install-release:536` | The release manifest records the gcc driver and the rustc stub, but not the linker, glibc/CRT, libgcc, ar or libstd that also determine the engine's bytes and whether it runs on the host |
+| build-04 | LOW→LOW | CONFIRMED | `src/app/plan.rs:437` | The candidate receipt records the compile argv and the rustc executable, but not the link argv (LINK_FLAGS: rust-lld, link-self-contained) or the toolchain files the musl link consumes |
+| contract-02 | MEDIUM→LOW | CONFIRMED | `tools/check-flow-scoreboard:360` | The release that (e)/(f) are verified against is not bound to RC02: the manifest is not required, not hashed against its directory name, and the name is joined unvalidated (an absolute path escapes RELEASES) |
+| contract-03 | MEDIUM→LOW | CONFIRMED | `tools/check-flow-scoreboard:357` | Rule (b) and the record are measured against HEAD and the working tree respectively, so uncommitted src changes (or an uncommitted record) still count as L2 |
+| contract-04 | LOW→LOW | CONFIRMED | `tests/host/f06_decide.py:248` | record() refuses only closure problems, dirty, the exe digest, extra units and netns; the S3 cgroup check, R-exec and C0 can print rc=1 and a record is still written |
+| contract-05 | LOW→LOW | CONFIRMED | `tests/host/f06_decide.py:259` | The aggregate-slice compensating control is read back but judged by nothing; an empty or unlimited slice list still yields a record |
+| contract-06 | LOW→LOW | CONFIRMED | `tests/host/f06_run.py:406` | source_sha and dirty are measured at the end of the run, not at P2; record() never re-checks source_sha against the manifest, so the writer can emit a record that the consumer's rule (f) refuses |
+| security-1 | MEDIUM→LOW | CONFIRMED | `src/worker/native.rs:956` | holder() accepts a single readable holder even when unreadable processes exist, so a same-uid non-dumpable co-holder of the listener is invisible and Owners never fires |
+| security-2 | LOW→LOW | CONFIRMED | `src/worker/native.rs:1074` | The endpoint resolver keeps every descriptor's readlink string for every process, so MAX_ENDPOINT_FDS bounds the count but not the bytes (the derived set has no byte bound) |
+| tests-10 | LOW→LOW | CONFIRMED | `tools/check-flow-scoreboard:165` | Rule (f) is skipped when the release holds an engine but no manifest; no control case covers manifest_source=None with release_digest present |
+| tests-2 | MEDIUM→LOW | CONFIRMED | `src/worker/native.rs:1084` | endpoint_holder's namespace, bound and unreadable wiring is pinned by nothing; only the extracted pure functions are tested |
+| tests-3 | MEDIUM→LOW | CONFIRMED | `tests/host/f06_decide.py:237` | F06 closure lines are pinned only with one attempt: attempts=1, each=1/1 and last-attempt choice are identity-element values |
+| tests-4 | LOW→LOW | CONFIRMED | `tests/host/f06_decide.py:222` | run_records' event filter and sort are unpinned: the case that moves the event asserts only line 4 |
+| tests-5 | LOW→LOW | CONFIRMED | `tests/host/f06_decide.py:183` | observation_finished's all() over attempts is pinned only with single-element lists; all->any survives |
+| tests-6 | LOW→LOW | CONFIRMED | `tests/host/f06_decide.py:190` | stale_count's integer comparison is pinned only on single-digit generations; dropping int() survives |
+| tests-7 | LOW→LOW | CONFIRMED | `tests/host/f06_decide.py:256` | record() writes units_before_equals_after=True after checking only one direction; the control has no vanished-unit case |
+| tests-9 | LOW→LOW | CONFIRMED | `tools/check-flow-scoreboard:43` | HOST_LINES checks field presence, not the passing value, for forward and execute; a record with provider=none or terminal=running counts as L2 |
+| contract-07 | LOW→NONE | REFUTED | `tools/check-flow-scoreboard:156` | The dirty check `!= 0` accepts JSON false (and 0.0) as clean |
+| security-3 | LOW→NONE | REFUTED | `deploy/install-release:462` | The release build reuses a persistent per-commit CARGO_TARGET_DIR that is never cleaned, so the installed binaries are whatever artifacts cargo considers fresh there, not bytes proven to be built from this run's clone |
+| tests-11 | LOW→NONE | REFUTED | `tests/host/f06_decide.py:229` | identity_event is derived from usage_event, not observed, so one_settle's identity half cannot fail on the event key |
+
+Refuted (kept for the record): contract-07 (JSON `false` as clean), security-3 (the persistent per-commit target dir: the contract requires per-commit reproducibility, and planting needs same-uid write access, which already implies more), tests-11. The reasons are in the JSON.

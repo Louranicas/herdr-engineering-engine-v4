@@ -1,0 +1,79 @@
+# HEE-v3 interface map at b5367bc (2026-10-01, louranicas-2c)
+Measured from the code with `git show` / `git grep` at b5367bc, plus a read-only host check at 2026-10-01 ~06:40. Every row cites its owning module and file:line.
+
+## 1 Unix sockets
+| Socket | Owner | Role | Evidence |
+|---|---|---|---|
+| `$XDG_RUNTIME_DIR/habitat-engine/control.sock` | app::control_socket | the engine's only listener: control-v1 API server | `control_socket.rs:50,52,299-301` (bind); dir 0700, socket 0600 (`:146,:242,:303`); idle 60 s, write 10 s (`:57-59`) |
+| `…/habitat-engine/control.lock` | app::control_socket | single-instance custody (exclusive non-blocking flock) | `control_socket.rs:54,246` |
+| client connect to control.sock | main (CLI client) | `habitat-engine <action>` sends one frame and prints the reply | `main.rs:1147,1175` |
+| liveness probe connect | app::control_socket | detects a live engine before replacing a stale socket | `control_socket.rs:217,278` |
+No other Unix socket is bound or connected in src. The bash wrapper and Pi reach the socket only through the `habitat-engine` binary (`integrations/bash/hee3:155` producer).
+
+## 2 Control API (control-v1 over the socket): 21 actions, 9 served, 12 refused by name
+Protocol `hee3.control` (`contracts/control.rs:29`), frame ≤ 1 MiB (`:23`), version 1 only (refusal `:1235-1241`); catalogue `actions.rs:332,568`; dispatch `actions/control.rs:469-564`.
+| Action | Served? | Owner / handler |
+|---|---|---|
+| health | yes | actions/control dispatch |
+| tools.list, tools.inspect | yes | actions (catalogue) |
+| task.preview | yes | app::tasks → app::routing → route (`tasks.rs:914`) |
+| task.submit, task.get, task.list, task.cancel, task.resolve | yes | app::tasks StoreTasks (`tasks.rs:571-899`) → store |
+| thread.get, thread.list | no (cohort, C06) | `actions/control.rs:421,425` |
+| roster.list, roster.inspect, roster.update, roster.disable | no (roster, C01) | `:428-440` |
+| service.inspect, service.probe, service.action | no (service, C02/C03) | `:444-452` |
+| analysis.request, analysis.get | no (numerical, C04) | `:460,464` |
+| events.subscribe | no (notify, B20) | `:457` |
+
+## 3 Command-line entry points
+| Entry | Owner | Evidence |
+|---|---|---|
+| `habitat-engine serve` / `serve --until-stdin-closes` | main → app (coordinator, control_socket, dispatcher) | `main.rs:261-266` |
+| `habitat-engine commission <seconds>` | main → app::coordinator | `main.rs:267` |
+| `habitat-engine <action> [args]` | main CLI client → control.sock | `main.rs:270, 1147` |
+| `hee3 <action> …`, `hee3 --check`, `hee3 chain …` | integrations/bash (runs habitat-engine as producer) | `hee3:873-900` |
+| `deploy/install-release --commit … --bundle … --deadline …` / `--control` | deploy | `install-release:6-8` |
+
+## 4 HTTP (loopback only): the ollama API
+| Endpoint | Use | Evidence |
+|---|---|---|
+| `http://127.0.0.1:11434/api/` base | worker::native, via the pinned `/usr/bin/curl` (native.toml client pin) | `native.rs:413`; curl pin `native_provider.rs:505` |
+| `GET version`, `GET tags`, `GET ps` | identity readback (model manifest, resident model) | `native.rs:1364,1374,1425` |
+| `POST generate` | the model call (one per exchange) | `native.rs:1328-1331` |
+| daemon identity | the LISTEN holder of :11434 from /proc/net/tcp{,6} + fd scan (N6b) | `native.rs` endpoint_holder |
+No TCP listener exists in src (`TcpListener` appears only in tests).
+
+## 5 D-Bus (systemd user manager, through the pinned `/usr/bin/busctl`)
+| Call | Owner | Evidence |
+|---|---|---|
+| `org.freedesktop.systemd1.Manager.StartTransientUnit` (slice and scope for candidates) | worker::aggregate / worker::resources | `aggregate.rs:16-18,402` |
+| `…Manager.StopUnit` | worker::aggregate | `aggregate.rs:206` |
+| `get-property` Slice/Scope/Service: ControlGroup, MainPID, CPUQuotaPerSecUSec, MemoryMax, MemorySwapMax, TasksMax, IOWeight | aggregate (limit readback), live_verifier | `aggregate.rs:337-349,550,1077-1089` |
+| busctl digest pin | class profile `busctl_sha256` | `class_profile.rs:166,541` |
+
+## 6 Processes the engine starts
+| Program | Door | Evidence |
+|---|---|---|
+| `/usr/bin/bwrap` (candidate sandbox) | app::live_verifier / worker::namespace | `live_verifier.rs:35` |
+| `/usr/bin/systemd-run` (transient scopes) | worker::resources | `resources.rs:135` |
+| `/usr/bin/busctl` | worker::aggregate | `aggregate.rs:26` |
+| `/usr/bin/curl` (ollama client) | worker::native, pinned in native.toml | `native_provider.rs:505` |
+| `hee-namespace-shim` (in-namespace exec; reports `HEE3_NATIVE_STATUS_V1` lines) | worker::namespace_shim | `namespace_shim.rs:226,291-296`; parsed at `namespace.rs:1215` |
+| julia `bin/analysis.jl` (offline, 1 thread) | numerical::process (**test callers only**) | `numerical/process.rs:220-231` |
+| the one spawn door | worker::process | `process.rs:547` |
+`plan.rs` spawns (rustc, mkfifo) are test-only (after `#[cfg(test)]` at `plan.rs:975`).
+
+## 7 Environment read by production code
+`HOME` (`main.rs:314`), `XDG_RUNTIME_DIR` (`main.rs:305,376,633`). Test-build seams, compiled only under feature `headroom-seam` (10 gates in main.rs): `HEE3_TEST_HEADROOM`, `HEE3_TEST_MOUNTINFO`, `HEE3_TEST_BLOCKTOPO`, `HEE3_TEST_DAEMON_PORT`. Children get allowlisted environments (`hee3:366-371`; JULIA_* in `numerical/process.rs:220-231`, `namespace_shim.rs:45-48`).
+
+## 8 Files the engine owns
+| Path | Owner | Evidence |
+|---|---|---|
+| `~/.local/state/herdr-engineering-engine-v3/` (state root): `active.json`, `generations/<gen>/ledger.sqlite3`, `objects/sha256/…`, `attempts/` (+ `.hee3-root-id`) | app::coordinator, store | `coordinator.rs:33,45,338,342`; `store.rs:1014-1031,1074-1075` |
+| `~/.config/herdr-engineering-engine-v3/`: `grants/`, `routing/`, `classes/rust-library-change-1/`, `native/native.toml`, `backup/backup.json` | main, app (routing, class_profile, native_provider, backup_target) | `coordinator.rs:37`; `main.rs:227`; `routing.rs:38`; `class_profile.rs:23`; `native_provider.rs:44,46`; `backup_target.rs:43,45` |
+| `~/.local/lib/herdr-engineering-engine-v3/releases/<manifest-sha256>/` + `current` | deploy/install-release | `install-release:182,214-215` |
+
+## 9 Deployed now (host, read-only, 2026-10-01 ~06:40)
+- **Engine: not running.** `pgrep -x habitat-engine`: none. `$XDG_RUNTIME_DIR/habitat-engine/` holds only `control.lock` (from 2026-09-30 08:28), **no control.sock**.
+- **Installed release:** `current` → `releases/38f3dfd2…` (built from cd952da; F06 host record).
+- **No engine systemd unit** (only `hee3-backup.service/.timer`, the evidence backup, which is not the engine). HO-07 owns the unit.
+- **ollama:** listening on 127.0.0.1:11434, pid 2508 (the toolbox daemon).

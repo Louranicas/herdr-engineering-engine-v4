@@ -1,0 +1,28 @@
+# restore-v3-modes — UNDO the v3 write guard (DECISIONS V4-68): chmod every recorded v3 path back
+# to its pre-protection mode from ~/hee4-evidence/ops-records/v3-modes-20261001.tsv, on the host.
+# The recipe refuses (exit 2) unless its positional argument is exactly "confirm"; this runbook
+# passes it, so running the runbook IS the confirmation. It is a human's act, never an agent's.
+name = "restore-v3-modes"
+purpose = "Undo the v3 write guard from the recorded modes (requires the explicit confirm argument)"
+cwd = "/var/home/Louranicas/herdr-engineering-engine-v4"
+
+[[precondition]]
+check = "test -f ~/hee4-evidence/ops-records/restore-v3-modes.sh && test -s ~/hee4-evidence/ops-records/v3-modes-20261001.tsv && wc -l < ~/hee4-evidence/ops-records/v3-modes-20261001.tsv"
+expect_not = "No such file"
+message = "the restore script or its modes TSV is absent"
+
+# The refusal path is itself a precondition: without confirm the recipe must refuse, or the guard is gone.
+[[precondition]]
+check = "just restore-v3-modes 2>&1 || true"
+expect = "verdict=REFUSED reason=no_confirm"
+message = "the recipe did not refuse without confirm; do not proceed"
+
+[[step]]
+name = "restore"
+just = "restore-v3-modes confirm"
+expect = "restore-v3-modes verdict=PASS"
+timeout = 1800
+
+[verify]
+run = "just restore-v3-modes 2>&1 || true"
+contains = "verdict=REFUSED reason=no_confirm"

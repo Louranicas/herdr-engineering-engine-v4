@@ -1,0 +1,24 @@
+# highway — every planning hop for ONE module as bounded JSON (hee4db highway MODULE).
+# Run with: habitat-runbook run highway --directory runbooks -v MODULE=store
+name = "highway"
+purpose = "One module's card, design section, phases, budget, readiness, DCs, held items and ids in one call"
+cwd = "/var/home/Louranicas/herdr-engineering-engine-v4"
+
+[[precondition]]
+check = "grep -q '^name = \"{{MODULE}}\"' modules/MODULES.toml && echo module_known"
+expect = "module_known"
+message = "MODULE is not a [[module]] name in modules/MODULES.toml"
+
+[[precondition]]
+check = "hee4db stale"
+expect = "stale_sources=0"
+message = "the ops DB is stale: run hee4db ingest first"
+
+[[step]]
+name = "highway"
+just = "highway {{MODULE}}"
+expect = "\"module\""
+
+[verify]
+run = "hee4db highway {{MODULE}}"
+contains = "hee4db highway verdict=PASS"

@@ -1,0 +1,31 @@
+# roster-selfcheck — one roster agent's selfcheck through the single runner. It SPENDS MONEY:
+# about $0.25 of API per run (the runner logs cost_usd=). Run with:
+#   habitat-runbook run roster-selfcheck --directory runbooks -v AGENT=hee4-curator
+name = "roster-selfcheck"
+purpose = "Run ops/roster/run-agent.sh AGENT selfcheck (about $0.25 per run) and read back its typed exit"
+cwd = "/var/home/Louranicas/herdr-engineering-engine-v4"
+
+[[precondition]]
+check = "test -f ops/roster/{{AGENT}}/modes.conf && test -x ops/roster/{{AGENT}}/measure.sh && test -f .claude/agents/{{AGENT}}.md && echo agent_ok"
+expect = "agent_ok"
+message = "AGENT has no ops/roster/<agent>/{modes.conf,measure.sh} or .claude/agents/<agent>.md"
+
+[[precondition]]
+check = "test -x ~/.local/bin/claude && echo claude_ok"
+expect = "claude_ok"
+message = "~/.local/bin/claude is absent: the runner cannot reach the model"
+
+[[step]]
+name = "selfcheck"
+just = "roster-selfcheck {{AGENT}}"
+timeout = 1800
+
+# Read-back: the run's own log carries the runner contract line and the DB record line.
+[[step]]
+name = "run-log"
+run = "tail -n 3 \"$(ls -1 ~/hee4-evidence/roster/{{AGENT}}/run-*-selfcheck.log | tail -n 1)\""
+expect = "db_record="
+
+[verify]
+run = "hee4db recipe last-runs 1"
+contains = "selfcheck"

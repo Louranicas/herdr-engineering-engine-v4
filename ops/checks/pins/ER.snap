@@ -1,0 +1,41 @@
+# Errata: v3 evidence copies at `b5367bc` (V4-18)
+
+The seven files in `v3-evidence-b5367bc/` are **read-only copies** (their `MANIFEST.sha256` pins them), and the v3 originals are outside the v4 fence. This file is the one home for every correction to them. Read a cited line in a copy together with this table.
+
+Sources: verification V3 (`~/hee4-evidence/verification/V3-evidence.md`, 2026-10-01, same-lineage, method `git show b5367bc:<path>`), V2 (`…/V2-design.md`), and the corrections the ULTRAMAP found while mapping (C1-C3). Locators re-read by louranicas-2c on 2026-10-01 with `git -C /run/host/var/home/herdr-engineering-engine-v3 show b5367bc:<path>`.
+
+## 1 · Corrections
+
+| # | Copy | Says | Correct | Evidence |
+|---|---|---|---|---|
+| E1 | cluster-map | "6 undeclared edges"; Stage 2 lists 6 | **7** edges: actions→task, context→budget, numerical→worker, service→store, **service→worker** (missing from Stage 2), task→recovery, worker→actions (`worker/tools.rs:620`); plus app→8 modules. No cycles | V3 §4 (comment/string-stripping parse, `#[cfg(test)]` dropped) |
+| E2 | cluster-map | module table has no recovery row | recovery has **0** crate edges (not even contracts); the row is absent | V3 §4 |
+| E3 | cluster-map | anchors.json says "every module → contracts only" | not so: julia is `[]`, and bash, pi_extension, skills and workflows → actions | V3 §1 |
+| E4 | architecture-review | System rec 3: "write or delete `queued`/`repair_pending`" | **`queued` only.** `repair_pending` is written (`store.rs:1536`, `store/verification.rs:248`) | V3 §3; ULTRAMAP C1 |
+| E5 | architecture-review | SYS: outbox inserted "on every acceptance" (`store.rs:2024`) | a second insert on every terminal stop, `store/terminal.rs:219` | ULTRAMAP C2; V1 §2 |
+| E6 | architecture-review | worker/tools.rs is "test-only" | `pub mod tools;` (`worker/mod.rs:1005`) with no `cfg(test)`: **compiled into the lib, with no production caller** | V3 §3 |
+| E7 | architecture-review | tracer's "21 inbound + 8 outbound hops, file:line for each" | the per-hop list was not persisted; ULTRAMAP §3 re-derives the hops | ULTRAMAP C3; V3 §5 |
+| E8 | architecture-review | `store.rs:2601` | `} else {` at that line; the site is **unverified** (the doc already flags it as unconfirmed) | V3 §1 |
+| E9 | interface-map | curl pin at `native_provider.rs:505` | inside `#[cfg(test)]` (from :491): a test-fixture `HOST` const. **Production curl path comes from `native.toml`** config, not a src pin | V3 §1 |
+| E10 | interface-map | UNSERVED `thread.get`/`thread.list` at :421/:425; `events.subscribe` at :457 (`actions/control.rs`) | **:420 / :424**; **:456** | V3 §1 |
+| E11 | jev-decision-map | J1: "harden the parser (language tags)" | `starts_with("```")` (`app/candidates.rs:224`) already admits a language-tagged fence. **The gap is indented fences** | V3 §1 |
+| E12 | jev-decision-map | Cohesion.jl:752 is a comparison | `:752` is the `cohesion()` entry function (decode and refusals); the comparison is built at `:921` (`comparison = (;`) | V3 §1; re-read |
+| E13 | route-to-v010 | §3.8: newest handover is `…_1400` | newest is **`HEE3_HANDOVER_20261001_0715.md`** (written after the doc) | V3 §3 |
+| E14 | route-to-v010 | `observe()` reads cfs at :541 | :541 is blank; the read is at **:540** | V3 §1 |
+| E15 | (v4) ULTRAMAP P4 | "decide cannot PASS" cited at `check/decision.rs:46,97,120` | those lines are the `Unavailable` variants of three enums; the hard-wiring is `app/u64_receipt.rs:136-145` `identities()` (Collector, Locks, Standards = `None`). The module-audit copy's own statement holds (V3 §1). Corrected in place in the ULTRAMAP | V2 §1 |
+| E16 | (v4) DECISION_POINTS-b5367bc | 15 locators | 6 wrong-file cites (service.rs:93/:130/:174/:277, numerical.rs:143, actions.rs:343 are comment lines; the sites are in `service/{observations,probe,local_probe}.rs`, `numerical/process.rs:143`, `actions/control.rs:343`) and 9 shifted (aggregate :443→:432, budget :999→:1424, budget :1357→inside `report` :1344, store :2297→`obligation_of` :2284, startup :173→:207, context :968→`MAX_*` :329-361, actions.rs:313→`actions/control.rs:313`, Cohesion.jl :752→:921, install-release :44→:121). Corrected in place in `~/hee4-evidence/design/DECISION_POINTS-b5367bc.md` (a v4 file, not a copy) | V3 §1; re-read |
+| E17 | (v4) DECISION_POINTS-b5367bc | "201 rows" | 201 sites in the agents' reports; 93 condensed rows (36/31/26); only JUDGMENT=14 recountable | V3 §2 |
+
+## 2 · Assertions presented as verified, not verified
+
+These are claims the copies state as findings; no check in the tree supports them. Treat each as the agents' assertion.
+
+| Copy | Assertion | Why it is not verified |
+|---|---|---|
+| module-audit | worker **FINISHED** | MET means code presence only; nothing was run, and there is no mutants record (V3 §5) |
+| module-audit | PI-02 register admits any action | UNVERIFIABLE from the tree (V3 §1) |
+| architecture-review | "task state written at ≥9 sites" | no site list in the file (V3 §5) |
+| architecture-review | "21 inbound + 8 outbound hops, file:line for each" | no hop list in the file (E7) |
+| DECISION_POINTS (v4) | EXACT 145 / THRESHOLD 42 | only JUDGMENT is recountable (E17) |
+| interface-map | §9 host state (engine not running, release `38f3dfd2`, ollama pid 2508) | time-bound; not re-measured (V3 §5). The ATLAS M-1001 probe saw ollama MainPID 1899 |
+| jev-decision-map | A4 (rate-limit change, 11 vs 9 jaggedness items) | an external page, unverifiable from the tree (V3 §5) |

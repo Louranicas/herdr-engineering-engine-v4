@@ -1,0 +1,26 @@
+# jev-entry — the ATLAS P0 Jev entry read-back (H-8, H-19; DEC V4-74): `hee4db jev-entry`. JP0 = the real
+# `jev-boundary text` refuses every v4 line from the world (MODULES.toml crates, the hee4 namespace, the v4 homes)
+# while the v3 and clean controls hold; then sent_engine_rows=E/S over verifier, router, read gate and recall since
+# the door and its loggers were installed. Negative control: ops/db/tests/jev_entry_control.py (a `just verify` step).
+name = "jev-entry"
+purpose = "Read back the P0 Jev entry criteria: v4 text refused by the door, no engine row sent by any sender"
+cwd = "/var/home/Louranicas/herdr-engineering-engine-v4"
+
+[[precondition]]
+check = "command -v jev-boundary >/dev/null && echo door"
+expect = "door"
+message = "jev-boundary is not on PATH: the read-back runs the real door's CLI"
+
+[[precondition]]
+check = "python3 ops/db/tests/jev_entry_control.py | tail -2 | head -1"
+expect = "verdict=PASS"
+message = "the jev-entry control is not green: a read-back whose control fails is not evidence"
+
+[[step]]
+name = "jev-entry"
+just = "jev-entry"
+expect = "verdict=PASS"
+
+[verify]
+run = "hee4db jev-entry 2>&1 >/dev/null"
+contains = "senders_measured=4/4"
