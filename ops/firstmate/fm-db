@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""fm-db: the ONE writer for a Firstmate home's orchestration database ($FM_HOME/data/firstmate.db).
+
+Verbs (each one transaction, BEGIN IMMEDIATE, under the writer flock; stdlib only):
+  init                                   create/migrate the DB from schema/*.sql (idempotent; refuses a changed applied file)
+  record unit|brief|spawn|claim|verify|receipt|exit|andon  --k v ...   one row; refusals are typed (exit 20)
+  clear-andon --id N --by WHO
+  q 'SELECT ...'                         one bounded read-only SELECT through tursodb --readonly (exit 30 if absent)
+  status                                 open units, spawned vs planned, open andon (JSON)
+Exit codes: 0 ok · 2 usage · 3 setup · 20 refused · 30 unmeasured.
+Engine roles follow ops/db/README.md "Writer safety": Python sqlite3 writes; tursodb is never opened read-write.
+"""
+from __future__ import annotations
+
+import fcntl
+import hashlib
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+FM_HOME = Path(os.environ.get("FM_HOME", Path.home() / "firstmate"))
+DB = Path(os.environ.get("FM_DB", FM_HOME / "data" / "firstmate.db"))
+TURSODB = os.environ.get("HEE4DB_TURSODB", str(Path.home() / ".local/bin/tursodb"))
+Q_CAP = 200  # rows per read-back; a larger answer is a report, not a query
+
+
+def out(verb: str, verdict: str, code: int, **kw) -> int:
+    print(json.dumps({"verb": verb, "verdict": verdict, "exit": code, "db": str(DB), **kw}, sort_keys=True))
+    return code
+
+
+def ts() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def kv(args: list[str]) -> dict[str, str]:
+    d, i = {}, 0
+    while i < len(args):
+        if not args[i].startswith("--") or i + 1 >= len(args):
+            raise SystemExit(out("record", "USAGE", 2, detail=f"expected --key value, got {args[i]!r}"))
+        d[args[i][2:].replace("-", "_")] = args[i + 1]
+        i += 2
+    return d
+
+
+class Writer:
+    """One transaction under the writer flock. script=True for DDL via executescript, which manages its own commit."""
+
+    def __init__(self, script: bool = False) -> None:
+        self.script = script
+
+    def __enter__(self):
+        DB.parent.mkdir(parents=True, exist_ok=True)
+        self.lock = open(DB.with_name(DB.name + ".writer.lock"), "w")
+        fcntl.flock(self.lock, fcntl.LOCK_EX)
+        self.con = sqlite3.connect(DB, isolation_level=None, timeout=5)
+        self.con.execute("PRAGMA foreign_keys = ON")
+        if not self.script:
+            self.con.execute("BEGIN IMMEDIATE")
+        return self.con
+
+    def __exit__(self, et, ev, tb):
+        if not self.script and self.con.in_transaction:
+            self.con.execute("ROLLBACK" if et else "COMMIT")
+        self.con.close()
+        fcntl.flock(self.lock, fcntl.LOCK_UN)
+        self.lock.close()
+        return False
+
+
+def init() -> int:
+    applied = {}
+    with Writer(script=True) as con:
+        con.executescript("CREATE TABLE IF NOT EXISTS schema_migrations (file TEXT PRIMARY KEY, sha256 TEXT NOT NULL, applied_ts TEXT NOT NULL)")
+        for f, s in con.execute("SELECT file, sha256 FROM schema_migrations"):
+            applied[f] = s
+        done = []
+        for p in sorted((HERE / "schema").glob("*.sql")):
+            sha = hashlib.sha256(p.read_bytes()).hexdigest()
+            if p.name in applied:
+                if applied[p.name] != sha:
+                    return out("init", "REFUSED", 20, detail=f"applied migration changed: {p.name}")
+                continue
+            con.executescript(p.read_text())
+            con.execute("INSERT INTO schema_migrations VALUES (?,?,?)", (p.name, sha, ts()))
+            done.append(p.name)
+    return out("init", "PASS", 0, applied=done, already=sorted(applied))
+
+
+COLS = {
+    "unit": ("units", ["unit_id", "project", "kind", "mode", "yolo", "brief_path", "planned_agents", "opened_ts"]),
+    "brief": ("briefs", ["brief_sha", "unit_id", "path", "head_sha", "standing_sha", "ts"]),
+    "spawn": ("spawns", ["task_id", "unit_id", "agent", "harness", "model", "backend", "worktree", "fresh", "ts"]),
+    "claim": ("claims", ["task_id", "text", "label", "witness_cmd", "head_sha", "ts"]),
+    "verify": ("verifications", ["claim_id", "verifier_task", "verdict", "result", "ts"]),
+    "receipt": ("receipts", ["task_id", "event", "detail", "pr", "head_sha", "ts"]),
+    "exit": ("exits", ["task_id", "verdict", "cases_ok", "cases_total", "reason", "report_path", "head_sha", "ts"]),
+    "andon": ("andon", ["unit_id", "raised_by", "reason", "measured", "ts"]),
+}
+STATUS_VERBS = {"done": "PASS", "failed": "FAIL", "blocked": "BLOCKED", "needs-decision": "BLOCKED", "paused": "PASS_WITH_GAPS"}
+
+
+def record(kind: str, args: list[str]) -> int:
+    if kind not in COLS:
+        return out("record", "USAGE", 2, detail=f"unknown kind {kind!r}; one of {sorted(COLS)}")
+    table, cols = COLS[kind]
+    d = kv(args)
+    d.setdefault("ts", ts())
+    if kind == "unit":
+        d.setdefault("opened_ts", d.pop("ts"))
+    if kind == "exit" and d.get("verdict") in STATUS_VERBS:        # Firstmate status verb → roster verdict
+        d["verdict"] = STATUS_VERBS[d["verdict"]]
+    if kind == "andon":
+        d["measured"] = "1" if d.get("measured", "0") in ("1", "true", "yes") else "0"
+    row = {c: d.get(c) for c in cols}
+    extra = sorted(set(d) - set(cols))
+    if extra:
+        return out("record", "USAGE", 2, detail=f"unknown keys {extra}; allowed {cols}")
+    try:
+        with Writer() as con:
+            if kind == "spawn":  # planned_agents is enforced HERE (Firstmate has no cap)
+                r = con.execute("SELECT planned_agents, (SELECT count(*) FROM spawns WHERE unit_id=?) FROM units WHERE unit_id=?",
+                                (row["unit_id"], row["unit_id"])).fetchone()
+                if r is None:
+                    return out("record", "REFUSED", 20, detail=f"no unit {row['unit_id']!r}; record the unit first")
+                if r[1] >= r[0]:
+                    return out("record", "REFUSED", 20, detail=f"planned_agents={r[0]} already spawned={r[1]}; raise the plan in a new unit, do not exceed it")
+                if con.execute("SELECT 1 FROM andon WHERE unit_id=? AND cleared_ts IS NULL", (row["unit_id"],)).fetchone():
+                    return out("record", "REFUSED", 20, detail="open andon on this unit: no spawn until the captain clears it")
+            given = [c for c in cols if row[c] is not None]          # absent keys take the schema's defaults
+            cur = con.execute(f"INSERT INTO {table} ({','.join(given)}) VALUES ({','.join('?' * len(given))})", [row[c] for c in given])
+            rid = cur.lastrowid
+    except sqlite3.IntegrityError as e:
+        return out("record", "REFUSED", 20, detail=str(e))
+    return out("record", "PASS", 0, kind=kind, table=table, rowid=rid)
+
+
+def clear_andon(args: list[str]) -> int:
+    d = kv(args)
+    with Writer() as con:
+        n = con.execute("UPDATE andon SET cleared_by=?, cleared_ts=? WHERE andon_id=? AND cleared_ts IS NULL", (d.get("by"), ts(), d.get("id"))).rowcount
+    return out("clear-andon", "PASS" if n else "REFUSED", 0 if n else 20, cleared=n)
+
+
+def q(sql: str) -> int:
+    if not sql.lstrip().upper().startswith("SELECT"):
+        return out("q", "REFUSED", 20, detail="one SELECT only")
+    if not Path(TURSODB).exists():
+        return out("q", "UNMEASURED", 30, detail=f"tursodb absent at {TURSODB}")
+    p = subprocess.run([TURSODB, "-q", "--readonly", "-m", "list", str(DB), f"{sql.rstrip(';')} LIMIT {Q_CAP}"],
+                       stdin=subprocess.DEVNULL, capture_output=True, text=True)
+    rows = [ln.split("|") for ln in p.stdout.splitlines() if ln]
+    return out("q", "PASS" if p.returncode == 0 else "FAIL", 0 if p.returncode == 0 else 20, rows=rows, rc=p.returncode, stderr=p.stderr[:200])
+
+
+def status() -> int:
+    if not DB.exists():
+        return out("status", "UNMEASURED", 30, detail="no database; run fm-db init")
+    con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    units = [dict(zip(("unit_id", "project", "kind", "planned_agents", "spawned", "open_andon"), r)) for r in con.execute("SELECT * FROM open_units")]
+    unverified = con.execute("SELECT count(*) FROM claims c WHERE c.label='MEASURED' AND NOT EXISTS (SELECT 1 FROM verifications v WHERE v.claim_id=c.claim_id)").fetchone()[0]
+    con.close()
+    return out("status", "PASS", 0, open_units=units, measured_claims_unverified=unverified)
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) < 2:
+        print(__doc__); return 2
+    v = argv[1]
+    if v == "init": return init()
+    if v == "record": return record(argv[2], argv[3:]) if len(argv) > 2 else out("record", "USAGE", 2)
+    if v == "clear-andon": return clear_andon(argv[2:])
+    if v == "q": return q(" ".join(argv[2:]))
+    if v == "status": return status()
+    print(__doc__); return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
