@@ -15,10 +15,12 @@ Every claim here is labelled. MEASURED means a command ran on this machine and i
 | Health | `recovery_complete=true` after reconcile | `hee4 health` |
 | Crash drill | SIGKILL → systemd restart → recovery complete, socket perms intact | `tools/drill --unit hee4.service --socket $XDG_RUNTIME_DIR/hee4/control.sock --repo .` |
 | Feature drive | health, task.submit, task.get, task.list, task.cancel against the live unit, restart included | `tools/drive --doctor-first --allow-restart` |
-| Gate | commit tier green; cut tier red on one row until a model answers on `127.0.0.1:11434` | `just gate commit`, `just gate cut` |
-| Tags | `skeleton-deployed-2026-10-05`, `hardened-deployed-2026-10-05` | `git tag -n` |
+| Gate | cut tier **7/7** at `6bd7579e20b7` (fmt, clippy, 129 tests, sealed diff, kill -9 drill, feature drive, doctor) with the live model on | `just gate commit`, `just gate cut` |
+| Model | user-space ollama 0.35.1 on `127.0.0.1:11434`, `qwen2.5:0.5b`, GPU via Vulkan; the engine reaches it only through the door | `systemctl --user is-active ollama.service`, `hee4 doctor --repo .` |
+| First live Pass | one task through the deployed unit: `admitted -> accepted` in 0.2 s, receipt `71a15c2b…`, `command` and `model-door` observations, one `model_request` row | `plan/DECISIONS.md` V4-94 |
+| Tags | `skeleton-deployed-2026-10-05`, `hardened-deployed-2026-10-05`, `live-model-deployed-2026-10-05` | `git tag -n` |
 
-The engine has not yet run a real model attempt. With no model endpoint, `decide` refuses rather than passing work that did not happen. That refusal is the design.
+The engine has run a real model attempt: a `sh:` VERIFY step inside the sandbox curled the model door, the door forwarded one request to ollama on loopback, and `decide` sealed `Pass` over two observations bound to the brief's VERIFY digest. Before the model existed, the same path ended in a refusal, not a Pass; that refusal is the design, and the Pass is the same code with a model behind the door. This is still not the ATLAS D10 version cut: that tag has its own field list (`tools/check-deployed` over D1–D9, a cold clone, `push-scan`, `apparatus_ratio=`) and none of those tools exist yet.
 
 ## The one rule
 
@@ -75,7 +77,7 @@ One JSON object per line over the socket. Request: `{request_id, action, action_
 
 ### The brief
 
-`task.submit` takes a brief with eleven fields: `GOAL SCOPE CONTEXT ACCEPTANCE VERIFY TIMEBOX FORBIDDEN REPORT STANDING RECON RESTATEMENT`. A missing field is refused by name; an empty `RESTATEMENT` is refused. The same brief shape is what the agent roster uses to dispatch work to itself.
+`task.submit` takes a brief with eleven fields: `GOAL SCOPE CONTEXT ACCEPTANCE VERIFY TIMEBOX FORBIDDEN REPORT STANDING RECON RESTATEMENT`. A missing field is refused by name; an empty `RESTATEMENT` is refused. `VERIFY` is one step per line: an absolute path runs as a bare argv in the sandbox; `sh: <line>` runs `/bin/sh -c <line>` there, which is how a step reaches the model (`curl --unix-socket "$HEE4_MODEL_SOCKET" http://model/api/generate …`); `model: <prompt>` is a recorded skip; anything else is a named skip. Every `Run` step records a `command` observation (`exit`, `stdout`), Pass only on exit 0, and every request through the door adds a `model-door` observation with one `model_request` row. The same brief shape is what the agent roster uses to dispatch work to itself.
 
 ## Build, test, gate
 
@@ -141,11 +143,15 @@ Recorded because each is now an instance a future door must fail on:
 - The dispatcher refused to run a binary whose baked head sha was `unknown`; the cause was the gate's `git archive` export sharing a target dir with the live tree.
 - A census test bound `CARGO_MANIFEST_DIR` at compile time and broke in a reused export; paths are now read at runtime.
 - A `CLOSED` marker written in the wrong table cell left two held items open in the ops database; `hee4db check=held` now refuses it.
+- The gate resolved `[gate].base = HEAD~1` against the checkout's moving HEAD; a commit landing mid-run emptied the diff and `deep-diff-forge` refused `0 files`. The base is now resolved against the subject sha before any step runs.
+- Under the gate's deeper target dir the model door's socket path reached 109 bytes and `bind(2)` refused it mid-attempt; the live tree, at 77 bytes, never saw it. The door now lives beside the control socket (50 bytes in production) and an over-long path is a typed `DoorPath` refusal at plan time.
+- The first live run ended `effect_unknown`: the door observation's `input_sha256` digested the request digests, so `decide` could never reconcile it with the subject. Every observation now carries the VERIFY digest.
 
 ## Not yet
 
-- A model server on `127.0.0.1:11434` (HELD: owner install). The dispatcher runs honest refusals until then; the first real attempt through the door and the first `Pass` verdict follow it.
-- Firstmate live crew in herdr: scouts in `auto` mode parked on Claude Code permission prompts; the current pilot runs in `dontAsk` mode against the repo allow-list (`plan/DECISIONS.md` V4-90 onward).
+- The D10 version cut as the ATLAS defines it: `tools/check-deployed` (D1–D9 aggregate and its `--control`), the cold clone, `push-scan` and `apparatus_ratio=` are unbuilt, so no `v4.0.0` tag exists and none is claimed.
+- A brief whose VERIFY is trivially true (`sh: true`) now reaches `accepted`, since a ran-and-exited-0 step is a Pass with exit evidence. That is a rung-2 gap at admission (refuse a VERIFY that looks at nothing), not at the verdict.
+- Firstmate live crew in herdr: decided (V4-93) as captain-supervised on this harness; zero-touch work runs through the Agent-tool roster recorded in `firstmate.db`. Revisit when herdr gains a key-send or Firstmate delivers briefs to raw launches.
 - Nineteen release actions beyond the skeleton (`thread.*`, `tools.*`, `service.*`, `roster.*`, `analysis.*`, `judge.inspect`): the drive reports each `UNMEASURED` by name.
 - An attempts table so recovery rules R03, R09 and R13 can fire; socket and door limits as K1 budgets rather than literals.
 - The Jev advisory port: the boundary door is installed and refuses every v4 name; no sender is installed.

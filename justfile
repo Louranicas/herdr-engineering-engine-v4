@@ -94,9 +94,11 @@ repin KEY:
     # the funnel's OWN rc (PIPESTATUS), never tail's: a piped $? would read a failing funnel as PASS
     python3 ops/checks/module_funnel.py < /dev/null | tail -n 2; r2=${PIPESTATUS[0]}
     # a pinned file may also be a DB source (DECISIONS, ATLAS, ...): re-ingest so `hee4db check` stale stays green
+    # ingest rc 10 is its own PASS_WITH_GAPS (a registry row it cannot read); the pins are still
+    # fresh, so the recipe passes and names the gap rather than hiding a green pin behind it.
     hee4db ingest < /dev/null > /dev/null 2>&1; r3=$?
-    v=PASS; [ "$r1" -eq 0 ] && [ "$r2" -eq 0 ] && [ "$r3" -eq 0 ] || v=FAIL
-    echo "repin verdict=$v key=$1 repin_rc=$r1 funnel_rc=$r2 ingest_rc=$r3"
+    v=PASS; [ "$r1" -eq 0 ] && [ "$r2" -eq 0 ] && { [ "$r3" -eq 0 ] || [ "$r3" -eq 10 ]; } || v=FAIL
+    echo "repin verdict=$v key=$1 repin_rc=$r1 funnel_rc=$r2 ingest_rc=$r3$([ "$r3" -eq 10 ] && echo ' ingest=PASS_WITH_GAPS')"
     [ "$v" = PASS ]
 
 # End-to-end funnel trace over all modules (ops/checks/funnel_trace.py)
