@@ -1,6 +1,7 @@
 # Brain
 
 ## Other
+- [[compile-time-paths-break-in-cached-exports]]
 - [[contradictions-2026-10-04]]
 - [[meta-goal-rungs]]
 - [[pinned-lines-append-only]]
