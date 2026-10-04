@@ -1,0 +1,284 @@
+//! Behaviour of the ledger doors: `open`, `apply`, `admit`, `record_observation`,
+//! `append_receipt`, `reconcile`.
+
+use std::error::Error;
+use std::path::PathBuf;
+
+use hee4_contracts::{
+    Decision, Event, GitSha, Observation, ObservationId, Outcome, Phase, Receipt, ReceiptBody,
+    RecoveryRule, Refusal, Settlement, Sha256Hex, TaskId, ToolId, Verdict,
+};
+use hee4_core::{Observations, OperationKey, Store, StoreError, reconcile};
+use serde_json::json;
+
+type R = Result<(), Box<dyn Error>>;
+
+fn db(name: &str) -> Result<PathBuf, Box<dyn Error>> {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("hee4-core-store");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{name}.sqlite"));
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+    Ok(path)
+}
+
+/// A fresh store whose (empty) reconcile has completed, so `Dispatch` is open.
+fn ready(name: &str) -> Result<Store, Box<dyn Error>> {
+    let store = Store::open(&db(name)?)?;
+    assert!(reconcile(&store, &Observations::default())?.complete);
+    Ok(store)
+}
+
+fn tid(s: &str) -> Result<TaskId, Box<dyn Error>> {
+    Ok(s.parse()?)
+}
+
+fn op(key: &str) -> OperationKey {
+    OperationKey {
+        principal: "luke".into(),
+        action: "task.submit".into(),
+        version: 1,
+        idem_key: key.into(),
+    }
+}
+
+fn observation() -> Result<Observation, Box<dyn Error>> {
+    Ok(Observation {
+        source: "cargo-test".parse()?,
+        input_sha256: Sha256Hex::digest(b"input"),
+        tool: ToolId {
+            name: "cargo".parse()?,
+            version: "1.99".parse()?,
+        },
+        head_sha: "a".repeat(40).parse::<GitSha>()?,
+        outcome: Outcome::Pass,
+        evidence: vec![],
+        advisory: false,
+        elapsed_ms: 1,
+        budget_ms: 10,
+    })
+}
+
+#[test]
+fn open_sets_wal_full_fk_and_schema() -> R {
+    let path = db("open")?;
+    let store = Store::open(&path)?;
+    store.apply(&"t1".parse()?, Event::Admit)?;
+    assert_eq!(store.pragmas()?, ("wal".into(), 2, 1));
+    assert_eq!(store.integrity_check()?, "ok");
+    assert!(!store.recovery_complete()?, "open resets the gate");
+    drop(store);
+    let again = Store::open(&path)?;
+    assert_eq!(again.event_count()?, 1, "reopen keeps the ledger");
+    assert_eq!(again.phase(&"t1".parse()?)?, Some(Phase::Admitted));
+    Ok(())
+}
+
+#[test]
+fn apply_writes_event_and_cache_together() -> R {
+    let store = ready("apply")?;
+    let t = tid("t1")?;
+    assert_eq!(store.apply(&t, Event::Admit)?, Phase::Admitted);
+    assert_eq!(store.apply(&t, Event::Dispatch)?, Phase::Running);
+    assert_eq!(store.event_count()?, 2);
+    let row = store.cached(&t)?.ok_or("no row")?;
+    assert_eq!(
+        (row.phase.as_str(), row.cancel, row.generation),
+        ("running", false, 1)
+    );
+    assert_eq!(store.phase(&t)?, Some(Phase::Running));
+    Ok(())
+}
+
+#[test]
+fn refused_edge_writes_nothing() -> R {
+    let store = ready("refused")?;
+    let t = tid("t1")?;
+    store.apply(&t, Event::Admit)?;
+    let before = store.event_count()?;
+    let err = store.apply(&t, Event::Accept);
+    assert!(
+        matches!(err, Err(StoreError::Refused(Refusal::Illegal { .. }))),
+        "{err:?}"
+    );
+    let err = store.apply(&tid("ghost")?, Event::Dispatch);
+    assert!(
+        matches!(err, Err(StoreError::Refused(Refusal::NotAdmitted { .. }))),
+        "{err:?}"
+    );
+    assert_eq!(store.event_count()?, before);
+    assert_eq!(store.cached(&tid("ghost")?)?, None);
+    assert_eq!(store.cached(&t)?.ok_or("row")?.phase, "admitted");
+    Ok(())
+}
+
+#[test]
+fn dispatch_is_refused_until_reconcile_completes() -> R {
+    let path = db("gate")?;
+    let store = Store::open(&path)?;
+    let t = tid("t1")?;
+    store.apply(&t, Event::Admit)?;
+    assert!(matches!(
+        store.apply(&t, Event::Dispatch),
+        Err(StoreError::RecoveryIncomplete)
+    ));
+    assert_eq!(store.event_count()?, 1);
+    assert!(reconcile(&store, &Observations::default())?.complete);
+    assert!(store.recovery_complete()?);
+    assert_eq!(store.apply(&t, Event::Dispatch)?, Phase::Running);
+    Ok(())
+}
+
+#[test]
+fn admit_replays_same_bytes_and_conflicts_on_other_bytes() -> R {
+    let store = ready("admit")?;
+    let t = tid("t1")?;
+    let first = store.admit(
+        &t,
+        &op("k1"),
+        b"spec-A",
+        |id, p| json!({"id": id.as_str(), "state": p.as_str()}),
+    )?;
+    assert!(!first.replayed);
+    assert_eq!(first.result, json!({"id": "t1", "state": "admitted"}));
+    let replay = store.admit(&tid("t2")?, &op("k1"), b"spec-A", |_, _| json!("never"))?;
+    assert_eq!(
+        (replay.replayed, replay.task_id.as_str(), &replay.result),
+        (true, "t1", &first.result)
+    );
+    let conflict = store.admit(&tid("t3")?, &op("k1"), b"spec-B", |_, _| json!("never"));
+    assert!(
+        matches!(conflict, Err(StoreError::Conflict(_))),
+        "{conflict:?}"
+    );
+    assert_eq!(store.event_count()?, 1, "one Admit event, no second task");
+    assert_eq!(store.task_ids()?.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn receipt_chain_and_observations_are_checked_on_append() -> R {
+    let store = ready("receipt")?;
+    let t = tid("t1")?;
+    store.apply(&t, Event::Admit)?;
+    let o1: ObservationId = "o1".parse()?;
+    store.record_observation(&t, &o1, &observation()?)?;
+    store.record_observation(&t, &o1, &observation()?)?; // idempotent
+    let mut other = observation()?;
+    other.outcome = Outcome::Fail;
+    assert!(matches!(
+        store.record_observation(&t, &o1, &other),
+        Err(StoreError::ObservationConflict(_))
+    ));
+
+    let body = |id: &str, obs: Vec<ObservationId>| -> Result<ReceiptBody, Box<dyn Error>> {
+        Ok(ReceiptBody {
+            id: id.parse()?,
+            task_id: t.clone(),
+            decision: Decision {
+                verdict: Verdict::Pass,
+            },
+            observed: obs,
+        })
+    };
+    let r1 = Receipt::seal(Sha256Hex::GENESIS, body("r1", vec![o1.clone()])?);
+    store.append_receipt(&r1)?;
+    assert_eq!(store.chain_head(&t)?, r1.hash_self());
+    let fork = Receipt::seal(Sha256Hex::GENESIS, body("r2", vec![])?);
+    assert!(matches!(
+        store.append_receipt(&fork),
+        Err(StoreError::Chain(_))
+    ));
+    let unledgered = Receipt::seal(r1.hash_self(), body("r3", vec!["o9".parse()?])?);
+    assert!(matches!(
+        store.append_receipt(&unledgered),
+        Err(StoreError::UnledgeredObservation(_))
+    ));
+    let r2 = Receipt::seal(r1.hash_self(), body("r2", vec![o1])?);
+    store.append_receipt(&r2)?;
+    assert_eq!(store.chain_head(&t)?, r2.hash_self());
+    Ok(())
+}
+
+#[test]
+fn reconcile_applies_r08_through_apply_and_is_idempotent() -> R {
+    let store = ready("reconcile")?;
+    for (name, events) in [
+        ("a-running", vec![Event::Admit, Event::Dispatch]),
+        ("b-admitted", vec![Event::Admit]),
+        (
+            "c-verifying",
+            vec![
+                Event::Admit,
+                Event::Dispatch,
+                Event::Settle(Settlement::Ready),
+            ],
+        ),
+        (
+            "d-cancel",
+            vec![Event::Admit, Event::Dispatch, Event::Cancel],
+        ),
+        (
+            "e-accepted",
+            vec![
+                Event::Admit,
+                Event::Dispatch,
+                Event::Settle(Settlement::Ready),
+                Event::Accept,
+            ],
+        ),
+    ] {
+        for e in events {
+            store.apply(&tid(name)?, e)?;
+        }
+    }
+    let before = store.event_count()?;
+    let report = reconcile(&store, &Observations::worker_absent())?;
+    assert!(report.complete, "{:?}", report.findings);
+    assert_eq!(report.applied, 2);
+    assert_eq!(store.event_count()?, before + 2);
+    let got: Vec<_> = report
+        .rows
+        .iter()
+        .map(|r| (r.task_id.as_str().to_owned(), r.rule, r.before, r.after))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (
+                "a-running".into(),
+                Some(RecoveryRule::R08WorkerAbsent),
+                Phase::Running,
+                Phase::EffectUnknown { cancel: false }
+            ),
+            ("b-admitted".into(), None, Phase::Admitted, Phase::Admitted),
+            (
+                "c-verifying".into(),
+                Some(RecoveryRule::R12VerificationBoundary),
+                Phase::Verifying,
+                Phase::Verifying
+            ),
+            (
+                "d-cancel".into(),
+                Some(RecoveryRule::R08WorkerAbsent),
+                Phase::CancellationRequested,
+                Phase::EffectUnknown { cancel: true }
+            ),
+            (
+                "e-accepted".into(),
+                Some(RecoveryRule::R04AcceptanceStands),
+                Phase::Accepted,
+                Phase::Accepted
+            ),
+        ]
+    );
+    assert_eq!(
+        store.history(&tid("a-running")?)?.last(),
+        Some(&Event::Recover(RecoveryRule::R08WorkerAbsent))
+    );
+    let second = reconcile(&store, &Observations::worker_absent())?;
+    assert_eq!((second.applied, second.complete), (0, true));
+    assert_eq!(store.event_count()?, before + 2);
+    Ok(())
+}
