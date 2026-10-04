@@ -38,7 +38,7 @@ The corpus's own rule is "one door per rule, one topic one home" (REQUIREMENTS r
 | Memory / learning | **brainmaxxing hooks + pstack `reflect`/`correct`** | Replace the cron curator agents (V4-19/26) with on-demand `/reflect` and periodic `/meditate`; the `correct` ladder (architecture → types → lint-that-names-the-fix → test → docs, each proven to fail on a real past mistake) upgrades REQUIREMENTS rank 9 |
 | Behaviour-level proof | **a HEE feature map** (one file per release action, the four H2s) | Written at P1; the "doctor first" rule is check-card done-criterion material |
 | Review evidence | **deep-diff-forge** via K6 live-verifier-adapter | Seal patch digest + binary version with the observation; refuse zero-file runs (it returns rc=0 and `ranked: []` on empty stdin — AP-29) |
-| Floor / display | **open decision** — herdr (what Omarchy ships, what HEE adapts to) vs LL glass/navigator (Zellij) | These are mutually exclusive substrates today |
+| Floor / display | **herdr** (Luke, 2026-10-05, V4-87): what Omarchy ships, what HEE adapts to, Firstmate's session backend | LoomLattice's glass/navigator (Zellij) is not built; LL contributes only its chain discipline |
 | Jev | HEE only, held (H-8) | "Jev scores it" cannot happen before P9 |
 
 ## 3 · The loop as it would actually run
@@ -67,7 +67,7 @@ Every arrow is HEE-owned. The other repos supply the *format* of the brief, the 
 5. **The mode dial** (`auto/supervised/manual`) becomes one door that gates admit, dispatch and settle; today's HOLD and grant sweep are the `manual` setting.
 6. **Port pstack + brainmaxxing into `.claude/`** of v4 for the *build*: poteto-mode router, the 23 playbooks, 24 principles, `how`/`architect`/`interrogate`/`swarm`, `/reflect`, `/correct`. Portable per frontmatter; Cursor-only keys dropped. This replaces the hee4-curator/workflow-curator cron roster.
 7. **Receipt chain**: add `hash_prev`/`hash_self` + periodic Merkle checkpoint to the receipt card; one format.
-8. **Floor decision** (herdr vs Zellij/LL) is an H-row for Luke; HEE keeps the herdr adapter until decided.
+8. **Floor decided: herdr** (V4-87). `hee4-floor-display` owns the herdr adapter; no Zellij projection.
 
 ## 5 · What not to take
 - noodle as a runtime (dormant, unsandboxed, schedule agent runs in the primary checkout with bypass).
@@ -82,4 +82,4 @@ Every arrow is HEE-owned. The other repos supply the *format* of the brief, the 
 - **V4-79** Outer loop stays P9; the orders-file shape and the mode dial land in P1 as `task.submit` producer and one door.
 - **V4-80** pstack/brainmaxxing ported into v4 `.claude/` for the build; cron roster retired.
 - **V4-81** Feature map at P1; deep-diff-forge as observation at P2.
-- **H-new** Floor substrate: herdr or Zellij/LoomLattice.
+- ~~**H-new** Floor substrate~~ decided herdr, V4-87.

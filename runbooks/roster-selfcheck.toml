@@ -1,6 +1,6 @@
 # roster-selfcheck — one roster agent's selfcheck through the single runner. It SPENDS MONEY:
 # about $0.25 of API per run (the runner logs cost_usd=). Run with:
-#   habitat-runbook run roster-selfcheck --directory runbooks -v AGENT=hee4-curator
+#   habitat-runbook run roster-selfcheck --directory runbooks -v AGENT=hee4-watch-drift
 name = "roster-selfcheck"
 purpose = "Run ops/roster/run-agent.sh AGENT selfcheck (about $0.25 per run) and read back its typed exit"
 cwd = "/mnt/storage-10tb/herdr-engineering-engine-v4"
