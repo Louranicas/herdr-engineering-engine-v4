@@ -8,7 +8,8 @@ and last
   gate tier=<t> verdict=PASS|FAIL steps=k/n subject=<sha12>
 Exit 0 only on PASS. A step is red if rc!=0, if it overran its budget (killed, rc=124),
 or if it looked at nothing (flag looked_at_nothing, AP-29). Logs: ~/.cache/hee4-gate/<stamp>/.
-Env: CARGO_TARGET_DIR (default ~/.cache/hee4-gate-target).
+Every step gets HEE4_HEAD=<full subject sha> (the export has no .git) and
+CARGO_TARGET_DIR=~/.cache/hee4-gate-target/<sha12> (per subject; --target-dir overrides). Prints target_dir=.
 """
 import argparse, json, os, re, shutil, signal, subprocess, sys, tempfile, time, tomllib
 
@@ -78,6 +79,7 @@ def main():
     ap.add_argument("--subject", default="HEAD", help="rev to export and gate (default HEAD)")
     ap.add_argument("--base", help="base rev for the ddf diff (default [gate].base)")
     ap.add_argument("--config", help="gate.toml path (default: <repo>/gate.toml, read from the subject export)")
+    ap.add_argument("--target-dir", help="CARGO_TARGET_DIR for every step (default ~/.cache/hee4-gate-target/<sha12>)")
     ap.add_argument("--repo", default=os.getcwd())
     a = ap.parse_args()
 
@@ -102,7 +104,10 @@ def main():
         names = resolve_steps(cfg, a.tier)
         base = a.base or cfg.get("gate", {}).get("base", "HEAD~1")
         env = dict(os.environ)
-        env.setdefault("CARGO_TARGET_DIR", os.path.expanduser("~/.cache/hee4-gate-target"))
+        env["HEE4_HEAD"] = sha
+        env["CARGO_TARGET_DIR"] = os.path.abspath(os.path.expanduser(
+            a.target_dir or f"~/.cache/hee4-gate-target/{sha[:12]}"))
+        print(f"target_dir={env['CARGO_TARGET_DIR']}")
         env["HEE4_GATE_SUBJECT"] = sha
         env["HEE4_GATE_REPO"] = os.path.abspath(a.repo)
         ok_n = 0

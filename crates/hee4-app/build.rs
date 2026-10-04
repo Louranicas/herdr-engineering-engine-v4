@@ -10,8 +10,16 @@ fn git(args: &[&str]) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+fn env_head() -> Option<String> {
+    let v = std::env::var("HEE4_HEAD").ok()?;
+    (v.len() == 40 && v.bytes().all(|b| b.is_ascii_hexdigit())).then_some(v)
+}
+
 fn main() {
-    let head = git(&["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".to_owned());
+    println!("cargo:rerun-if-env-changed=HEE4_HEAD");
+    let head = env_head()
+        .or_else(|| git(&["rev-parse", "HEAD"]))
+        .unwrap_or_else(|| "unknown".to_owned());
     println!("cargo:rustc-env=HEE4_HEAD={head}");
     if let Some(dir) = git(&["rev-parse", "--absolute-git-dir"]) {
         println!("cargo:rerun-if-changed={dir}/HEAD");
