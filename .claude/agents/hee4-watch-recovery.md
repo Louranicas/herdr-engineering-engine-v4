@@ -50,7 +50,8 @@ are counts against a feature file and an atlas; what the recovery policy should 
 - Vault `20 Deployment Atlas/Deployment Atlas.md` §1 D7, §6; `16 System Maps/End-to-End Flow
   Traces.md` E2E-05, E2E-06, E2E-08.
 - `plan/STACK-MAP-2026-10-04.md` §3.5, §4 step 7, §8 #3; `$HEE4_EVIDENCE/verification/` and
-  `$HEE4_EVIDENCE/ops-records/` for drill records (absent is UNMEASURED).
+  `$HEE4_EVIDENCE/ops-records/` for drill records, `$HEE4_EVIDENCE/reviews/` (absent is UNMEASURED);
+  the unit's agents from `$FM_HOME/data/firstmate.db` via `ops/firstmate/fm-db status|q` (offline fallback `agents/ledger.tsv`, PROTOCOL §4).
 
 ## Writes
 - The one report file above. Nothing else.
@@ -64,7 +65,8 @@ are counts against a feature file and an atlas; what the recovery policy should 
 - Reporting `non_terminal=0` with no engine to ask (HOLD): that line is UNMEASURED (hold).
 
 ## Report shape
-1. RESTATEMENT; unit; `head_sha`; whether an engine or a drill record existed to measure.
+1. RESTATEMENT; unit; `head_sha`; whether an engine or a drill record existed to measure; the
+   report path, its directory created with `mkdir -p` if absent.
 2. Per class: command, printed count with denominator, quoted lines with path:line, the rung it sits
    at (5) and the rung-2 door it should have.
 3. `Restart=` census: atlas line, service card line, trace line, quoted side by side (§8 #3).
@@ -74,13 +76,22 @@ Last line: `watch-recovery verdict=PASS|PASS_WITH_GAPS|FAIL|STOP cases=k/n [reas
 n = classes watched, k = classes measured clean; any UNMEASURED class caps at PASS_WITH_GAPS.
 
 ## Witness commands
-Run from the repo root after `. ./hee4.env`; use `/usr/bin/grep`.
+Run from the repo root after `. ./hee4.env`; use `/usr/bin/grep`, `/usr/bin/find`, `/usr/bin/ls` (this
+host aliases them). `UNIT` is the brief's UNIT field, else `adhoc-<date>`. The live ledger is
+`$FM_HOME/data/firstmate.db` read through `ops/firstmate/fm-db status|q` (read-only; write no LIMIT,
+fm-db caps rows at 200); `agents/ledger.tsv` is the offline fallback when `fmq` exits non-zero (20 no DB or refused,
+30 tursodb absent; PROTOCOL §4).
 ```
-/usr/bin/grep -c 'UNWRITTEN' gates/features/crash-restart.md                                  # work items left in the crash feature (denominator: sub-feature bullets, grep -c '^- ' under Sub-features)
+UNIT="${UNIT:-$(/usr/bin/grep -m1 -oE '^UNIT[:=] *[^ ]+' "${BRIEF:-/dev/null}" | /usr/bin/grep -oE '[^ ]+$')}"; UNIT="${UNIT:-adhoc-$(date +%F)}"; echo "unit=$UNIT"   # BRIEF=<path> when the brief is a file
+mkdir -p "$HEE4_EVIDENCE/roster/hee4-watch-recovery"; report="$HEE4_EVIDENCE/roster/hee4-watch-recovery/$(date +%F)-$UNIT.md"; echo "report=$report"   # the one report file; dir created if absent
+[ -d "$HEE4_EVIDENCE/reviews" ] || echo "reviews=UNMEASURED ($HEE4_EVIDENCE/reviews absent)"
+fmq() { ops/firstmate/fm-db q "$1" | python3 -c 'import json,sys;d=json.load(sys.stdin);sys.exit(d["exit"]) if d["exit"] else [print(*r,sep="\t") for r in d["rows"]]'; }   # rows as TSV; rc 20/30 = fall back to the TSV
+ops/firstmate/fm-db status | head -c 600; echo                                                                      # open units, spawned vs planned, open andon
+/usr/bin/grep -c 'UNWRITTEN' gates/features/crash-restart.md                                  # work items left in the crash feature (denominator: sub-feature bullets, /usr/bin/grep -c '^- ' under Sub-features)
 /usr/bin/grep -n -E 'Restart=' "$HEE4_VAULT/20 Deployment Atlas/Deployment Atlas.md" modules/hee4-habitat/service/MODULE.md gates/features/crash-restart.md   # expect only the "no Restart=" statements (D7, CN-06)
 /usr/bin/grep -n -E 'E2E-08|restarts serve' "$HEE4_VAULT/16 System Maps/End-to-End Flow Traces.md" | head -5          # §8 #3: the trace that assumes a restart
 /usr/bin/grep -n -E 'effect_unknown' modules/hee4-core/recovery/MODULE.md modules/hee4-core/task/MODULE.md gates/features/crash-restart.md gates/features/task.resolve.md   # each must name an exit other than manual
 /usr/bin/grep -n -i -E 'ledger(ed)? before|from memory|reads from the ledger' modules/hee4-evidence/check/MODULE.md modules/hee4-core/store/MODULE.md plan/STACK-MAP-2026-10-04.md   # §3.5 durability-before-verdict stated or not
-ls -t "$HEE4_EVIDENCE"/verification/ 2>/dev/null | head -5 || echo "drill_records=UNMEASURED (dir absent)"              # latest drill records; then grep -n -E 'non_terminal|terminal|quarantin|rto_s=' on the newest
+/usr/bin/ls -t "$HEE4_EVIDENCE"/verification/ 2>/dev/null | head -5 || echo "drill_records=UNMEASURED (dir absent)"     # latest drill records; then /usr/bin/grep -n -E 'non_terminal|terminal|quarantin|rto_s=' on the newest
 systemctl --user show -p MainPID --value hee4.service 2>/dev/null || echo "unit=UNMEASURED (no hee4.service, HOLD)"       # read-only; never stop/start/kill
 ```

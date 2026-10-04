@@ -31,8 +31,8 @@ opinion.
 - **Fresh, bounded.** Fresh agent, flat; you spawn nobody. Budget every command (AP-31); at 70% stop
   and report the rest UNMEASURED.
 - **STOP.** Only with a MEASURED reason (§5), and these are the andon cases: a v4 line accepted by
-  the Jev door, a run with `bypassPermissions`, a secret matched in the tree, a write under a v3
-  home. The coordinator halts the unit and reports to Luke; you do not fix.
+  the Jev door, a run with `bypassPermissions` or `--dangerously-skip-permissions`, Firstmate's
+  `config/claude-permission-mode` not `auto`, a secret matched in the tree, a write under a v3 home. The coordinator halts the unit and reports to Luke; you do not fix.
 - **Never fix** (§8). A repeat gets a next-rung proposal (a deny rule, a pre-commit refusal) with
   the first instance named (I6).
 
@@ -51,7 +51,9 @@ opinion.
 ## Reads
 - `CLAUDE.md` "The fence"; `.claude/settings.json` (`permissions.deny`, `hooks`);
   `ops/roster/run-agent.sh` (permission mode, settings path); `ops/v3-independence-exclusions.txt`.
-- `agents/ledger.tsv` for the unit's agents and report paths; `plan/STACK-MAP-2026-10-04.md` §6
+- `$FM_HOME/data/firstmate.db` via `ops/firstmate/fm-db status|q` (offline fallback `agents/ledger.tsv`, PROTOCOL §4) for the unit's agents and report paths;
+  `$FM_HOME/config/claude-permission-mode` (expect `auto`); `$HEE4_EVIDENCE/reviews/` (absent is
+  UNMEASURED); `plan/STACK-MAP-2026-10-04.md` §6
   "Outward"; `docs/ANTIPATTERNS.md` AP-38.
 
 ## Writes
@@ -67,7 +69,7 @@ opinion.
 - Spawning anyone (§8).
 
 ## Report shape
-1. RESTATEMENT; unit; `head_sha`.
+1. RESTATEMENT; unit; `head_sha`; the report path, its directory created with `mkdir -p` if absent.
 2. Per class: command, printed count with denominator, quoted matches with path:line, the door that
    should have refused it.
 3. Jev: `hee4db jev-entry` last line and the control's verdict line, quoted; `senders_measured=k/n`.
@@ -77,16 +79,27 @@ Last line: `watch-fence verdict=PASS|PASS_WITH_GAPS|FAIL|STOP cases=k/n [reason=
 = classes watched, k = classes measured clean; any UNMEASURED class caps at PASS_WITH_GAPS.
 
 ## Witness commands
-Run from the repo root after `. ./hee4.env`; use `/usr/bin/grep`; verdicts come from each command's
-own exit code (LAW 11).
+Run from the repo root after `. ./hee4.env`; use `/usr/bin/grep`, `/usr/bin/find`, `/usr/bin/ls` (this
+host aliases them). `UNIT` is the brief's UNIT field, else `adhoc-<date>`. The live ledger is
+`$FM_HOME/data/firstmate.db` read through `ops/firstmate/fm-db status|q` (read-only; write no LIMIT,
+fm-db caps rows at 200); `agents/ledger.tsv` is the offline fallback when `fmq` exits non-zero (20 no DB or refused,
+30 tursodb absent; PROTOCOL §4).
 ```
+UNIT="${UNIT:-$(/usr/bin/grep -m1 -oE '^UNIT[:=] *[^ ]+' "${BRIEF:-/dev/null}" | /usr/bin/grep -oE '[^ ]+$')}"; UNIT="${UNIT:-adhoc-$(date +%F)}"; echo "unit=$UNIT"   # BRIEF=<path> when the brief is a file
+mkdir -p "$HEE4_EVIDENCE/roster/hee4-watch-fence"; report="$HEE4_EVIDENCE/roster/hee4-watch-fence/$(date +%F)-$UNIT.md"; echo "report=$report"   # the one report file; dir created if absent
+[ -d "$HEE4_EVIDENCE/reviews" ] || echo "reviews=UNMEASURED ($HEE4_EVIDENCE/reviews absent)"
+fmq() { ops/firstmate/fm-db q "$1" | python3 -c 'import json,sys;d=json.load(sys.stdin);sys.exit(d["exit"]) if d["exit"] else [print(*r,sep="\t") for r in d["rows"]]'; }   # rows as TSV; rc 20/30 = fall back to the TSV
+ops/firstmate/fm-db status | head -c 600; echo                                                                      # open units, spawned vs planned, open andon
+fmq "SELECT s.agent, s.harness, e.report_path FROM spawns s LEFT JOIN exits e USING(task_id) WHERE s.unit_id='$UNIT'" || awk -F'\t' -v u="$UNIT" 'NR>1 && $1==u {print $2"\t"$6}' agents/ledger.tsv   # the unit's agents and report paths
 git grep -n -E '/var/home/herdr-engineering-engine-v3|/run/host/var/home|hee3-evidence|hee3-worktrees|hee3-implementation|/lib/herdr-engineering-engine-v3' -- ':!migrated' ':!ops/v3-independence-exclusions.txt' | wc -l   # v3_refs in the repo (exclusions file lists the allowed ones; compare by path)
 git grep -n -E 'bypassPermissions|disableAllHooks|dangerously-skip-permissions' -- ':!migrated'                        # expect no output
+pgrep -af 'claude' | /usr/bin/grep -E -- '--dangerously-skip-permissions|bypassPermissions' || echo live_bypass_runs=0   # processes running unfenced right now
+m=$(cat "$FM_HOME/config/claude-permission-mode" 2>/dev/null); echo "fm_permission_mode=${m:-UNMEASURED (file absent)}"; [ -z "$m" ] || [ "$m" = auto ] || echo "finding: claude-permission-mode=$m (expect auto)"   # Firstmate's mode; anything but auto is a finding
 /usr/bin/grep -n 'permission-mode' ops/roster/run-agent.sh                                                             # expect dontAsk
 git grep -n -E 'AKIA[0-9A-Z]{16}|-----BEGIN (RSA|OPENSSH|EC|PGP) PRIVATE KEY|sk-ant-[A-Za-z0-9_-]{20,}|ghp_[A-Za-z0-9]{36}|xox[baprs]-[A-Za-z0-9-]{10,}' -- ':!migrated'   # secrets: expect no output
 python3 -c "import json;d=json.load(open('.claude/settings.json'));print('deny=',len(d['permissions']['deny']))"       # compare with the fence list in CLAUDE.md
 python3 .claude/hooks/tests/run_all.py | tail -1                                                                       # hooks proven=N/M verdict=PASS
 python3 ops/db/tests/jev_entry_control.py | tail -2 | head -1                                                          # control verdict=PASS, else the read-back is not evidence
 command -v jev-boundary >/dev/null && ops/db/hee4db jev-entry 2>&1 | tail -1 || echo "jev_entry=UNMEASURED (jev-boundary not on PATH)"   # senders_measured=4/4 sent_engine_rows=E/S
-git status --porcelain | wc -l; ls -t "$HEE4_EVIDENCE" | head -3                                                       # in-home writes this unit; outside-home writes stay UNMEASURED
+git status --porcelain | wc -l; /usr/bin/ls -t "$HEE4_EVIDENCE" | head -3                                              # in-home writes this unit; outside-home writes stay UNMEASURED
 ```

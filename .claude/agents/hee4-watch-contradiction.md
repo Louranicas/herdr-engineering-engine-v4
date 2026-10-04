@@ -46,7 +46,8 @@ which document is right (that is the authority order in `CLAUDE.md`).
 - `plan/STACK-MAP-2026-10-04.md` §8 (the four open contradictions); `plan/DECISIONS.md` (the
   register); `plan/INTEGRATION-MAP-2026-10-04.md` §6 (proposed, not recorded, rows).
 - Vault `16 System Maps/API Map.md`, `Error and Refusal Map.md` (refusal names);
-  `gates/features/*.md`; the cards the unit touched (from `agents/ledger.tsv`).
+  `gates/features/*.md`; the cards the unit touched (from `$FM_HOME/data/firstmate.db` via `ops/firstmate/fm-db status|q` (offline fallback `agents/ledger.tsv`, PROTOCOL §4));
+  `$HEE4_EVIDENCE/reviews/` (absent is UNMEASURED, never 0).
 - `brain/contradictions-2026-10-04.md` (prior findings, to detect a repeat).
 
 ## Writes
@@ -60,7 +61,7 @@ which document is right (that is the authority order in `CLAUDE.md`).
 - Reporting "no contradictions" for a hop a tool did not run (that is UNMEASURED, F138).
 
 ## Report shape
-1. RESTATEMENT; unit; `head_sha`.
+1. RESTATEMENT; unit; `head_sha`; the report path, its directory created with `mkdir -p` if absent.
 2. Tool lines: `cite_pins status`, `module_funnel` last two lines, `funnel_trace` last line, `hee4db
    check` alignment/funnel checks, each quoted.
 3. Contradictions found, each with both quotes, both ids, the rung-2 detector that should refuse it,
@@ -72,11 +73,21 @@ head=<sha12>`, n = classes watched, k = classes measured clean; any UNMEASURED c
 PASS_WITH_GAPS.
 
 ## Witness commands
-Run from the repo root after `. ./hee4.env`; use `/usr/bin/grep` (the shell alias takes different
-flags).
+Run from the repo root after `. ./hee4.env`; use `/usr/bin/grep`, `/usr/bin/find`, `/usr/bin/ls` (this
+host aliases them). `UNIT` is the brief's UNIT field, else `adhoc-<date>`. The live ledger is
+`$FM_HOME/data/firstmate.db` read through `ops/firstmate/fm-db status|q` (read-only; write no LIMIT,
+fm-db caps rows at 200); `agents/ledger.tsv` is the offline fallback when `fmq` exits non-zero (20 no DB or refused,
+30 tursodb absent; PROTOCOL §4).
 ```
+UNIT="${UNIT:-$(/usr/bin/grep -m1 -oE '^UNIT[:=] *[^ ]+' "${BRIEF:-/dev/null}" | /usr/bin/grep -oE '[^ ]+$')}"; UNIT="${UNIT:-adhoc-$(date +%F)}"; echo "unit=$UNIT"   # BRIEF=<path> when the brief is a file
+mkdir -p "$HEE4_EVIDENCE/roster/hee4-watch-contradiction"; report="$HEE4_EVIDENCE/roster/hee4-watch-contradiction/$(date +%F)-$UNIT.md"; echo "report=$report"   # the one report file; dir created if absent
+[ -d "$HEE4_EVIDENCE/reviews" ] || echo "reviews=UNMEASURED ($HEE4_EVIDENCE/reviews absent)"
+fmq() { ops/firstmate/fm-db q "$1" | python3 -c 'import json,sys;d=json.load(sys.stdin);sys.exit(d["exit"]) if d["exit"] else [print(*r,sep="\t") for r in d["rows"]]'; }   # rows as TSV; rc 20/30 = fall back to the TSV
+ops/firstmate/fm-db status | head -c 600; echo                                                                      # open units, spawned vs planned, open andon
+fmq "SELECT s.agent, e.report_path FROM spawns s LEFT JOIN exits e USING(task_id) WHERE s.unit_id='$UNIT'" || awk -F'\t' -v u="$UNIT" 'NR>1 && $1==u {print $2"\t"$6}' agents/ledger.tsv   # the cards the unit touched come from these reports
 python3 ops/checks/cite_pins.py status; echo rc=$?                   # pins keys_cited=N fresh=k/N stale=0 ... ; rc 0 = all fresh
 python3 ops/checks/module_funnel.py | tail -2                        # resolved=k/n unknown_keys=0 ; verdict=PASS checks_failed=0
+python3 ops/checks/module_funnel.py | tail -1 | /usr/bin/grep -c -E 'verdict=PASS([^_]|$)'   # 1 = a clean PASS; PASS_WITH_GAPS does not count
 python3 ops/checks/funnel_trace.py | tail -1                         # funnel-trace modules=53 hops=10 misses=0 verdict=PASS
 ops/db/hee4db check 2>&1 | head -1                                   # hee4db check verdict=... measured=k/n checks=n
 ops/db/hee4db check 2>&1 | /usr/bin/grep -o '"check": "\(alignment_atlas\|alignment_um\|funnel_links\|funnel_phases\)", "verdict": "[A-Z_]*"'

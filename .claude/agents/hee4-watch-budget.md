@@ -43,9 +43,10 @@ are arithmetic over a TSV and a table: planned vs launched, spent vs budget, com
   you print, not 100%).
 
 ## Reads
-- ``$FM_HOME/data/firstmate.db` via `ops/firstmate/fm-db status` (fallback `agents/ledger.tsv`)` (columns `unit agent brief head_sha verdict report ts`; the `planned_agents=`
-  row is expected in the `verdict` field of a `hee4-coordinator` row, see Report); the unit's briefs
-  (`brief` column) for BUDGET and TIMEBOX.
+- `$FM_HOME/data/firstmate.db` via `ops/firstmate/fm-db status|q` (offline fallback `agents/ledger.tsv`, PROTOCOL §4): tables `units` (`planned_agents`), `spawns` (`fresh`), `briefs`, `exits`; in the TSV
+  fallback (columns `unit agent brief head_sha verdict report ts`) `planned_agents=` sits in the
+  `verdict` field of a `hee4-coordinator` row. The unit's briefs for BUDGET and TIMEBOX;
+  `$HEE4_EVIDENCE/reviews/` (absent is UNMEASURED).
 - `ops/roster/*/modes.conf` (`mode|budget_usd|prompt`); `hee4db schema roster_runs` (read the cost
   column name before any query); `hee4db recipe agents` (the `agent_status` view: spend and
   unmeasured-cost count over 24 h).
@@ -63,8 +64,9 @@ are arithmetic over a TSV and a table: planned vs launched, spent vs budget, com
   UNMEASURED and caps the verdict).
 
 ## Report shape
-1. RESTATEMENT; unit; `head_sha`; the `planned_agents=` row quoted (or its absence as a finding: the
-   ledger's seven columns have no planned_agents field, so record where it was found).
+1. RESTATEMENT; unit; `head_sha`; the report path (directory created with `mkdir -p` if absent);
+   the `planned_agents` row quoted (or its absence as a finding; in the TSV fallback record where it
+   was found).
 2. Per class: command, the printed numbers (`launched=k planned=N`, `spend=$x budget=$y pct=`,
    `commands=k budget=n`, `resumed=k`), and the door line missing.
 3. Nested fan-out: coordinator lines present or absent per nested agent.
@@ -73,14 +75,23 @@ Last line: `watch-budget verdict=PASS|PASS_WITH_GAPS|FAIL|STOP cases=k/n [reason
 = classes watched, k = classes measured clean; any UNMEASURED class caps at PASS_WITH_GAPS.
 
 ## Witness commands
-Run from the repo root after `. ./hee4.env`; `UNIT` is the unit id from the brief; use
-`/usr/bin/grep`.
+Run from the repo root after `. ./hee4.env`; use `/usr/bin/grep`, `/usr/bin/find`, `/usr/bin/ls` (this
+host aliases them). `UNIT` is the brief's UNIT field, else `adhoc-<date>`. The live ledger is
+`$FM_HOME/data/firstmate.db` read through `ops/firstmate/fm-db status|q` (read-only; write no LIMIT,
+fm-db caps rows at 200); `agents/ledger.tsv` is the offline fallback when `fmq` exits non-zero (20 no DB or refused,
+30 tursodb absent; PROTOCOL §4).
 ```
-/usr/bin/grep -n 'planned_agents=' `$FM_HOME/data/firstmate.db` via `ops/firstmate/fm-db status` (fallback `agents/ledger.tsv`) | /usr/bin/grep -F "$UNIT"                                        # the planned row; none → finding "fan-out without planned_agents"
-planned=$(/usr/bin/grep -F "$UNIT" `$FM_HOME/data/firstmate.db` via `ops/firstmate/fm-db status` (fallback `agents/ledger.tsv`) | /usr/bin/grep -o 'planned_agents=[0-9]*' | head -1 | cut -d= -f2); echo planned=${planned:-UNMEASURED}
-awk -F'\t' -v u="$UNIT" 'NR>1 && $1==u && $2!="hee4-coordinator" {n++} END{print "launched=" n+0}' `$FM_HOME/data/firstmate.db` via `ops/firstmate/fm-db status` (fallback `agents/ledger.tsv`)   # compare with planned; launched > planned is STOP
-awk -F'\t' -v u="$UNIT" 'NR>1 && $1==u {c[$2]++} END{for(a in c) if(c[a]>1) print "resumed_or_respawned " a " rows=" c[a]}' `$FM_HOME/data/firstmate.db` via `ops/firstmate/fm-db status` (fallback `agents/ledger.tsv`)   # more than one row per agent: fresh respawn (allowed once, §1) or a resume (finding)
-for b in $(awk -F'\t' -v u="$UNIT" 'NR>1 && $1==u {print $3}' `$FM_HOME/data/firstmate.db` via `ops/firstmate/fm-db status` (fallback `agents/ledger.tsv`) | sort -u); do [ -f "$b" ] && printf '%s %s %s\n' "$b" "$(/usr/bin/grep -m1 -E '^(BUDGET|TIMEBOX)' "$b")" "$(/usr/bin/grep -c -E '^BUDGET|^TIMEBOX' "$b")"; done   # a brief with no BUDGET or TIMEBOX line is a finding
+UNIT="${UNIT:-$(/usr/bin/grep -m1 -oE '^UNIT[:=] *[^ ]+' "${BRIEF:-/dev/null}" | /usr/bin/grep -oE '[^ ]+$')}"; UNIT="${UNIT:-adhoc-$(date +%F)}"; echo "unit=$UNIT"   # BRIEF=<path> when the brief is a file
+mkdir -p "$HEE4_EVIDENCE/roster/hee4-watch-budget"; report="$HEE4_EVIDENCE/roster/hee4-watch-budget/$(date +%F)-$UNIT.md"; echo "report=$report"   # the one report file; dir created if absent
+[ -d "$HEE4_EVIDENCE/reviews" ] || echo "reviews=UNMEASURED ($HEE4_EVIDENCE/reviews absent)"
+fmq() { ops/firstmate/fm-db q "$1" | python3 -c 'import json,sys;d=json.load(sys.stdin);sys.exit(d["exit"]) if d["exit"] else [print(*r,sep="\t") for r in d["rows"]]'; }   # rows as TSV; rc 20/30 = fall back to the TSV
+ops/firstmate/fm-db status | head -c 600; echo                                                                      # open units, spawned vs planned, open andon
+fmq "SELECT unit_id, planned_agents, mode, yolo FROM units WHERE unit_id='$UNIT'" || /usr/bin/grep -F "$UNIT" agents/ledger.tsv | /usr/bin/grep -n 'planned_agents='   # the planned row; none → finding "fan-out without planned_agents"
+planned=$(fmq "SELECT planned_agents FROM units WHERE unit_id='$UNIT'" || /usr/bin/grep -F "$UNIT" agents/ledger.tsv | /usr/bin/grep -o 'planned_agents=[0-9]*' | head -1 | cut -d= -f2); echo planned=${planned:-UNMEASURED}
+launched=$(fmq "SELECT count(*) FROM spawns WHERE unit_id='$UNIT' AND agent<>'hee4-coordinator'" || awk -F'\t' -v u="$UNIT" 'NR>1 && $1==u && $2!="hee4-coordinator" {n++} END{print n+0}' agents/ledger.tsv); echo launched=$launched   # launched > planned is STOP
+fmq "SELECT agent, count(*), sum(fresh=0) FROM spawns WHERE unit_id='$UNIT' GROUP BY agent HAVING count(*)>1" || awk -F'\t' -v u="$UNIT" 'NR>1 && $1==u {c[$2]++} END{for(a in c) if(c[a]>1) print a "\t" c[a]}' agents/ledger.tsv   # agent, rows, resumed(fresh=0): one fresh respawn is allowed (§1), a resume is a finding
+for b in $(fmq "SELECT path FROM briefs WHERE unit_id='$UNIT'" || awk -F'\t' -v u="$UNIT" 'NR>1 && $1==u {print $3}' agents/ledger.tsv | sort -u); do [ -f "$b" ] && printf '%s %s %s\n' "$b" "$(/usr/bin/grep -m1 -E '^(BUDGET|TIMEBOX)' "$b")" "$(/usr/bin/grep -c -E '^BUDGET|^TIMEBOX' "$b")"; done   # a brief with no BUDGET or TIMEBOX line is a finding
+for r in $(fmq "SELECT e.report_path FROM exits e JOIN spawns s USING(task_id) WHERE s.unit_id='$UNIT' AND e.report_path IS NOT NULL" || awk -F'\t' -v u="$UNIT" 'NR>1 && $1==u {print $6}' agents/ledger.tsv); do [ -f "$r" ] && printf '%s pass=%s gaps=%s cmds=%s\n' "$r" "$(/usr/bin/grep -c -E 'verdict=PASS([^_]|$)' "$r")" "$(/usr/bin/grep -c 'verdict=PASS_WITH_GAPS' "$r")" "$(/usr/bin/grep -c -E '^\$ |^```' "$r")"; done   # finished runs by exact verdict; cmds vs the brief's BUDGET
 ops/db/hee4db schema roster_runs | head -40                                                                            # read the cost column before the next line
 ops/db/hee4db recipe agents --table 2>&1 | head -30                                                                   # agent_status: spend_24h and unmeasured-cost count per agent
 cat ops/roster/*/modes.conf 2>/dev/null                                                                               # mode|budget_usd|prompt; 70% of budget_usd is the line you print

@@ -47,7 +47,8 @@ the refuter.
   `gates/REQUIREMENTS.md` ranks 2, 9, 10.
 - `hee4db schema module_budgets` (read the column names before any query; never guess them), `hee4db
   get drift D-05`.
-- The unit's ledger rows (`agents/ledger.tsv`) to know which files the builders touched.
+- The unit's ledger rows, `$FM_HOME/data/firstmate.db` via `ops/firstmate/fm-db status|q` (offline fallback `agents/ledger.tsv`, PROTOCOL §4), to know which files the builders touched;
+  `$HEE4_EVIDENCE/reviews/` (absent is UNMEASURED, never 0).
 
 ## Writes
 - The one report file above. Nothing else.
@@ -62,7 +63,8 @@ the refuter.
   (hold)`).
 
 ## Report shape
-1. RESTATEMENT; the unit and the tree (`head_sha` from `git rev-parse --short=12 HEAD`).
+1. RESTATEMENT; the unit and the tree (`head_sha` from `git rev-parse --short=12 HEAD`); the report
+   path, its directory created with `mkdir -p` if absent.
 2. One section per watched class: the command, the printed line, the bound, the rung it sits at and
    the rung-2 detector that should hold it.
 3. Findings by severity with ids (AP-nn, D-nn); repeat offenders get a next-rung proposal with the
@@ -73,9 +75,18 @@ Last line: `watch-drift verdict=PASS|PASS_WITH_GAPS|FAIL|STOP cases=k/n [reason=
 PASS_WITH_GAPS.
 
 ## Witness commands
-Run from the repo root after `. ./hee4.env`; use `/usr/bin/grep` and `/usr/bin/find` (the shell
-aliases take different flags).
+Run from the repo root after `. ./hee4.env`; use `/usr/bin/grep`, `/usr/bin/find`, `/usr/bin/ls` (this
+host aliases them). `UNIT` is the brief's UNIT field, else `adhoc-<date>`. The live ledger is
+`$FM_HOME/data/firstmate.db` read through `ops/firstmate/fm-db status|q` (read-only; write no LIMIT,
+fm-db caps rows at 200); `agents/ledger.tsv` is the offline fallback when `fmq` exits non-zero (20 no DB or refused,
+30 tursodb absent; PROTOCOL §4).
 ```
+UNIT="${UNIT:-$(/usr/bin/grep -m1 -oE '^UNIT[:=] *[^ ]+' "${BRIEF:-/dev/null}" | /usr/bin/grep -oE '[^ ]+$')}"; UNIT="${UNIT:-adhoc-$(date +%F)}"; echo "unit=$UNIT"   # BRIEF=<path> when the brief is a file
+mkdir -p "$HEE4_EVIDENCE/roster/hee4-watch-drift"; report="$HEE4_EVIDENCE/roster/hee4-watch-drift/$(date +%F)-$UNIT.md"; echo "report=$report"   # the one report file; dir created if absent
+[ -d "$HEE4_EVIDENCE/reviews" ] || echo "reviews=UNMEASURED ($HEE4_EVIDENCE/reviews absent)"
+fmq() { ops/firstmate/fm-db q "$1" | python3 -c 'import json,sys;d=json.load(sys.stdin);sys.exit(d["exit"]) if d["exit"] else [print(*r,sep="\t") for r in d["rows"]]'; }   # rows as TSV; rc 20/30 = fall back to the TSV
+ops/firstmate/fm-db status | head -c 600; echo                                                                      # open units, spawned vs planned, open andon
+fmq "SELECT s.agent, e.report_path FROM spawns s LEFT JOIN exits e USING(task_id) WHERE s.unit_id='$UNIT'" || awk -F'\t' -v u="$UNIT" 'NR>1 && $1==u {print $2"\t"$6}' agents/ledger.tsv   # the unit's agents and reports (which files the builders touched)
 python3 ops/checks/module_funnel.py | tail -1                       # verdict=... checks_failed=N
 python3 ops/checks/funnel_trace.py | tail -1                         # funnel-trace modules=53 hops=10 misses=0 (second homes, dangling hops)
 git grep -n -E 'BEGIN GENERATED|END GENERATED|<!-- *generated' -- ':!migrated' ':!docs/DRIFT_AND_OVERENGINEERING.md'   # D-08: expect no output

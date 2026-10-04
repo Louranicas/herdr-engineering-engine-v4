@@ -47,7 +47,7 @@ Opus because a fail-closed lattice is judgment over what counts as evidence (pst
 - Mutation score as evidence (Pitest, cargo-mutants): survivors enter as a tier-0 observation
   `survivors=k/n` with NOT_COMPILED and HUNG counted as survivors (REQUIREMENTS rank 7), never as a
   pass/fail word.
-- deep-diff-forge sealed observation: `input_sha256` + `tool{name,version}` + `--require-files` rc=7
+- deep-diff-forge sealed observation: `input_sha256` + `tool{name,version}` + `--require-files --require-hunks` rc=7
   (STACK-MAP §5) is the template every source must match before `decide` admits it.
 
 ## Reads

@@ -15,7 +15,7 @@ is the refuter's.
   `head_sha` (I3, STACK-MAP §3.2); a PASS whose only source is tier-1 (interrogate, swarm, arena, a
   Jev score; §3.1).
 - Rung it reports on: **2**. Each class has an admission door (`decide`, the coordinator's drop
-  rule, `--require-files`); a report that reached a reader unlabelled is a rung-4 catch of a rung-2
+  rule, `--require-files --require-hunks`); a report that reached a reader unlabelled is a rung-4 catch of a rung-2
   class.
 
 ## Law (PROTOCOL.md §1, §3, §5, §8; where it and this file disagree, PROTOCOL wins)
@@ -45,7 +45,7 @@ is the refuter's.
   author.
 
 ## Reads
-- The unit's ledger rows (`agents/ledger.tsv`, column `report`) for the report paths;
+- The unit's report paths from `$FM_HOME/data/firstmate.db` via `ops/firstmate/fm-db status|q` (offline fallback `agents/ledger.tsv`, PROTOCOL §4), `exits.report_path` (TSV column `report`);
   `$HEE4_EVIDENCE/roster/*/`, `$HEE4_EVIDENCE/reviews/` (create nothing; absent is UNMEASURED).
 - `~/.cache/hee4-just/verify-*/` (the latest `just verify` log) and `justfile` `verify` for the step
   list.
@@ -63,23 +63,32 @@ is the refuter's.
 - Counting a directory that does not exist as zero findings.
 
 ## Report shape
-1. RESTATEMENT; unit; `head_sha`; the report paths inspected (n).
+1. RESTATEMENT; unit; `head_sha`; the report paths inspected (n); your own report path, its
+   directory created with `mkdir -p` if absent.
 2. Per class: the command, the printed count with its denominator (lines or reports inspected), the
    offending lines quoted with path:line.
-3. Tier-1 PASS check: sources named near each `verdict=PASS`, and whether a tier-0 source is
-   present.
+3. Tier-1 PASS check: sources named near each exact `verdict=PASS` (not `PASS_WITH_GAPS`) in
+   report files under `roster/` and `reviews/` only, and whether a tier-0 source is present.
 4. Repeat offenders and the next-rung proposal.
 5. UNMEASURED items with reasons.
 Last line: `watch-evidence verdict=PASS|PASS_WITH_GAPS|FAIL|STOP cases=k/n [reason=…] head=<sha12>`,
 n = classes watched, k = classes measured clean; any UNMEASURED class caps at PASS_WITH_GAPS.
 
 ## Witness commands
-Run from the repo root after `. ./hee4.env`; use `/usr/bin/grep`; count array matches before any
-loop (LAW 9 nullglob).
+Run from the repo root after `. ./hee4.env`; use `/usr/bin/grep`, `/usr/bin/find`, `/usr/bin/ls` (this
+host aliases them). `UNIT` is the brief's UNIT field, else `adhoc-<date>`. The live ledger is
+`$FM_HOME/data/firstmate.db` read through `ops/firstmate/fm-db status|q` (read-only; write no LIMIT,
+fm-db caps rows at 200); `agents/ledger.tsv` is the offline fallback when `fmq` exits non-zero (20 no DB or refused,
+30 tursodb absent; PROTOCOL §4).
 ```
-reports=( $(awk -F'\t' -v u="$UNIT" 'NR>1 && $1==u {print $6}' agents/ledger.tsv) ); echo reports=${#reports[@]}   # the unit's report paths; 0 → UNMEASURED (no ledger rows)
-for r in "${reports[@]}"; do [ -f "$r" ] || { echo "absent $r"; continue; }; printf '%s pass=%s labels=%s witness=%s sha=%s\n' "$r" "$(/usr/bin/grep -c 'verdict=PASS' "$r")" "$(/usr/bin/grep -c -E 'MEASURED|INFERRED|UNMEASURED' "$r")" "$(/usr/bin/grep -c -E '^\$ |^```|witness' "$r")" "$(/usr/bin/grep -c -E 'head_sha|head=[0-9a-f]{12}|input_sha256' "$r")"; done   # pass>0 with labels=0 or witness=0 or sha=0 is a finding
+UNIT="${UNIT:-$(/usr/bin/grep -m1 -oE '^UNIT[:=] *[^ ]+' "${BRIEF:-/dev/null}" | /usr/bin/grep -oE '[^ ]+$')}"; UNIT="${UNIT:-adhoc-$(date +%F)}"; echo "unit=$UNIT"   # BRIEF=<path> when the brief is a file
+mkdir -p "$HEE4_EVIDENCE/roster/hee4-watch-evidence"; report="$HEE4_EVIDENCE/roster/hee4-watch-evidence/$(date +%F)-$UNIT.md"; echo "report=$report"   # the one report file; dir created if absent
+[ -d "$HEE4_EVIDENCE/reviews" ] || echo "reviews=UNMEASURED ($HEE4_EVIDENCE/reviews absent)"
+fmq() { ops/firstmate/fm-db q "$1" | python3 -c 'import json,sys;d=json.load(sys.stdin);sys.exit(d["exit"]) if d["exit"] else [print(*r,sep="\t") for r in d["rows"]]'; }   # rows as TSV; rc 20/30 = fall back to the TSV
+ops/firstmate/fm-db status | head -c 600; echo                                                                      # open units, spawned vs planned, open andon
+reports=( $(fmq "SELECT e.report_path FROM exits e JOIN spawns s USING(task_id) WHERE s.unit_id='$UNIT' AND e.report_path IS NOT NULL" || awk -F'\t' -v u="$UNIT" 'NR>1 && $1==u {print $6}' agents/ledger.tsv) ); echo reports=${#reports[@]}   # 0 → UNMEASURED (no ledger rows); count before any loop (LAW 9)
+for r in "${reports[@]}"; do [ -f "$r" ] || { echo "absent $r"; continue; }; printf '%s pass=%s gaps=%s labels=%s witness=%s sha=%s\n' "$r" "$(/usr/bin/grep -c -E 'verdict=PASS([^_]|$)' "$r")" "$(/usr/bin/grep -c 'verdict=PASS_WITH_GAPS' "$r")" "$(/usr/bin/grep -c -E 'MEASURED|INFERRED|UNMEASURED' "$r")" "$(/usr/bin/grep -c -E '^\$ |^```|witness' "$r")" "$(/usr/bin/grep -c -E 'head_sha|head=[0-9a-f]{12}|input_sha256' "$r")"; done   # pass>0 with labels=0 or witness=0 or sha=0 is a finding
 for r in "${reports[@]}"; do [ -f "$r" ] && /usr/bin/grep -n -E '\b(done|passes|verified|complete|all|none|every)\b' "$r" | /usr/bin/grep -v -E 'MEASURED|INFERRED|UNMEASURED'; done   # asserting sentences with no label
-for r in "${reports[@]}"; do [ -f "$r" ] && /usr/bin/grep -n -i -E 'interrogate|swarm|arena|advisory|jev' "$r" | /usr/bin/grep -i 'pass'; done     # a PASS leaning on a tier-1 source
-log=$(ls -dt ~/.cache/hee4-just/verify-* 2>/dev/null | head -1); echo "log=${log:-UNMEASURED (no verify log)}"; [ -n "$log" ] && tail -1 "$log"/* 2>/dev/null | /usr/bin/grep -E 'verify verdict=|steps=0/|UNMEASURED'   # a gate that looked at nothing
+for r in "${reports[@]}"; do case "$r" in "$HEE4_EVIDENCE"/roster/*|"$HEE4_EVIDENCE"/reviews/*) [ -f "$r" ] && /usr/bin/grep -n -i -E 'interrogate|swarm|arena|advisory|jev' "$r" | /usr/bin/grep -E 'verdict=PASS([^_]|$)';; *) echo "tier1_skip=$r (not a report under roster/ or reviews/)";; esac; done   # a PASS leaning on a tier-1 source; plan/brain text is out of scope
+log=$(/usr/bin/ls -dt ~/.cache/hee4-just/verify-* 2>/dev/null | head -1); echo "log=${log:-UNMEASURED (no verify log)}"; [ -n "$log" ] && tail -1 "$log"/* 2>/dev/null | /usr/bin/grep -E 'verify verdict=|steps=0/|UNMEASURED'   # a gate that looked at nothing
 ```
