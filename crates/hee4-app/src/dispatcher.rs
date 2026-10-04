@@ -240,14 +240,13 @@ pub fn step(engine: &Engine, cfg: &Config) -> Result<Option<(TaskId, Phase)>, Di
             )));
         }
     };
-    let ns = match NamespaceTask::new(
+    let ns = match NamespaceTask::with_door_root(
         task.clone(),
         engine.work(),
+        engine.doors(),
         needs_model,
         timebox(brief.get(BriefField::Timebox)),
-    )
-    .and_then(|ns| ns.with_door_root(engine.doors()))
-    {
+    ) {
         Ok(ns) => ns,
         Err(e) => {
             eprintln!("dispatch task={task} cause={e}");

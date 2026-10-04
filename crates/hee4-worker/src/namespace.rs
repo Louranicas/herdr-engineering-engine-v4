@@ -41,6 +41,31 @@ impl NamespaceTask {
         needs_model: bool,
         timeout: Duration,
     ) -> Result<Self, WorkerError> {
+        Self::with_door_root(task_id, work_root, work_root, needs_model, timeout)
+    }
+
+    /// [`new`](Self::new), with the door served from `door_root`: `<door_root>/<task_id>.model.sock`.
+    /// The runtime dir (`$XDG_RUNTIME_DIR/hee4`) is short and already the unit's; a work root
+    /// under a deep path pushed the door past [`DOOR_PATH_MAX`] once (the gate's export, 109
+    /// bytes). The length is checked only when the task needs the model, since a task without a
+    /// door never binds it.
+    ///
+    /// # Errors
+    /// [`WorkerError::WorkRoot`] as for `new`, or for a relative `door_root`;
+    /// [`WorkerError::DoorPath`] when `needs_model` and the door path would not fit `sun_path`.
+    pub fn with_door_root(
+        task_id: TaskId,
+        work_root: &Path,
+        door_root: &Path,
+        needs_model: bool,
+        timeout: Duration,
+    ) -> Result<Self, WorkerError> {
+        if !door_root.is_absolute() {
+            return Err(WorkerError::WorkRoot(format!(
+                "door root {} is relative",
+                door_root.display()
+            )));
+        }
         if !work_root.is_absolute() {
             return Err(WorkerError::WorkRoot(format!(
                 "{} is relative",
@@ -58,7 +83,14 @@ impl NamespaceTask {
                 work_dir.display()
             )));
         }
-        let door = door_under(work_root, &task_id)?;
+        let door = door_root.join(format!("{}.model.sock", task_id.as_str()));
+        let len = door.as_os_str().len();
+        if needs_model && len > DOOR_PATH_MAX {
+            return Err(WorkerError::DoorPath {
+                len,
+                max: DOOR_PATH_MAX,
+            });
+        }
         Ok(Self {
             task_id,
             work_dir,
@@ -66,24 +98,6 @@ impl NamespaceTask {
             needs_model,
             timeout,
         })
-    }
-
-    /// Serve the door from `root` instead of the work root: `<root>/<task_id>.model.sock`. The
-    /// runtime dir (`$XDG_RUNTIME_DIR/hee4`) is short and already the unit's; a work root under
-    /// a deep path pushed the door past [`DOOR_PATH_MAX`] once (the gate's export, 109 bytes).
-    ///
-    /// # Errors
-    /// [`WorkerError::WorkRoot`] for a relative root; [`WorkerError::DoorPath`] when the path
-    /// would not fit.
-    pub fn with_door_root(mut self, root: &Path) -> Result<Self, WorkerError> {
-        if !root.is_absolute() {
-            return Err(WorkerError::WorkRoot(format!(
-                "door root {} is relative",
-                root.display()
-            )));
-        }
-        self.door = door_under(root, &self.task_id)?;
-        Ok(self)
     }
 
     /// The task's id.
@@ -108,19 +122,6 @@ impl NamespaceTask {
 
 /// The longest socket path `bind(2)` takes on Linux: `sun_path` is 108 bytes with its NUL.
 pub const DOOR_PATH_MAX: usize = 107;
-
-/// `<root>/<task_id>.model.sock`, refused by name when it would not fit `sun_path`.
-fn door_under(root: &Path, task_id: &TaskId) -> Result<PathBuf, WorkerError> {
-    let door = root.join(format!("{}.model.sock", task_id.as_str()));
-    let len = door.as_os_str().len();
-    if len > DOOR_PATH_MAX {
-        return Err(WorkerError::DoorPath {
-            len,
-            max: DOOR_PATH_MAX,
-        });
-    }
-    Ok(door)
-}
 
 /// `$HEE4_WORK`, when set to a non-empty value.
 #[must_use]
@@ -199,7 +200,13 @@ mod tests {
 
     #[test]
     fn door_moves_to_the_door_root_and_the_work_dir_stays() -> R {
-        let t = task(true)?.with_door_root(Path::new("/run/user/1000/hee4"))?;
+        let t = NamespaceTask::with_door_root(
+            "t-1".parse()?,
+            Path::new("/var/hee4-work"),
+            Path::new("/run/user/1000/hee4"),
+            true,
+            Duration::from_secs(5),
+        )?;
         assert_eq!(
             t.door_path(),
             Path::new("/run/user/1000/hee4/t-1.model.sock")
@@ -220,23 +227,41 @@ mod tests {
     #[test]
     fn a_door_path_over_sun_path_is_refused_by_name() -> R {
         // A 92-byte root plus the 15-byte "/t-1.model.sock" is exactly the limit; one more is not.
+        let id = || "t-1".parse::<TaskId>();
+        let t = Duration::from_secs(5);
         let fits = PathBuf::from("/").join("d".repeat(DOOR_PATH_MAX - 16));
-        assert!(task(true)?.with_door_root(&fits).is_ok());
+        assert!(NamespaceTask::new(id()?, &fits, true, t).is_ok());
         let deep = PathBuf::from("/").join("d".repeat(DOOR_PATH_MAX - 15));
-        let Err(err) = NamespaceTask::new("t-1".parse()?, &deep, true, Duration::from_secs(5))
-        else {
+        let Err(err) = NamespaceTask::new(id()?, &deep, true, t) else {
             return Err("accepted a door path that cannot bind".into());
         };
         assert!(
             matches!(err, WorkerError::DoorPath { len, max } if len == max + 1 && max == DOOR_PATH_MAX),
             "{err}"
         );
-        let Err(err) = task(true)?.with_door_root(&deep) else {
+        // A deep work root with a short door root is fine: the door is what binds.
+        let short = Path::new("/run/user/1000/hee4");
+        let moved = NamespaceTask::with_door_root(id()?, &deep, short, true, t)?;
+        assert_eq!(moved.door_path(), short.join("t-1.model.sock"));
+        assert!(moved.work_dir().starts_with(&deep));
+        // The reverse is refused: a short work root cannot rescue a deep door root.
+        let Err(err) =
+            NamespaceTask::with_door_root(id()?, Path::new("/var/hee4-work"), &deep, true, t)
+        else {
             return Err("accepted a door root that cannot bind".into());
         };
         assert!(matches!(err, WorkerError::DoorPath { .. }), "{err}");
+        // No door, no bind: a task that needs no model is not refused for the door's length.
+        assert!(NamespaceTask::new(id()?, &deep, false, t).is_ok());
         assert!(
-            task(true)?.with_door_root(Path::new("rt")).is_err(),
+            NamespaceTask::with_door_root(
+                id()?,
+                Path::new("/var/hee4-work"),
+                Path::new("rt"),
+                true,
+                t
+            )
+            .is_err(),
             "a relative door root"
         );
         Ok(())
