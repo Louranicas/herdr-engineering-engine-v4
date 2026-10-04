@@ -55,9 +55,16 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), Box<dyn Error>> 
     Ok(())
 }
 
+/// The crate directory, read when the test runs: `env!` would bake the compile-time path into
+/// a binary the gate reuses across `git archive` exports.
+fn manifest_dir() -> Result<String, Box<dyn Error>> {
+    std::env::var("CARGO_MANIFEST_DIR")
+        .map_err(|e| format!("CARGO_MANIFEST_DIR is not set (run under cargo test): {e}").into())
+}
+
 #[test]
 fn no_sql_outside_store_rs() -> Result<(), Box<dyn Error>> {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let src = Path::new(&manifest_dir()?).join("src");
     let mut files = Vec::new();
     rust_files(&src, &mut files)?;
     let mut offenders = Vec::new();

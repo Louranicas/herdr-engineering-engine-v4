@@ -6,6 +6,7 @@ use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -110,22 +111,51 @@ pub fn bind(path: &Path) -> Result<UnixListener, BindError> {
     Ok(listener)
 }
 
-/// Serve connections forever, one thread per connection.
+/// Concurrent connections served; the next is refused `too_many_connections`.
+pub const MAX_CONNECTIONS: usize = 256;
+
+/// Frees one connection slot when the serving thread ends, however it ends.
+struct Slot(Arc<AtomicUsize>);
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Serve connections forever, one thread per connection, at most [`MAX_CONNECTIONS`] at once.
 pub fn serve(listener: &UnixListener, engine: &Arc<Engine>) {
+    let open = Arc::new(AtomicUsize::new(0));
     for conn in listener.incoming() {
-        let Ok(stream) = conn else { continue };
+        let Ok(mut stream) = conn else { continue };
+        if open.load(Ordering::Acquire) >= MAX_CONNECTIONS {
+            let fault = Fault::new(
+                Code::TooManyConnections,
+                "/",
+                format!("{MAX_CONNECTIONS} connections are open"),
+            );
+            let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
+            let _ = stream.write_all(format!("{}\n", wire::error("", &fault)).as_bytes());
+            continue;
+        }
+        open.fetch_add(1, Ordering::AcqRel);
+        let slot = Slot(Arc::clone(&open));
         let engine = Arc::clone(engine);
-        std::thread::spawn(move || match Admitted::check(stream) {
-            Ok(peer) => {
-                if let Err(e) = connection(peer, &engine) {
-                    eprintln!("socket connection ended: {e}");
+        std::thread::spawn(move || {
+            let _slot = slot;
+            match Admitted::check(stream) {
+                Ok(peer) => {
+                    if let Err(e) = connection(peer, &engine) {
+                        eprintln!("socket connection ended: {e}");
+                    }
                 }
-            }
-            Err((mut stream, fault)) => {
-                let fault = fault
-                    .unwrap_or_else(|| Fault::new(Code::Forbidden, "/", "SO_PEERCRED unreadable"));
-                eprintln!("socket refused peer: {}", fault.message);
-                let _ = stream.write_all(format!("{}\n", wire::error("", &fault)).as_bytes());
+                Err((mut stream, fault)) => {
+                    let fault = fault.unwrap_or_else(|| {
+                        Fault::new(Code::Forbidden, "/", "SO_PEERCRED unreadable")
+                    });
+                    eprintln!("socket refused peer: {}", fault.message);
+                    let _ = stream.write_all(format!("{}\n", wire::error("", &fault)).as_bytes());
+                }
             }
         });
     }
@@ -146,7 +176,12 @@ fn connection(peer: Admitted, engine: &Arc<Engine>) -> std::io::Result<()> {
             return Ok(());
         }
         if !line.ends_with('\n') {
-            // Oversize or EOF inside a record: close without dispatch (Socket and IPC Map).
+            // EOF inside a record closes silently; a full-bound read with no LF is oversize:
+            // refuse by name, then close. Neither is dispatched.
+            if n > MAX_FRAME_BYTES {
+                let fault = Fault::new(Code::FrameTooLarge, "/", "request line over 1048576 bytes");
+                writer.write_all(format!("{}\n", wire::error("", &fault)).as_bytes())?;
+            }
             return Ok(());
         }
         match answer(engine, line.trim_end()) {

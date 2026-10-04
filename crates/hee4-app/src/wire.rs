@@ -33,11 +33,15 @@ pub enum Code {
     NoRoute,
     /// `events.subscribe`: the subscriber fell a full queue behind; the stream closes.
     SlowConsumer,
+    /// A request line was longer than [`MAX_FRAME_BYTES`]; the connection closes after this frame.
+    FrameTooLarge,
+    /// The server already holds its cap of concurrent connections.
+    TooManyConnections,
 }
 
 impl Code {
     /// Every name, in declaration order (`ALL[c.ordinal()] == c`).
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 12] = [
         Self::InvalidArgument,
         Self::UnknownAction,
         Self::UnsupportedActionVersion,
@@ -48,6 +52,8 @@ impl Code {
         Self::Internal,
         Self::NoRoute,
         Self::SlowConsumer,
+        Self::FrameTooLarge,
+        Self::TooManyConnections,
     ];
 
     /// Position in [`Code::ALL`]. No wildcard arm: a new variant does not compile until it has
@@ -65,6 +71,8 @@ impl Code {
             Self::Internal => 7,
             Self::NoRoute => 8,
             Self::SlowConsumer => 9,
+            Self::FrameTooLarge => 10,
+            Self::TooManyConnections => 11,
         }
     }
 
@@ -82,6 +90,8 @@ impl Code {
             Self::Internal => "internal",
             Self::NoRoute => "no_route",
             Self::SlowConsumer => "slow_consumer",
+            Self::FrameTooLarge => "frame_too_large",
+            Self::TooManyConnections => "too_many_connections",
         }
     }
 
@@ -89,14 +99,17 @@ impl Code {
     #[must_use]
     pub const fn retry(self) -> &'static str {
         match self {
-            Self::NotReady | Self::NoRoute | Self::SlowConsumer => "after_condition",
+            Self::NotReady | Self::NoRoute | Self::SlowConsumer | Self::TooManyConnections => {
+                "after_condition"
+            }
             Self::Conflict => "after_readback",
             Self::Internal => "same_exact_request",
             Self::InvalidArgument
             | Self::UnknownAction
             | Self::UnsupportedActionVersion
             | Self::NotFound
-            | Self::Forbidden => "never",
+            | Self::Forbidden
+            | Self::FrameTooLarge => "never",
         }
     }
 }
