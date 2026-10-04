@@ -11,7 +11,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Instant;
 
-use hee4_contracts::{Brief, BriefField, Event, Phase, Resolution, Sha256Hex, TaskId};
+use hee4_contracts::{
+    AbandonReason, Brief, BriefField, Event, Phase, QuarantineReason, RecoveryRule, Resolution,
+    Sha256Hex, TaskId,
+};
 use hee4_core::{OperationKey, Store, StoreError};
 use hee4_host::model::OllamaClient;
 use hee4_worker::native::StepKind;
@@ -357,25 +360,83 @@ fn preview(engine: &Engine, body: &Value) -> Reply {
     }
 }
 
-/// `Store::apply(Resolve(..))`. The reason is journalled: `Event::Resolve` carries none.
+/// The wire spellings of `task.resolve`'s `reason`, per resolution. Nothing else is accepted.
+const ABANDON_REASONS: [(&str, AbandonReason); 8] = [
+    ("brief_unreadable", AbandonReason::BriefUnreadable),
+    (
+        "route_refused",
+        AbandonReason::RouteRefused { floor_unmet: false },
+    ),
+    (
+        "route_refused_floor_unmet",
+        AbandonReason::RouteRefused { floor_unmet: true },
+    ),
+    ("namespace_refused", AbandonReason::NamespaceRefused),
+    ("work_dir_unavailable", AbandonReason::WorkDirUnavailable),
+    ("head_unknown", AbandonReason::HeadUnknown),
+    ("no_permit", AbandonReason::NoPermit),
+    ("attempt_failed", AbandonReason::AttemptFailed),
+];
+
+/// The abandon reason when the operator names none.
+const DEFAULT_ABANDON: AbandonReason = AbandonReason::AttemptFailed;
+
+/// The quarantine reason when the operator names none.
+const DEFAULT_QUARANTINE: QuarantineReason = QuarantineReason::EffectUnknownPermanent {
+    rule: RecoveryRule::R10EffectAmbiguity,
+};
+
+/// The wire spelling of a quarantine reason: `effect_unknown_permanent_r01` .. `_r14`.
+fn quarantine_reason(wire: &str) -> Option<QuarantineReason> {
+    RecoveryRule::ALL
+        .iter()
+        .enumerate()
+        .find(|(i, _)| wire == format!("effect_unknown_permanent_r{:02}", i + 1))
+        .map(|(_, rule)| QuarantineReason::EffectUnknownPermanent { rule: *rule })
+}
+
+/// The typed `Resolution` for the wire's `resolution` and optional `reason`. An unknown
+/// resolution, an unknown reason, or a reason of the other resolution is `invalid_argument`.
+fn resolution_of(body: &Value) -> Result<Resolution, Fault> {
+    let bad_reason = || {
+        Fault::new(
+            Code::InvalidArgument,
+            "/body/reason",
+            "a reason this resolution defines",
+        )
+    };
+    let reason = match body.get("reason") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(r)) => Some(r.as_str()),
+        Some(_) => return Err(bad_reason()),
+    };
+    match body.get("resolution").and_then(Value::as_str) {
+        Some("quarantine") => reason
+            .map_or(Ok(DEFAULT_QUARANTINE), |r| {
+                quarantine_reason(r).ok_or_else(bad_reason)
+            })
+            .map(Resolution::Quarantine),
+        Some("abandon") => reason
+            .map_or(Ok(DEFAULT_ABANDON), |r| {
+                ABANDON_REASONS
+                    .iter()
+                    .find(|(wire, _)| *wire == r)
+                    .map(|(_, reason)| *reason)
+                    .ok_or_else(bad_reason)
+            })
+            .map(Resolution::Abandon),
+        _ => Err(Fault::new(
+            Code::InvalidArgument,
+            "/body/resolution",
+            "\"quarantine\" or \"abandon\"",
+        )),
+    }
+}
+
+/// `Store::apply(Resolve(..))`; the typed reason rides in the event.
 fn resolve(engine: &Engine, body: &Value) -> Reply {
     let task = task_id_of(body)?;
-    let resolution = match body.get("resolution").and_then(Value::as_str) {
-        Some("quarantine") => Resolution::Quarantine,
-        Some("abandon") => Resolution::Abandon,
-        _ => {
-            return Err(Fault::new(
-                Code::InvalidArgument,
-                "/body/resolution",
-                "\"quarantine\" or \"abandon\"",
-            ));
-        }
-    };
-    let reason = body
-        .get("reason")
-        .and_then(Value::as_str)
-        .filter(|r| !r.trim().is_empty())
-        .ok_or_else(|| Fault::new(Code::InvalidArgument, "/body/reason", "non-empty string"))?;
+    let resolution = resolution_of(body)?;
     let store = engine.store();
     phase_of(&store, &task)?;
     let phase = store
@@ -384,11 +445,7 @@ fn resolve(engine: &Engine, body: &Value) -> Reply {
             StoreError::Refused(r) => Fault::new(Code::Conflict, "/body/task_id", r.to_string()),
             other => internal(&other),
         })?;
-    // TODO(C2): the contracts have no resolution-reason enum yet (`Operator` equivalent);
-    // until then the operator's text is journalled, not ledgered.
-    eprintln!(
-        "resolve task={task} resolution={resolution:?} reason_kind=operator reason={reason:?}"
-    );
+    eprintln!("resolve task={task} resolution={resolution:?}");
     Ok((
         false,
         json!({"task_id": task.as_str(), "phase": phase.as_str()}),
@@ -512,22 +569,65 @@ mod tests {
         let e = engine("resolve")?;
         reconcile(&e.store(), &Observations::worker_absent())?;
         let id = handle(&e, &submit_line("k4", BRIEF))["body"]["task_id"].clone();
-        let q = json!({"task_id": id, "resolution": "quarantine", "reason": "op"});
+        let q = json!({"task_id": id, "resolution": "quarantine", "reason": "effect_unknown_permanent_r10"});
         let r = handle(&e, &line("task.resolve", Some("q1"), q.clone()));
         assert_eq!(r["body"]["phase"], "blocked");
         let no_key = handle(&e, &line("task.resolve", None, q));
         assert_eq!(no_key["field"], "/idempotency_key");
-        let bad = json!({"task_id": id, "resolution": "retry", "reason": "op"});
+        let bad = json!({"task_id": id, "resolution": "retry", "reason": "attempt_failed"});
         assert_eq!(
             handle(&e, &line("task.resolve", Some("q2"), bad))["field"],
             "/body/resolution"
         );
-        let a = json!({"task_id": id, "resolution": "abandon", "reason": "op"});
+        let a = json!({"task_id": id, "resolution": "abandon", "reason": "attempt_failed"});
         let r = handle(&e, &line("task.resolve", Some("a1"), a.clone()));
         assert_eq!(r["body"]["phase"], "abandoned");
         let again = handle(&e, &line("task.resolve", Some("a2"), a));
         assert_eq!(again["code"], "conflict");
         Ok(())
+    }
+
+    #[test]
+    fn resolve_reason_table_is_typed() {
+        let r = |res: &str, reason: Option<&str>| {
+            let mut b = json!({"resolution": res});
+            if let Some(x) = reason {
+                b["reason"] = json!(x);
+            }
+            resolution_of(&b)
+        };
+        for (wire, want) in ABANDON_REASONS {
+            assert_eq!(
+                r("abandon", Some(wire)).ok(),
+                Some(Resolution::Abandon(want))
+            );
+        }
+        assert_eq!(
+            r("abandon", None).ok(),
+            Some(Resolution::Abandon(DEFAULT_ABANDON))
+        );
+        assert_eq!(
+            r("quarantine", None).ok(),
+            Some(Resolution::Quarantine(DEFAULT_QUARANTINE))
+        );
+        for (i, rule) in RecoveryRule::ALL.iter().enumerate() {
+            let wire = format!("effect_unknown_permanent_r{:02}", i + 1);
+            assert_eq!(
+                r("quarantine", Some(&wire)).ok(),
+                Some(Resolution::Quarantine(
+                    QuarantineReason::EffectUnknownPermanent { rule: *rule }
+                ))
+            );
+        }
+        for bad in [
+            r("abandon", Some("operator")),
+            r("abandon", Some("")),
+            r("abandon", Some("effect_unknown_permanent_r01")),
+            r("quarantine", Some("attempt_failed")),
+            r("retry", None),
+        ] {
+            assert!(bad.is_err());
+        }
     }
 
     #[test]

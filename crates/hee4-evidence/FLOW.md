@@ -29,11 +29,12 @@ contribution, folded from a floor.
 | tier-0, bound | `evidence` empty | `Refused(invalid)` |
 | tier-0, bound | `elapsed_ms > budget_ms` | `Refused(timeout)` |
 | tier-0, bound | outcome `error` / `fail` / `pass` | `Refused(error)` / `Fail` / `Pass` |
+| tier-0, bound, in budget | outcome `refused{reason}` (exit 7) | `Refused(invalid)`; the reason is in the observation, whose content address is sealed in `observed` |
 
 `decide` never emits `Refused(cancelled)`; it is ranked only so the order is total.
 A missing `input_sha256` or `head_sha` cannot reach `decide`: the I3 type requires both (rung 1).
 
-Tests: `tests/lattice.rs` (18 single rows, 18 paired rows, 5832 ordered triples checked for
+Tests: `tests/lattice.rs` (24 single rows, 24 paired rows, 13824 ordered triples checked for
 order-independence, advisory-only-refuses, Pass-needs-tier-0, monotonicity),
 `tests/seal.rs` (order gives the same `hash_self`; a changed set changes it).
 
@@ -44,8 +45,8 @@ checked against the bytes it sent. `ddf::observe(diff, &subject, &clock, budget)
 
 - runs `deep-diff-forge --stdin-patch --rank --json --require-files --require-hunks` as a local
   process (no network, no shell);
-- exit 7 → `AdapterError::Refused{stderr_line}`; any other non-zero exit → `AdapterError::Exit`;
-  neither produces an observation, so neither can be a Pass;
+- exit 7 → a tier-0 observation with `Outcome::Refused{reason}` (first stderr line); any other
+  non-zero exit → `AdapterError::Exit` (no observation); neither can be a Pass;
 - stdout must be `deep-diff-forge.rank.v0`; its `input_sha256` must equal
   `Sha256Hex::digest(diff)` or `AdapterError::SealMismatch`; an empty `ranked` is
   `AdapterError::LookedAtNothing`;

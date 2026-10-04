@@ -31,7 +31,7 @@ EOF inside a line closes the connection with no reply (Socket and IPC Map).
 | `task.list` | `{}` | `{tasks: [{task_id, phase}]}` | `Store::task_ids`, `phase` |
 | `task.cancel` | `{task_id}` + `idempotency_key` | `{task_id, phase}` | `Store::apply(Event::Cancel)` |
 | `task.preview` | `{brief}` | `{eligible: true, model}` or `{eligible: false, refusal, message}` | `Brief::parse` + `check_restatement` + `dispatcher::route` (`route::select`); admits nothing |
-| `task.resolve` | `{task_id, resolution: "quarantine"\|"abandon", reason}` + `idempotency_key` | `{task_id, phase}` | `Store::apply(Event::Resolve(..))`; reason journalled (TODO(C2)) |
+| `task.resolve` | `{task_id, resolution: "quarantine"\|"abandon", reason?}` + `idempotency_key` | `{task_id, phase}` | `Store::apply(Event::Resolve(..))`; `reason` is a typed wire string from `actions.rs` `ABANDON_REASONS` / `effect_unknown_permanent_r01..r14` (default `attempt_failed` / `_r10`); an unknown one is `invalid_argument` |
 | `events.subscribe` | `{since_seq: u64\|null}` | ack `{since_seq, stream:"events"}`, then the stream below | read-only SQLite connection + `Store::history` |
 
 `head_sha` is baked by `build.rs`: env `HEE4_HEAD` (40 hex; the gate sets it, its export has no `.git`), else `git rev-parse HEAD`, else `unknown` (the dispatcher refuses to dispatch on `unknown`).
@@ -43,7 +43,7 @@ The brief text is written to `<W>/briefs/<task>.brief` under the same ledger loc
 
 | Name | Retry | When | Field |
 |---|---|---|---|
-| `invalid_argument` | never | line not a JSON object; `request_id`/`action`/`action_version`/`body` missing or mistyped; mutating action without `idempotency_key`; brief missing a field, duplicate field, empty RESTATEMENT; bad `task_id`; `resolution` not quarantine/abandon; empty `reason`; `since_seq` not a u64 | the member's pointer (`/`, `/body/brief`, …) |
+| `invalid_argument` | never | line not a JSON object; `request_id`/`action`/`action_version`/`body` missing or mistyped; mutating action without `idempotency_key`; brief missing a field, duplicate field, empty RESTATEMENT; bad `task_id`; `resolution` not quarantine/abandon; `reason` not in that resolution's table; `since_seq` not a u64 | the member's pointer (`/`, `/body/brief`, …) |
 | `unknown_action` | never | action not one of the eight | `/action` |
 | `unsupported_action_version` | never | `action_version` ≠ 1 | `/action_version` |
 | `not_ready` | after_condition | mutating action while the ledger's `recovery_complete` is false | `/action` |
@@ -66,10 +66,10 @@ DC proposal below.
 | Step | Door | On refusal |
 |---|---|---|
 | first `admitted` task | `Store::task_ids`, `phase` | — |
-| brief | `<W>/briefs/<task>.brief`, `Brief::parse` | `Resolve(Abandon)`, reason `brief_unreadable` journalled |
+| brief | `<W>/briefs/<task>.brief`, `Brief::parse` | `Resolve(Abandon(BriefUnreadable))` |
 | playbook | VERIFY lines: absolute path → `Run`; `model: <prompt>` → `Generate`; else `Unsupported` (named skip) | — |
-| route | `route::select` over a one-row roster (`HEE4_MODEL`, default `qwen2.5-coder:7b`), floor local-only, baseline = that model; availability probed (`tags`) only when a model step will run | `Resolve(Abandon)`, reason journalled |
-| namespace | `NamespaceTask::new(task, W, needs_model, TIMEBOX)` → `plan_for`; `needs_model` = a `Generate` step and `HEE4_LIVE_MODEL=1`, so no `--share-net` otherwise | `Resolve(Abandon)` |
+| route | `route::select` over a one-row roster (`HEE4_MODEL`, default `qwen2.5-coder:7b`), floor local-only, baseline = that model; availability probed (`tags`) only when a model step will run | `Resolve(Abandon(RouteRefused{floor_unmet}))` |
+| namespace | `NamespaceTask::new(task, W, needs_model, TIMEBOX)` → `plan_for`; `needs_model` = a `Generate` step and `HEE4_LIVE_MODEL=1` | `Resolve(Abandon(NamespaceRefused))`; work dir → `WorkDirUnavailable`; unknown head → `HeadUnknown`; door upstream unparsable → `NoPermit` |
 | permit | `Permit::mint(ReceiptId "r-<task>-<ns>", scope = the Run programs)` | — |
 | dispatch | `Store::apply(Dispatch)` → running (refused before reconcile by K1) | — |
 | attempt | `Attempt::run` (bwrap for Run steps; Generate steps skip with no loopback when not live, `UNMEASURED` printed) | error or a `Failed` step: `Settle(NotReady)` → `Stop` → failed, no receipt |
@@ -105,14 +105,12 @@ three threads. Resume with `since_seq` = the last `seq` received: exactly-once b
 
 - The brief lives in a file, not the ledger (no `Store` brief column or reader). A crash between
   `admit` and the write leaves an admitted task the dispatcher abandons by name.
-- `Event::Resolve` carries no reason: abandon reasons are journalled (stderr), not ledgered.
 - `health`'s CLI line prints `database=ready socket=owned` from a successful reply; no flock
   custody is held (S-2), so `socket=owned` is INFERRED.
 - `task.cancel` replays are not stored: a second cancel re-applies `Cancel` (legal self-edge).
   `task.resolve` likewise: a replayed resolve re-applies (abandon twice → `conflict`).
 - The stream reads `events` through a second, read-only SQLite connection: `Store` has no
   `events_since(seq)` reader (DC proposal). Writes stay `Store::*` only.
-- `task.resolve`'s reason is not ledgered (`Event::Resolve` carries none; TODO(C2)).
 - A bwrap child can outlive `kill -9` of `hee4` (re-parented to the user manager; seen in 2 of 7
   runs of `tests/e2e.rs`). The probe names it R07; nothing kills it in-process. Under the unit,
   `KillMode=control-group` kills it before restart.

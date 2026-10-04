@@ -1,7 +1,9 @@
 //! The lattice, by table: identities, binding, tier, outcome, budget, evidence.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use hee4_contracts::{Evidence, Observation, Outcome, Reason, Sha256Hex, ToolId, Verdict};
+use hee4_contracts::{
+    Evidence, Observation, Outcome, Reason, RefusalText, Sha256Hex, ToolId, Verdict,
+};
 use hee4_evidence::{Identities, Identity, Source, Subject, Why, decide};
 
 const HEAD: &str = "1111111111111111111111111111111111111111";
@@ -112,19 +114,25 @@ fn over_budget_tier0_is_timeout() {
     assert_eq!(v(&all_wired(), &[slow]), R(Reason::Timeout));
 }
 
-/// Every single observation in the 2 x 3 x 3 domain, alone and next to a bound tier-0 pass.
+/// Every single observation in the 2 x 4 x 3 domain, alone and next to a bound tier-0 pass.
 #[test]
 fn single_and_paired_table() {
     use Bind::{Bound, HeadOff, InputOff};
     use Outcome::{Error, Fail, Pass};
     use Tier::{Adv, T0};
+    let refused = || Outcome::Refused {
+        reason: "refused: 0 files".parse::<RefusalText>().unwrap(),
+    };
     let u = R(Reason::Unreconciled);
     #[rustfmt::skip]
-    let table: [(Tier, Outcome, Bind, Verdict, Verdict); 18] = [
+    let table: [(Tier, Outcome, Bind, Verdict, Verdict); 24] = [
         // tier, outcome, binding,   alone,              with a bound tier-0 Pass
         (T0,  Pass,  Bound,    Verdict::Pass,      Verdict::Pass),
         (T0,  Fail,  Bound,    Verdict::Fail,      Verdict::Fail),
         (T0,  Error, Bound,    R(Reason::Error),   R(Reason::Error)),
+        (T0,  refused(), Bound, R(Reason::Invalid), R(Reason::Invalid)),
+        (T0,  refused(), HeadOff, u, u),
+        (T0,  refused(), InputOff, u, u),
         (T0,  Pass,  HeadOff,  u, u),
         (T0,  Fail,  HeadOff,  u, u),
         (T0,  Error, HeadOff,  u, u),
@@ -134,6 +142,9 @@ fn single_and_paired_table() {
         (Adv, Pass,  Bound,    R(Reason::Invalid), Verdict::Pass),
         (Adv, Fail,  Bound,    R(Reason::Invalid), Verdict::Pass),
         (Adv, Error, Bound,    R(Reason::Invalid), Verdict::Pass),
+        (Adv, refused(), Bound, R(Reason::Invalid), Verdict::Pass),
+        (Adv, refused(), HeadOff, u, u),
+        (Adv, refused(), InputOff, u, u),
         (Adv, Pass,  HeadOff,  u, u),
         (Adv, Fail,  HeadOff,  u, u),
         (Adv, Error, HeadOff,  u, u),
@@ -143,7 +154,7 @@ fn single_and_paired_table() {
     ];
     let base = obs(T0, Pass, Bound);
     for (tier, outcome, bind, alone, paired) in table {
-        let o = obs(tier, outcome, bind);
+        let o = obs(tier, outcome.clone(), bind);
         assert_eq!(
             v(&all_wired(), std::slice::from_ref(&o)),
             alone,
@@ -160,9 +171,16 @@ fn single_and_paired_table() {
 fn domain() -> Vec<Observation> {
     let mut d = Vec::new();
     for tier in [Tier::T0, Tier::Adv] {
-        for outcome in [Outcome::Pass, Outcome::Fail, Outcome::Error] {
+        for outcome in [
+            Outcome::Pass,
+            Outcome::Fail,
+            Outcome::Error,
+            Outcome::Refused {
+                reason: "refused: 0 files".parse().unwrap(),
+            },
+        ] {
             for bind in [Bind::Bound, Bind::HeadOff, Bind::InputOff] {
-                d.push(obs(tier, outcome, bind));
+                d.push(obs(tier, outcome.clone(), bind));
             }
         }
     }
@@ -177,7 +195,7 @@ fn rank(x: Verdict) -> u8 {
     }
 }
 
-/// Over every ordered triple of the domain (18^3 = 5832 sets): order does not matter, an
+/// Over every ordered triple of the domain (24^3 = 13824 sets): order does not matter, an
 /// advisory never moves a verdict except to `Refused(Unreconciled)`, a Pass needs a bound
 /// tier-0 Pass, and adding a tier-0 observation never lowers a verdict that already had one.
 #[test]
@@ -211,5 +229,5 @@ fn exhaustive_laws_over_triples() {
             }
         }
     }
-    assert_eq!(cases, 5832);
+    assert_eq!(cases, 13_824);
 }

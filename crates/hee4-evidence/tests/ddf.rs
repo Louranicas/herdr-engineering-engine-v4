@@ -55,22 +55,43 @@ fn real_run_on_fixture_is_a_sealed_tier0_observation() {
 }
 
 #[test]
-fn exit_7_is_refused_with_the_stderr_line() {
+fn exit_7_is_a_tier0_refused_observation_that_decides_invalid() {
     if !present() {
         return;
     }
-    let header_only = b"diff --git a/x b/x\n";
-    match ddf::observe(header_only, &subject(), &TestClock::new(0), BUDGET) {
-        Err(AdapterError::Refused { stderr_line }) => {
-            assert!(stderr_line.starts_with("refused: 0"), "{stderr_line}");
+    let pin = |n: &str| {
+        Identity::Wired(Source {
+            name: n.parse().unwrap(),
+            digest: Sha256Hex::digest(n.as_bytes()),
+        })
+    };
+    let ids = Identities {
+        collector: pin("c"),
+        locks: pin("l"),
+        standards: pin("s"),
+    };
+    for (diff, reason) in [
+        (b"diff --git a/x b/x\n".as_slice(), None),
+        (
+            b"".as_slice(),
+            Some("refused: 0 files in input (--require-files)"),
+        ),
+    ] {
+        let mut subject = subject();
+        subject.input_sha256 = Sha256Hex::digest(diff);
+        let o = ddf::observe(diff, &subject, &TestClock::new(0), BUDGET).unwrap();
+        assert!(!o.advisory);
+        let Outcome::Refused { reason: got } = &o.outcome else {
+            panic!("expected Refused, got {:?}", o.outcome);
+        };
+        match reason {
+            Some(want) => assert_eq!(got.as_str(), want),
+            None => assert!(got.as_str().starts_with("refused: 0"), "{got}"),
         }
-        other => panic!("expected Refused, got {other:?}"),
-    }
-    match ddf::observe(b"", &subject(), &TestClock::new(0), BUDGET) {
-        Err(AdapterError::Refused { stderr_line }) => {
-            assert_eq!(stderr_line, "refused: 0 files in input (--require-files)");
-        }
-        other => panic!("expected Refused, got {other:?}"),
+        assert_eq!(
+            decide(&ids, &[o], &subject).verdict,
+            Verdict::Refused(Reason::Invalid)
+        );
     }
 }
 
@@ -143,4 +164,24 @@ fn a_tool_that_never_exits_is_killed_at_the_budget_and_refused_timeout() {
         decide(&ids, &[o], &subject()).verdict,
         Verdict::Refused(Reason::Timeout)
     );
+}
+
+#[test]
+fn a_silent_exit_7_still_carries_a_reason() {
+    let o = ddf::observe_with(
+        &stub("ddf-exit7-silent.sh"),
+        FIXTURE,
+        &subject(),
+        &TestClock::new(0),
+        BUDGET,
+    )
+    .unwrap();
+    let Outcome::Refused { reason } = &o.outcome else {
+        panic!("expected Refused, got {:?}", o.outcome);
+    };
+    assert_eq!(
+        reason.as_str(),
+        "deep-diff-forge exited 7 without a message"
+    );
+    assert!(!o.advisory);
 }
