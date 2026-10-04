@@ -48,6 +48,35 @@ class GateTests(unittest.TestCase):
         rc, out, _ = gate(d)
         self.assertEqual(rc, 0, out)
 
+    def test_step_env_carries_subject_sha_and_per_subject_target_dir(self):
+        chk = ('test "${#HEE4_HEAD}" = 40 && test "$HEE4_HEAD" = "$HEE4_GATE_SUBJECT" '
+               '&& test "$CARGO_TARGET_DIR" = "$HOME/.cache/hee4-gate-target/${HEE4_HEAD:0:12}"')
+        d, sha = make_repo(toml(("env", chk, 5, "none")))
+        rc, out, _ = gate(d)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out.count("target_dir="), 1)
+        self.assertIn(f"target_dir={os.path.expanduser('~')}/.cache/hee4-gate-target/{sha[:12]}\n", out)
+
+    def test_target_dir_flag_overrides(self):
+        d, _ = make_repo(toml(("env", 'test "$CARGO_TARGET_DIR" = /tmp/zz-td', 5, "none")))
+        rc, out, _ = gate(d, "t", "--target-dir", "/tmp/zz-td")
+        self.assertEqual(rc, 0, out); self.assertIn("target_dir=/tmp/zz-td\n", out)
+
+    def test_build_rs_in_gitless_export_bakes_subject_sha(self):
+        import subprocess, tempfile
+        src = os.path.join(os.path.dirname(TOOLS), "crates", "hee4-app", "build.rs")
+        tmp = tempfile.mkdtemp(prefix="gt-b-")
+        exe = os.path.join(tmp, "b")
+        subprocess.run(["rustc", "--edition", "2021", src, "-o", exe], check=True, capture_output=True)
+        d, sha = make_repo(toml(("a", "true", 5, "none")))
+        ex = tempfile.mkdtemp(prefix="gt-x-")
+        subprocess.run(f"git -C {d} archive {sha} | tar -x -C {ex}", shell=True, check=True)
+        self.assertFalse(os.path.exists(os.path.join(ex, ".git")))
+        rc, out, _ = run(exe, cwd=ex, env={"HEE4_HEAD": sha})
+        self.assertIn(f"cargo:rustc-env=HEE4_HEAD={sha}\n", out)
+        rc, out, _ = run(exe, cwd=ex, env={"HEE4_HEAD": "nothex"})
+        self.assertIn("cargo:rustc-env=HEE4_HEAD=unknown\n", out)
+
     def test_ddf_seals_input_sha256(self):
         d, _ = make_repo(toml(("ddf", "deep-diff-forge --stdin-patch --rank --json --require-files --require-hunks", 30, "ddf_sealed")))
         rc, out, _ = gate(d)

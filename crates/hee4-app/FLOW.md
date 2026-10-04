@@ -30,6 +30,8 @@ EOF inside a line closes the connection with no reply (Socket and IPC Map).
 | `task.list` | `{}` | `{tasks: [{task_id, phase}]}` | `Store::task_ids`, `phase` |
 | `task.cancel` | `{task_id}` + `idempotency_key` | `{task_id, phase}` | `Store::apply(Event::Cancel)` |
 
+`head_sha` is baked by `build.rs`: env `HEE4_HEAD` (40 hex; the gate sets it, its export has no `.git`), else `git rev-parse HEAD`, else `unknown` (the dispatcher refuses to dispatch on `unknown`).
+
 `task_id` = `t-` + 24 hex of SHA-256(`principal \n idempotency_key`), so a key names one task.
 The brief text is written to `<W>/briefs/<task>.brief` under the same ledger lock as `admit`.
 
