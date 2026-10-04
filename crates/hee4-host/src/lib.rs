@@ -5,4 +5,5 @@
 
 pub mod clock;
 pub mod model;
+pub mod model_door;
 pub mod spawn;

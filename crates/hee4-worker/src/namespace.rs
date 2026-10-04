@@ -21,7 +21,9 @@ pub const RO_BINDS_IF_PRESENT: [&str; 1] = ["/etc/alternatives"];
 pub struct NamespaceTask {
     task_id: TaskId,
     work_dir: PathBuf,
-    /// The task talks to the local model, so loopback is shared.
+    door: PathBuf,
+    /// The task talks to the local model, so the plan carries the model door. The candidate
+    /// never has a network either way.
     pub needs_model: bool,
     /// Kill the child after this long.
     pub timeout: Duration,
@@ -56,9 +58,11 @@ impl NamespaceTask {
                 work_dir.display()
             )));
         }
+        let door = work_root.join(format!("{}.model.sock", task_id.as_str()));
         Ok(Self {
             task_id,
             work_dir,
+            door,
             needs_model,
             timeout,
         })
@@ -74,6 +78,13 @@ impl NamespaceTask {
     #[must_use]
     pub fn work_dir(&self) -> &Path {
         &self.work_dir
+    }
+
+    /// `<work_root>/<task_id>.model.sock`: where the attempt serves the model door. A sibling of
+    /// the work dir, never inside it, so the candidate cannot replace it.
+    #[must_use]
+    pub fn door_path(&self) -> &Path {
+        &self.door
     }
 }
 
@@ -100,13 +111,15 @@ pub fn plan_for_with(task: &NamespaceTask, present: impl Fn(&Path) -> bool) -> N
         .map(PathBuf::from)
         .filter(|p| RO_BINDS.iter().any(|r| Path::new(r) == p) || present(p))
         .collect();
+    let model_door = task.needs_model.then(|| task.door.clone());
     let mut listed_mounts = ro_binds.clone();
     listed_mounts.push(task.work_dir.clone());
+    listed_mounts.extend(model_door.clone());
     NamespacePlan {
         listed_mounts,
         ro_binds,
         work_dir: task.work_dir.clone(),
-        allow_loopback: task.needs_model,
+        model_door,
         timeout: task.timeout,
     }
 }
@@ -136,9 +149,17 @@ mod tests {
     }
 
     #[test]
-    fn loopback_only_when_model_needed() -> R {
-        assert!(!plan_for(&task(false)?).allow_loopback);
-        assert!(plan_for(&task(true)?).allow_loopback);
+    fn door_only_when_model_needed() -> R {
+        assert_eq!(plan_for(&task(false)?).model_door, None);
+        let with = plan_for(&task(true)?);
+        assert_eq!(
+            with.model_door.as_deref(),
+            Some(Path::new("/var/hee4-work/t-1.model.sock"))
+        );
+        assert!(
+            with.listed_mounts
+                .contains(&"/var/hee4-work/t-1.model.sock".into())
+        );
         Ok(())
     }
 
@@ -159,10 +180,15 @@ mod tests {
         Ok(())
     }
 
-    /// Rung-2 door: through the host's own renderer, the only writable bind is the work dir.
+    /// Rung-2 door: through the host's own renderer, the only writable binds are the work dir
+    /// and the model door (a socket), and the network is unshared.
     #[test]
-    fn no_writable_bind_outside_work_dir() -> R {
-        let t = task(true)?;
+    fn no_writable_bind_outside_work_dir_and_door() -> R {
+        let root = std::env::temp_dir().join(format!("hee4-ns-{}", std::process::id()));
+        std::fs::create_dir_all(&root)?;
+        let t = NamespaceTask::new("t-1".parse()?, &root, true, Duration::from_secs(5))?;
+        let _ = std::fs::remove_file(t.door_path());
+        let _listener = std::os::unix::net::UnixListener::bind(t.door_path())?;
         let ns = plan_for_with(&t, |_| true);
         let permit = Permit::mint(
             ReceiptId("r".into()),
@@ -178,13 +204,16 @@ mod tests {
             },
             ns.clone(),
         )?;
-        let writable: Vec<&str> = sp
+        let writable: Vec<String> = sp
             .argv
             .windows(3)
             .filter(|w| w[0] == "--bind" || w[0] == "--dev-bind" || w[0] == "--tmpfs")
-            .map(|w| w[1].as_str())
+            .map(|w| w[1].clone())
             .collect();
-        assert_eq!(writable, vec!["/var/hee4-work/t-1"]);
+        let (work, door) = (t.work_dir().display(), t.door_path().display());
+        assert_eq!(writable, vec![work.to_string(), door.to_string()]);
+        assert!(sp.argv.iter().any(|a| a == "--unshare-net"));
+        assert!(!sp.argv.iter().any(|a| a == "--share-net"));
         for ro in &ns.ro_binds {
             assert!(
                 !t.work_dir().starts_with(ro),
@@ -192,6 +221,7 @@ mod tests {
                 ro.display()
             );
         }
+        let _ = std::fs::remove_dir_all(&root);
         Ok(())
     }
 

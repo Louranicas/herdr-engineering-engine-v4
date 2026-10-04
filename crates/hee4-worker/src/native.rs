@@ -1,11 +1,11 @@
-//! The native driver: runs one candidate attempt, step by step, against the local model.
+//! The native driver: runs one candidate attempt, step by step.
 //!
-//! Model calls are made by this process through `hee4_host::model` (the plan's loopback is for
-//! processes the steps spawn); command steps run inside bwrap through the spawn door. A step the
-//! driver does not run is recorded as [`StepStatus::Skipped`] with its reason, never dropped.
+//! This process makes no model call. Command steps run inside bwrap with no network; when the
+//! plan carries a model door, [`Attempt::run`] serves it for the whole attempt
+//! (`hee4_host::model_door`), the candidate finds it at `$HEE4_MODEL_SOCKET`, and every request
+//! through it becomes `model_request` evidence on one observation. A step the driver does not run
+//! is recorded as [`StepStatus::Skipped`] with its reason, never dropped.
 
-use std::collections::hash_map::RandomState;
-use std::hash::{BuildHasher, Hasher};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -13,18 +13,20 @@ use hee4_contracts::{
     Brief, Evidence, GitSha, Observation, Outcome, Sha256Hex, SourceId, ToolId, ToolName,
     ToolVersion,
 };
-use hee4_host::model::{ModelError, OllamaClient};
+use hee4_host::model_door::{self, DoorBudget, DoorFate, DoorRequest, Upstream};
 use hee4_host::spawn::{self, Command, NamespacePlan, Permit, SpawnError};
 
 use crate::WorkerError;
 
-/// The env guard for the real model call.
+/// The env guard for a live attempt (one whose candidate may reach the real model).
 pub const LIVE_ENV: &str = "HEE4_LIVE_MODEL";
 
 /// What one playbook step asks for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StepKind {
-    /// Send `prompt` to the model.
+    /// A model prompt named by the playbook. The driver no longer calls the model itself, so it
+    /// records this step as skipped; a `Run` step's own command talks to the model through the
+    /// door.
     Generate {
         /// The exact prompt.
         prompt: String,
@@ -55,7 +57,7 @@ pub struct Step {
 /// What happened to one step.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StepStatus {
-    /// The step ran to its end. `exit` is the process exit for a run step, `None` for a model step.
+    /// The step ran to its end. `exit` is the process exit.
     Done {
         /// Process exit code, if a process ran.
         exit: Option<i32>,
@@ -69,7 +71,7 @@ pub enum StepStatus {
     Failed {
         /// Why.
         cause: String,
-        /// Model attempts made (1 for a run step).
+        /// Process attempts made (always 1).
         attempts: u32,
     },
 }
@@ -83,23 +85,12 @@ pub struct StepRecord {
     pub status: StepStatus,
 }
 
-/// A retry that happened, printed as `attempt=k/n backoff_ms=`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RetryNote {
-    /// The attempt that failed, 1-based.
-    pub attempt: u32,
-    /// The attempt limit.
-    pub of: u32,
-    /// The sleep before the next attempt.
-    pub backoff_ms: u64,
-}
-
 /// Everything one attempt produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttemptOutcome {
     /// Every playbook step, in order, one record each.
     pub steps: Vec<StepRecord>,
-    /// Process and model output, concatenated in step order.
+    /// Process stdout, concatenated in step order.
     pub stdout: Vec<u8>,
     /// Process stderr, concatenated in step order.
     pub stderr: Vec<u8>,
@@ -107,47 +98,12 @@ pub struct AttemptOutcome {
     pub exit: Option<i32>,
     /// Wall time of the whole attempt.
     pub elapsed: Duration,
-    /// Candidate observations, one per model step that was tried (never advisory).
+    /// Candidate observations: one for the model door when any request went through it (never
+    /// advisory); none otherwise, since a source that saw nothing is not evidence.
     pub observations: Vec<Observation>,
-    /// Retries taken.
-    pub retries: Vec<RetryNote>,
-}
-
-/// Bounded retry with jittered exponential backoff, for `ModelUnreachable` only.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RetryPolicy {
-    /// Total model calls allowed per step.
-    pub max_attempts: u32,
-    /// Backoff before the second call, ms (doubles each time).
-    pub base_ms: u64,
-    /// Backoff ceiling, ms.
-    pub cap_ms: u64,
-}
-
-impl RetryPolicy {
-    /// Three attempts, 200 ms base, 2 s cap. UNMEASURED: K1 `budget` is not built yet, so these
-    /// literals are the stand-in (DC proposal in the report).
-    pub const DEFAULT: Self = Self {
-        max_attempts: 3,
-        base_ms: 200,
-        cap_ms: 2_000,
-    };
-
-    /// Backoff after failed attempt `attempt` (1-based): half to full of `min(cap, base*2^(k-1))`.
-    #[must_use]
-    pub fn backoff(&self, attempt: u32, entropy: u64) -> Duration {
-        let full = self
-            .base_ms
-            .saturating_mul(1u64 << attempt.saturating_sub(1).min(20))
-            .min(self.cap_ms);
-        let half = full / 2;
-        let spread = full - half + 1;
-        Duration::from_millis(half + entropy % spread)
-    }
-}
-
-fn entropy() -> u64 {
-    RandomState::new().build_hasher().finish()
+    /// Every request the door saw, with its body byte count (the contracts' `Evidence` has no
+    /// byte field; DC proposal).
+    pub model_requests: Vec<DoorRequest>,
 }
 
 /// One candidate attempt's configuration.
@@ -157,25 +113,22 @@ pub struct Attempt {
     pub model: String,
     /// The commit the candidate is built on.
     pub head_sha: GitSha,
-    /// Per-call model timeout.
-    pub call_timeout: Duration,
-    /// Retry policy for an unreachable model.
-    pub retry: RetryPolicy,
+    /// Limits on the model door.
+    pub door_budget: DoorBudget,
 }
 
 impl Attempt {
-    /// An attempt with a 60 s call timeout and [`RetryPolicy::DEFAULT`].
+    /// An attempt with [`DoorBudget::DEFAULT`].
     #[must_use]
     pub fn new(model: &str, head_sha: GitSha) -> Self {
         Self {
             model: model.to_owned(),
             head_sha,
-            call_timeout: Duration::from_secs(60),
-            retry: RetryPolicy::DEFAULT,
+            door_budget: DoorBudget::DEFAULT,
         }
     }
 
-    /// The real-model entry: runs only when `HEE4_LIVE_MODEL=1`; otherwise prints UNMEASURED and
+    /// The live entry: runs only when `HEE4_LIVE_MODEL=1`; otherwise prints UNMEASURED and
     /// returns an outcome with every step `Skipped`.
     ///
     /// # Errors
@@ -184,14 +137,14 @@ impl Attempt {
         &self,
         permit: &Permit,
         plan: &NamespacePlan,
-        model: &OllamaClient,
+        upstream: Upstream,
         brief: &Brief,
         playbook: &[Step],
     ) -> Result<AttemptOutcome, WorkerError> {
         if std::env::var(LIVE_ENV).as_deref() == Ok("1") {
-            return self.run(permit, plan, model, brief, playbook);
+            return self.run(permit, plan, upstream, brief, playbook);
         }
-        eprintln!("UNMEASURED: live model not called ({LIVE_ENV}!=1)");
+        eprintln!("UNMEASURED: live attempt not run ({LIVE_ENV}!=1)");
         brief.check_restatement()?;
         let reason = format!("{LIVE_ENV} unset");
         Ok(AttemptOutcome {
@@ -209,27 +162,33 @@ impl Attempt {
             exit: None,
             elapsed: Duration::ZERO,
             observations: Vec::new(),
-            retries: Vec::new(),
+            model_requests: Vec::new(),
         })
     }
 
-    /// Drive `playbook` in order. After a failed step every later step is `Skipped`.
+    /// Drive `playbook` in order. After a failed step every later step is `Skipped`. When the
+    /// plan carries a model door, the door forwards to `upstream` for the whole attempt and is
+    /// closed (socket removed) before this returns.
     ///
     /// # Errors
     /// [`WorkerError::Contract`] for a brief with an empty RESTATEMENT or an unparseable token,
-    /// [`WorkerError::Host`] when the spawn door refuses a run step, [`WorkerError::Spawn`] when a
-    /// process cannot start. A timed-out process and a failed model call are recorded as
-    /// [`StepStatus::Failed`], not errors.
+    /// [`WorkerError::Door`] when the door cannot open, [`WorkerError::Host`] when the spawn door
+    /// refuses a run step, [`WorkerError::Spawn`] when a process cannot start. A timed-out or
+    /// failing process is recorded as [`StepStatus::Failed`], not an error.
     pub fn run(
         &self,
         permit: &Permit,
         plan: &NamespacePlan,
-        model: &OllamaClient,
+        upstream: Upstream,
         brief: &Brief,
         playbook: &[Step],
     ) -> Result<AttemptOutcome, WorkerError> {
         brief.check_restatement()?;
         let start = Instant::now();
+        let door = match &plan.model_door {
+            Some(path) => Some(model_door::serve(path, upstream, self.door_budget)?),
+            None => None,
+        };
         let mut out = AttemptOutcome {
             steps: Vec::new(),
             stdout: Vec::new(),
@@ -237,7 +196,7 @@ impl Attempt {
             exit: None,
             elapsed: Duration::ZERO,
             observations: Vec::new(),
-            retries: Vec::new(),
+            model_requests: Vec::new(),
         };
         let mut failed = false;
         for step in playbook {
@@ -248,10 +207,10 @@ impl Attempt {
                     StepKind::Unsupported { kind } => {
                         skip(&format!("driver has no handler for step kind {kind}"))
                     }
-                    StepKind::Generate { .. } if !plan.allow_loopback => {
-                        skip("plan does not allow the model (no loopback)")
-                    }
-                    StepKind::Generate { prompt } => self.generate(model, prompt, &mut out)?,
+                    StepKind::Generate { .. } => skip(
+                        "the driver makes no model call; a run step reaches the model \
+                         through HEE4_MODEL_SOCKET",
+                    ),
                     StepKind::Run { program, args } => {
                         run_step(permit, plan, program, args, &mut out)?
                     }
@@ -264,74 +223,64 @@ impl Attempt {
             });
         }
         out.elapsed = start.elapsed();
+        if let Some(door) = door {
+            out.model_requests = door.close();
+            let budget_ms = u64::try_from(plan.timeout.as_millis()).unwrap_or(u64::MAX);
+            if let Some(ob) = self.door_observation(&out.model_requests, out.elapsed, budget_ms)? {
+                out.observations.push(ob);
+            }
+        }
         Ok(out)
     }
 
-    fn generate(
+    /// One observation for the door's log: one `model_request` evidence per request, `Pass` only
+    /// when every request was forwarded. `input_sha256` digests the request digests in order.
+    /// `None` when no request came through.
+    ///
+    /// # Errors
+    /// [`WorkerError::Contract`] when a token does not parse (the model name as a tool version).
+    pub fn door_observation(
         &self,
-        client: &OllamaClient,
-        prompt: &str,
-        out: &mut AttemptOutcome,
-    ) -> Result<StepStatus, WorkerError> {
-        let t0 = Instant::now();
-        let mut attempts = 0;
-        let result = loop {
-            attempts += 1;
-            match client.generate(&self.model, prompt, self.call_timeout) {
-                Err(ModelError::ModelUnreachable(_)) if attempts < self.retry.max_attempts => {
-                    let wait = self.retry.backoff(attempts, entropy());
-                    let note = RetryNote {
-                        attempt: attempts,
-                        of: self.retry.max_attempts,
-                        backoff_ms: u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
-                    };
-                    eprintln!(
-                        "attempt={}/{} backoff_ms={}",
-                        note.attempt, note.of, note.backoff_ms
-                    );
-                    out.retries.push(note);
-                    std::thread::sleep(wait);
-                }
-                other => break other,
-            }
-        };
-        let elapsed_ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX);
-        let (outcome, evidence, status) = match result {
-            Ok(g) => {
-                out.stdout.extend_from_slice(g.text.as_bytes());
-                (
-                    Outcome::Pass,
-                    vec![Evidence {
-                        label: "generation".parse()?,
-                        sha256: Sha256Hex::digest(g.text.as_bytes()),
-                    }],
-                    StepStatus::Done { exit: None },
-                )
-            }
-            Err(e) => (
-                Outcome::Error,
-                Vec::new(),
-                StepStatus::Failed {
-                    cause: e.to_string(),
-                    attempts,
-                },
-            ),
-        };
-        out.observations.push(Observation {
+        requests: &[DoorRequest],
+        elapsed: Duration,
+        budget_ms: u64,
+    ) -> Result<Option<Observation>, WorkerError> {
+        if requests.is_empty() {
+            return Ok(None);
+        }
+        let mut joined = String::new();
+        for r in requests {
+            joined.push_str(&r.sha256.to_string());
+            joined.push('\n');
+        }
+        let evidence = requests
+            .iter()
+            .map(|r| {
+                Ok(Evidence {
+                    label: "model_request".parse()?,
+                    sha256: r.sha256,
+                })
+            })
+            .collect::<Result<Vec<_>, WorkerError>>()?;
+        let all_forwarded = requests.iter().all(|r| r.fate == DoorFate::Forwarded);
+        Ok(Some(Observation {
             source: "hee4-worker-native".parse::<SourceId>()?,
-            input_sha256: Sha256Hex::digest(prompt.as_bytes()),
+            input_sha256: Sha256Hex::digest(joined.as_bytes()),
             tool: ToolId {
-                name: "ollama".parse::<ToolName>()?,
+                name: "model-door".parse::<ToolName>()?,
                 version: self.model.parse::<ToolVersion>()?,
             },
             head_sha: self.head_sha.clone(),
-            outcome,
+            outcome: if all_forwarded {
+                Outcome::Pass
+            } else {
+                Outcome::Error
+            },
             evidence,
             advisory: false,
-            elapsed_ms,
-            budget_ms: u64::try_from(self.call_timeout.as_millis()).unwrap_or(u64::MAX),
-        });
-        Ok(status)
+            elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+            budget_ms,
+        }))
     }
 }
 
@@ -386,57 +335,72 @@ mod tests {
     use hee4_host::spawn::{ReceiptId, SpawnScope};
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
 
     const BRIEF: &str = "GOAL: g\nSCOPE: s\nCONTEXT: c\nACCEPTANCE: a\nVERIFY: v\nTIMEBOX: t\nFORBIDDEN: f\nREPORT: r\nSTANDING: s\nRECON: r\nRESTATEMENT: I restate the goal.";
+    const TAGS: &str = r#"{"models":[{"name":"mock:1"}]}"#;
 
-    fn http(body: &str) -> String {
-        format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        )
-    }
-
-    /// Mock on 127.0.0.1: drops the first `refuse` connections unanswered, then answers every one.
-    fn mock(refuse: usize, reply: String) -> std::io::Result<String> {
+    /// Mock upstream on 127.0.0.1 answering every connection with `TAGS`; counts connections.
+    fn mock() -> std::io::Result<(Upstream, u16, Arc<AtomicUsize>)> {
         let l = TcpListener::bind("127.0.0.1:0")?;
-        let addr = l.local_addr()?;
+        let port = l.local_addr()?.port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = Arc::clone(&hits);
         thread::spawn(move || {
-            for (i, conn) in l.incoming().enumerate() {
+            for conn in l.incoming() {
                 let Ok(mut s) = conn else { continue };
+                h.fetch_add(1, Ordering::SeqCst);
                 let mut buf = [0u8; 8192];
                 let _ = s.read(&mut buf);
-                if i >= refuse {
-                    let _ = s.write_all(reply.as_bytes());
-                }
+                let _ = s.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{TAGS}",
+                        TAGS.len()
+                    )
+                    .as_bytes(),
+                );
             }
         });
-        Ok(format!("http://{addr}"))
+        let up = Upstream::parse(&format!("http://127.0.0.1:{port}"))
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        Ok((up, port, hits))
     }
 
+    fn closed() -> Result<Upstream, Box<dyn std::error::Error>> {
+        Ok(Upstream::parse("http://127.0.0.1:9")?)
+    }
+
+    /// A fresh work root per test (`name`), so concurrent tests never share a door path.
     fn fixture(
+        name: &str,
         needs_model: bool,
         programs: &[&str],
     ) -> Result<(Permit, NamespacePlan, Brief, Attempt), Box<dyn std::error::Error>> {
+        let root = std::env::temp_dir().join(format!("hee4-nat-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&root)?;
         let permit = Permit::mint(
             ReceiptId("r1".into()),
             SpawnScope {
                 programs: programs.iter().map(PathBuf::from).collect(),
             },
         );
-        let task = NamespaceTask::new(
-            "t1".parse()?,
-            std::path::Path::new("/tmp"),
-            needs_model,
-            Duration::from_secs(10),
-        )?;
-        let mut a = Attempt::new("qwen:7b", "a".repeat(40).parse()?);
-        a.retry = RetryPolicy {
-            max_attempts: 3,
-            base_ms: 2,
-            cap_ms: 10,
-        };
+        let task = NamespaceTask::new("t1".parse()?, &root, needs_model, Duration::from_secs(20))?;
+        std::fs::create_dir_all(task.work_dir())?;
+        let a = Attempt::new("qwen:7b", "a".repeat(40).parse()?);
         Ok((permit, plan_for(&task), Brief::parse(BRIEF)?, a))
+    }
+
+    fn run_step(name: &str, program: &str, args: &[&str]) -> Step {
+        Step {
+            name: name.into(),
+            kind: StepKind::Run {
+                program: program.into(),
+                args: args.iter().map(|a| (*a).to_owned()).collect(),
+            },
+        }
     }
 
     fn gen_step(p: &str) -> Step {
@@ -446,84 +410,124 @@ mod tests {
         }
     }
 
-    const ANSWER: &str = r#"{"response":"hello","eval_count":3,"total_duration":2000000}"#;
+    fn sandbox_tools() -> bool {
+        let ok = ["/usr/bin/curl", "/usr/bin/sh", spawn::BWRAP]
+            .iter()
+            .all(|p| Path::new(p).exists());
+        if !ok {
+            println!("UNMEASURED: bwrap, sh or curl absent; sandbox test skipped");
+        }
+        ok
+    }
 
+    /// Acceptance 3 and 4: in a real `--unshare-net` bwrap sandbox the candidate reaches the
+    /// mock model only through the door (found via `$HEE4_MODEL_SOCKET`), and direct TCP to the
+    /// mock's own live port, or to 127.0.0.1:11434, fails. Each forwarded request is evidence.
     #[test]
-    fn model_step_builds_a_candidate_observation() -> R {
-        let url = mock(0, http(ANSWER))?;
-        let (permit, plan, brief, a) = fixture(true, &[])?;
-        let o = a.run(
-            &permit,
-            &plan,
-            &OllamaClient::new(&url),
-            &brief,
-            &[gen_step("say hi")],
-        )?;
-        assert_eq!(o.steps[0].status, StepStatus::Done { exit: None });
-        assert_eq!(o.stdout, b"hello");
+    fn sandbox_reaches_model_only_through_door() -> R {
+        if !sandbox_tools() {
+            return Ok(());
+        }
+        let (up, port, hits) = mock()?;
+        let (permit, plan, brief, a) = fixture("door", true, &["/usr/bin/sh", "/usr/bin/curl"])?;
+        let door = plan.model_door.clone().ok_or("no door in plan")?;
+        let through = run_step(
+            "through-door",
+            "/usr/bin/sh",
+            &[
+                "-c",
+                r#"/usr/bin/curl -sS -m 5 --unix-socket "$HEE4_MODEL_SOCKET" http://model/api/tags"#,
+            ],
+        );
+        let direct = format!("http://127.0.0.1:{port}/api/tags");
+        let direct_step = run_step("direct-mock", "/usr/bin/curl", &["-sS", "-m", "3", &direct]);
+        let o = a.run(&permit, &plan, up, &brief, &[through, direct_step])?;
+        let stdout = String::from_utf8_lossy(&o.stdout);
+        let stderr = String::from_utf8_lossy(&o.stderr);
+        println!(
+            "SANDBOX positive: curl --unix-socket {} http://model/api/tags -> {:?} stdout={stdout}",
+            door.display(),
+            o.steps[0].status
+        );
+        println!(
+            "SANDBOX negative: curl {direct} -> {:?} stderr={}",
+            o.steps[1].status,
+            stderr.trim()
+        );
+        assert_eq!(o.steps[0].status, StepStatus::Done { exit: Some(0) });
+        assert_eq!(stdout, TAGS);
+        assert!(matches!(o.steps[1].status, StepStatus::Failed { .. }));
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "only the door's forward hit the mock"
+        );
+        assert!(!door.exists(), "door socket removed after the attempt");
+        assert_eq!(o.model_requests.len(), 1);
+        assert_eq!(o.model_requests[0].bytes, 0);
+        assert_eq!(o.model_requests[0].fate, DoorFate::Forwarded);
         assert_eq!(o.observations.len(), 1);
         let ob = &o.observations[0];
+        assert_eq!(ob.outcome, Outcome::Pass);
         assert!(!ob.advisory);
-        assert_eq!(ob.input_sha256, Sha256Hex::digest(b"say hi"));
         assert_eq!(
             (ob.tool.name.as_str(), ob.tool.version.as_str()),
-            ("ollama", "qwen:7b")
+            ("model-door", "qwen:7b")
         );
-        assert_eq!(ob.outcome, Outcome::Pass);
-        assert_eq!(ob.evidence[0].sha256, Sha256Hex::digest(b"hello"));
+        assert_eq!(ob.evidence.len(), 1);
+        assert_eq!(ob.evidence[0].label.as_str(), "model_request");
+        assert_eq!(ob.evidence[0].sha256, Sha256Hex::digest(b""));
+
+        let (permit, plan, brief, a) = fixture("ollama", true, &["/usr/bin/curl"])?;
+        let ollama = run_step(
+            "direct-11434",
+            "/usr/bin/curl",
+            &["-sS", "-m", "3", "http://127.0.0.1:11434/"],
+        );
+        let o = a.run(&permit, &plan, up, &brief, &[ollama])?;
+        println!(
+            "SANDBOX negative: curl http://127.0.0.1:11434/ -> {:?} stderr={}",
+            o.steps[0].status,
+            String::from_utf8_lossy(&o.stderr).trim()
+        );
+        assert!(matches!(o.steps[0].status, StepStatus::Failed { .. }));
+        assert!(o.observations.is_empty(), "no request, no observation");
         Ok(())
     }
 
     #[test]
-    fn unreachable_twice_then_answer_retries_with_backoff() -> R {
-        let url = mock(2, http(ANSWER))?;
-        let (permit, plan, brief, a) = fixture(true, &[])?;
-        let o = a.run(
-            &permit,
-            &plan,
-            &OllamaClient::new(&url),
-            &brief,
-            &[gen_step("p")],
-        )?;
-        assert_eq!(o.steps[0].status, StepStatus::Done { exit: None });
-        assert_eq!(o.retries.len(), 2);
-        assert_eq!(
-            o.retries
-                .iter()
-                .map(|r| (r.attempt, r.of))
-                .collect::<Vec<_>>(),
-            vec![(1, 3), (2, 3)]
-        );
-        assert!(o.retries.iter().all(|r| (1..=10).contains(&r.backoff_ms)));
-        Ok(())
-    }
-
-    #[test]
-    fn retries_are_bounded_at_three() -> R {
-        let url = mock(usize::MAX, String::new())?;
-        let (permit, plan, brief, a) = fixture(true, &[])?;
-        let o = a.run(
-            &permit,
-            &plan,
-            &OllamaClient::new(&url),
-            &brief,
-            &[gen_step("p"), gen_step("q")],
-        )?;
-        assert!(matches!(
-            &o.steps[0].status,
-            StepStatus::Failed { attempts: 3, .. }
-        ));
-        assert_eq!(o.retries.len(), 2);
-        assert_eq!(o.observations[0].outcome, Outcome::Error);
+    fn door_observation_records_each_request() -> R {
+        let (_, _, _, a) = fixture("obs", false, &[])?;
+        let reqs = vec![
+            DoorRequest {
+                bytes: 3,
+                sha256: Sha256Hex::digest(b"abc"),
+                fate: DoorFate::Forwarded,
+            },
+            DoorRequest {
+                bytes: 0,
+                sha256: Sha256Hex::digest(b""),
+                fate: DoorFate::Unreachable,
+            },
+        ];
+        let ob = a
+            .door_observation(&reqs, Duration::from_millis(5), 100)?
+            .ok_or("no observation")?;
+        assert_eq!(ob.evidence.len(), 2);
         assert!(
-            matches!(&o.steps[1].status, StepStatus::Skipped { reason } if reason.contains("earlier step failed"))
+            ob.evidence
+                .iter()
+                .all(|e| e.label.as_str() == "model_request")
         );
+        assert_eq!(ob.evidence[0].sha256, Sha256Hex::digest(b"abc"));
+        assert_eq!(ob.outcome, Outcome::Error);
+        assert_eq!(a.door_observation(&[], Duration::ZERO, 0)?, None);
         Ok(())
     }
 
     #[test]
     fn skipped_steps_are_recorded_never_dropped() -> R {
-        let (permit, plan, brief, a) = fixture(false, &[])?;
+        let (permit, plan, brief, a) = fixture("skip", false, &[])?;
         let playbook = vec![
             gen_step("p"),
             Step {
@@ -533,20 +537,13 @@ mod tests {
                 },
             },
         ];
-        let o = a.run(
-            &permit,
-            &plan,
-            &OllamaClient::new("http://127.0.0.1:9"),
-            &brief,
-            &playbook,
-        )?;
-        assert_eq!(o.steps.len(), 2);
+        let o = a.run(&permit, &plan, closed()?, &brief, &playbook)?;
         assert_eq!(
             o.steps.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
             vec!["ask", "review"]
         );
         assert!(
-            matches!(&o.steps[0].status, StepStatus::Skipped { reason } if reason.contains("no loopback"))
+            matches!(&o.steps[0].status, StepStatus::Skipped { reason } if reason.contains("HEE4_MODEL_SOCKET"))
         );
         assert!(
             matches!(&o.steps[1].status, StepStatus::Skipped { reason } if reason.contains("human-review"))
@@ -557,27 +554,13 @@ mod tests {
 
     #[test]
     fn run_step_records_stdout_exit_elapsed_in_bwrap() -> R {
-        if !std::path::Path::new(spawn::BWRAP).exists() {
+        if !Path::new(spawn::BWRAP).exists() {
             println!("UNMEASURED: bwrap absent; run_step test skipped");
             return Ok(());
         }
-        let (permit, plan, brief, a) = fixture(false, &["/usr/bin/echo"])?;
-        std::fs::create_dir_all(&plan.work_dir)?;
-        let step = Step {
-            name: "echo".into(),
-            kind: StepKind::Run {
-                program: "/usr/bin/echo".into(),
-                args: vec!["hi".into()],
-            },
-        };
-        let res = a.run(
-            &permit,
-            &plan,
-            &OllamaClient::new("http://127.0.0.1:9"),
-            &brief,
-            &[step],
-        );
-        match res {
+        let (permit, plan, brief, a) = fixture("echo", false, &["/usr/bin/echo"])?;
+        let step = run_step("echo", "/usr/bin/echo", &["hi"]);
+        match a.run(&permit, &plan, closed()?, &brief, &[step]) {
             Ok(o) => {
                 assert_eq!(o.stdout, b"hi\n");
                 assert_eq!(o.exit, Some(0));
@@ -590,21 +573,9 @@ mod tests {
 
     #[test]
     fn run_step_out_of_scope_is_a_host_refusal() -> R {
-        let (permit, plan, brief, a) = fixture(false, &[])?;
-        let step = Step {
-            name: "x".into(),
-            kind: StepKind::Run {
-                program: "/usr/bin/echo".into(),
-                args: vec![],
-            },
-        };
-        let res = a.run(
-            &permit,
-            &plan,
-            &OllamaClient::new("http://127.0.0.1:9"),
-            &brief,
-            &[step],
-        );
+        let (permit, plan, brief, a) = fixture("scope", false, &[])?;
+        let step = run_step("x", "/usr/bin/echo", &[]);
+        let res = a.run(&permit, &plan, closed()?, &brief, &[step]);
         assert!(matches!(res, Err(WorkerError::Host(_))));
         Ok(())
     }
@@ -615,33 +586,12 @@ mod tests {
             println!("UNMEASURED: {LIVE_ENV}=1 set; guard test not applicable");
             return Ok(());
         }
-        let (permit, plan, brief, a) = fixture(true, &[])?;
-        let o = a.run_live(
-            &permit,
-            &plan,
-            &OllamaClient::new("http://127.0.0.1:9"),
-            &brief,
-            &[gen_step("p")],
-        )?;
+        let (permit, plan, brief, a) = fixture("live", true, &[])?;
+        let o = a.run_live(&permit, &plan, closed()?, &brief, &[gen_step("p")])?;
         assert!(
             matches!(&o.steps[0].status, StepStatus::Skipped { reason } if reason.contains(LIVE_ENV))
         );
         assert_eq!(o.observations.len(), 0);
         Ok(())
-    }
-
-    #[test]
-    fn backoff_is_jittered_within_bounds() {
-        let p = RetryPolicy {
-            max_attempts: 3,
-            base_ms: 100,
-            cap_ms: 150,
-        };
-        for e in [0, 1, 7, u64::MAX] {
-            let d = p.backoff(1, e).as_millis();
-            assert!((50..=100).contains(&d), "{d}");
-            let d = p.backoff(5, e).as_millis();
-            assert!((75..=150).contains(&d), "{d}");
-        }
     }
 }
