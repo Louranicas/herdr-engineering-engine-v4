@@ -1,9 +1,10 @@
 //! The deep-diff-forge observation adapter: one `rank.v0` run over a diff becomes one tier-0
 //! observation, sealed to the exact diff bytes. Local process only; no network.
 
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use hee4_contracts::{Evidence, Observation, Outcome, Sha256Hex, ToolId};
 use hee4_host::clock::Clock;
@@ -23,8 +24,8 @@ pub const ARGS: [&str; 5] = [
 ];
 /// The schema the adapter admits.
 pub const SCHEMA: &str = "deep-diff-forge.rank.v0";
-/// Wall time allowed for one run, in milliseconds. Reported, not enforced (see `FLOW.md`).
-pub const BUDGET_MS: u64 = 60_000;
+/// How often the deadline loop looks at the child.
+const POLL: Duration = Duration::from_millis(10);
 
 /// Why no observation was produced. None of these is a pass.
 #[derive(Debug, thiserror::Error)]
@@ -57,22 +58,62 @@ pub enum AdapterError {
         /// Digest the tool reported.
         sealed: Sha256Hex,
     },
+    /// The deadline passed; the child was killed and reaped. Map it with [`timeout_observation`].
+    #[error("{BIN} ran past its {budget:?} budget and was killed")]
+    Timeout {
+        /// The budget the caller passed.
+        budget: Duration,
+    },
     /// The ranking was empty: the run looked at nothing.
     #[error("rank.v0 ranked no files")]
     LookedAtNothing,
 }
 
 /// Run deep-diff-forge from `PATH` over `diff` and turn its ranking into an observation of
-/// `subject`.
+/// `subject`. The child is killed when `budget` of wall time has passed.
 ///
 /// # Errors
-/// [`AdapterError`]; exit 7 is [`AdapterError::Refused`].
+/// [`AdapterError`]; exit 7 is [`AdapterError::Refused`]; a run past `budget` is
+/// [`AdapterError::Timeout`].
 pub fn observe(
     diff: &[u8],
     subject: &Subject,
     clock: &impl Clock,
+    budget: Duration,
 ) -> Result<Observation, AdapterError> {
-    observe_with(Path::new(BIN), diff, subject, clock)
+    observe_with(Path::new(BIN), diff, subject, clock, budget)
+}
+
+/// The tier-0 observation for a run that hit its deadline: outcome `error`, `elapsed_ms` one
+/// past `budget_ms`, one evidence item (the digest of the diff that was sent). `decide` reads
+/// the elapsed-over-budget row first, so this yields `Refused(timeout)` and never a pass.
+///
+/// # Errors
+/// [`AdapterError::Malformed`] if a fixed token fails to parse (a bug, not an input).
+pub fn timeout_observation(
+    budget: Duration,
+    diff: &[u8],
+    subject: &Subject,
+) -> Result<Observation, AdapterError> {
+    let bad = |e: hee4_contracts::Refusal| AdapterError::Malformed(e.to_string());
+    let budget_ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX);
+    Ok(Observation {
+        source: "deep-diff-forge.rank".parse().map_err(bad)?,
+        input_sha256: subject.input_sha256,
+        tool: ToolId {
+            name: "deep-diff-forge".parse().map_err(bad)?,
+            version: "unknown".parse().map_err(bad)?,
+        },
+        head_sha: subject.head_sha.clone(),
+        outcome: Outcome::Error,
+        evidence: vec![Evidence {
+            label: "deadline".parse().map_err(bad)?,
+            sha256: Sha256Hex::digest(diff),
+        }],
+        advisory: false,
+        elapsed_ms: budget_ms.saturating_add(1),
+        budget_ms,
+    })
 }
 
 /// [`observe`] with an explicit binary.
@@ -84,6 +125,7 @@ pub fn observe_with(
     diff: &[u8],
     subject: &Subject,
     clock: &impl Clock,
+    budget: Duration,
 ) -> Result<Observation, AdapterError> {
     let started = clock.now();
     let mut child = Command::new(bin)
@@ -92,14 +134,41 @@ pub fn observe_with(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
+    // Owned, detached threads: a grandchild that keeps a pipe open must not hold us past the
+    // deadline. Draining while we poll keeps a chatty child from blocking on a full pipe.
     let stdin = child.stdin.take();
-    let output = std::thread::scope(|s| {
-        let writer = s.spawn(move || stdin.map_or(Ok(()), |mut w| w.write_all(diff)));
-        let output = child.wait_with_output();
-        // A tool that exits before reading all of stdin breaks the pipe; its exit code speaks.
-        let _ = writer.join();
-        output
-    })?;
+    let input = diff.to_vec();
+    let writer = std::thread::spawn(move || stdin.map_or(Ok(()), |mut w| w.write_all(&input)));
+    let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut p) = pipe {
+                let _ = p.read_to_end(&mut buf);
+            }
+            buf
+        })
+    };
+    let out_t = drain(child.stdout.take().map(|p| Box::new(p) as _));
+    let err_t = drain(child.stderr.take().map(|p| Box::new(p) as _));
+    let deadline = Instant::now() + budget;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            child.kill()?;
+            child.wait()?;
+            return Err(AdapterError::Timeout { budget });
+        }
+        std::thread::sleep(POLL);
+    };
+    // A tool that exits before reading all of stdin breaks the pipe; its exit code speaks.
+    let _ = writer.join();
+    let output = std::process::Output {
+        status,
+        stdout: out_t.join().unwrap_or_default(),
+        stderr: err_t.join().unwrap_or_default(),
+    };
     let elapsed_ms =
         u64::try_from(clock.now().saturating_sub(started).as_millis()).unwrap_or(u64::MAX);
     let stderr_line = String::from_utf8_lossy(&output.stderr)
@@ -156,6 +225,6 @@ pub fn observe_with(
         }],
         advisory: false,
         elapsed_ms,
-        budget_ms: BUDGET_MS,
+        budget_ms: u64::try_from(budget.as_millis()).unwrap_or(u64::MAX),
     })
 }

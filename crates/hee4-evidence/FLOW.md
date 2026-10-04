@@ -40,7 +40,7 @@ order-independence, advisory-only-refuses, Pass-needs-tier-0, monotonicity),
 ## What K6's adapter may hand in
 
 Only an `Observation` (parsed I3, `deny_unknown_fields`) whose `input_sha256` the adapter
-checked against the bytes it sent. `ddf::observe(diff, &subject, &clock)` is the template:
+checked against the bytes it sent. `ddf::observe(diff, &subject, &clock, budget)` is the template:
 
 - runs `deep-diff-forge --stdin-patch --rank --json --require-files --require-hunks` as a local
   process (no network, no shell);
@@ -50,15 +50,33 @@ checked against the bytes it sent. `ddf::observe(diff, &subject, &clock)` is the
   `Sha256Hex::digest(diff)` or `AdapterError::SealMismatch`; an empty `ranked` is
   `AdapterError::LookedAtNothing`;
 - fills `tool` from the JSON, `head_sha` from the subject, `advisory: false`, outcome `pass`,
-  one evidence item `rank.v0` = digest of stdout, `budget_ms = ddf::BUDGET_MS`.
+  one evidence item `rank.v0` = digest of stdout, `budget_ms` = the `budget` argument.
+
+## The deadline
+
+The caller passes `budget: Duration`. The child is spawned; stdin is written and stdout/stderr
+drained on detached threads; the adapter polls `try_wait` every 10 ms against a wall-clock
+`Instant`. At the deadline it calls `kill()` then `wait()` and returns
+`AdapterError::Timeout{budget}`. `ddf::timeout_observation(budget, diff, &subject)` turns that
+into a tier-0 observation (outcome `error`, `elapsed_ms = budget_ms + 1`, one `deadline`
+evidence item, the digest of the diff). `decide` tests `elapsed_ms > budget_ms` before the outcome,
+so it yields `Refused(timeout)`, never Pass. Test: a `sleep 5` stub with a 300 ms budget returns
+well under 1 s (`tests/ddf.rs`). Detached threads mean a grandchild holding a pipe cannot hold the
+adapter past the deadline; the grandchild itself is not killed (UNMEASURED beyond the stub).
+
+## The seal door (census)
+
+`decide_and_seal` is the only sealing path in this crate. `ReceiptBody`'s fields are public in
+`hee4-contracts`, so a type cannot stop another crate sealing a Pass over invented `observed` ids;
+`tests/one_sealer.rs` scans `crates/*/src/**` and fails on `Receipt::seal(` or `ReceiptBody {`
+outside `hee4-evidence/src/decide.rs` and `hee4-contracts/src/receipt.rs`. It scans `src/` only:
+test files (e.g. `hee4-core/tests/store.rs`) are not covered. Proposed type fix: DC to K0.
 
 An adapter may not hand in a verdict, a `Decision`, or an observation it built from a caption
 or exit code alone (AP-29).
 
 ## Gaps
 
-- `ddf::BUDGET_MS` is reported, not enforced: the run is not killed at the budget; `decide`
-  refuses `timeout` after the fact. UNMEASURED for a hung tool.
 - `ObservationId` is a content address (`obs-` + SHA-256 of canonical JSON) because I3 carries
   no id; if the ledger (K1) assigns ids, `decide_and_seal` must take them instead.
 - Exit 7 yields no observation, because I3 `Outcome` has no `refused` variant.
