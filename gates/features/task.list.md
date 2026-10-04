@@ -35,6 +35,15 @@ Socket: request `body` `{states[], task_class, parent_task_id, page{limit, curso
 - Persistence: none written; a cursor obtained before a restart is `resync_required` after it (restored epoch) and the client must restart paging, not resume.
 - Side effect: none; `operations` count unchanged.
 
+Concrete, deployed frame (rev 2026-10-05 drive) (run all of it with `tools/drive`):
+
+```bash
+hee4 task.list                 # raw body: {}
+```
+
+- Body `{tasks:[{task_id, phase}]}`; the task just submitted is listed. The skeleton has no filter or page, so there is no empty variant.
+- Persistence: `systemctl --user restart hee4.service`, wait for `hee4 health`, list again; the submitted id is still there. `tools/drive --allow-restart` does this against the live unit; without the flag the path is UNMEASURED.
+
 ## Gotchas
 
 - `resync_required` has three causes with three `because` strings (cursor expiry, snapshot revision, preview catalogue revision; Error map F-6). A test asserting the code alone cannot tell them apart; assert the detail.

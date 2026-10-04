@@ -37,6 +37,14 @@ Socket: request `body` `{selector: TaskSelectorV1, evidence}` (FACT required bot
 - Persistence: none written. Repeat yields the same bytes for a terminal task; for a live task the `task.generation` moves and later reads differ (not a flake).
 - Side effect: none; assert `operations` count unchanged.
 
+Concrete, deployed frame (rev 2026-10-05 drive) (run all of it with `tools/drive`):
+
+```bash
+hee4 task.get <task_id>        # raw body: {"task_id":"<id>"}
+```
+
+- Found: body `{task_id, phase, events, last_receipt_hash}`. Unknown valid id (`t-` + 24 zeros): `not_found` at `/body/task_id`. A malformed id (not a token, e.g. `bad id/..`): `invalid_argument` at `/body/task_id`.
+
 ## Gotchas
 
 - `queued` is gone from both `TaskStateV1` and `attempts[].state` in v4 (API Map §3 note; UM §5b). A reply carrying `queued` is a v3 binary.

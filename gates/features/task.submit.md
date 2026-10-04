@@ -39,6 +39,16 @@ Socket: request `body` `{spec: TaskSpecV1}` with `idempotency_key` set and `prec
 - Empty: `spec` missing → `invalid_argument` at `/body/spec`; a missing `idempotency_key` on a mutating action → `invalid_argument` at `/idempotency_key` (`UNWRITTEN: the exact pointer and constraint text`).
 - Side effects to read: `tasks`, `operations`, `events` (INTERP) rows; the dispatcher's wake (the task leaves `admitted` within the gate's budget when a model is present).
 
+Concrete, deployed frame (rev 2026-10-05 drive) (run all of it with `tools/drive`):
+
+```bash
+hee4 task.submit --brief-file brief.txt --key $(uuidgen)       # prints the reply frame
+# raw: {"request_id":"r","action":"task.submit","action_version":1,"idempotency_key":"<K>","body":{"brief":"GOAL: …\n…RESTATEMENT: …\n"}}
+```
+
+- Success: `{task_id:"t-<24 hex>", phase:"admitted"}`, `replayed=false`. Replay (same key, same bytes): `replayed=true`, same `task_id`. Same key, other bytes: `conflict` at `/idempotency_key`.
+- Empty brief `""`: `invalid_argument` at `/body/brief`, message names `GOAL` (the first absent field). Missing RESTATEMENT line: `invalid_argument` at `/body/brief` naming `RESTATEMENT`. No key: `invalid_argument` at `/idempotency_key`.
+
 ## Gotchas
 
 - `Admit` on an existing task is `Illegal` by construction (I-08): a repeated submit is a replay through the primitive, never a transition. Seeing a second `tasks` row for one key is a store defect.

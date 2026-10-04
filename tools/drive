@@ -1,0 +1,271 @@
+#!/usr/bin/env python3
+"""drive [--socket PATH] [--unit hee4.service] [--doctor-first] [--allow-restart] [--repo DIR] [--evidence-root DIR]
+
+The rung-3 feature-map driver (gates/features/README.md "The drive"). Runs the "Driving it with
+hee4" procedure of each served feature (health, task.submit, task.get, task.list, task.cancel)
+over the JSON-line frame on AF_UNIX, and writes every frame sent and received to
+  <evidence-root>/<sha12>/<feature>.jsonl      (default ~/.cache/hee4-drive)
+Prints one line per feature
+  drive feature=<name> verdict=PASS|FAIL|UNMEASURED paths=k/n evidence=<path>
+(UNMEASURED always names a reason; never a 0) and a last line
+  drive verdict=PASS|FAIL|UNMEASURED features=k/n unserved=u head=<sha12>
+Unserved features (no action in the deployed catalogue, FLOW.md) print UNMEASURED with scope=unserved
+and are counted in unserved=, not in features=k/n. A feature file without the
+"(rev 2026-10-05 drive)" marker in its Driving block is UNMEASURED: procedure UNWRITTEN.
+--doctor-first: run tools/doctor; if its unit or socket check is not MEASURED, print that line, exit 3.
+--allow-restart: the persistence path restarts the unit (live unit only; else UNMEASURED).
+Exit: 0 PASS, 1 FAIL, 3 UNMEASURED.
+"""
+import argparse, json, os, re, socket, stat, subprocess, sys, time, uuid
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+MARK = "(rev 2026-10-05 drive)"
+TERMINAL = {"accepted", "failed", "cancelled", "abandoned"}
+PHASES = TERMINAL | {"admitted", "running", "verifying", "cancellation_requested", "repair_pending"}
+BRIEF = ("GOAL: drive\nSCOPE: s\nCONTEXT: c\nACCEPTANCE: a\nVERIFY: /usr/bin/true\nTIMEBOX: 10s\n"
+         "FORBIDDEN: f\nREPORT: r\nSTANDING: s\nRECON: r\nRESTATEMENT: run true\n")
+
+
+def sh(*cmd, timeout=30):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout.strip(), r.stderr.strip()
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return None, "", str(e)
+
+
+def refusal_table(repo):
+    """name -> (retry, field) from the FLOW.md 'Refusal names' table: the one vocabulary."""
+    out = {}
+    try:
+        text = open(os.path.join(repo, "crates/hee4-app/FLOW.md")).read()
+    except OSError:
+        return out
+    sect = text.split("## Refusal names", 1)[-1].split("\n## ", 1)[0]
+    for line in sect.splitlines():
+        m = re.match(r"\|\s*`(\w+)`\s*\|\s*(\w+)\s*\|", line)
+        if m:
+            out[m.group(1)] = m.group(2)
+    return out
+
+
+class Feature:
+    def __init__(self, name, path, sock, table):
+        self.name, self.path, self.sock, self.table = name, path, sock, table
+        self.f = open(path, "w")
+        self.paths = []  # (name, status, detail)
+
+    def frame(self, obj_or_raw, timeout=10):
+        raw = obj_or_raw if isinstance(obj_or_raw, str) else json.dumps(obj_or_raw, separators=(",", ":"))
+        self.f.write(json.dumps({"t": time.time(), "dir": "send", "raw": raw}) + "\n")
+        s = socket.socket(socket.AF_UNIX); s.settimeout(timeout)
+        reply = None
+        try:
+            s.connect(self.sock)
+            s.sendall(raw.encode() + b"\n")
+            buf = b""
+            while not buf.endswith(b"\n"):
+                c = s.recv(65536)
+                if not c:
+                    break
+                buf += c
+            reply = buf.decode(errors="replace").rstrip("\n") if buf else None
+        except OSError as e:
+            self.f.write(json.dumps({"t": time.time(), "dir": "io_error", "raw": str(e)}) + "\n")
+        finally:
+            s.close()
+        self.f.write(json.dumps({"t": time.time(), "dir": "recv", "raw": reply}) + "\n")
+        self.f.flush()
+        try:
+            return json.loads(reply) if reply else None
+        except ValueError:
+            return None
+
+    def req(self, action, body, key=None, version=1):
+        return self.frame({"request_id": "drive-" + uuid.uuid4().hex[:12], "action": action,
+                           "action_version": version, "idempotency_key": key, "body": body})
+
+    def check(self, name, ok, detail, unmeasured=False):
+        self.paths.append((name, "UNMEASURED" if unmeasured else "PASS" if ok else "FAIL", detail))
+
+    def refuse(self, name, reply, code, field=None, msg_has=None):
+        """One name per refusal: the code is the expected one, is in the table, with its retry class."""
+        if not reply or reply.get("kind") != "error":
+            return self.check(name, False, f"expected error {code}, got {reply}")
+        got = reply.get("code")
+        probs = []
+        if got != code: probs.append(f"code={got} want {code}")
+        if got not in self.table: probs.append(f"code {got} not in FLOW.md refusal table")
+        elif reply.get("retry") != self.table[got]: probs.append(f"retry={reply.get('retry')} want {self.table[got]}")
+        if field and reply.get("field") != field: probs.append(f"field={reply.get('field')} want {field}")
+        if msg_has and msg_has not in str(reply.get("message", "")): probs.append(f"message lacks {msg_has!r}: {reply.get('message')}")
+        self.check(name, not probs, "; ".join(probs) or f"{got} field={reply.get('field')}")
+
+    def verdict(self):
+        st = [p[1] for p in self.paths]
+        v = "FAIL" if "FAIL" in st else "UNMEASURED" if "UNMEASURED" in st or not st else "PASS"
+        return v, st.count("PASS"), len(st)
+
+
+def is_result(r): return bool(r) and r.get("kind") == "result"
+
+
+def d_health(F, ctx):
+    r = F.req("health", {})
+    b = (r or {}).get("body", {})
+    F.check("success", is_result(r) and b.get("ok") is True and b.get("recovery_complete") is True
+           and re.fullmatch(r"[0-9a-f]{40}|unknown", str(b.get("head_sha"))) is not None and r.get("replayed") is False, f"{r}")
+    r2 = F.req("health", {})
+    F.check("repeat_not_replayed", is_result(r2) and r2.get("replayed") is False and r2["request_id"] != (r or {}).get("request_id"), "second health replayed=false")
+    F.refuse("malformed_frame", F.frame("{not json"), "invalid_argument", "/")
+    F.refuse("unknown_action", F.req("health.explode", {}), "unknown_action", "/action")
+    F.refuse("bad_version", F.req("health", {}, version=2), "unsupported_action_version", "/action_version")
+    d = os.path.dirname(F.sock)
+    try:
+        md, ms = stat.S_IMODE(os.stat(d).st_mode), stat.S_IMODE(os.stat(F.sock).st_mode)
+        F.check("perms", md == 0o700 and ms == 0o600, f"dir={md:o} sock={ms:o}")
+    except OSError as e:
+        F.check("perms", False, str(e))
+
+
+def d_submit(F, ctx):
+    k = str(uuid.uuid4())
+    r = F.req("task.submit", {"brief": BRIEF}, key=k)
+    b = (r or {}).get("body", {})
+    ok = is_result(r) and r.get("replayed") is False and b.get("phase") == "admitted" and re.fullmatch(r"t-[0-9a-f]{24}", str(b.get("task_id"))) is not None
+    F.check("success", ok, f"{r}")
+    if ok:
+        ctx["task"] = b["task_id"]
+    rr = F.req("task.submit", {"brief": BRIEF}, key=k)
+    F.check("replay", is_result(rr) and rr.get("replayed") is True and (rr.get("body") or {}).get("task_id") == b.get("task_id"), f"{rr}")
+    F.refuse("conflict", F.req("task.submit", {"brief": BRIEF.replace("run true", "other")}, key=k), "conflict", "/idempotency_key")
+    F.refuse("empty_brief", F.req("task.submit", {"brief": ""}, key=str(uuid.uuid4())), "invalid_argument", "/body/brief", "GOAL")
+    F.refuse("missing_restatement", F.req("task.submit", {"brief": BRIEF.replace("RESTATEMENT: run true\n", "")}, key=str(uuid.uuid4())),
+             "invalid_argument", "/body/brief", "RESTATEMENT")
+    F.refuse("empty_restatement", F.req("task.submit", {"brief": BRIEF.replace("RESTATEMENT: run true", "RESTATEMENT:")}, key=str(uuid.uuid4())),
+             "invalid_argument", "/body/brief")
+    F.refuse("missing_key", F.req("task.submit", {"brief": BRIEF}), "invalid_argument", "/idempotency_key")
+
+
+def d_get(F, ctx):
+    t = ctx.get("task")
+    if not t:
+        F.check("found", False, "no task from task.submit", unmeasured=True)
+    else:
+        r = F.req("task.get", {"task_id": t}); b = (r or {}).get("body", {})
+        F.check("found", is_result(r) and b.get("task_id") == t and b.get("phase") in PHASES and isinstance(b.get("events"), int), f"{r}")
+    F.refuse("not_found", F.req("task.get", {"task_id": "t-" + "0" * 24}), "not_found", "/body/task_id")
+    F.refuse("bad_id", F.req("task.get", {"task_id": "bad id/.."}), "invalid_argument", "/body/task_id")
+
+
+def d_list(F, ctx):
+    t = ctx.get("task")
+    r = F.req("task.list", {})
+    ids = [x.get("task_id") for x in (r or {}).get("body", {}).get("tasks", [])]
+    if not t:
+        F.check("lists_submitted", False, "no task from task.submit", unmeasured=True)
+    else:
+        F.check("lists_submitted", is_result(r) and t in ids, f"{len(ids)} tasks listed")
+    F.check("rows_typed", is_result(r) and all(x.get("phase") in PHASES for x in r["body"]["tasks"]), "every row has a known phase")
+    if not ctx["restart_ok"]:
+        return F.check("persistence_restart", False, ctx["restart_why"], unmeasured=True)
+    rc, _, err = sh("systemctl", "--user", "restart", ctx["unit"], timeout=60)
+    if rc != 0:
+        return F.check("persistence_restart", False, f"restart rc={rc} {err}")
+    up, t0 = None, time.monotonic()
+    while time.monotonic() - t0 < 30 and not is_result(up):
+        time.sleep(0.5); up = F.req("health", {})
+    r2 = F.req("task.list", {})
+    ids2 = [x.get("task_id") for x in (r2 or {}).get("body", {}).get("tasks", [])]
+    F.check("persistence_restart", is_result(r2) and t in ids2 and len(ids2) >= len(ids), f"after restart {len(ids2)} tasks, submitted present={t in ids2}")
+
+
+def d_cancel(F, ctx):
+    r = F.req("task.submit", {"brief": BRIEF}, key=str(uuid.uuid4()))
+    t = (r or {}).get("body", {}).get("task_id")
+    if not t:
+        F.check("cancel_admitted", False, f"submit failed: {r}")
+    else:
+        c = F.req("task.cancel", {"task_id": t}, key=str(uuid.uuid4()))
+        ph = (c or {}).get("body", {}).get("phase")
+        if is_result(c):
+            F.check("cancel_admitted", ph in {"cancellation_requested", "cancelled"}, f"phase={ph}")
+        else:  # the dispatcher won the race to a terminal phase: the State map says Illegal -> conflict
+            F.refuse("cancel_admitted", c, "conflict", "/body/task_id")
+    term = ctx.get("task")
+    ph, t0 = None, time.monotonic()
+    while term and time.monotonic() - t0 < 25 and ph not in TERMINAL:
+        g = F.req("task.get", {"task_id": term}); ph = (g or {}).get("body", {}).get("phase")
+        if ph not in TERMINAL: time.sleep(0.5)
+    if ph in TERMINAL:
+        F.refuse("cancel_terminal", F.req("task.cancel", {"task_id": term}, key=str(uuid.uuid4())), "conflict", "/body/task_id")
+    else:
+        F.check("cancel_terminal", False, f"submitted task not terminal in 25s (phase={ph})", unmeasured=True)
+    F.refuse("cancel_not_found", F.req("task.cancel", {"task_id": "t-" + "0" * 24}, key=str(uuid.uuid4())), "not_found", "/body/task_id")
+    F.refuse("cancel_missing_key", F.req("task.cancel", {"task_id": term or "t-" + "0" * 24}), "invalid_argument", "/idempotency_key")
+
+
+FEATURES = [("health", d_health), ("task.submit", d_submit), ("task.get", d_get), ("task.list", d_list), ("task.cancel", d_cancel)]
+
+
+def main():
+    xdg = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    live = f"{xdg}/hee4/control.sock"
+    ap = argparse.ArgumentParser(prog="drive", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--socket", default=live)
+    ap.add_argument("--unit", default="hee4.service")
+    ap.add_argument("--doctor-first", action="store_true")
+    ap.add_argument("--allow-restart", action="store_true")
+    ap.add_argument("--repo", default=REPO)
+    ap.add_argument("--evidence-root", default=os.path.expanduser("~/.cache/hee4-drive"))
+    a = ap.parse_args()
+    rc, head, _ = sh("git", "-C", a.repo, "rev-parse", "HEAD")
+    head = head[:12] if rc == 0 and head else os.environ.get("HEE4_HEAD", "unknown")[:12]  # the gate's export has no .git
+
+    if a.doctor_first:
+        _, out, _ = sh(os.path.join(HERE, "doctor"), "--socket", a.socket, "--unit", a.unit, "--repo", a.repo, timeout=60)
+        for line in out.splitlines():
+            m = re.match(r"check=(unit|socket) status=(\S+)", line)
+            if m and m.group(2) != "MEASURED":
+                print(line); print(f"drive verdict=UNMEASURED features=0/0 unserved=0 head={head} (doctor refused)")
+                sys.exit(3)
+
+    table = refusal_table(a.repo)
+    ev = os.path.join(a.evidence_root, head); os.makedirs(ev, exist_ok=True)
+    is_live = os.path.realpath(a.socket) == os.path.realpath(live)
+    ctx = {"unit": a.unit, "restart_ok": a.allow_restart and is_live,
+           "restart_why": ("--allow-restart not passed" if not a.allow_restart else "socket is not the live unit's; restart only drives the live unit")}
+    fdir = os.path.join(a.repo, "gates/features")
+    served = dict(FEATURES)
+    names = sorted(f[:-3] for f in os.listdir(fdir) if f.endswith(".md") and f != "README.md")
+    verdicts = []
+    for name in [n for n in names if n not in served] + [n for n, _ in FEATURES]:
+        evp = os.path.join(ev, f"{name}.jsonl")
+        if name not in served:
+            open(evp, "w").write(json.dumps({"unmeasured": "not served by the deployed skeleton (FLOW.md catalogue)"}) + "\n")
+            print(f"drive feature={name} verdict=UNMEASURED paths=0/0 evidence={evp} scope=unserved reason=no action in the deployed catalogue")
+            continue
+        text = open(os.path.join(fdir, name + ".md")).read() if os.path.exists(os.path.join(fdir, name + ".md")) else ""
+        drive_sect = text.split("## Driving it with hee4", 1)[-1].split("\n## ", 1)[0]
+        if MARK not in drive_sect:
+            open(evp, "w").write(json.dumps({"unmeasured": "procedure UNWRITTEN in file"}) + "\n")
+            print(f"drive feature={name} verdict=UNMEASURED paths=0/0 evidence={evp} reason=procedure UNWRITTEN in gates/features/{name}.md (no {MARK} marker)")
+            verdicts.append("UNMEASURED"); continue
+        F = Feature(name, evp, a.socket, table)
+        try:
+            served[name](F, ctx)
+        except Exception as e:  # a crash in a procedure is a FAIL, never a silent skip
+            F.check("driver", False, f"{type(e).__name__}: {e}")
+        F.f.close()
+        v, k, n = F.verdict(); verdicts.append(v)
+        print(f"drive feature={name} verdict={v} paths={k}/{n} evidence={evp}")
+        for p, st, d in F.paths:
+            if st != "PASS": print(f"  path={p} status={st} detail={d[:300]}")
+    v = "FAIL" if "FAIL" in verdicts else "UNMEASURED" if "UNMEASURED" in verdicts or not verdicts else "PASS"
+    print(f"drive verdict={v} features={verdicts.count('PASS')}/{len(FEATURES)} unserved={len(names) - len([n for n in names if n in served])} head={head}")
+    sys.exit({"PASS": 0, "FAIL": 1, "UNMEASURED": 3}[v])
+
+
+if __name__ == "__main__":
+    main()
