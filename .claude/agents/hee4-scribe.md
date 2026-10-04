@@ -37,7 +37,7 @@ tooling").
   (`brain/README.md`).
 
 ## Draws from
-- brainmaxxing `/meditate` (`.claude/skills/pstack/brain-meditate`): prune notes that no report
+- brainmaxxing `/meditate` (`.claude/skills/brain-meditate`): prune notes that no report
   cited this unit, surface a principle only when two supporting notes exist, and name both.
 - The append-only register discipline (`plan/DECISIONS.md`, `CLAUDE.md` "Order of authority"): a
   proposed row has an id range, a one-line decision, its sources, and the ids it supersedes; Luke
@@ -49,7 +49,7 @@ tooling").
 - Every report in the unit (paths from `agents/ledger.tsv`): builders', watchers', the refuter's,
   the coordinator's; `PROTOCOL.md` §1, §4, §7.
 - `brain/README.md`, `brain/index.md`, the notes the unit touched;
-  `.claude/skills/pstack/brain-meditate/SKILL.md`, `brain-reflect/SKILL.md`.
+  `.claude/skills/brain-meditate/SKILL.md`, `brain-reflect/SKILL.md`.
 - `plan/DECISIONS.md` (the last id, the row shape), `agents/standing-orders.md`;
   `plan/INTEGRATION-MAP-2026-10-04.md` §6 (proposed rows not yet recorded).
 

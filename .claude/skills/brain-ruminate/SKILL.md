@@ -14,7 +14,7 @@ Mine conversation history for brain-worthy knowledge that was never captured. Co
 
 ### 1. Read the brain
 
-Build a brain snapshot: `sh .claude/skills/pstack/brain-meditate/scripts/snapshot.sh brain/ /tmp/brain-snapshot-ruminate.md`. Pass the snapshot path to each analysis agent. This avoids loading the full brain into the ruminate orchestrator's context.
+Build a brain snapshot: `sh .claude/skills/brain-meditate/scripts/snapshot.sh brain/ /tmp/brain-snapshot-ruminate.md`. Pass the snapshot path to each analysis agent. This avoids loading the full brain into the ruminate orchestrator's context.
 
 ### 2. Locate conversations
 
@@ -29,7 +29,7 @@ Find the project conversation directory:
 Run the extraction script to parse JSONL conversation files into readable text and split into batches:
 
 ```bash
-python3 .claude/skills/pstack/brain-ruminate/scripts/extract-conversations.py "$CONV_DIR" "$OUT_DIR" --batches N
+python3 .claude/skills/brain-ruminate/scripts/extract-conversations.py "$CONV_DIR" "$OUT_DIR" --batches N
 ```
 
 Choose N based on the number of conversations found: ~1 batch per 20 conversations, minimum 2, maximum 10.

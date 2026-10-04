@@ -27,7 +27,7 @@ item "brain has notes beyond its README"     bash -c "ls '$BRAIN'/*.md 2>/dev/nu
 item "just on PATH"                          command -v just
 item "hee4db on PATH"                        command -v hee4db
 item "habitat-runbook on PATH"               command -v habitat-runbook
-item "pstack router skill"                   test -f "$ROOT/.claude/skills/pstack/poteto-mode/SKILL.md"
+item "pstack router skill"                   test -f "$ROOT/.claude/skills/poteto-mode/SKILL.md"
 item "cargo (for the walking skeleton)"      command -v cargo
 item "local model endpoint (ollama :11434)"  bash -c "command -v curl >/dev/null && curl -s -m 1 http://127.0.0.1:11434/api/tags"
 

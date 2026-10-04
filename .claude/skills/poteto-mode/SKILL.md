@@ -4,7 +4,7 @@ description: poteto's agent style for concise, detailed responses, deliberate su
 disable-model-invocation: true
 ---
 
-> Ported note: Ported from Cursor pstack 0.15.9. Three differences here: subagents are the `Agent` tool (`general-purpose`, or `Explore` for read-only; no cloud environment), models come from `.claude/skills/pstack/models.md` (Claude family only), and `/deslop`, `control-ui`, `control-cli`, Bugbot are Cursor-side and not bundled.
+> Ported note: Ported from Cursor pstack 0.15.9. Three differences here: subagents are the `Agent` tool (`general-purpose`, or `Explore` for read-only; no cloud environment), models come from `.claude/skills/models.md` (Claude family only), and `/deslop`, `control-ui`, `control-cli`, Bugbot are Cursor-side and not bundled.
 
 # Poteto mode
 

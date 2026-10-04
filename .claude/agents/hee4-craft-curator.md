@@ -49,7 +49,7 @@ Sonnet: skill text is a prose surface with measured size rules, worker tier (pst
   `.claude/hooks/tests/`.
 
 ## Reads
-- `.claude/skills/pstack/README.md`, `PROVENANCE.md`, `models.md`, `poteto-mode/SKILL.md` and
+- `.claude/skills/README.md`, `PROVENANCE.md`, `models.md`, `poteto-mode/SKILL.md` and
   `playbooks/`; `.claude/skills/hee4-{brief,lessons,module-slice,roster-router}/SKILL.md`;
   `.claude/agents/ROSTER.md`, `PROTOCOL.md`.
 - `docs/ANTIPATTERNS.md` (AP-01…50, the rung-3/4 backlog), `docs/DRIFT_AND_OVERENGINEERING.md`

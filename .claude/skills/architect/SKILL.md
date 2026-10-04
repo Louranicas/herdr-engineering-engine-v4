@@ -4,7 +4,7 @@ description: "Sketch types, signatures, and module structure before code, then s
 disable-model-invocation: true
 ---
 
-> Ported note: Runner models come from `.claude/skills/pstack/models.md` (Claude family only).
+> Ported note: Runner models come from `.claude/skills/models.md` (Claude family only).
 
 # Architect
 
@@ -32,7 +32,7 @@ Skip Phase A only when the work is genuinely greenfield with no surrounding syst
 
 Run the **arena** skill with the design-sketch task and the Phase A grounding artifacts. Pass `references/runner-prompt.md` as each runner's prompt. Each candidate produces a design package shaped per `references/rationale-template.md`.
 
-Take the runners from the `architect runners` line in the `models.md` table (`.claude/skills/pstack/models.md`), in place of the `arena runners` line. If the rule or that line is missing, use `claude-opus-5-5`, `claude-opus-5-5`, `claude-sonnet-5-5`. Alias and rejected entries follow the runner rules in the **arena** skill's Phase A.
+Take the runners from the `architect runners` line in the `models.md` table (`.claude/skills/models.md`), in place of the `arena runners` line. If the rule or that line is missing, use `claude-opus-5-5`, `claude-opus-5-5`, `claude-sonnet-5-5`. Alias and rejected entries follow the runner rules in the **arena** skill's Phase A.
 
 Design it twice. Require at least two structurally distinct candidates before synthesis, even when the first looks sufficient. This is the **exhaust-the-design-space** principle skill made concrete. Whole-shape alternatives, not point fixes inside one shape.
 

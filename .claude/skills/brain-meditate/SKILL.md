@@ -15,8 +15,8 @@ description: >-
 ### 1. Build snapshots
 
 ```bash
-sh .claude/skills/pstack/brain-meditate/scripts/snapshot.sh brain/ /tmp/brain-snapshot.md
-sh .claude/skills/pstack/brain-meditate/scripts/snapshot.sh .claude/skills/ /tmp/skills-snapshot.md
+sh .claude/skills/brain-meditate/scripts/snapshot.sh brain/ /tmp/brain-snapshot.md
+sh .claude/skills/brain-meditate/scripts/snapshot.sh .claude/skills/ /tmp/skills-snapshot.md
 ```
 
 Files are delimited with `=== path/to/file.md ===` headers. Also locate the auto-memory directory (`~/.claude/projects/<project>/memory/`).

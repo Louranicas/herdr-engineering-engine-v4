@@ -50,7 +50,7 @@ Sonnet: the facet is a rule pipeline with named rules and a table, worker tier (
 - Vault `16 System Maps/Workflow and Loop Map.md`, `API Map.md` (roster.* rows), `Error and Refusal
   Map.md`; `plan/STACK-MAP-2026-10-04.md` §4 step 2; `plan/INTEGRATION-MAP-2026-10-04.md` §2
   "Router".
-- `gates/features/roster.{list,inspect,update,disable}.md`; `.claude/skills/pstack/models.md`;
+- `gates/features/roster.{list,inspect,update,disable}.md`; `.claude/skills/models.md`;
   `docs/ANTIPATTERNS.md` AP-01, AP-31.
 - `hee4db highway route` (then `roster`, `native`); `just verify` before and after.
 

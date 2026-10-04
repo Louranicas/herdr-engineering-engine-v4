@@ -46,7 +46,7 @@ Subagent mechanics
   `TeamCreate` (brain-ruminate) → N parallel `Agent` calls.
 - `AskQuestion` → `AskUserQuestion`.
 Paths
-- `~/.cursor/rules/pstack-models.mdc` → `.claude/skills/pstack/models.md` (new file, role → model table).
+- `~/.cursor/rules/pstack-models.mdc` → `.claude/skills/models.md` (new file, role → model table).
 - `~/.cursor/projects/<slug>/agent-transcripts` → `~/.claude/projects/<slug>/` (slug keeps its leading
   dash); also in `poteto-mode/scripts/worktree-audit.sh` (the only script edited).
 - `.cursor/skills/`, `~/.cursor/skills/`, `~/.cursor/plugins/` → `.claude/...`; `.cursor/worktrees` →
@@ -92,3 +92,6 @@ Hooks (brainmaxxing)
   brain tests pass standalone (`brain-inject.sh 5/5`, `brain-auto-index.sh 8/8`) and join `run_all.py`
   once the hooks are registered per `BRAIN-HOOKS-INSTALL.md`.
 - `brain-auto-index.sh` run against the real `brain/` left `index.md` byte-identical.
+
+## 2026-10-05 · flattened
+Claude Code discovers project skills only at `.claude/skills/<name>/SKILL.md` (docs: code.claude.com/docs/en/skills), so the 53 skill directories were moved from `.claude/skills/pstack/<name>/` to `.claude/skills/<name>/` (measured in the 10-minute environment test). `pstack/` keeps LICENSE, PROVENANCE.md, README.md and models.md; references to `.claude/skills/pstack/models.md` are unchanged.

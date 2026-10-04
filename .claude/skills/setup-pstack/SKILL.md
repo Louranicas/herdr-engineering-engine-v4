@@ -3,11 +3,11 @@ name: setup-pstack
 description: Configure which models pstack uses per role and at what reasoning budget. Detects your available models and writes an always-applied rule that overrides the skill defaults. Use for /setup-pstack, "configure pstack models", "pstack budget", or changing pstack's model choices.
 ---
 
-> Ported note: Cursor-only in substance. It wrote `~/.cursor/rules/pstack-models.mdc`; in Claude Code edit `.claude/skills/pstack/models.md` by hand instead (Claude family only; the `Agent` tool takes `model: opus|sonnet|haiku`). The budget ladder (`max`/`xhigh`/...) has no Claude Code equivalent. Step 7 still applies.
+> Ported note: Cursor-only in substance. It wrote `~/.cursor/rules/pstack-models.mdc`; in Claude Code edit `.claude/skills/models.md` by hand instead (Claude family only; the `Agent` tool takes `model: opus|sonnet|haiku`). The budget ladder (`max`/`xhigh`/...) has no Claude Code equivalent. Step 7 still applies.
 
 # Setup pstack
 
-Write `.claude/skills/pstack/models.md`, an always-applied rule that sets pstack's model per role.
+Write `.claude/skills/models.md`, an always-applied rule that sets pstack's model per role.
 
 ## Steps
 
@@ -17,7 +17,7 @@ Enumerate the model slugs you can pass to an `Agent` subagent in this session (`
 
 ### 2. Load current state
 
-The default role-to-model mapping is the rule shape shown in step 5 below. If `.claude/skills/pstack/models.md` already exists, read it and treat its `# budget` line and its role values as the current choices. Otherwise start from those defaults. A line whose role is not in step 5, such as `how critics`, is from a retired role. Drop it.
+The default role-to-model mapping is the rule shape shown in step 5 below. If `.claude/skills/models.md` already exists, read it and treat its `# budget` line and its role values as the current choices. Otherwise start from those defaults. A line whose role is not in step 5, such as `how critics`, is from a retired role. Drop it.
 
 ### 3. Budget, map, and confirm
 
@@ -38,7 +38,7 @@ Every real slug written must be in the detected set. `inherit-parent` and `auto`
 
 ### 5. Write the rule
 
-Write `.claude/skills/pstack/models.md` with `alwaysApply: true`, a `# budget` line with the chosen label and its target effort, and one line per role, using the same labels poteto-mode uses. Overwrite the whole file so re-runs stay idempotent. Shape:
+Write `.claude/skills/models.md` with `alwaysApply: true`, a `# budget` line with the chosen label and its target effort, and one line per role, using the same labels poteto-mode uses. Overwrite the whole file so re-runs stay idempotent. Shape:
 
 ```
 ---
@@ -73,4 +73,4 @@ Tell the user the rule was written and that it applies to new sessions. Re-runni
 
 ### 7. Offer a verification skill (optional)
 
-Check whether the project has a way to drive the real app for proof (a `verify-*` skill, or an existing harness). If not, offer once: "want a project-local verification skill, so agents can drive the app the way a user does and prove changes work? I can generate one with /create-verification-skill." On yes, invoke `/create-verification-skill` (installed at `.claude/skills/pstack/create-verification-skill`). On no, move on without pushing.
+Check whether the project has a way to drive the real app for proof (a `verify-*` skill, or an existing harness). If not, offer once: "want a project-local verification skill, so agents can drive the app the way a user does and prove changes work? I can generate one with /create-verification-skill." On yes, invoke `/create-verification-skill` (installed at `.claude/skills/create-verification-skill`). On no, move on without pushing.

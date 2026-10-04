@@ -1,6 +1,6 @@
 # HEE v4: project instructions (read before any action here)
 
-**Fresh context?** Read `START.md` (one hop: what this is, where every home is on this machine, what to run, what to build first). Then `bash .claude/hooks/context-doctor.sh` (prints present|MISSING per home and tool; fix or route around every MISSING line before trusting a pointer), then `just verify`. The restart pointer `~/handoffs/HEE4_RESTART.md` and `hee4db recipe restart` are the deeper routes. Claude tooling for this repo: `.claude/README.md`; the ported pstack/brainmaxxing craft layer: `.claude/skills/pstack/README.md`.
+**Fresh context?** Read `START.md` (one hop: what this is, where every home is on this machine, what to run, what to build first). Then `bash .claude/hooks/context-doctor.sh` (prints present|MISSING per home and tool; fix or route around every MISSING line before trusting a pointer), then `just verify`. The restart pointer `~/handoffs/HEE4_RESTART.md` and `hee4db recipe restart` are the deeper routes. Claude tooling for this repo: `.claude/README.md`; the ported pstack/brainmaxxing craft layer: `.claude/skills/README.md`.
 
 **Meta goal (Luke, 2026-10-04): an environment that makes it hard to write bad code.** Prefer the highest rung for every door — impossible (types/architecture) > refused at admission > caught by a check > caught by review > caught in production. `plan/STACK-MAP-2026-10-04.md` §0.
 

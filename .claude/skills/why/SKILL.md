@@ -4,7 +4,7 @@ description: "Use for 'why does X work this way', 'why we picked Y', design rati
 disable-model-invocation: true
 ---
 
-> Ported note: MCP discovery is the `mcp__<server>__*` tools in this session; subagents are `general-purpose` (no `readonly` flag). Models from `.claude/skills/pstack/models.md`.
+> Ported note: MCP discovery is the `mcp__<server>__*` tools in this session; subagents are `general-purpose` (no `readonly` flag). Models from `.claude/skills/models.md`.
 
 # Why
 
@@ -12,7 +12,7 @@ Investigate the motivation and intent behind code.
 
 Companion to the `how` skill. `how` answers what the code does and how it works. `why` answers what forces led to its shape.
 
-Each spawn below names a role line in the `models.md` table (`.claude/skills/pstack/models.md`) and a default. Set `model` to that line's value, or to the default if the rule or the line is missing. Leave `model` unset when the value is `auto` or `inherit-parent`. If the `Agent` tool rejects a slug, use the default and say so. If it rejects the default, use the closest valid slug of the same family from its error message.
+Each spawn below names a role line in the `models.md` table (`.claude/skills/models.md`) and a default. Set `model` to that line's value, or to the default if the rule or the line is missing. Leave `model` unset when the value is `auto` or `inherit-parent`. If the `Agent` tool rejects a slug, use the default and say so. If it rejects the default, use the closest valid slug of the same family from its error message.
 
 ## Operating Posture
 

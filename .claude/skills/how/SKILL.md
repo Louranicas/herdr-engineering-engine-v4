@@ -4,13 +4,13 @@ description: "Use for \"how does X work\", code walkthroughs before changing som
 disable-model-invocation: true
 ---
 
-> Ported note: Read-only subagents are `subagent_type: Explore` in Claude Code (there is no `readonly` flag). Models from `.claude/skills/pstack/models.md`.
+> Ported note: Read-only subagents are `subagent_type: Explore` in Claude Code (there is no `readonly` flag). Models from `.claude/skills/models.md`.
 
 # How
 
 Explore the codebase to answer "how does X work?" questions. Produce architectural explanations at the level of a senior engineer onboarding onto a subsystem, enough to build a working mental model, not so much that it reads like annotated source code.
 
-Each spawn below names a role line in the `models.md` table (`.claude/skills/pstack/models.md`) and a default. Set `model` to that line's value, or to the default if the rule or the line is missing. Leave `model` unset when the value is `auto` or `inherit-parent`. If the `Agent` tool rejects a slug, use the default and say so. If it rejects the default, use the closest valid slug of the same family from its error message.
+Each spawn below names a role line in the `models.md` table (`.claude/skills/models.md`) and a default. Set `model` to that line's value, or to the default if the rule or the line is missing. Leave `model` unset when the value is `auto` or `inherit-parent`. If the `Agent` tool rejects a slug, use the default and say so. If it rejects the default, use the closest valid slug of the same family from its error message.
 
 ## Step 1. Assess Complexity
 
