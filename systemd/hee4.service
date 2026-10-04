@@ -1,0 +1,26 @@
+# HEE v4 engine (walking skeleton, U-skeleton-01 S6). A user unit; installed by the first mate,
+# not by the build. %t = $XDG_RUNTIME_DIR, %h = $HOME.
+[Unit]
+Description=HEE v4 engine (hee4 serve: control socket, ledger, dispatcher)
+Documentation=file://%h/herdr-engineering-engine-v4/crates/hee4-app/FLOW.md
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/hee4 serve --socket %t/hee4/control.sock --ledger %h/.local/share/hee4/ledger.sqlite3 --work %h/.local/share/hee4/work
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=20
+# Every process of the unit (including an orphaned bwrap child) is killed on stop and before a
+# restart, so reconcile after a crash sees the worker absent (R08) unless it survived (R07).
+KillMode=control-group
+# Creates %t/hee4 (0700) before the namespace is set up, so ReadWritePaths can name it.
+RuntimeDirectory=hee4
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=%h/.local/share/hee4 %t/hee4
+PrivateTmp=yes
+
+[Install]
+WantedBy=default.target

@@ -248,6 +248,8 @@ dependencies = [
  "hee4-evidence",
  "hee4-host",
  "hee4-worker",
+ "rusqlite",
+ "serde",
  "serde_json",
  "thiserror",
 ]

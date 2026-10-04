@@ -4,9 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+build = "build.rs"
 
 [lints]
 workspace = true
+
+[[bin]]
+name = "hee4"
+path = "src/main.rs"
 
 [dependencies]
 hee4-contracts = { path = "../hee4-contracts" }
@@ -14,5 +19,9 @@ hee4-host = { path = "../hee4-host" }
 hee4-core = { path = "../hee4-core" }
 hee4-worker = { path = "../hee4-worker" }
 hee4-evidence = { path = "../hee4-evidence" }
+serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+rusqlite = { workspace = true }
