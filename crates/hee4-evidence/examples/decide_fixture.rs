@@ -23,7 +23,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         locks: pin("locks")?,
         standards: pin("standards")?,
     };
-    let obs = ddf::observe(diff, &subject, &SystemClock)?;
+    let obs = ddf::observe(
+        diff,
+        &subject,
+        &SystemClock,
+        std::time::Duration::from_secs(60),
+    )?;
     println!("observation: {}", serde_json::to_string(&obs)?);
     println!(
         "decide: {:?}",

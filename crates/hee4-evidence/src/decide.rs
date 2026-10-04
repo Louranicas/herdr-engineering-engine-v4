@@ -151,6 +151,10 @@ pub fn observation_id(o: &Observation) -> Result<ObservationId, SealError> {
 /// Decide over `obs` and seal the decision with exactly the observations read (sorted,
 /// deduplicated content addresses) after `prev`, in one record.
 ///
+/// This is the only sealing path in this crate, and `tests/one_sealer.rs` (the census) fails if
+/// `Receipt::seal(` or `ReceiptBody {` appears in any `crates/*/src` file other than this one and
+/// `hee4-contracts/src/receipt.rs`.
+///
 /// # Errors
 /// [`SealError`] if an observation id cannot be derived; nothing is sealed then.
 pub fn decide_and_seal(
