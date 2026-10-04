@@ -1,9 +1,14 @@
 //! The I3 observation: what one source saw, sealed to its input.
 
-use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::str::FromStr;
 
-use crate::hex::{GitSha, Sha256Hex};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+use crate::bounds::MAX_TEXT_BYTES;
+use crate::hex::{GitSha, Sha256Hex, serde_via_str};
 use crate::ids::{EvidenceLabel, SourceId, ToolName, ToolVersion};
+use crate::refusal::{Refusal, TokenFault, TokenKind};
 
 /// The tool that produced an observation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -15,9 +20,53 @@ pub struct ToolId {
     pub version: ToolVersion,
 }
 
+/// Why an adapter refused to run (its exit 7): 1..=512 bytes, no control characters. Human text
+/// for the record only; `decide` never branches on it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RefusalText(String);
+
+impl RefusalText {
+    /// The text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for RefusalText {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl FromStr for RefusalText {
+    type Err = Refusal;
+    fn from_str(s: &str) -> Result<Self, Refusal> {
+        let fault = if s.is_empty() {
+            Some(TokenFault::Empty)
+        } else if s.len() > MAX_TEXT_BYTES {
+            Some(TokenFault::TooLong { found: s.len() })
+        } else {
+            s.bytes()
+                .position(|b| b.is_ascii_control())
+                .map(|at| TokenFault::Forbidden { at })
+        };
+        match fault {
+            Some(fault) => Err(Refusal::MalformedToken {
+                kind: TokenKind::RefusalText,
+                fault,
+            }),
+            None => Ok(Self(s.to_owned())),
+        }
+    }
+}
+
+serde_via_str!(RefusalText);
+
 /// What the source concluded.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Outcome {
     /// The check passed.
     Pass,
@@ -25,6 +74,11 @@ pub enum Outcome {
     Fail,
     /// The check could not run to a conclusion.
     Error,
+    /// The adapter refused to run (exit 7). `decide` maps this to `Refused(Invalid)`, never Pass.
+    Refused {
+        /// Why it refused.
+        reason: RefusalText,
+    },
 }
 
 /// One piece of evidence, by content address.

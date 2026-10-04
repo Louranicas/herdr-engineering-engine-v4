@@ -44,6 +44,8 @@ pub enum TokenKind {
     ToolVersion,
     /// [`crate::EvidenceLabel`].
     EvidenceLabel,
+    /// [`crate::RefusalText`].
+    RefusalText,
 }
 
 /// What was wrong with a token.
@@ -56,7 +58,7 @@ pub enum TokenFault {
         /// Bytes found.
         found: usize,
     },
-    /// The byte at this offset is whitespace or a control character.
+    /// The byte at this offset is a control character (or, for identifiers, whitespace).
     Forbidden {
         /// Byte offset.
         at: usize,

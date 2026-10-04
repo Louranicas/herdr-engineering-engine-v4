@@ -3,8 +3,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use hee4_contracts::{
-    Event, Phase, Reason, RecoveryRule, Refusal, Resolution, Settlement, TaskState, Verdict,
-    transition,
+    AbandonReason, Event, Phase, QuarantineReason, Reason, RecoveryRule, Refusal, Resolution,
+    Settlement, TaskState, Verdict, transition,
 };
 
 use Event::{Accept, Admit, Cancel, Dispatch, Observe, Stop};
@@ -30,8 +30,12 @@ const ERROR: Event = refused(Reason::Error);
 const TIMEOUT: Event = refused(Reason::Timeout);
 const CANCELLED_V: Event = refused(Reason::Cancelled);
 const UNRECONCILED: Event = refused(Reason::Unreconciled);
-const RQ: Event = Event::Resolve(Resolution::Quarantine);
-const RA: Event = Event::Resolve(Resolution::Abandon);
+const RQ: Event = Event::Resolve(Resolution::Quarantine(
+    QuarantineReason::EffectUnknownPermanent {
+        rule: RecoveryRule::R10EffectAmbiguity,
+    },
+));
+const RA: Event = Event::Resolve(Resolution::Abandon(AbandonReason::HeadUnknown));
 const R07: Event = Event::Recover(RecoveryRule::R07ProcessNotOurs);
 const R08: Event = Event::Recover(RecoveryRule::R08WorkerAbsent);
 

@@ -26,8 +26,11 @@ mod verdict;
 pub use brief::{Brief, BriefField};
 pub use hex::{GitSha, Sha256Hex};
 pub use ids::{EvidenceLabel, ObservationId, ReceiptId, SourceId, TaskId, ToolName, ToolVersion};
-pub use observation::{Evidence, Observation, Outcome, ToolId};
+pub use observation::{Evidence, Observation, Outcome, RefusalText, ToolId};
 pub use receipt::{BreakCause, ChainBreak, Decision, Receipt, ReceiptBody, canonical_json};
 pub use refusal::{HexFault, HexKind, Refusal, TokenFault, TokenKind};
-pub use state::{Event, Phase, RecoveryRule, Resolution, Settlement, TaskState, transition};
+pub use state::{
+    AbandonReason, Event, Phase, QuarantineReason, RecoveryRule, Resolution, Settlement, TaskState,
+    transition,
+};
 pub use verdict::{Reason, Verdict};
