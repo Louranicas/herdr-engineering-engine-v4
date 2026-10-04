@@ -4,7 +4,7 @@
 //! Every state change is `Store::apply`; the only verdict is `hee4_evidence::decide_and_seal`'s.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hee4_contracts::{
@@ -63,7 +63,9 @@ pub enum DispatchError {
 }
 
 /// The playbook named by the brief's VERIFY field: one step per non-empty line. An absolute
-/// path runs in the namespace; `model: <prompt>` asks the model; anything else is a named skip.
+/// path runs in the namespace as a bare argv; `sh: <line>` runs `/bin/sh -c <line>` there, so the
+/// line can use `$HEE4_MODEL_SOCKET`; `model: <prompt>` is a recorded skip (the driver makes no
+/// model call; use `sh:`); anything else is a named skip.
 #[must_use]
 pub fn playbook(verify: &str) -> Vec<Step> {
     verify
@@ -75,6 +77,11 @@ pub fn playbook(verify: &str) -> Vec<Step> {
             let kind = if let Some(prompt) = line.strip_prefix("model:") {
                 StepKind::Generate {
                     prompt: prompt.trim().to_owned(),
+                }
+            } else if let Some(cmd) = line.strip_prefix("sh:") {
+                StepKind::Run {
+                    program: PathBuf::from("/bin/sh"),
+                    args: vec!["-c".to_owned(), cmd.trim().to_owned()],
                 }
             } else if line.starts_with('/') {
                 let mut words = line.split_whitespace().map(str::to_owned);
@@ -214,9 +221,11 @@ pub fn step(engine: &Engine, cfg: &Config) -> Result<Option<(TaskId, Phase)>, Di
         )));
     };
     let steps = playbook(brief.get(BriefField::Verify));
-    let wants_model = steps
-        .iter()
-        .any(|s| matches!(s.kind, StepKind::Generate { .. }));
+    let wants_model = steps.iter().any(|s| match &s.kind {
+        StepKind::Generate { .. } => true,
+        StepKind::Run { program, .. } => program == Path::new("/bin/sh"),
+        StepKind::Unsupported { .. } => false,
+    });
     if wants_model && !cfg.live {
         eprintln!("UNMEASURED: live model not called ({LIVE_ENV}!=1); model steps skip");
     }
@@ -298,9 +307,7 @@ pub fn step(engine: &Engine, cfg: &Config) -> Result<Option<(TaskId, Phase)>, Di
             return Ok(Some((task.clone(), apply(engine, &task, Event::Stop)?)));
         }
     };
-    settle_and_decide(
-        engine, &task, receipt_id, &permit, &brief, &steps, head, &outcome,
-    )
+    settle_and_decide(engine, &task, receipt_id, &permit, &brief, head, &outcome)
 }
 
 /// After the attempt: settle, ledger each observation, `decide_and_seal`, append, decide.
@@ -311,7 +318,6 @@ fn settle_and_decide(
     receipt_id: ReceiptId,
     permit: &Permit,
     brief: &Brief,
-    steps: &[Step],
     head: GitSha,
     outcome: &AttemptOutcome,
 ) -> Result<Option<(TaskId, Phase)>, DispatchError> {
@@ -338,7 +344,6 @@ fn settle_and_decide(
         receipt_id,
         permit,
         brief,
-        steps,
         head,
         &outcome.observations,
     )?;
@@ -361,7 +366,6 @@ fn seal(
     id: ReceiptId,
     permit: &Permit,
     brief: &Brief,
-    steps: &[Step],
     head: GitSha,
     obs: &[Observation],
 ) -> Result<hee4_contracts::Receipt, DispatchError> {
@@ -383,14 +387,8 @@ fn seal(
         locks: source("hee4-permit", format!("{permit:?}").as_bytes())?,
         standards: source("gate.toml", crate::GATE_TOML)?,
     };
-    // The subject's input is the first model prompt (what a model observation read), else VERIFY.
-    let input = steps
-        .iter()
-        .find_map(|s| match &s.kind {
-            StepKind::Generate { prompt } => Some(prompt.as_str()),
-            _ => None,
-        })
-        .unwrap_or_else(|| brief.get(BriefField::Verify));
+    // The subject's input is the VERIFY text; every observation carries its digest.
+    let input = brief.get(BriefField::Verify);
     let subject = Subject {
         task_id: task.clone(),
         head_sha: head,
@@ -404,6 +402,19 @@ fn seal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sh_line_becomes_a_shell_run_step() {
+        let steps = playbook("sh: echo \"$HEE4_MODEL_SOCKET\" | wc -c\nmodel: hi\n");
+        assert_eq!(
+            steps[0].kind,
+            StepKind::Run {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "echo \"$HEE4_MODEL_SOCKET\" | wc -c".into()]
+            }
+        );
+        assert!(matches!(steps[1].kind, StepKind::Generate { .. }));
+    }
 
     #[test]
     fn verify_lines_become_steps() {

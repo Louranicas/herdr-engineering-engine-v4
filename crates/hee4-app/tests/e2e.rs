@@ -31,15 +31,24 @@ struct Server {
 }
 
 fn start(dir: &Path, log: &str) -> R<Server> {
+    start_with(dir, log, false)
+}
+
+fn start_with(dir: &Path, log: &str, live: bool) -> R<Server> {
     let sock = dir.join("rt/control.sock");
-    let child = Command::new(BIN)
+    let mut cmd = Command::new(BIN);
+    if live {
+        cmd.env("HEE4_LIVE_MODEL", "1");
+    } else {
+        cmd.env_remove("HEE4_LIVE_MODEL");
+    }
+    let child = cmd
         .args(["serve", "--socket"])
         .arg(&sock)
         .arg("--ledger")
         .arg(dir.join("ledger.sqlite3"))
         .arg("--work")
         .arg(dir.join("work"))
-        .env_remove("HEE4_LIVE_MODEL")
         .stdout(Stdio::null())
         .stderr(fs::File::create(dir.join(log))?)
         .spawn()?;
@@ -395,4 +404,85 @@ fn a_subscriber_that_never_reads_gets_the_close_frame_or_the_log_line() -> R<()>
     server.child.kill()?;
     server.child.wait()?;
     Ok(())
+}
+
+/// The first real model attempt through the door: a `sh:` step curls `$HEE4_MODEL_SOCKET`.
+/// Skipped (UNMEASURED) unless `HEE4_LIVE_MODEL=1` and the model answers on loopback.
+#[test]
+fn live_model_attempt_through_the_door() -> R<()> {
+    let answers = || -> bool {
+        Command::new("/usr/bin/curl")
+            .args(["-sS", "-m", "3", "http://127.0.0.1:11434/api/tags"])
+            .output()
+            .is_ok_and(|o| o.status.success() && !o.stdout.is_empty())
+    };
+    if std::env::var("HEE4_LIVE_MODEL").as_deref() != Ok("1") || !answers() {
+        println!(
+            "UNMEASURED: live model attempt skipped (HEE4_LIVE_MODEL!=1 or no model on 11434)"
+        );
+        return Ok(());
+    }
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("e2e-live");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir)?;
+    let mut server = start_with(&dir, "serve-live.log", true)?;
+    let verify = r#"sh: /usr/bin/curl -sS -m 60 --unix-socket "$HEE4_MODEL_SOCKET" http://model/api/generate -d '{"model":"qwen2.5:0.5b","prompt":"Say exactly: hee4 ok","stream":false}'"#;
+    let sub = call(
+        &server.sock,
+        "task.submit",
+        Some("key-live"),
+        json!({ "brief": brief(verify) }),
+    )?;
+    assert_eq!(sub["kind"], "result", "{sub}");
+    let id = sub["body"]["task_id"].clone();
+    let mut trace = vec!["admitted".to_owned()];
+    let t0 = Instant::now();
+    let mut done = None;
+    while t0.elapsed() < Duration::from_secs(120) {
+        let got = call(&server.sock, "task.get", None, json!({ "task_id": id }))?;
+        let phase = got["body"]["phase"].as_str().unwrap_or("?").to_owned();
+        if trace.last() != Some(&phase) {
+            trace.push(phase.clone());
+        }
+        if TERMINAL.contains(&phase.as_str()) {
+            done = Some(got);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    println!("live task {id} trace {}", trace.join(" -> "));
+    for line in fs::read_to_string(dir.join("serve-live.log"))?.lines() {
+        println!("serve-live.log: {line}");
+    }
+    let done = done.ok_or("live task never reached a terminal phase")?;
+    let chain = receipts(&dir.join("ledger.sqlite3"), id.as_str().ok_or("id")?)?;
+    server.child.kill()?;
+    server.child.wait()?;
+    assert_eq!(done["body"]["phase"], "accepted", "{done}");
+    assert_eq!(chain.len(), 1);
+    Receipt::verify_chain(&chain).map_err(|b| format!("{b:?}"))?;
+    let rec = chain.last().ok_or("empty chain")?;
+    let json = serde_json::to_value(rec)?;
+    println!(
+        "live receipt verdict={:?} hash_self={} verify_chain=ok",
+        rec.decision().verdict,
+        rec.hash_self()
+    );
+    assert_eq!(rec.decision().verdict, hee4_contracts::Verdict::Pass);
+    let text = json.to_string();
+    let n = observed_model_requests(&dir.join("ledger.sqlite3"), id.as_str().ok_or("id")?)?;
+    println!("model_request evidence rows on observations: {n}");
+    assert!(n >= 1, "no model_request evidence; receipt {text}");
+    Ok(())
+}
+
+fn observed_model_requests(ledger: &Path, task: &str) -> R<usize> {
+    let conn =
+        rusqlite::Connection::open_with_flags(ledger, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut n = 0;
+    let mut q = conn.prepare("SELECT json FROM observations WHERE task_id = ?1")?;
+    for row in q.query_map([task], |r| r.get::<_, String>(0))? {
+        n += row?.matches("\"model_request\"").count();
+    }
+    Ok(n)
 }

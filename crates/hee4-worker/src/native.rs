@@ -10,8 +10,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use hee4_contracts::{
-    Brief, Evidence, GitSha, Observation, Outcome, Sha256Hex, SourceId, ToolId, ToolName,
-    ToolVersion,
+    Brief, BriefField, Evidence, GitSha, Observation, Outcome, Sha256Hex, SourceId, ToolId,
+    ToolName, ToolVersion,
 };
 use hee4_host::model_door::{self, DoorBudget, DoorFate, DoorRequest, Upstream};
 use hee4_host::spawn::{self, Command, NamespacePlan, Permit, SpawnError};
@@ -189,6 +189,7 @@ impl Attempt {
             Some(path) => Some(model_door::serve(path, upstream, self.door_budget)?),
             None => None,
         };
+        let input = Sha256Hex::digest(brief.get(BriefField::Verify).as_bytes());
         let mut out = AttemptOutcome {
             steps: Vec::new(),
             stdout: Vec::new(),
@@ -208,11 +209,24 @@ impl Attempt {
                         skip(&format!("driver has no handler for step kind {kind}"))
                     }
                     StepKind::Generate { .. } => skip(
-                        "the driver makes no model call; a run step reaches the model \
-                         through HEE4_MODEL_SOCKET",
+                        "the driver makes no model call; use a `sh:` step, whose command \
+                         reaches the model through HEE4_MODEL_SOCKET",
                     ),
                     StepKind::Run { program, args } => {
-                        run_step(permit, plan, program, args, &mut out)?
+                        let t0 = Instant::now();
+                        let before = (out.stdout.len(), out.exit);
+                        out.exit = None;
+                        let status = run_step(permit, plan, program, args, &mut out)?;
+                        let stdout = out.stdout.get(before.0..).unwrap_or_default().to_vec();
+                        let ob = self.command_observation(
+                            input,
+                            out.exit,
+                            &stdout,
+                            t0.elapsed(),
+                            plan.timeout,
+                        )?;
+                        out.observations.push(ob);
+                        status
                     }
                 }
             };
@@ -226,15 +240,63 @@ impl Attempt {
         if let Some(door) = door {
             out.model_requests = door.close();
             let budget_ms = u64::try_from(plan.timeout.as_millis()).unwrap_or(u64::MAX);
-            if let Some(ob) = self.door_observation(&out.model_requests, out.elapsed, budget_ms)? {
+            if let Some(ob) =
+                self.door_observation(&out.model_requests, input, out.elapsed, budget_ms)?
+            {
                 out.observations.push(ob);
             }
         }
         Ok(out)
     }
 
+    /// The tier-0 observation for one `Run` step: `Pass` only on exit 0, `Fail` otherwise (a
+    /// timeout has no exit and is `Fail`). It always carries `exit` and `stdout` evidence, so a
+    /// ran-and-passed step is never an empty source.
+    ///
+    /// # Errors
+    /// [`WorkerError::Contract`] when a token does not parse.
+    pub fn command_observation(
+        &self,
+        input: Sha256Hex,
+        exit: Option<i32>,
+        stdout: &[u8],
+        elapsed: Duration,
+        budget: Duration,
+    ) -> Result<Observation, WorkerError> {
+        let exit_text = exit.map_or_else(|| "none".to_owned(), |c| c.to_string());
+        Ok(Observation {
+            source: "hee4-worker-native".parse::<SourceId>()?,
+            input_sha256: input,
+            tool: ToolId {
+                name: "command".parse::<ToolName>()?,
+                version: "bwrap".parse::<ToolVersion>()?,
+            },
+            head_sha: self.head_sha.clone(),
+            outcome: if exit == Some(0) {
+                Outcome::Pass
+            } else {
+                Outcome::Fail
+            },
+            evidence: vec![
+                Evidence {
+                    label: "exit".parse()?,
+                    sha256: Sha256Hex::digest(exit_text.as_bytes()),
+                },
+                Evidence {
+                    label: "stdout".parse()?,
+                    sha256: Sha256Hex::digest(stdout),
+                },
+            ],
+            advisory: false,
+            elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+            budget_ms: u64::try_from(budget.as_millis()).unwrap_or(u64::MAX),
+        })
+    }
+
     /// One observation for the door's log: one `model_request` evidence per request, `Pass` only
-    /// when every request was forwarded. `input_sha256` digests the request digests in order.
+    /// when every request was forwarded. `input_sha256` is `input`, the subject's input (the
+    /// digest of the brief's VERIFY text), so `decide` can reconcile it; the request digests are
+    /// the evidence.
     /// `None` when no request came through.
     ///
     /// # Errors
@@ -242,16 +304,12 @@ impl Attempt {
     pub fn door_observation(
         &self,
         requests: &[DoorRequest],
+        input: Sha256Hex,
         elapsed: Duration,
         budget_ms: u64,
     ) -> Result<Option<Observation>, WorkerError> {
         if requests.is_empty() {
             return Ok(None);
-        }
-        let mut joined = String::new();
-        for r in requests {
-            joined.push_str(&r.sha256.to_string());
-            joined.push('\n');
         }
         let evidence = requests
             .iter()
@@ -265,7 +323,7 @@ impl Attempt {
         let all_forwarded = requests.iter().all(|r| r.fate == DoorFate::Forwarded);
         Ok(Some(Observation {
             source: "hee4-worker-native".parse::<SourceId>()?,
-            input_sha256: Sha256Hex::digest(joined.as_bytes()),
+            input_sha256: input,
             tool: ToolId {
                 name: "model-door".parse::<ToolName>()?,
                 version: self.model.parse::<ToolVersion>()?,
@@ -466,8 +524,13 @@ mod tests {
         assert_eq!(o.model_requests.len(), 1);
         assert_eq!(o.model_requests[0].bytes, 0);
         assert_eq!(o.model_requests[0].fate, DoorFate::Forwarded);
-        assert_eq!(o.observations.len(), 1);
-        let ob = &o.observations[0];
+        let doors: Vec<_> = o
+            .observations
+            .iter()
+            .filter(|ob| ob.tool.name.as_str() == "model-door")
+            .collect();
+        assert_eq!(doors.len(), 1);
+        let ob = doors[0];
         assert_eq!(ob.outcome, Outcome::Pass);
         assert!(!ob.advisory);
         assert_eq!(
@@ -491,7 +554,12 @@ mod tests {
             String::from_utf8_lossy(&o.stderr).trim()
         );
         assert!(matches!(o.steps[0].status, StepStatus::Failed { .. }));
-        assert!(o.observations.is_empty(), "no request, no observation");
+        assert!(
+            o.observations
+                .iter()
+                .all(|ob| ob.tool.name.as_str() == "command" && ob.outcome == Outcome::Fail),
+            "no request, no door observation; the failed command is a Fail"
+        );
         Ok(())
     }
 
@@ -515,7 +583,12 @@ mod tests {
             },
         ];
         let ob = a
-            .door_observation(&reqs, Duration::from_millis(5), 100)?
+            .door_observation(
+                &reqs,
+                Sha256Hex::digest(b"v"),
+                Duration::from_millis(5),
+                100,
+            )?
             .ok_or("no observation")?;
         assert_eq!(ob.evidence.len(), 2);
         assert!(
@@ -525,7 +598,10 @@ mod tests {
         );
         assert_eq!(ob.evidence[0].sha256, Sha256Hex::digest(b"abc"));
         assert_eq!(ob.outcome, Outcome::Error);
-        assert_eq!(a.door_observation(&[], Duration::ZERO, 0)?, None);
+        assert_eq!(
+            a.door_observation(&[], Sha256Hex::digest(b"v"), Duration::ZERO, 0)?,
+            None
+        );
         Ok(())
     }
 
@@ -569,6 +645,9 @@ mod tests {
                 assert_eq!(o.stdout, b"hi\n");
                 assert_eq!(o.exit, Some(0));
                 assert!(o.elapsed > Duration::ZERO);
+                assert_eq!(o.observations.len(), 1);
+                assert_eq!(o.observations[0].outcome, Outcome::Pass);
+                assert_eq!(o.observations[0].evidence[0].label.as_str(), "exit");
             }
             Err(e) => println!("UNMEASURED: bwrap could not run here: {e}"),
         }
