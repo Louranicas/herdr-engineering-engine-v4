@@ -11,7 +11,7 @@ hee4 serve --socket S --ledger L --work W
   recovery::reconcile(store, probe)   findings → exit "recovery incomplete", never listens
   dispatcher thread                   loop { step(); sleep 100 ms when idle }
   socket::bind(S)                     dir 0700 (owner = our uid), stale socket removed only if nothing answers, socket 0600
-  socket::serve                       one thread per connection; SO_PEERCRED uid ≠ ours → one `forbidden` frame, close;
+  socket::serve                       one thread per connection, at most 256 open (the next is refused too_many_connections, no thread); SO_PEERCRED uid ≠ ours → one `forbidden` frame, close;
                                       one JSON frame per LF line each way
 ```
 
@@ -21,7 +21,8 @@ Request (one line): `{"request_id": str, "action": str, "action_version": 1, "id
 Other API Map envelope members are ignored by the skeleton. Reply (one line):
 `{"kind":"result","request_id","replayed","body"}` or
 `{"kind":"error","request_id","code","retry","field","message"}`. A line over 1,048,576 bytes or
-EOF inside a line closes the connection with no reply (Socket and IPC Map).
+EOF inside a line closes the connection with no reply; a line over the bound is answered
+`frame_too_large` first, then closed (Socket and IPC Map).
 
 | Action | Body | Result body | Door |
 |---|---|---|---|
@@ -52,7 +53,9 @@ The brief text is written to `<W>/briefs/<task>.brief` under the same ledger loc
 | `forbidden` | never | `SO_PEERCRED` uid ≠ the process uid (or unreadable); sent before any request is read, then close | `/` |
 | `internal` | same_exact_request | the ledger failed under the request | `/` |
 | `no_route` | after_condition | `task.preview`: `route::select` refused the brief (result body `refusal`, not an error frame) | — |
-| `slow_consumer` | after_condition | `events.subscribe`: the subscriber is 256 frames behind; `{"kind":"close",…}` frame, then close | — |
+| `slow_consumer` | after_condition | `events.subscribe`: the subscriber is 256 frames behind; `{"kind":"close",…}` frame, then close. Best effort: written with a 200 ms write deadline; if the peer's socket buffer is full the frame is not delivered, the server logs `slow_consumer close frame not delivered`, and the client sees EOF | — |
+| `frame_too_large` | never | a request line over 1,048,576 bytes; error frame, then close | `/` |
+| `too_many_connections` | after_condition | 256 connections already open; error frame written from the accept loop before any thread is spawned, then close | `/` |
 
 `wire::tests::every_emittable_refusal_has_one_row_in_flow` parses this table and asserts its names
 equal `wire::Code::ALL`, each once. The API Map names the queue overflow `queue_limit` (A-10);

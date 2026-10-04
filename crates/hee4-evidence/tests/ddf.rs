@@ -97,9 +97,10 @@ fn exit_7_is_a_tier0_refused_observation_that_decides_invalid() {
 
 fn stub(name: &str) -> PathBuf {
     // Committed with mode 755: a script written at test time races parallel forks (ETXTBSY).
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures")
-        .join(name)
+    // Read at run time: a binary reused across `git archive` exports must not walk a baked path.
+    let manifest = std::env::var("CARGO_MANIFEST_DIR")
+        .expect("CARGO_MANIFEST_DIR is not set (run under cargo test)");
+    PathBuf::from(manifest).join("tests/fixtures").join(name)
 }
 
 #[test]

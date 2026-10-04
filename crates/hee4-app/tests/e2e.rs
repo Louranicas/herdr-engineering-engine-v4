@@ -280,3 +280,119 @@ fn events_subscribe_streams_in_seq_order_and_resumes_exactly_once() -> R<()> {
     server.child.wait()?;
     Ok(())
 }
+
+#[test]
+fn an_oversize_line_is_refused_by_name_then_closed() -> R<()> {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("e2e-oversize");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir)?;
+    let mut server = start(&dir, "serve.log")?;
+    let mut s = UnixStream::connect(&server.sock)?;
+    s.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let junk = vec![b'a'; wire::MAX_FRAME_BYTES + 2];
+    s.write_all(&junk)?;
+    let mut r = BufReader::new(s);
+    let mut line = String::new();
+    r.read_line(&mut line)?;
+    let v: Value = serde_json::from_str(&line)?;
+    assert_eq!(
+        (v["kind"].as_str(), v["code"].as_str()),
+        (Some("error"), Some("frame_too_large")),
+        "{v}"
+    );
+    line.clear();
+    assert_eq!(r.read_line(&mut line)?, 0, "closed after the refusal");
+    assert_eq!(
+        call(&server.sock, "health", None, json!({}))?["body"]["ok"],
+        true
+    );
+    println!("MEASURED oversize line -> {v}");
+    server.child.kill()?;
+    server.child.wait()?;
+    Ok(())
+}
+
+#[test]
+fn the_connection_after_the_cap_is_refused_by_name_and_health_still_answers() -> R<()> {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("e2e-cap");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir)?;
+    let mut server = start(&dir, "serve.log")?;
+    let mut held = Vec::new();
+    for _ in 0..socket::MAX_CONNECTIONS {
+        held.push(UnixStream::connect(&server.sock)?);
+    }
+    let extra = UnixStream::connect(&server.sock)?;
+    extra.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let mut line = String::new();
+    BufReader::new(&extra).read_line(&mut line)?;
+    let v: Value = serde_json::from_str(&line)?;
+    assert_eq!(v["code"], "too_many_connections", "{v}");
+    println!("MEASURED connection {} -> {v}", socket::MAX_CONNECTIONS + 1);
+    // An admitted connection is unharmed: health answers on it.
+    let mut first = held.remove(0);
+    first.set_read_timeout(Some(Duration::from_secs(10)))?;
+    first.write_all(format!("{}\n", wire::request("cap", "health", None, json!({}))).as_bytes())?;
+    let mut line = String::new();
+    BufReader::new(&first).read_line(&mut line)?;
+    let h: Value = serde_json::from_str(&line)?;
+    assert_eq!(h["body"]["ok"], true, "{h}");
+    // Closing one frees a slot.
+    drop(held);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        call(&server.sock, "health", None, json!({}))?["body"]["ok"],
+        true
+    );
+    server.child.kill()?;
+    server.child.wait()?;
+    Ok(())
+}
+
+#[test]
+fn a_subscriber_that_never_reads_gets_the_close_frame_or_the_log_line() -> R<()> {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("e2e-slow");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir)?;
+    let mut server = start(&dir, "serve.log")?;
+    let mut sub = subscribe(&server.sock, 0)?;
+    // One connection, many submits: enough events to fill the queue and the socket buffer.
+    let mut c = UnixStream::connect(&server.sock)?;
+    c.set_read_timeout(Some(Duration::from_secs(30)))?;
+    let mut cr = BufReader::new(c.try_clone()?);
+    for i in 0..3000 {
+        let f = wire::request(
+            "slow",
+            "task.submit",
+            Some(&format!("slow-{i}")),
+            json!({ "brief": brief("/usr/bin/true") }),
+        );
+        c.write_all(format!("{f}\n").as_bytes())?;
+        let mut l = String::new();
+        cr.read_line(&mut l)?;
+    }
+    let log = dir.join("serve.log");
+    let t0 = Instant::now();
+    let mut logged = false;
+    while t0.elapsed() < Duration::from_secs(20) && !logged {
+        logged = fs::read_to_string(&log)?.contains("slow_consumer close frame not delivered");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // Now read what the subscriber was sent: a close frame, or EOF.
+    let mut delivered = false;
+    loop {
+        let mut l = String::new();
+        if sub.read_line(&mut l).unwrap_or(0) == 0 {
+            break;
+        }
+        delivered |= l.contains("\"kind\":\"close\"") && l.contains("slow_consumer");
+    }
+    println!("MEASURED close_frame_delivered={delivered} log_line={logged}");
+    assert!(
+        delivered || logged,
+        "neither the close frame nor the log line"
+    );
+    server.child.kill()?;
+    server.child.wait()?;
+    Ok(())
+}

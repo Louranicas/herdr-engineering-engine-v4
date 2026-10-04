@@ -143,6 +143,23 @@ fn read_ledger(
     Ok(Stop::Gone)
 }
 
+/// Deadline for the `slow_consumer` close frame: the peer's buffer is probably full, so the
+/// write must not wait on it.
+const CLOSE_DEADLINE: Duration = Duration::from_millis(200);
+
+/// Send the `slow_consumer` close frame, best effort: when the write misses its deadline the
+/// peer sees EOF and the server logs it.
+fn write_close(writer: &mut UnixStream) -> std::io::Result<()> {
+    let close = wire::close(Code::SlowConsumer, "queue full; resubscribe with since_seq");
+    let sent = writer
+        .set_write_timeout(Some(CLOSE_DEADLINE))
+        .and_then(|()| writer.write_all(format!("{close}\n").as_bytes()));
+    if let Err(e) = &sent {
+        eprintln!("slow_consumer close frame not delivered ({e})");
+    }
+    sent
+}
+
 /// Write frames from `rx` until the client closes or the reader stops; a slow consumer gets
 /// a `slow_consumer` close frame first.
 fn write_frames(
@@ -153,8 +170,7 @@ fn write_frames(
 ) -> std::io::Result<()> {
     loop {
         if slow.load(Ordering::Acquire) {
-            let close = wire::close(Code::SlowConsumer, "queue full; resubscribe with since_seq");
-            return writer.write_all(format!("{close}\n").as_bytes());
+            return write_close(writer);
         }
         match rx.recv_timeout(POLL) {
             Ok(frame) => writer.write_all(format!("{frame}\n").as_bytes())?,
@@ -195,6 +211,10 @@ pub fn run(mut writer: UnixStream, engine: Arc<Engine>, since_seq: i64) -> std::
         },
     );
     let result = write_frames(&mut writer, &rx, &slow, &closed);
+    if result.is_err() && slow.load(Ordering::Acquire) {
+        // The writer itself was stuck on a full peer buffer, so the close frame was never tried.
+        eprintln!("slow_consumer close frame not delivered (writer blocked)");
+    }
     closed.store(true, Ordering::Release);
     let _ = writer.shutdown(Shutdown::Both);
     result
@@ -203,6 +223,28 @@ pub fn run(mut writer: UnixStream, engine: Arc<Engine>, since_seq: i64) -> std::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_close_frame_arrives_when_the_peer_reads_and_is_logged_when_it_cannot()
+    -> std::io::Result<()> {
+        use std::io::{BufRead as _, BufReader};
+        let (mut server, client) = UnixStream::pair()?;
+        assert!(write_close(&mut server).is_ok());
+        let mut line = String::new();
+        BufReader::new(&client).read_line(&mut line)?;
+        assert!(line.contains("slow_consumer"), "{line}");
+
+        // A peer that never reads: fill the buffer until a write would block, then the close
+        // frame misses its deadline and the function reports it (and logs the line).
+        let (mut server, _client) = UnixStream::pair()?;
+        server.set_nonblocking(true)?;
+        while server.write(&[b'x'; 4096]).is_ok() {}
+        server.set_nonblocking(false)?;
+        let t0 = std::time::Instant::now();
+        assert!(write_close(&mut server).is_err());
+        assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
+        Ok(())
+    }
 
     #[test]
     fn a_full_queue_is_a_slow_consumer_not_a_wait() {

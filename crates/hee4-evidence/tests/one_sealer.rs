@@ -24,9 +24,17 @@ fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// The crate directory, read when the test runs: `env!` would bake the compile-time path into
+/// a binary the gate reuses across `git archive` exports.
+fn manifest_dir() -> Result<String, Box<dyn std::error::Error>> {
+    std::env::var("CARGO_MANIFEST_DIR")
+        .map_err(|e| format!("CARGO_MANIFEST_DIR is not set (run under cargo test): {e}").into())
+}
+
 #[test]
-fn only_decide_and_the_receipt_definition_name_the_sealer() {
-    let crates = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+fn only_decide_and_the_receipt_definition_name_the_sealer() -> Result<(), Box<dyn std::error::Error>>
+{
+    let crates = Path::new(&manifest_dir()?).join("..");
     let mut scanned = 0_usize;
     let mut offenders = Vec::new();
     for c in fs::read_dir(&crates).unwrap() {
@@ -57,4 +65,5 @@ fn only_decide_and_the_receipt_definition_name_the_sealer() {
     println!("MEASURED scanned {scanned} files under crates/*/src");
     assert!(scanned > 0, "the census looked at nothing");
     assert!(offenders.is_empty(), "seal door breached: {offenders:#?}");
+    Ok(())
 }
