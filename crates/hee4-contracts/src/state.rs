@@ -4,7 +4,7 @@
 //! brief's renames (`Begin` → `Dispatch`, `Verdict` → `Decide`) and two additions: `Observe`
 //! (`verifying` self-edge) and `Recover(R07 | R08)` (the R-table's `Settle{unsettled}`).
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::refusal::Refusal;
 use crate::verdict::{Reason, Verdict};
@@ -113,7 +113,7 @@ impl TaskState {
 }
 
 /// How an attempt settled.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Settlement {
     /// Settled, ready to verify.
@@ -124,18 +124,55 @@ pub enum Settlement {
     Unsettled,
 }
 
-/// An operator (or later, recovery) resolution of a stuck task.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+/// An operator (or later, recovery) resolution of a stuck task. The reason is payload: it never
+/// changes which edge [`transition`] takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Resolution {
     /// Move to `blocked`, carrying any cancel request.
-    Quarantine,
+    Quarantine(QuarantineReason),
     /// Close: `cancelled` if cancellation was requested, else `abandoned`.
-    Abandon,
+    Abandon(AbandonReason),
+}
+
+/// Why a task was abandoned. Data, not text.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AbandonReason {
+    /// The brief could not be read.
+    BriefUnreadable,
+    /// Routing refused every model; `floor_unmet` is true when the capability floor was the cause.
+    RouteRefused {
+        /// The capability floor excluded every candidate.
+        floor_unmet: bool,
+    },
+    /// The task's namespace could not be made.
+    NamespaceRefused,
+    /// The working directory could not be made.
+    WorkDirUnavailable,
+    /// The commit the task builds on is unknown.
+    HeadUnknown,
+    /// No permit was granted to dispatch.
+    NoPermit,
+    /// The attempt failed and no repair is allowed.
+    AttemptFailed,
+}
+
+/// Why a task was quarantined. Data, not text.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuarantineReason {
+    /// The external effect stayed unknown after the recovery `rule` ran.
+    EffectUnknownPermanent {
+        /// The rule that left the effect unknown.
+        rule: RecoveryRule,
+    },
 }
 
 /// The startup reconcile rules (gates/features/crash-restart.md, table R01–R14).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[allow(missing_docs)] // each name is the R-table row's name
 pub enum RecoveryRule {
     R01StaleObservationEpoch,
@@ -175,7 +212,7 @@ impl RecoveryRule {
 }
 
 /// Everything that can happen to a task.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Event {
     /// Create the task (`task.submit`).
@@ -247,11 +284,11 @@ pub fn transition(state: Option<TaskState>, event: Event) -> Result<TaskState, R
         (P::Verifying, E::Accept) => P::Accepted,
         (P::Blocked { .. }, E::Cancel) => P::Blocked { cancel: true },
         (P::EffectUnknown { .. }, E::Cancel) => P::EffectUnknown { cancel: true },
-        (_, E::Resolve(Resolution::Quarantine)) => P::Blocked { cancel },
-        (_, E::Resolve(Resolution::Abandon)) | (P::CancellationRequested, E::Stop) if cancel => {
+        (_, E::Resolve(Resolution::Quarantine(_))) => P::Blocked { cancel },
+        (_, E::Resolve(Resolution::Abandon(_))) | (P::CancellationRequested, E::Stop) if cancel => {
             P::Cancelled
         }
-        (_, E::Resolve(Resolution::Abandon)) => P::Abandoned,
+        (_, E::Resolve(Resolution::Abandon(_))) => P::Abandoned,
         (_, E::Recover(rule)) => return Err(Refusal::NoTaskEdge { from, rule }),
         _ => return Err(Refusal::Illegal { from, event }),
     };
