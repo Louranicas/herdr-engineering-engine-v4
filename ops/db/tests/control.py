@@ -354,6 +354,32 @@ def main() -> int:
              ["check"], 20, ["check=jev_gates verdict=FAIL", "jev_gates_b_ungated id=Q1"])
         case("jev-gates-absent", "fault", lambda w: w.sql("DELETE FROM held_items WHERE id='H-12'"),
              ["check"], 20, ["check=jev_gates verdict=FAIL", "jev_gates_absent gate=H-12"])
+        # held (rev 2026-10-05 watch-contradiction): the status word written in the id cell, not the Item cell
+        # parse_held reads. The plant is the H-27 row as it was committed on 2026-10-05 (V4-86), re-ingested so
+        # the DB shows the symptom (H-27 open); `check=held` must name the cause.
+        ATLAS = "evidence/design/DEPLOYMENT_ATLAS.md"
+        H27_ROW = "| H-27 *(rev 2026-10-01 V7/V8/V9/V10-fix, V7 F07)* | **CLOSED 2026-10-05 by V4-86**: Luke ratified"
+
+        def misplace_h27_then_ingest(w):
+            edit(ATLAS, H27_ROW, "| H-27 **CLOSED 2026-10-05 by V4-86** *(rev 2026-10-01 V7/V8/V9/V10-fix, V7 F07)* | Luke ratified")(w)
+            rc, out = w.run("ingest")
+            assert rc == 0, f"plant ingest rc={rc} {out[-300:]}"
+
+        def h27_open_in_db(w, _pre):
+            rc, out = w.run("q", "SELECT id, status FROM held_items WHERE id='H-27'")
+            return "open" in out, f"db_status={'open' if 'open' in out else 'not-open'}"
+        case("held-closed-word-misplaced", "fault", misplace_h27_then_ingest,
+             ["check"], 20, ["check=held verdict=FAIL", "held_closed_word_misplaced id=H-27"], post=h27_open_in_db)
+        # quiet half: the same word written in the Item cell of an open row (H-3) is where parse_held reads it,
+        # so `check=held` stays PASS and names no row
+        n += 1
+        w = World(base, f"c{n:02d}", frozen)
+        w.copy_db_from(snap)
+        edit(ATLAS, "| H-3 | **`systemctl --user enable`**", "| H-3 | **CLOSED 2026-10-05 by V4-99**: planted. Was: **`systemctl --user enable`**")(w)
+        _, hout = w.run("check")   # json out: the check lines sit inside the doc, so match the token, not a line
+        hok = "check=held verdict=PASS" in hout and "held_closed_word_misplaced" not in hout
+        results.append(("quiet", "quiet-held-closed-in-status-cell", hok,
+                        f"held_pass={'check=held verdict=PASS' in hout} misplaced_token={'held_closed_word_misplaced' in hout}"))
         case("jev-fit-unknown-grade", "fault", edit(FIT, "| 0 | **X**: exact (DESIGN JM J4) |", "| 0 | **Z**: exact (DESIGN JM J4) |"),
              ["ingest"], 20, ["ingest_malformed", "J4 grade 'Z' not in"])
         case("jev-fit-unknown-module", "fault", edit(FIT, "| J4 | Is the reply empty? | K6 `candidates` |", "| J4 | Is the reply empty? | K6 `candidatez` |"),
@@ -522,6 +548,7 @@ NEUTERS = [
     ("jev-scope-engine", "if f[\"engine_data\"] and grant_absent and (f[\"allowed_now\"] != \"no\" or", "if False and (f[\"allowed_now\"] != \"no\" or"),
     ("jev-scope-x-reason", "for f in xs if not f[\"grade_reason\"].strip()]", "for f in xs if False]"),
     ("jev-gates-absent", "bad = [f\"jev_gates_absent gate={g}\" for g in cited if aliases.get(g, g) not in held]", "bad = []"),
+    ("held-closed-word-misplaced", 'if status == "open" and any("**closed" in c.lower()', 'if False and any("**closed" in c.lower()'),
     ("jev-scope-a-now", "if f[\"grade\"] == \"A\" and (f[\"allowed_now\"] != \"yes\" or f[\"engine_data\"]):", "if False:"),
     ("jev-gates-b-ungated", "for f in fits if f[\"grade\"] == \"B\" and not f[\"gates\"]]", "for f in fits if False]"),
     ("jev-fit-grade", "            if grade not in JEV_GRADES:\n", "            if False:\n"),

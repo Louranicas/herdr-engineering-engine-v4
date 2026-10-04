@@ -622,7 +622,10 @@ def expand_phases(cell_text: str) -> list[str]:
     return sorted(phases)
 
 
-def parse_held(text: str, src: str) -> dict:
+def held_table_rows(text: str, src: str):
+    """Yield (line_no, cells, header_map, id, item_cell, status) for every H- row of ATLAS §5.
+    One home for the row grammar: parse_held (ingest) and held_checks (`check=held`) both read through it.
+    The status word is read from the Item cell only: `**CLOSED` there → closed; anywhere else it is invisible."""
     lines = md_lines(text)
     sec = [s for s in sections(lines, 2) if s["title"].startswith("5 ")]
     if not sec:
@@ -632,7 +635,6 @@ def parse_held(text: str, src: str) -> dict:
     tbls = [t for t in md_tables(lines) if start <= t["line"] <= end]
     if not tbls:
         raise Refusal("ingest_malformed", f"source={src} §5 has no table")
-    rows, phases = [], []
     for t in tbls:
         hm = header_map(t["header"], {"id": ("#",), "item": ("item",), "why": ("why",), "blocks": ("blocks",),
                                       "form": ("form",), "source": ("source",)}, src)
@@ -646,14 +648,20 @@ def parse_held(text: str, src: str) -> dict:
                 hid = inner
             low = item.lower()
             status = "closed" if "**closed" in low else ("merged" if "merged into" in low[:200] else "open")
-            bolds = [strip_md(b) for b in item.split("**")[1::2]]
-            title = next((b for b in bolds if b and b != hid), "") or strip_md(item)[:120]
-            rows.append({"id": hid, "owner": "Luke", "status": status, "title": title[:300], "item": strip_md(item),
-                         "why": strip_md(cell(cells, hm["why"])), "blocks": strip_md(drop_struck(cell(cells, hm["blocks"]))).strip(),
-                         "answer_form": strip_md(cell(cells, hm["form"])), "cite": strip_md(cell(cells, hm["source"])),
-                         "line": no})
-            for p in expand_phases(cell(cells, hm["blocks"])):
-                phases.append({"held_id": hid, "phase": p})
+            yield no, cells, hm, hid, item, status
+
+
+def parse_held(text: str, src: str) -> dict:
+    rows, phases = [], []
+    for no, cells, hm, hid, item, status in held_table_rows(text, src):
+        bolds = [strip_md(b) for b in item.split("**")[1::2]]
+        title = next((b for b in bolds if b and b != hid), "") or strip_md(item)[:120]
+        rows.append({"id": hid, "owner": "Luke", "status": status, "title": title[:300], "item": strip_md(item),
+                     "why": strip_md(cell(cells, hm["why"])), "blocks": strip_md(drop_struck(cell(cells, hm["blocks"]))).strip(),
+                     "answer_form": strip_md(cell(cells, hm["form"])), "cite": strip_md(cell(cells, hm["source"])),
+                     "line": no})
+        for p in expand_phases(cell(cells, hm["blocks"])):
+            phases.append({"held_id": hid, "phase": p})
     if not rows:
         raise Refusal("ingest_malformed", f"source={src} §5 table has no H- rows")
     ids = [r["id"] for r in rows]
@@ -3295,6 +3303,8 @@ def verb_check(a, o: Out) -> int:
     jev_checks(a.db, add)
     # 16-17. the registry (rev 2026-10-01 registry, V4-70): v4-relevant skills parse; every scheduled agent is defined
     registry_checks(a.db, add)
+    # 18. held: every ATLAS §5 status word sits in the Item cell, the one cell parse_held reads (rev 2026-10-05)
+    held_checks(add)
     # aggregate refuses as one unit: worst code wins (20 > 30 > 10 > 0)
     order = {EXIT_OK: 0, EXIT_GAPS: 1, EXIT_UNMEASURED: 2, EXIT_REFUSED: 3}
     worst = max((c for _, c, _ in results), key=lambda c: order[c])
@@ -3988,6 +3998,21 @@ def held_aliases(con: sqlite3.Connection) -> dict[str, str]:
     return out
 
 
+def held_checks(add) -> None:
+    """`check=held` (rev 2026-10-05 watch-contradiction): an ATLAS §5 row whose Item cell parses as open while
+    another cell of the same row carries `**CLOSED` has its status word where parse_held does not read it, so
+    the DB keeps the item open (H-18 on 2026-10-01; H-27 and H-29 on 2026-10-05). Read from the ATLAS text, not
+    the DB: the DB row is the symptom, the misplaced word is the cause."""
+    try:
+        rows = list(held_table_rows(read_text(ROOTS["evidence"] / "design/DEPLOYMENT_ATLAS.md"), "evidence:design/DEPLOYMENT_ATLAS.md"))
+        bad = [hid for _, cells, hm, hid, _, status in rows
+               if status == "open" and any("**closed" in c.lower() for i, c in enumerate(cells) if i != hm["item"])]
+        add("held", EXIT_OK if not bad else EXIT_REFUSED,
+            f"measured={len(rows) - len(bad)}/{len(rows)} rows" + "".join(f" held_closed_word_misplaced id={h}" for h in bad))
+    except (Refusal, OSError) as e:
+        add("held", EXIT_REFUSED, f"error={e}")
+
+
 def jev_checks(db: Path, add) -> None:
     """jev_grades, jev_scope, jev_gates (rev 2026-10-01 jev-fit). Each prints what it looked at."""
     try:
@@ -4101,7 +4126,7 @@ VERBS = [
     ("record claim", "an agent's claim, open until someone else verifies it", "hee4db record claim --who curator --claim 'links=18/18' --evidence measure-….txt"),
     ("record verify", "verify/refute a claim (the claimant cannot)", "hee4db record verify --id 3 --by reviewer --status verified --result 'reran: 18/18'"),
     ("migrate-habitat", "one-time copy of useful habitat-ops.db rows with provenance (read via tursodb --readonly)", "hee4db migrate-habitat"),
-    ("check", "integrity (2 engines), foreign keys, migrations, world, stale, orphans, sidecar, alignment_atlas, alignment_um, funnel_links, funnel_phases, readiness_note, jev_grades, jev_scope, jev_gates, registry_skills, registry_agents", "hee4db check"),
+    ("check", "integrity (2 engines), foreign keys, migrations, world, stale, orphans, sidecar, alignment_atlas, alignment_um, funnel_links, funnel_phases, readiness_note, jev_grades, jev_scope, jev_gates, registry_skills, registry_agents, held", "hee4db check"),
     ("highway", "ONE bounded JSON with every planning hop for a module, incl. its jev_fits hop (or --phase Pn, --dc DC-nn, --jev [--grade A|B|C|X], --phase-table, --um-amendments; --md)", "hee4db highway store"),
     ("readiness", "per-module build/deploy readiness from the rules in code; --md prints the vault note", "hee4db readiness --md"),
     ("stale", "derived rows whose source sha changed; imported rows whose habitat row changed", "hee4db stale"),
