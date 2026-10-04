@@ -102,7 +102,19 @@ def main():
         except OSError as e:
             die(f"cannot read {cfg_path} (is gate.toml in the subject?): {e}")
         names = resolve_steps(cfg, a.tier)
+        # The base names a rev relative to the SUBJECT, never the checkout's moving HEAD: a commit
+        # landing mid-run made <base>..<subject> empty once (ddf refused "0 files"). Resolved to a
+        # sha once, before any step runs.
         base = a.base or cfg.get("gate", {}).get("base", "HEAD~1")
+        if base.startswith("HEAD"):
+            base = sha + base[len("HEAD"):]
+        rb = git(a.repo, "rev-parse", "--verify", "--quiet", base + "^{commit}")
+        if rb.returncode:
+            die(f"base {base!r} does not resolve in {a.repo}")
+        base = rb.stdout.decode().strip()
+        if base == sha:
+            die(f"base equals the subject {sha[:12]}: nothing to diff")
+        print(f"subject={sha[:12]} base={base[:12]}")
         env = dict(os.environ)
         env["HEE4_HEAD"] = sha
         env["CARGO_TARGET_DIR"] = os.path.abspath(os.path.expanduser(

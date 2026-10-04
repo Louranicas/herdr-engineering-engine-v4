@@ -42,8 +42,13 @@ def main():
     ap.add_argument("--repo", default=os.getcwd())
     a = ap.parse_args()
 
-    rc, head, _ = sh("git", "-C", a.repo, "rev-parse", "HEAD")
-    head = head[:12] if rc == 0 and head else "unmeasured"
+    # Under the gate the tree is a `git archive` export with no .git: the gate passes the subject
+    # in HEE4_HEAD (the sha build.rs baked), and that wins over a rev-parse of the cwd.
+    head = os.environ.get("HEE4_HEAD", "").strip()
+    if not head:
+        rc, head, _ = sh("git", "-C", a.repo, "rev-parse", "HEAD")
+        head = head if rc == 0 else ""
+    head = head[:12] if head else "unmeasured"
 
     tool("cargo", ["--version"])
     tool("bwrap", ["--version"])
