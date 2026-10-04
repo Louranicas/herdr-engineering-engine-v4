@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+"""gate TIER [--subject REV] [--base REV] [--config gate.toml] [--repo DIR]
+
+Runs the steps of one tier declared in gate.toml, on a `git archive` export of the subject
+(never the live worktree). Prints per step
+  step=<name> rc=<n> elapsed=<s>/<budget>s margin=<s> [flags]
+and last
+  gate tier=<t> verdict=PASS|FAIL steps=k/n subject=<sha12>
+Exit 0 only on PASS. A step is red if rc!=0, if it overran its budget (killed, rc=124),
+or if it looked at nothing (flag looked_at_nothing, AP-29). Logs: ~/.cache/hee4-gate/<stamp>/.
+Env: CARGO_TARGET_DIR (default ~/.cache/hee4-gate-target).
+"""
+import argparse, json, os, re, shutil, signal, subprocess, sys, tempfile, time, tomllib
+
+def die(msg, code=2):
+    print(f"gate: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+def git(repo, *args, **kw):
+    return subprocess.run(["git", "-C", repo, *args], capture_output=True, **kw)
+
+def resolve_steps(cfg, tier, seen=()):
+    t = cfg.get("tier", {}).get(tier)
+    if t is None:
+        die(f"unknown tier {tier!r}; declared: {', '.join(cfg.get('tier', {}))}")
+    if tier in seen:
+        die(f"tier cycle at {tier}")
+    inc = resolve_steps(cfg, t["includes"], seen + (tier,)) if "includes" in t else []
+    return inc + [s for s in t.get("steps", []) if s not in inc]
+
+def run_cmd(cmd, cwd, env, budget, stdin_bytes=None):
+    """Own a process group; on budget overrun kill the whole group. Returns (rc, out, err, elapsed)."""
+    t0 = time.monotonic()
+    p = subprocess.Popen(["bash", "-c", cmd], cwd=cwd, env=env, start_new_session=True,
+                         stdin=subprocess.PIPE if stdin_bytes is not None else subprocess.DEVNULL,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        out, err = p.communicate(stdin_bytes, timeout=budget)
+        rc = p.returncode
+    except subprocess.TimeoutExpired:
+        os.killpg(p.pid, signal.SIGKILL)
+        out, err = p.communicate()
+        rc = 124
+    return rc, out, err, time.monotonic() - t0
+
+def judge(expect, rc, out, err):
+    """Return (ok, flags, extra) from what the step actually looked at."""
+    flags, extra = [], {}
+    if rc == 124:
+        return False, ["budget_exceeded"], extra
+    if expect == "tests_ran":
+        text = (out + err).decode("utf-8", "replace")
+        ran = sum(int(m) for m in re.findall(r"(\d+) passed", text))
+        extra["tests_passed"] = ran
+        if rc == 0 and ran == 0:
+            flags.append("looked_at_nothing")
+    elif expect == "ddf_sealed":
+        if rc == 7:
+            flags.append("refused_rc7")
+            extra["reason"] = err.decode("utf-8", "replace").strip().splitlines()[-1:] or ["no stderr"]
+            extra["reason"] = extra["reason"][0]
+        elif rc == 0:
+            try:
+                sha = json.loads(out).get("input_sha256")
+            except (ValueError, AttributeError):
+                sha = None
+            if sha:
+                extra["input_sha256"] = sha
+            else:
+                flags.append("looked_at_nothing")
+    elif expect == "tool_rc" and rc == 3:
+        flags.append("unmeasured")
+    return rc == 0 and not flags, flags, extra
+
+def main():
+    ap = argparse.ArgumentParser(prog="gate", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("tier")
+    ap.add_argument("--subject", default="HEAD", help="rev to export and gate (default HEAD)")
+    ap.add_argument("--base", help="base rev for the ddf diff (default [gate].base)")
+    ap.add_argument("--config", help="gate.toml path (default: <repo>/gate.toml, read from the subject export)")
+    ap.add_argument("--repo", default=os.getcwd())
+    a = ap.parse_args()
+
+    r = git(a.repo, "rev-parse", "--verify", "--quiet", a.subject + "^{commit}")
+    if r.returncode:
+        die(f"subject {a.subject!r} does not resolve in {a.repo}")
+    sha = r.stdout.decode().strip()
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    logs = os.path.expanduser(f"~/.cache/hee4-gate/{stamp}-{sha[:12]}")
+    os.makedirs(logs, exist_ok=True)
+    tmp = tempfile.mkdtemp(prefix="hee4-gate-", dir=os.path.expanduser("~/.cache"))
+    try:
+        ar = subprocess.run(f"git -C {a.repo!s} archive {sha} | tar -x -C {tmp}", shell=True, capture_output=True)
+        if ar.returncode:
+            die("git archive failed: " + ar.stderr.decode())
+        cfg_path = a.config or os.path.join(tmp, "gate.toml")
+        try:
+            with open(cfg_path, "rb") as f:
+                cfg = tomllib.load(f)
+        except OSError as e:
+            die(f"cannot read {cfg_path} (is gate.toml in the subject?): {e}")
+        names = resolve_steps(cfg, a.tier)
+        base = a.base or cfg.get("gate", {}).get("base", "HEAD~1")
+        env = dict(os.environ)
+        env.setdefault("CARGO_TARGET_DIR", os.path.expanduser("~/.cache/hee4-gate-target"))
+        env["HEE4_GATE_SUBJECT"] = sha
+        env["HEE4_GATE_REPO"] = os.path.abspath(a.repo)
+        ok_n = 0
+        for name in names:
+            st = cfg.get("step", {}).get(name)
+            if st is None or "cmd" not in st:
+                die(f"step {name!r} has no [step.{name}] cmd")
+            if "budget_s" not in st:
+                die(f"step {name!r} has no budget_s (refused)")
+            budget, expect = st["budget_s"], st.get("expect", "none")
+            stdin = None
+            if expect == "ddf_sealed":
+                d = git(a.repo, "diff", f"{base}..{sha}")
+                if d.returncode:
+                    out, err, rc, el = b"", f"cannot diff {base}..{sha}: {d.stderr.decode().strip()}".encode(), 2, 0.0
+                    ok, flags, extra = False, ["no_diff_input"], {}
+                    stdin = None
+                else:
+                    stdin = d.stdout
+            if stdin is not None or expect != "ddf_sealed":
+                rc, out, err, el = run_cmd(st["cmd"], tmp, env, budget, stdin)
+                ok, flags, extra = judge(expect, rc, out, err)
+            with open(os.path.join(logs, f"{name}.log"), "wb") as f:
+                f.write(out + b"\n--- stderr ---\n" + err)
+            extras = "".join(f" {k}={v}" for k, v in extra.items())
+            print(f"step={name} rc={rc} elapsed={el:.1f}/{budget}s margin={budget - el:.1f}"
+                  + "".join(f" {fl}" for fl in flags) + extras + ("" if ok else f" log={logs}/{name}.log"))
+            ok_n += ok
+        v = "PASS" if ok_n == len(names) else "FAIL"
+        print(f"gate tier={a.tier} verdict={v} steps={ok_n}/{len(names)} subject={sha[:12]}")
+        sys.exit(0 if v == "PASS" else 1)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+if __name__ == "__main__":
+    main()
