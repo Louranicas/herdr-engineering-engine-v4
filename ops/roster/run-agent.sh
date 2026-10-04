@@ -20,9 +20,9 @@
 # v4 only: reads no v3 path (V4-9).
 set -uo pipefail
 AGENT="${1:-}"; MODE="${2:-light}"
-V4=/var/home/Louranicas/herdr-engineering-engine-v4
-LOGDIR=/var/home/Louranicas/hee4-evidence/roster/$AGENT
-CLAUDE=/var/home/Louranicas/.local/bin/claude
+V4=${HEE4_ROOT:-/mnt/storage-10tb/herdr-engineering-engine-v4}
+LOGDIR=${HEE4_EVIDENCE:-/mnt/storage-10tb/hee4-evidence}/roster/$AGENT
+CLAUDE=$(command -v claude 2>/dev/null || echo "$HOME/.local/bin/claude")
 ROSTER=$V4/ops/roster
 DIR=$ROSTER/$AGENT
 [[ "$AGENT" =~ ^[a-z0-9-]+$ ]] && [ -f "$DIR/modes.conf" ] && [ -x "$DIR/measure.sh" ] && [ -f "$DIR/settings.json" ] && [ -f "$V4/.claude/agents/$AGENT.md" ] || { echo "usage: $0 <agent> light|deep|selfcheck (agent is [a-z0-9-]+ and needs ops/roster/<agent>/{modes.conf,measure.sh,settings.json} and .claude/agents/<agent>.md)" >&2; exit 2; }
@@ -31,7 +31,7 @@ mkdir -p "$LOGDIR" || exit 3
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 LOG="$LOGDIR/run-$STAMP-$MODE.log"; MEAS="$LOGDIR/measure-$STAMP-$MODE.txt"; REPORT="$LOGDIR/report-$STAMP-$MODE.md"
 MRC=NA
-HEE4DB=/var/home/Louranicas/herdr-engineering-engine-v4/ops/db/hee4db
+HEE4DB=$V4/ops/db/hee4db
 # The DB step runs in this shell's error-tolerant mode (no set -e) and its status is only ever logged.
 db_record() {
   local out="$LOGDIR/db-$STAMP-$MODE.txt" rrc mrc=skipped_no_measure_file worst=0
@@ -89,7 +89,7 @@ else
   while IFS= read -r l || [ -n "$l" ]; do l=${l%$'\r'}; [[ "$l" =~ [^[:space:]] ]] && last=$l; done < <(tail -c 65536 "$REPORT")
   [ -n "$last" ] || reason=empty_report
 fi
-re="^${NAME} verdict=(PASS_WITH_GAPS|PASS|FAIL)( |\$)"
+re="^${NAME} verdict=(PASS_WITH_GAPS|PASS|FAIL|BLOCKED|STOP)( |\$)"   # BLOCKED/STOP: PROTOCOL §5 (V4-84)
 verdict=""
 if [ -z "$reason" ]; then
   if [[ "$last" =~ $re ]]; then verdict=${BASH_REMATCH[1]}; else reason=last_line_not_typed_verdict; fi
@@ -122,5 +122,7 @@ case "$verdict" in
     [ "$verdict" = PASS ] && finish 0
     finish 10 ;;
   FAIL) finish 20 ;;
+  BLOCKED) echo "blocked=$last" >> "$LOG"; finish 20 ;;   # named blocker; not a pass, not unmeasured
+  STOP) echo "andon=$last" >> "$LOG"; finish 30 ;;        # the andon: the unit halts until the captain clears it
   *) finish 30 ;;
 esac

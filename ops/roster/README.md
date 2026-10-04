@@ -1,14 +1,14 @@
 # Agent roster: operations
 One runner for every roster agent: `run-agent.sh <agent> light|deep|selfcheck`.
 - **Code measures** (`<agent>/measure.sh`); the agent reads the measurements and curates. Every measurement section prints `UNMEASURED (<reason>)` when its source is absent (an unmounted STORAGE, a missing vault, script or evidence dir) or it looked at nothing (F138); a 0 from an absent source is never printed.
-- **The exit code is the agent's typed verdict**, read from the report's LAST non-empty line only (trailing CR stripped), which must match `^<agent without hee4-> verdict=(PASS_WITH_GAPS|PASS|FAIL)( |$)`:
+- **The exit code is the agent's typed verdict**, read from the report's LAST non-empty line only (trailing CR stripped), which must match `^<agent without hee4-> verdict=(PASS_WITH_GAPS|PASS|FAIL|BLOCKED|STOP)( |$)` (BLOCKED and STOP added 2026-10-05, V4-84, so the runner and `.claude/agents/PROTOCOL.md` §5 agree):
 
 | Exit | Meaning |
 |---|---|
 | 0 | PASS, and the run was clean: `claude_rc=0`, `is_error=False`, cost measured |
 | 10 | PASS_WITH_GAPS, or a PASS degraded (`degraded_by=` in the log) by an unclean run (`claude_rc`≠0, `is_error`≠False, cost UNMEASURED) **or by a measurement floor** (`degraded_by=measured_*`): `v3_refs>0` (`measured_v3_refs=N`), `funnel: verdict=FAIL` (`measured_funnel_fail`), or any measurement line containing UNMEASURED (`measured_unmeasured_lines=N`). Code measures, the agent curates: a red floor outranks the agent's PASS |
-| 20 | FAIL |
-| 30 | REFUSED / UNMEASURED: no report, empty report, or a last line not in the typed form (`verdict_line=REFUSED <reason>`); also any run claude ended with `subtype=error_max_budget_usd` (cut off mid-run, whatever the report says) |
+| 20 | FAIL; or BLOCKED (the line names what blocks — an H-row, a grant, a missing input; `blocked=` in the log) |
+| 30 | STOP (the andon: raised only by a watcher or refuter with a MEASURED reason, `andon=` in the log; the unit halts until the captain clears it in `firstmate.db`); or REFUSED / UNMEASURED: no report, empty report, or a last line not in the typed form (`verdict_line=REFUSED <reason>`); also any run claude ended with `subtype=error_max_budget_usd` (cut off mid-run, whatever the report says) |
 | 40 | SKIPPED: another run of the same agent held the lock; one line in `skipped.log` and in that run's log |
 | 2 / 3 | usage / setup |
 

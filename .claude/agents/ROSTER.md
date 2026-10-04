@@ -1,0 +1,54 @@
+# The HEE v4 agent roster — one specialist per facet, watchers for every rung, one protocol
+
+Drafted 2026-10-05. Every agent is a Claude Code agent file in this directory (`hee4-<name>.md`), spawnable with the `Agent` tool or routed by `/hee4-roster` (`.claude/skills/hee4-roster/SKILL.md`). All obey `PROTOCOL.md` (the comms and collaboration contract) and the typed exit line that `ops/roster/README.md` already defines. None may send anything to Jev. The HOLD applies: until "start coding", builders plan, prototype in the scratchpad, and write cards, feature files and design conflicts — not engine code.
+
+**The one law above every agent:** the meta goal (`plan/STACK-MAP-2026-10-04.md` §0). A specialist's job is to move its facet's mistake classes **up a rung** — from reviewed to checked to refused to impossible. A watcher's job is to notice when something sits at a lower rung than it could.
+
+**"Top tail of performance":** each agent names the practices and exemplars it draws from — specific, auditable sources, not "best practice". The pattern is the Anti-Bloat Budget's own: a named reference, a measured number, a cite. If an agent cannot name where a technique comes from, it may not call it top-tail.
+
+## Facet specialists (builders — write within their facet only)
+
+| Agent | Facet (crate / interface) | Rung it owns | Draws from (named) |
+|---|---|---|---|
+| `hee4-contracts-architect` | K0 `hee4-contracts`: types, `TaskState`, bounds, receipt schema, brief schema (I1) | **1 — impossible** | "Make illegal states unrepresentable" (Minsky); typestate pattern; Rust API Guidelines; Parse-don't-validate (King); v3 `check/decision.rs` severity lattice (EX-17); property tests for every transition whitelist (LoomLattice `lifecycle.rs` proptests) |
+| `hee4-store-recovery` | K1 `store` (SQLite ledger, objects/sha256, `transition` as the only writer) + `recovery` R01–R14 | 1–2 | SQLite WAL + fsync discipline (sqlite.org "How to corrupt"); Jepsen's crash-consistency method (Kingsbury); Kubernetes controller reconcile (level-triggered, idempotent); Erlang supervision "let it crash"; noodle `reconcile.go` as the worked case list |
+| `hee4-app-runtime` | K6 runtime cluster: `dispatcher`, `runtime`, `main`, `routing`, `startup-coordinator`, `plan`, `candidates`, `workload`, `repair`, `backup-target`, `tasks` (V4-84) | 2 | v3 `app/runtime.rs` ↔ `live_verifier` cycle (A-5) broken by observations-only; noodle `loop_cycle_pipeline.go` + `reconcile.go`; Kubernetes level-triggered reconcile; Erlang supervision order |
+| `hee4-isolation` | K2 `namespace`, K0h `spawn`, the actuation permit at the spawn door; K5 `service` (the systemd unit, `Restart=`, sandboxing directives — V4-84) | 2 | bubblewrap + seccomp (Flatpak sandbox model); least privilege (Saltzer & Schroeder); LoomLattice `SendPermit` (no actuation without a permit, no permit without a receipt); systemd sandboxing directives; cgroup v2 accounting |
+| `hee4-verdict` | K4 `check`: `decide`, the observation schema (I3), identity sources, Decision+Observed sealing | 2 | Fail-closed severity lattices (EX-17); "prove it works, no proxies" (pstack); "a gap is never a pass" (swarm); mutation-score as evidence (Pitest/cargo-mutants literature); deep-diff-forge sealed observation as the exemplar input |
+| `hee4-control-socket` | K6 `control-socket`, `actions`, `events.subscribe` (I5), the API/Error maps | 2 | Unix-socket peer-credential auth (SO_PEERCRED); idempotency keys (Stripe API design); versioned schemas with additive-only evolution (deep-diff-forge `.v0` policy); one name per refusal (Error map, one door per rule) |
+| `hee4-worker-route` | K2-worker `route`, `roster`, `native` model driver; capability floor | 2 | Capability-floor routing with typed refusal (LoomLattice `ll-router`); R02–R13 rule pipeline; model-per-role tables (pstack `models.md`); bounded retries with jittered backoff |
+| `hee4-receipts-chain` | Receipt v1 + `hash_prev`/`hash_self` + Merkle checkpoints (I4) | 1–2 | Certificate Transparency / Merkle tree logs (RFC 6962); Sigstore Rekor; LoomLattice `chain.rs` + `fable_chain.py verify`; canonical JSON (RFC 8785) before hashing |
+| `hee4-gate` | The derived tiered gate (`gate.toml`, commit/stack/cut), feature-map drive, `doctor`, deep-diff-forge and mutants adapters | 3 | Hermetic builds (Bazel; `git archive` at a sha); mutation testing (cargo-mutants); property-based testing (QuickCheck/proptest); `elapsed/budget` per step (REQUIREMENTS rank 6); verification-skill phases Launch/Doctor/Drive/Evidence/Cleanup |
+| `hee4-outer-loop` | I2 orders file, `control.ndjson`/acks, the mode dial (`manual`/`supervised`/`auto`) | 2 | noodle's file-API and idempotent control sequence; Toyota andon (any watcher can stop the line); Kubernetes admission webhooks (one gate over admit/dispatch/settle) |
+| `hee4-craft-curator` | `.claude/skills/pstack`, the `correct` ladder (I6), playbooks for building HEE; proposes `brain/` notes, which `hee4-scribe` writes (PROTOCOL §4) | 4→up | pstack `correct` ("fix at the highest level that works; prove the check fails on a real past mistake"); brainmaxxing (one topic per file, <50 lines); Diátaxis; "encode lessons in structure" |
+| `hee4-floor-display` | L7: `events.subscribe` consumers — herdr adapter (`hee4-habitat/herdr`), LoomLattice glass projection | read-only consumer | herdr `--json` over screen-scrape; ISA-18.2 quiet-dark alarm philosophy (LoomLattice glass); hooks-over-detection precedence |
+
+## Watchers (read-only, continuous or scheduled; each ends with a typed verdict and may raise STOP)
+
+| Agent | Watches for | Rung it reports on | Draws from |
+|---|---|---|---|
+| `hee4-watch-drift` | apparatus_ratio, count literals in prose, generated blocks, second homes, cards longer than their code budget (AP-28, AP-44–48, D-01…D-16) | things sitting at rung 4 that have a rung-2 detector | the DRIFT doc's printed numbers; SRE golden signals (measure, don't narrate) |
+| `hee4-watch-contradiction` | maps vs cards vs register vs feature files disagreeing (today's §8 class); dangling cites (V4-77); stale pins | rung 2 door "one name / one phase / one home" | `cite_pins`, `module_funnel`, `funnel_trace`; the feature map |
+| `hee4-watch-evidence` | claims without MEASURED/INFERRED/UNMEASURED; gates that looked at nothing; observations without `input_sha256`/`head_sha`; a PASS from a tier-1 source | rung 2 | pstack reply rule ("every claim carries its evidence or its label"); AP-29, AP-33, AP-34 |
+| `hee4-watch-recovery` | non-terminal tasks after a drill; `effect_unknown` rows; missing `Restart=`; observations not ledgered before a verdict | rung 5 → 2 | Jepsen; D7; the crash-restart feature file |
+| `hee4-watch-fence` | writes outside the v4 homes; v3 paths; unsandboxed agent runs (`bypassPermissions`, `disableAllHooks`); secrets in the tree; **any v4 text headed for Jev** | rung 2 | `hee4-v3-guard`, `.claude/settings.json` deny rules, `hee4db jev-entry`, secret-scan preflight (V4-76) |
+| `hee4-watch-budget` | fan-outs over `planned_agents=`, spend past 70% of budget, briefs over their command budget, agents resumed instead of fresh | rung 2 | REQUIREMENTS rank 3 (fan-out kernel); pstack orchestrate's measured lessons ("each nested layer re-pays orientation"; "stop at ~70%") |
+
+## Collaboration roles (never code; the brief and the ledger are their product)
+
+**Luke, 2026-10-05: Firstmate is the orchestrator.** The `hee4-coordinator` role is played by **the first mate** of a Firstmate home (`~/firstmate`, upstream `kunchenguid/firstmate`; `FM_HOME` selects the home). Each Firstmate home is allocated **one orchestration database**, `$FM_HOME/data/firstmate.db`, written only by `ops/firstmate/fm-db` and read back with `tursodb --readonly`. Design: `plan/FIRSTMATE-ORCHESTRATION-2026-10-05.md`. Four reconciliations with Firstmate's own conventions, measured against its `AGENTS.md`:
+- *Fresh vs resume:* crew and scouts are fresh per spawn (both agree). A **secondmate** is a persistent *home*, not a resumed agent: a relaunch counts as a new spawn against the same brief (`fresh=0`), recorded in `spawns`.
+- *Budget:* Firstmate has no concurrency cap by design; `planned_agents=` is enforced by `fm-db record spawn`, which refuses the N+1th spawn, and by `spend_max_concurrent_workers` in the away-mode contract.
+- *Permissions:* Firstmate launches Claude workers in bypass by default; this home sets `config/claude-permission-mode = auto` (done 2026-10-05, gitignored) so `hee4-watch-fence` has nothing to flag.
+- *Vocabulary:* Firstmate status verbs map onto the typed exits (`done`→PASS, `failed`→FAIL, `blocked`/`needs-decision`→BLOCKED, `paused`→PASS_WITH_GAPS); STOP is the andon, raised only by a watcher or refuter, recorded in `andon`, and it blocks every further spawn in the unit until the captain clears it (`fm-captain-hold.sh hold` is Firstmate's half).
+
+| Agent | Role | Draws from |
+|---|---|---|
+| `hee4-coordinator` (= the first mate) | Writes the 11-field brief (I1) for every spawn (`data/<id>/brief.md`); records the unit with `planned_agents=` before any spawn; pastes standing orders verbatim (`config/brief-include.md`); the one writer of `firstmate.db`; halts the unit on any STOP; never codes (Firstmate hard rule 1) | Firstmate `AGENTS.md` (brief before spawn; never writes projects); pstack orchestrate ("the brief is the product"; pilot one unit, then a rolling window); the roster runner's typed exit codes |
+| `hee4-refuter` | Independently re-runs the witness command behind another agent's claim; cannot verify its own; drops a report missing SHAs or method and respawns once | pstack swarm/interrogate; `hee4db record verify` ("the claimant cannot"); Popperian falsification; the existing `hee4-reviewer` law |
+| `hee4-scribe` | The one writer into `brain/` and the one proposer of `plan/DECISIONS.md` rows (proposals only; Luke appends); reconciles reports into one record with every claim labelled | brainmaxxing `/meditate` (prune, surface principles, two supporting notes per principle); the append-only register discipline |
+
+## Not in this roster, on purpose
+- No agent may hold two facets (one door per rule). A cross-facet change is two briefs and a coordinator.
+- No watcher may fix what it finds; it reports with a witness command, and a builder or Luke acts.
+- The old cron curators (`hee4-curator`, `hee4-workflow-curator`) are superseded by `hee4-scribe` + `hee4-watch-drift`; their files stay until Luke retires them (V4-80 proposal).
