@@ -31,7 +31,22 @@
       "Bash(fm-db status)",
       "Bash(fm-db q:*)",
       "Bash(fm-db record claim:*)",
-      "Bash(deep-diff-forge:*)"
+      "Bash(deep-diff-forge:*)",
+      "Bash(/usr/bin/head:*)",
+      "Bash(/usr/bin/tail:*)",
+      "Bash(/usr/bin/cat:*)",
+      "Bash(/usr/bin/sed -n:*)",
+      "Bash(/usr/bin/sort:*)",
+      "Bash(/usr/bin/uniq:*)",
+      "Bash(/usr/bin/cut:*)",
+      "Bash(/usr/bin/awk:*)",
+      "Bash(/usr/bin/diff:*)",
+      "Bash(/usr/bin/file:*)",
+      "Bash(/usr/bin/stat:*)",
+      "Bash(git worktree list)",
+      "Bash(git remote -v)",
+      "Bash(git ls-files:*)",
+      "Bash(git grep:*)"
     ],
     "deny": [
       "Edit(//var/home/herdr-engineering-engine-v3/**)",
