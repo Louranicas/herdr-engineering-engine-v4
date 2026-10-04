@@ -197,3 +197,16 @@ restore-v3-modes CONFIRM="":
     v=PASS; [ "$rc" -eq 0 ] && [ -n "$line" ] && [ "$n" = "$m" ] && [ "$m" = "$rows" ] || v=FAIL
     echo "restore-v3-modes verdict=$v rc=$rc restored=${line#restored=} tsv_rows=$rows"
     [ "$v" = PASS ]
+
+# The derived tiered code gate on a `git archive` of HEAD: `just gate commit|stack|cut` (tools/gate, gate.toml)
+gate tier:
+    @tools/gate "{{tier}}"
+
+# The kill -9 drill (`drill` is taken by the corpus backup drill): `just drill-kill9 [UNIT [SOCKET]]`
+drill-kill9 unit="hee4.service" socket="":
+    #!/usr/bin/env bash
+    exec tools/drill --unit "$1" ${2:+--socket "$2"}
+
+# Fresh-instance readiness: unit, socket perms, ledger, model, binary sha
+doctor:
+    @tools/doctor

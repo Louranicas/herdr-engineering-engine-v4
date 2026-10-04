@@ -1,0 +1,53 @@
+# The gate, declared once (REQUIREMENTS ranks 1 and 6). `tools/gate TIER` is the only runner.
+# A tier is its `includes` tier's steps, then its own. Every step has budget_s (the runner refuses
+# a step without one). `expect` says what the step must have LOOKED AT (AP-29); no count literal
+# lives here (AP-28): a relation ("more than none ran") is the only expectation.
+#   expect = "none"        rc only
+#   expect = "tests_ran"   cargo test output must report tests that ran (sum of "N passed" > 0)
+#   expect = "ddf_sealed"  stdout is ddf JSON with input_sha256; rc 7 is FAIL with the stderr reason
+#   expect = "tool_rc"     a tools/ script that prints its own lines; rc 0 only (rc 3 = UNMEASURED = red)
+
+[gate]
+base = "HEAD~1"            # `stack` diffs <base>..<subject>; override with --base
+
+[tier.commit]
+steps = ["fmt", "clippy", "test"]
+
+[tier.stack]
+includes = "commit"
+steps = ["ddf"]
+
+[tier.cut]
+includes = "stack"
+steps = ["drill", "doctor"]
+
+[step.fmt]
+cmd = "cargo fmt --all -- --check"
+budget_s = 60
+expect = "none"
+
+[step.clippy]
+cmd = "cargo clippy --workspace --all-targets -- -D warnings"
+budget_s = 600
+expect = "none"
+
+[step.test]
+cmd = "cargo test --workspace"
+budget_s = 600
+expect = "tests_ran"
+
+[step.ddf]
+# runs `git diff <base>..<subject>` (code and docs together) into this command
+cmd = "deep-diff-forge --stdin-patch --rank --json --require-files --require-hunks"
+budget_s = 60
+expect = "ddf_sealed"
+
+[step.drill]
+cmd = "tools/drill"
+budget_s = 120
+expect = "tool_rc"
+
+[step.doctor]
+cmd = "tools/doctor"
+budget_s = 60
+expect = "tool_rc"
