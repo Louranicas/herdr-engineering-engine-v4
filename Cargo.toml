@@ -1,0 +1,35 @@
+# HEE v4 workspace (V4-89, 2026-10-05). Six crates: the walking skeleton's set (STACK-MAP §4).
+[workspace]
+resolver = "2"
+members = [
+  "crates/hee4-contracts",
+  "crates/hee4-host",
+  "crates/hee4-core",
+  "crates/hee4-worker",
+  "crates/hee4-evidence",
+  "crates/hee4-app",
+]
+
+[workspace.package]
+version = "4.0.0-skeleton"
+edition = "2024"
+license = "UNLICENSED"
+rust-version = "1.99"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.37", features = ["bundled"] }
+sha2 = "0.10"
+thiserror = "2"
+proptest = "1"

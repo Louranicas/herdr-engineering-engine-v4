@@ -1,0 +1,18 @@
+[package]
+name = "hee4-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+hee4-contracts = { path = "../hee4-contracts" }
+hee4-host = { path = "../hee4-host" }
+hee4-core = { path = "../hee4-core" }
+hee4-worker = { path = "../hee4-worker" }
+hee4-evidence = { path = "../hee4-evidence" }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
