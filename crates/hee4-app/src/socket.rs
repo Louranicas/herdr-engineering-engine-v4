@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::actions::{Engine, handle};
+use crate::actions::{Engine, Outcome, answer};
 use crate::wire::{self, Code, Fault, MAX_FRAME_BYTES};
 
 /// Why the socket could not be bound.
@@ -27,16 +27,65 @@ pub enum BindError {
     Io(#[from] std::io::Error),
 }
 
-/// How the peer was checked. `SO_PEERCRED` needs `getsockopt` (unsafe, forbidden here) or the
-/// unstable `UnixStream::peer_cred`; the skeleton relies on the 0700 dir and says so.
+/// How the peer is checked: the kernel's `SO_PEERCRED` uid, read through `rustix`'s safe
+/// `getsockopt` wrapper, compared with this process's uid before any frame is read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerCheck {
-    /// Not measured: no safe `SO_PEERCRED` reader is available to this crate.
-    Unmeasured,
+    /// `SO_PEERCRED` uid equals the process uid, or the connection is refused `forbidden`.
+    SoPeercred,
 }
 
 /// The peer check in force.
-pub const PEER_CHECK: PeerCheck = PeerCheck::Unmeasured;
+pub const PEER_CHECK: PeerCheck = PeerCheck::SoPeercred;
+
+/// The comparison the peer check makes. `ours` is `None` when the process uid could not be
+/// read; that refuses too (fail closed).
+///
+/// # Errors
+/// [`Code::Forbidden`] at `/`.
+pub fn peer_allowed(peer_uid: u32, ours: Option<u32>) -> Result<(), Fault> {
+    if ours == Some(peer_uid) {
+        Ok(())
+    } else {
+        Err(Fault::new(
+            Code::Forbidden,
+            "/",
+            "peer uid is not the server's uid",
+        ))
+    }
+}
+
+/// A connection whose peer passed [`peer_allowed`]. The only way to build one is
+/// [`Admitted::check`], so no frame is read from an unchecked peer.
+#[derive(Debug)]
+pub struct Admitted {
+    stream: UnixStream,
+    /// The peer's uid, from the kernel.
+    pub uid: u32,
+    /// The peer's pid, from the kernel.
+    pub pid: i32,
+}
+
+impl Admitted {
+    /// Read `SO_PEERCRED` and compare its uid with the process uid.
+    ///
+    /// # Errors
+    /// `Err(Some(fault))` for a foreign uid; `Err(None)` when `getsockopt` itself failed.
+    pub fn check(stream: UnixStream) -> Result<Self, (UnixStream, Option<Fault>)> {
+        let Ok(cred) = rustix::net::sockopt::socket_peercred(&stream) else {
+            return Err((stream, None));
+        };
+        let uid = cred.uid.as_raw();
+        match peer_allowed(uid, crate::process_uid()) {
+            Ok(()) => Ok(Self {
+                stream,
+                uid,
+                pid: cred.pid.as_raw_pid(),
+            }),
+            Err(f) => Err((stream, Some(f))),
+        }
+    }
+}
 
 /// Bind `path`: create its directory 0700 (refusing one owned by another uid), replace a stale
 /// socket only when nothing answers on it, bind, chmod 0600.
@@ -66,15 +115,24 @@ pub fn serve(listener: &UnixListener, engine: &Arc<Engine>) {
     for conn in listener.incoming() {
         let Ok(stream) = conn else { continue };
         let engine = Arc::clone(engine);
-        std::thread::spawn(move || {
-            if let Err(e) = connection(stream, &engine) {
-                eprintln!("socket connection ended: {e}");
+        std::thread::spawn(move || match Admitted::check(stream) {
+            Ok(peer) => {
+                if let Err(e) = connection(peer, &engine) {
+                    eprintln!("socket connection ended: {e}");
+                }
+            }
+            Err((mut stream, fault)) => {
+                let fault = fault
+                    .unwrap_or_else(|| Fault::new(Code::Forbidden, "/", "SO_PEERCRED unreadable"));
+                eprintln!("socket refused peer: {}", fault.message);
+                let _ = stream.write_all(format!("{}\n", wire::error("", &fault)).as_bytes());
             }
         });
     }
 }
 
-fn connection(stream: UnixStream, engine: &Engine) -> std::io::Result<()> {
+fn connection(peer: Admitted, engine: &Arc<Engine>) -> std::io::Result<()> {
+    let stream = peer.stream;
     stream.set_read_timeout(Some(Duration::from_secs(60)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     let mut writer = stream.try_clone()?;
@@ -91,8 +149,14 @@ fn connection(stream: UnixStream, engine: &Engine) -> std::io::Result<()> {
             // Oversize or EOF inside a record: close without dispatch (Socket and IPC Map).
             return Ok(());
         }
-        let reply = handle(engine, line.trim_end());
-        writer.write_all(format!("{reply}\n").as_bytes())?;
+        match answer(engine, line.trim_end()) {
+            Outcome::Frame(reply) => writer.write_all(format!("{reply}\n").as_bytes())?,
+            Outcome::Subscribe { ack, since_seq } => {
+                writer.write_all(format!("{ack}\n").as_bytes())?;
+                // The connection is a stream from here on; requests after it are not read.
+                return crate::stream::run(writer, Arc::clone(engine), since_seq);
+            }
+        }
     }
 }
 
@@ -109,4 +173,33 @@ pub fn request(path: &Path, frame: &Value) -> std::io::Result<Value> {
     Ok(serde_json::from_str(&line).unwrap_or_else(|_| {
         wire::error("", &Fault::new(Code::Internal, "/", "reply was not JSON"))
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn peer_uid_comparison_is_typed() {
+        assert_eq!(peer_allowed(1000, Some(1000)), Ok(()));
+        for (peer, ours) in [(0, Some(1000)), (1000, Some(0)), (1000, None)] {
+            let refused = peer_allowed(peer, ours).map_err(|f| f.code);
+            assert_eq!(refused, Err(Code::Forbidden), "peer={peer} ours={ours:?}");
+        }
+    }
+
+    #[test]
+    fn a_real_same_uid_connection_is_admitted() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = std::env::temp_dir().join(format!("hee4-peer-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let listener = bind(&dir.join("s.sock"))?;
+        let client = UnixStream::connect(dir.join("s.sock"))?;
+        let (server_side, _) = listener.accept()?;
+        let peer = Admitted::check(server_side).map_err(|(_, f)| format!("refused: {f:?}"))?;
+        assert_eq!(Some(peer.uid), crate::process_uid());
+        assert_eq!(u32::try_from(peer.pid)?, std::process::id());
+        drop(client);
+        fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
 }

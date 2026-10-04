@@ -25,13 +25,49 @@ pub enum Code {
     Conflict,
     /// The task does not exist.
     NotFound,
-    /// The peer is not this process's uid.
+    /// The peer is not this process's uid (`SO_PEERCRED`).
     Forbidden,
     /// The ledger failed under the request.
     Internal,
+    /// `task.preview`: `route::select` found no model for the brief (a result-body name).
+    NoRoute,
+    /// `events.subscribe`: the subscriber fell a full queue behind; the stream closes.
+    SlowConsumer,
 }
 
 impl Code {
+    /// Every name, in declaration order (`ALL[c.ordinal()] == c`).
+    pub const ALL: [Self; 10] = [
+        Self::InvalidArgument,
+        Self::UnknownAction,
+        Self::UnsupportedActionVersion,
+        Self::NotReady,
+        Self::Conflict,
+        Self::NotFound,
+        Self::Forbidden,
+        Self::Internal,
+        Self::NoRoute,
+        Self::SlowConsumer,
+    ];
+
+    /// Position in [`Code::ALL`]. No wildcard arm: a new variant does not compile until it has
+    /// a position, and the table test then fails until `ALL` and FLOW.md name it.
+    #[must_use]
+    pub const fn ordinal(self) -> usize {
+        match self {
+            Self::InvalidArgument => 0,
+            Self::UnknownAction => 1,
+            Self::UnsupportedActionVersion => 2,
+            Self::NotReady => 3,
+            Self::Conflict => 4,
+            Self::NotFound => 5,
+            Self::Forbidden => 6,
+            Self::Internal => 7,
+            Self::NoRoute => 8,
+            Self::SlowConsumer => 9,
+        }
+    }
+
     /// The wire spelling.
     #[must_use]
     pub const fn name(self) -> &'static str {
@@ -44,6 +80,8 @@ impl Code {
             Self::NotFound => "not_found",
             Self::Forbidden => "forbidden",
             Self::Internal => "internal",
+            Self::NoRoute => "no_route",
+            Self::SlowConsumer => "slow_consumer",
         }
     }
 
@@ -51,7 +89,7 @@ impl Code {
     #[must_use]
     pub const fn retry(self) -> &'static str {
         match self {
-            Self::NotReady => "after_condition",
+            Self::NotReady | Self::NoRoute | Self::SlowConsumer => "after_condition",
             Self::Conflict => "after_readback",
             Self::Internal => "same_exact_request",
             Self::InvalidArgument
@@ -176,6 +214,12 @@ pub fn error(request_id: &str, fault: &Fault) -> Value {
     })
 }
 
+/// A stream's close frame: the last line before the server closes the connection.
+#[must_use]
+pub fn close(code: Code, message: &str) -> Value {
+    json!({"kind": "close", "code": code.name(), "retry": code.retry(), "message": message})
+}
+
 /// A request frame (the CLI's half).
 #[must_use]
 pub fn request(
@@ -192,4 +236,39 @@ pub fn request(
     });
     v["body"] = body;
     v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Code;
+    use std::collections::BTreeSet;
+
+    /// The names in FLOW.md's "Refusal names" table, first column.
+    fn flow_table() -> Vec<String> {
+        let flow = include_str!("../FLOW.md");
+        let section = flow
+            .split("## Refusal names")
+            .nth(1)
+            .and_then(|s| s.split("\n## ").next())
+            .unwrap_or("");
+        section
+            .lines()
+            .filter_map(|l| l.strip_prefix("| `"))
+            .filter_map(|l| l.split('`').next())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn every_emittable_refusal_has_one_row_in_flow() {
+        for (i, c) in Code::ALL.iter().enumerate() {
+            assert_eq!(c.ordinal(), i, "{c:?} out of place in Code::ALL");
+        }
+        let code: BTreeSet<String> = Code::ALL.iter().map(|c| c.name().to_owned()).collect();
+        let table = flow_table();
+        let rows: BTreeSet<String> = table.iter().cloned().collect();
+        assert_eq!(rows.len(), table.len(), "a name appears twice: {table:?}");
+        assert_eq!(code.len(), Code::ALL.len(), "two variants share a name");
+        assert_eq!(rows, code);
+    }
 }

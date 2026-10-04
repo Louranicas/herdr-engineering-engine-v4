@@ -2,7 +2,9 @@
 
 use std::error::Error;
 use std::fs;
+use std::io::{BufRead as _, BufReader, Write as _};
 use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -190,5 +192,91 @@ fn one_task_end_to_end_then_kill9_mid_dispatch() -> R<()> {
     // The orphaned bwrap child of task B (if still alive) is the test's to clean up.
     let work = dir.join("work").to_string_lossy().into_owned();
     let _ = Command::new("pkill").args(["-KILL", "-f", &work]).status();
+    Ok(())
+}
+
+/// Open an `events.subscribe` stream after `since`, returning the reader past the ack.
+fn subscribe(sock: &Path, since: i64) -> R<BufReader<UnixStream>> {
+    let mut s = UnixStream::connect(sock)?;
+    let frame = wire::request(
+        "sub",
+        "events.subscribe",
+        None,
+        json!({ "since_seq": since }),
+    );
+    s.write_all(format!("{frame}\n").as_bytes())?;
+    s.set_read_timeout(Some(Duration::from_secs(30)))?;
+    let mut r = BufReader::new(s);
+    let mut ack = String::new();
+    r.read_line(&mut ack)?;
+    let ack: Value = serde_json::from_str(&ack)?;
+    assert_eq!(ack["body"]["since_seq"], since, "{ack}");
+    Ok(r)
+}
+
+/// Read event frames until one for `task` reaches a terminal phase.
+fn until_terminal(r: &mut BufReader<UnixStream>, task: &Value) -> R<Vec<Value>> {
+    let mut out = Vec::new();
+    loop {
+        let mut line = String::new();
+        if r.read_line(&mut line)? == 0 {
+            return Err(format!("stream closed after {out:?}").into());
+        }
+        let v: Value = serde_json::from_str(&line)?;
+        assert_eq!(v["kind"], "event", "{v}");
+        let done =
+            v["task_id"] == *task && TERMINAL.contains(&v["phase_after"].as_str().unwrap_or("?"));
+        out.push(v);
+        if done {
+            return Ok(out);
+        }
+    }
+}
+
+#[test]
+fn events_subscribe_streams_in_seq_order_and_resumes_exactly_once() -> R<()> {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("e2e-stream");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir)?;
+    let mut server = start(&dir, "serve.log")?;
+    let sock = server.sock.clone();
+    let mut live = subscribe(&sock, 0)?;
+    let a = call(
+        &sock,
+        "task.submit",
+        Some("key-s"),
+        json!({ "brief": brief("/usr/bin/true") }),
+    )?;
+    let id = a["body"]["task_id"].clone();
+    let first = until_terminal(&mut live, &id)?;
+    for f in &first {
+        println!("stream {f}");
+    }
+    assert_eq!(first[0]["event"], "admit");
+    assert_eq!(first[0]["phase_after"], "admitted");
+    let seqs: Vec<i64> = first.iter().filter_map(|f| f["seq"].as_i64()).collect();
+    assert_eq!(seqs.len(), first.len());
+    assert!(seqs.windows(2).all(|w| w[0] < w[1]), "{seqs:?}");
+    assert!(first.len() >= 3, "{first:?}");
+
+    // Resume after the second event: exactly the rest, once each, then nothing.
+    let mut resumed = subscribe(&sock, seqs[1])?;
+    let rest = until_terminal(&mut resumed, &id)?;
+    assert_eq!(rest, first[2..].to_vec());
+    resumed
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_millis(500)))?;
+    let mut extra = String::new();
+    assert!(
+        resumed.read_line(&mut extra).is_err(),
+        "extra frame {extra}"
+    );
+    println!(
+        "resume since_seq={} replayed={} frames, no extra",
+        seqs[1],
+        rest.len()
+    );
+    server.child.kill()?;
+    server.child.wait()?;
     Ok(())
 }

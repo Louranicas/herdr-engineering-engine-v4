@@ -1,4 +1,6 @@
-//! The four skeleton actions plus `health`, behind one `handle(line) -> reply` door.
+//! The control actions behind one `answer(line)` door: `health`, `task.{submit,get,list,
+//! cancel,preview,resolve}` answer one frame; `events.subscribe` turns the connection into a
+//! stream (`crate::stream`).
 //!
 //! Every state change goes through `Store::admit` or `Store::apply`. A mutating action before
 //! startup reconcile completed is refused `not_ready`, read from the ledger's own flag.
@@ -9,28 +11,36 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Instant;
 
-use hee4_contracts::{Brief, Event, Phase, Sha256Hex, TaskId};
+use hee4_contracts::{Brief, BriefField, Event, Phase, Resolution, Sha256Hex, TaskId};
 use hee4_core::{OperationKey, Store, StoreError};
+use hee4_host::model::OllamaClient;
+use hee4_worker::native::StepKind;
 use serde_json::{Value, json};
 
+use crate::dispatcher::{self, Config};
 use crate::wire::{self, Code, Fault, Request};
 
 /// The engine one `serve` process holds: the ledger (one connection, one process) and paths.
 #[derive(Debug)]
 pub struct Engine {
     store: Mutex<Store>,
+    ledger: PathBuf,
     work: PathBuf,
+    cfg: Config,
     started: Instant,
     principal: String,
 }
 
 impl Engine {
-    /// Wrap an opened store. `work` is the work root (`<work>/<task_id>` per task).
+    /// Wrap an opened store. `ledger` is its file (read-only stream readers open it),
+    /// `work` the work root (`<work>/<task_id>` per task), `cfg` what `task.preview` routes by.
     #[must_use]
-    pub fn new(store: Store, work: PathBuf) -> Self {
+    pub fn new(store: Store, ledger: PathBuf, work: PathBuf, cfg: Config) -> Self {
         Self {
             store: Mutex::new(store),
+            ledger,
             work,
+            cfg,
             started: Instant::now(),
             principal: crate::process_uid()
                 .map_or_else(|| "uid:unknown".into(), |u| format!("uid:{u}")),
@@ -43,6 +53,12 @@ impl Engine {
         self.store
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The ledger file.
+    #[must_use]
+    pub fn ledger(&self) -> &Path {
+        &self.ledger
     }
 
     /// The work root.
@@ -58,24 +74,61 @@ impl Engine {
     }
 }
 
-/// Answer one request line with one reply frame.
+/// What one request line asks of the connection.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Outcome {
+    /// Write this frame and read the next request.
+    Frame(Value),
+    /// Write `ack`, then stream ledger events after `since_seq` until close.
+    Subscribe {
+        /// The result frame acknowledging the subscription.
+        ack: Value,
+        /// Events with `seq > since_seq` are streamed.
+        since_seq: i64,
+    },
+}
+
+/// Answer one request line.
+#[must_use]
+pub fn answer(engine: &Engine, line: &str) -> Outcome {
+    match wire::parse(line) {
+        Err((id, fault)) => Outcome::Frame(wire::error(&id, &fault)),
+        Ok(req) => match dispatch(engine, &req) {
+            Ok(Answer::Frame(replayed, body)) => {
+                Outcome::Frame(wire::result(&req.request_id, replayed, body))
+            }
+            Ok(Answer::Subscribe(since_seq)) => Outcome::Subscribe {
+                ack: wire::result(
+                    &req.request_id,
+                    false,
+                    json!({ "since_seq": since_seq, "stream": "events" }),
+                ),
+                since_seq,
+            },
+            Err(fault) => Outcome::Frame(wire::error(&req.request_id, &fault)),
+        },
+    }
+}
+
+/// Answer one request line with one frame (a subscription's frame is its ack).
 #[must_use]
 pub fn handle(engine: &Engine, line: &str) -> Value {
-    match wire::parse(line) {
-        Err((id, fault)) => wire::error(&id, &fault),
-        Ok(req) => match dispatch(engine, &req) {
-            Ok((replayed, body)) => wire::result(&req.request_id, replayed, body),
-            Err(fault) => wire::error(&req.request_id, &fault),
-        },
+    match answer(engine, line) {
+        Outcome::Frame(v) | Outcome::Subscribe { ack: v, .. } => v,
     }
 }
 
 type Reply = Result<(bool, Value), Fault>;
 
-fn dispatch(engine: &Engine, req: &Request) -> Reply {
+enum Answer {
+    Frame(bool, Value),
+    Subscribe(i64),
+}
+
+fn dispatch(engine: &Engine, req: &Request) -> Result<Answer, Fault> {
     let mutating = match req.action.as_str() {
-        "health" | "task.get" | "task.list" => false,
-        "task.submit" | "task.cancel" => true,
+        "health" | "task.get" | "task.list" | "task.preview" | "events.subscribe" => false,
+        "task.submit" | "task.cancel" | "task.resolve" => true,
         _ => {
             return Err(Fault::new(
                 Code::UnknownAction,
@@ -111,12 +164,32 @@ fn dispatch(engine: &Engine, req: &Request) -> Reply {
             ));
         }
     }
-    match req.action.as_str() {
+    let frame = match req.action.as_str() {
+        "events.subscribe" => return since_seq_of(&req.body).map(Answer::Subscribe),
         "health" => health(engine),
         "task.submit" => submit(engine, req),
         "task.get" => get(engine, &req.body),
         "task.list" => list(engine),
+        "task.preview" => preview(engine, &req.body),
+        "task.resolve" => resolve(engine, &req.body),
         _ => cancel(engine, &req.body),
+    };
+    frame.map(|(replayed, body)| Answer::Frame(replayed, body))
+}
+
+fn since_seq_of(body: &Value) -> Result<i64, Fault> {
+    match body.get("since_seq") {
+        None | Some(Value::Null) => Ok(0),
+        Some(v) => v
+            .as_u64()
+            .and_then(|n| i64::try_from(n).ok())
+            .ok_or_else(|| {
+                Fault::new(
+                    Code::InvalidArgument,
+                    "/body/since_seq",
+                    "unsigned integer or null",
+                )
+            }),
     }
 }
 
@@ -255,6 +328,73 @@ fn cancel(engine: &Engine, body: &Value) -> Reply {
     ))
 }
 
+/// Parse, check the restatement and route, as dispatch would; admit nothing.
+fn preview(engine: &Engine, body: &Value) -> Reply {
+    let text = body
+        .get("brief")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Fault::new(Code::InvalidArgument, "/body/brief", "string required"))?;
+    let not_eligible = |code: Code, message: String| {
+        Ok((
+            false,
+            json!({"eligible": false, "refusal": code.name(), "message": message}),
+        ))
+    };
+    let brief = match Brief::parse(text) {
+        Ok(b) => b,
+        Err(e) => return not_eligible(Code::InvalidArgument, e.to_string()),
+    };
+    if let Err(e) = brief.check_restatement() {
+        return not_eligible(Code::InvalidArgument, e.to_string());
+    }
+    let wants_model = dispatcher::playbook(brief.get(BriefField::Verify))
+        .iter()
+        .any(|s| matches!(s.kind, StepKind::Generate { .. }));
+    let client = OllamaClient::new(dispatcher::MODEL_URL);
+    match dispatcher::route(&engine.cfg, &client, wants_model && engine.cfg.live) {
+        Ok(sel) => Ok((false, json!({"eligible": true, "model": sel.model}))),
+        Err(r) => not_eligible(Code::NoRoute, r.to_string()),
+    }
+}
+
+/// `Store::apply(Resolve(..))`. The reason is journalled: `Event::Resolve` carries none.
+fn resolve(engine: &Engine, body: &Value) -> Reply {
+    let task = task_id_of(body)?;
+    let resolution = match body.get("resolution").and_then(Value::as_str) {
+        Some("quarantine") => Resolution::Quarantine,
+        Some("abandon") => Resolution::Abandon,
+        _ => {
+            return Err(Fault::new(
+                Code::InvalidArgument,
+                "/body/resolution",
+                "\"quarantine\" or \"abandon\"",
+            ));
+        }
+    };
+    let reason = body
+        .get("reason")
+        .and_then(Value::as_str)
+        .filter(|r| !r.trim().is_empty())
+        .ok_or_else(|| Fault::new(Code::InvalidArgument, "/body/reason", "non-empty string"))?;
+    let store = engine.store();
+    phase_of(&store, &task)?;
+    let phase = store
+        .apply(&task, Event::Resolve(resolution))
+        .map_err(|e| match e {
+            StoreError::Refused(r) => Fault::new(Code::Conflict, "/body/task_id", r.to_string()),
+            other => internal(&other),
+        })?;
+    // TODO(C2): the contracts have no resolution-reason enum yet (`Operator` equivalent);
+    // until then the operator's text is journalled, not ledgered.
+    eprintln!(
+        "resolve task={task} resolution={resolution:?} reason_kind=operator reason={reason:?}"
+    );
+    Ok((
+        false,
+        json!({"task_id": task.as_str(), "phase": phase.as_str()}),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,7 +408,12 @@ mod tests {
         fs::create_dir_all(&dir)?;
         Ok(Engine::new(
             Store::open(&dir.join("ledger.sqlite3"))?,
+            dir.join("ledger.sqlite3"),
             dir.join("work"),
+            Config {
+                model: "m:1".into(),
+                live: false,
+            },
         ))
     }
 
@@ -342,6 +487,59 @@ mod tests {
         let c = wire::request("r", "task.cancel", Some("c1"), json!({ "task_id": id })).to_string();
         assert_eq!(handle(&e, &c)["body"]["phase"], "cancellation_requested");
         assert_eq!(handle(&e, &c)["body"]["phase"], "cancellation_requested");
+        Ok(())
+    }
+
+    fn line(action: &str, key: Option<&str>, body: Value) -> String {
+        wire::request("r", action, key, body).to_string()
+    }
+
+    #[test]
+    fn preview_admits_nothing_and_names_its_refusal() -> Result<(), Box<dyn std::error::Error>> {
+        let e = engine("preview")?;
+        let ok = handle(&e, &line("task.preview", None, json!({ "brief": BRIEF })));
+        assert_eq!(ok["body"], json!({"eligible": true, "model": "m:1"}));
+        let bad = BRIEF.replace("RESTATEMENT: run true", "RESTATEMENT:");
+        let no = handle(&e, &line("task.preview", None, json!({ "brief": bad })));
+        assert_eq!(no["body"]["eligible"], false);
+        assert_eq!(no["body"]["refusal"], "invalid_argument");
+        assert_eq!(e.store().task_ids()?.len(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_goes_through_apply() -> Result<(), Box<dyn std::error::Error>> {
+        let e = engine("resolve")?;
+        reconcile(&e.store(), &Observations::worker_absent())?;
+        let id = handle(&e, &submit_line("k4", BRIEF))["body"]["task_id"].clone();
+        let q = json!({"task_id": id, "resolution": "quarantine", "reason": "op"});
+        let r = handle(&e, &line("task.resolve", Some("q1"), q.clone()));
+        assert_eq!(r["body"]["phase"], "blocked");
+        let no_key = handle(&e, &line("task.resolve", None, q));
+        assert_eq!(no_key["field"], "/idempotency_key");
+        let bad = json!({"task_id": id, "resolution": "retry", "reason": "op"});
+        assert_eq!(
+            handle(&e, &line("task.resolve", Some("q2"), bad))["field"],
+            "/body/resolution"
+        );
+        let a = json!({"task_id": id, "resolution": "abandon", "reason": "op"});
+        let r = handle(&e, &line("task.resolve", Some("a1"), a.clone()));
+        assert_eq!(r["body"]["phase"], "abandoned");
+        let again = handle(&e, &line("task.resolve", Some("a2"), a));
+        assert_eq!(again["code"], "conflict");
+        Ok(())
+    }
+
+    #[test]
+    fn subscribe_parses_since_seq() -> Result<(), Box<dyn std::error::Error>> {
+        let e = engine("subscribe")?;
+        let ok = answer(&e, &line("events.subscribe", None, json!({"since_seq": 7})));
+        assert!(matches!(ok, Outcome::Subscribe { since_seq: 7, .. }));
+        let bad = handle(
+            &e,
+            &line("events.subscribe", None, json!({"since_seq": -1})),
+        );
+        assert_eq!(bad["field"], "/body/since_seq");
         Ok(())
     }
 }

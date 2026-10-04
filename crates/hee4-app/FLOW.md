@@ -1,6 +1,6 @@
 # hee4-app flow
 
-K6. The `hee4` binary: startup order, the control socket, five actions, the synchronous
+K6. The `hee4` binary: startup order, the control socket, eight actions (one a stream), the synchronous
 dispatcher, `doctor`. Defines no contract type; every state change is `Store::admit` or
 `Store::apply`, and the only verdict is `hee4_evidence::decide_and_seal`'s.
 
@@ -11,7 +11,8 @@ hee4 serve --socket S --ledger L --work W
   recovery::reconcile(store, probe)   findings → exit "recovery incomplete", never listens
   dispatcher thread                   loop { step(); sleep 100 ms when idle }
   socket::bind(S)                     dir 0700 (owner = our uid), stale socket removed only if nothing answers, socket 0600
-  socket::serve                       one thread per connection, one JSON frame per LF line each way
+  socket::serve                       one thread per connection; SO_PEERCRED uid ≠ ours → one `forbidden` frame, close;
+                                      one JSON frame per LF line each way
 ```
 
 ## Frame
@@ -29,6 +30,9 @@ EOF inside a line closes the connection with no reply (Socket and IPC Map).
 | `task.get` | `{task_id}` | `{task_id, phase, events, last_receipt_hash}` | `Store::phase`, `history`, `chain_head` |
 | `task.list` | `{}` | `{tasks: [{task_id, phase}]}` | `Store::task_ids`, `phase` |
 | `task.cancel` | `{task_id}` + `idempotency_key` | `{task_id, phase}` | `Store::apply(Event::Cancel)` |
+| `task.preview` | `{brief}` | `{eligible: true, model}` or `{eligible: false, refusal, message}` | `Brief::parse` + `check_restatement` + `dispatcher::route` (`route::select`); admits nothing |
+| `task.resolve` | `{task_id, resolution: "quarantine"\|"abandon", reason}` + `idempotency_key` | `{task_id, phase}` | `Store::apply(Event::Resolve(..))`; reason journalled (TODO(C2)) |
+| `events.subscribe` | `{since_seq: u64\|null}` | ack `{since_seq, stream:"events"}`, then the stream below | read-only SQLite connection + `Store::history` |
 
 `head_sha` is baked by `build.rs`: env `HEE4_HEAD` (40 hex; the gate sets it, its export has no `.git`), else `git rev-parse HEAD`, else `unknown` (the dispatcher refuses to dispatch on `unknown`).
 
@@ -39,14 +43,20 @@ The brief text is written to `<W>/briefs/<task>.brief` under the same ledger loc
 
 | Name | Retry | When | Field |
 |---|---|---|---|
-| `invalid_argument` | never | line not a JSON object; `request_id`/`action`/`action_version`/`body` missing or mistyped; mutating action without `idempotency_key`; brief missing a field, duplicate field, empty RESTATEMENT; bad `task_id` | the member's pointer (`/`, `/body/brief`, …) |
-| `unknown_action` | never | action not one of the five | `/action` |
+| `invalid_argument` | never | line not a JSON object; `request_id`/`action`/`action_version`/`body` missing or mistyped; mutating action without `idempotency_key`; brief missing a field, duplicate field, empty RESTATEMENT; bad `task_id`; `resolution` not quarantine/abandon; empty `reason`; `since_seq` not a u64 | the member's pointer (`/`, `/body/brief`, …) |
+| `unknown_action` | never | action not one of the eight | `/action` |
 | `unsupported_action_version` | never | `action_version` ≠ 1 | `/action_version` |
 | `not_ready` | after_condition | mutating action while the ledger's `recovery_complete` is false | `/action` |
-| `conflict` | after_readback | same idempotency key, other body bytes; `transition` refused the cancel | `/idempotency_key`, `/body/task_id` |
-| `not_found` | never | `task.get`/`task.cancel` of a task never admitted | `/body/task_id` |
-| `forbidden` | never | reserved for a peer uid ≠ ours; not raised (peer check UNMEASURED, below) | — |
+| `conflict` | after_readback | same idempotency key, other body bytes; `transition` refused the cancel or the resolve | `/idempotency_key`, `/body/task_id` |
+| `not_found` | never | `task.get`/`task.cancel`/`task.resolve` of a task never admitted | `/body/task_id` |
+| `forbidden` | never | `SO_PEERCRED` uid ≠ the process uid (or unreadable); sent before any request is read, then close | `/` |
 | `internal` | same_exact_request | the ledger failed under the request | `/` |
+| `no_route` | after_condition | `task.preview`: `route::select` refused the brief (result body `refusal`, not an error frame) | — |
+| `slow_consumer` | after_condition | `events.subscribe`: the subscriber is 256 frames behind; `{"kind":"close",…}` frame, then close | — |
+
+`wire::tests::every_emittable_refusal_has_one_row_in_flow` parses this table and asserts its names
+equal `wire::Code::ALL`, each once. The API Map names the queue overflow `queue_limit` (A-10);
+this slice uses `slow_consumer` as briefed (DC proposal).
 
 `not_ready` is not in the Error map's 18 codes; the map's nearest is `unavailable` (after_condition).
 DC proposal below.
@@ -75,10 +85,21 @@ I3 has no "unmeasured" outcome, so none is fabricated.
 
 ## Peer credentials
 
-`SO_PEERCRED` needs `getsockopt` (unsafe; `unsafe_code = "forbid"`) or the unstable
-`UnixStream::peer_cred` (E0658 on rustc 1.99). `socket::PEER_CHECK = PeerCheck::Unmeasured`;
-the 0700 directory owned by our uid is the only gate. The principal is the process uid from
-`/proc/self`.
+`socket::Admitted::check` reads `SO_PEERCRED` through `rustix::net::sockopt::socket_peercred`
+(safe API; `unsafe_code = "forbid"` holds) and compares the uid with the process uid from
+`/proc/self` (`socket::peer_allowed`). `connection` takes an `Admitted`, so an unchecked stream
+cannot be served. The 0700 directory stays as the first gate. The principal is still the
+process uid, not the peer's (they are equal by the check).
+
+## Stream (`events.subscribe`)
+
+After the ack, one line per ledger `events` row with `seq > since_seq`, in `seq` order:
+`{"kind":"event","seq","task_id","event","phase_after","ts"}`. `event` is the contracts'
+`Serialize` spelling; `phase_after` is `TaskState::replay` over the task's history up to that row.
+A reader thread polls the ledger every 100 ms through its own read-only connection and
+`try_send`s into a 256-frame queue; a full queue sets `slow_consumer`, the writer sends the close
+frame and shuts the socket. A watcher thread reads the socket to EOF so a closed client ends all
+three threads. Resume with `since_seq` = the last `seq` received: exactly-once by `seq`.
 
 ## Gaps
 
@@ -88,6 +109,10 @@ the 0700 directory owned by our uid is the only gate. The principal is the proce
 - `health`'s CLI line prints `database=ready socket=owned` from a successful reply; no flock
   custody is held (S-2), so `socket=owned` is INFERRED.
 - `task.cancel` replays are not stored: a second cancel re-applies `Cancel` (legal self-edge).
+  `task.resolve` likewise: a replayed resolve re-applies (abandon twice → `conflict`).
+- The stream reads `events` through a second, read-only SQLite connection: `Store` has no
+  `events_since(seq)` reader (DC proposal). Writes stay `Store::*` only.
+- `task.resolve`'s reason is not ledgered (`Event::Resolve` carries none; TODO(C2)).
 - A bwrap child can outlive `kill -9` of `hee4` (re-parented to the user manager; seen in 2 of 7
   runs of `tests/e2e.rs`). The probe names it R07; nothing kills it in-process. Under the unit,
   `KillMode=control-group` kills it before restart.
