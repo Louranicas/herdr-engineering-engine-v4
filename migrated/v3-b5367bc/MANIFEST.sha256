@@ -101,3 +101,4 @@ b81153d178b7a2d9c4a5fb36b35b87aa7ae0ac2ed6404119bfcb89c8a8926e6a  ./tests/t21_an
 6151d31e9b4739726f2afecd07e00fae185d3efbfa37de04ba688eb7ce32075f  ./tests/t21_process.rs
 394f31081564db68961e1b1fd6d8d9f11a3a662d571f9cc9f7effd9abe5beadc  ./tests/t28_actions.rs
 d9d536208cf1e5f62579a3044495c1c408a320bc16b5ae2d4e59a10113889bb9  ./tests/t28_control.rs
+401f3367f7bff0bd087dccf5689dd82d21f8b900754e3021be8cbacf6d9d5d39  ./src/recovery.rs

@@ -35,3 +35,6 @@
 **Provenance:** `git -C /var/home/herdr-engineering-engine-v3 archive b5367bc -- <paths>` (the path list is in this file's module table). Re-derive by re-running it, and compare against `MANIFEST.sha256`. From inside the toolbox the v3 root is an empty directory; use `git -C /run/host/var/home/herdr-engineering-engine-v3 archive b5367bc -- <paths>` *(rev 2026-10-01, V1)*.
 
 *This file is the map, not migrated code: it is not listed in `MANIFEST.sha256` and was revised 2026-10-01 after verification V1 (`~/hee4-evidence/verification/V1-repo.md`).*
+
+## 2026-10-05 · recovery staged
+`src/recovery.rs` (1,305 lines, sha in `MANIFEST.sha256`) copied verbatim from the `b5367bc` tree. V4-59 ratified under H-27 (V4-86). The R01–R14 reconcile table in `gates/features/crash-restart.md` cites its line ranges. Staged, not wired.
