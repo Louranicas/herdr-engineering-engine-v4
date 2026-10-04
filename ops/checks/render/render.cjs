@@ -34,7 +34,7 @@ const os = require('os');
 const path = require('path');
 
 const HERE = __dirname;
-const DEFAULT_VAULT = '/var/mnt/STORAGE-10TB/fedora-obsidian-vaults/herdr-engineering-engine-v4.vault';
+const DEFAULT_VAULT = process.env.HEE4_VAULT || '/mnt/storage-10tb/fedora-obsidian-vaults/herdr-engineering-engine-v4.vault';
 const MODULES = process.env.HEE4_RENDER_MODULES || path.join(os.homedir(), '.cache/hee4-render/node_modules');
 const NOTE_CAP = 4096;          // notes scanned; a larger world refuses rather than truncates
 const NOTE_BYTES_CAP = 4 << 20; // bytes per note read

@@ -5,11 +5,11 @@
 set -uo pipefail
 shopt -s nullglob
 STAMP="${1:-UNSET}"
-V4=/var/home/Louranicas/herdr-engineering-engine-v4
-EV=/var/home/Louranicas/hee4-evidence
-ARENA=/var/home/Louranicas/fedora-arena
-STORAGE=/var/mnt/STORAGE-10TB
-VAULT=$STORAGE/fedora-obsidian-vaults/herdr-engineering-engine-v4.vault
+V4=${HEE4_ROOT:-/mnt/storage-10tb/herdr-engineering-engine-v4}
+EV=${HEE4_EVIDENCE:-/mnt/storage-10tb/hee4-evidence}
+ARENA=$HOME/fedora-arena
+STORAGE=${HEE4_STORAGE:-/mnt/storage-10tb}
+VAULT=${HEE4_VAULT:-$STORAGE/fedora-obsidian-vaults/herdr-engineering-engine-v4.vault}
 PL=$EV/learnings/PROCESS-LEARNINGS.md
 
 # STORAGE is a nofail mount: an unmounted disk leaves an empty directory, which every count below would read as "0".
@@ -89,7 +89,7 @@ wn=0
 while read -r w; do
   j="$w/journal.jsonl"; [ -f "$j" ] || continue; wn=$((wn + 1))
   echo "  $(basename "$w") agents=$(grep -c '"type":"result"' "$j") mtime=$(date -u -r "$j" +%Y-%m-%dT%H:%MZ)"
-done < <(ls -dt /var/home/Louranicas/.claude/projects/*/*/subagents/workflows/wf_* 2>/dev/null | head -10)
+done < <(ls -dt "$HOME"/.claude/projects/*/*/subagents/workflows/wf_* 2>/dev/null | head -10)
 [ $wn -gt 0 ] || echo "  UNMEASURED (no workflow journal found under ~/.claude/projects/*/*/subagents/workflows/)"
 
 if [ $vault_ok = 0 ]; then

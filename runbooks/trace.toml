@@ -2,10 +2,10 @@
 # system maps -> phases -> H items -> DCs -> migrated paths -> highway), ops/checks/funnel_trace.py.
 name = "trace"
 purpose = "Trace every module through all ten funnel hops"
-cwd = "/var/home/Louranicas/herdr-engineering-engine-v4"
+cwd = "/mnt/storage-10tb/herdr-engineering-engine-v4"
 
 [[precondition]]
-check = "test -d '/var/mnt/STORAGE-10TB/fedora-obsidian-vaults/herdr-engineering-engine-v4.vault/15 Module Design' && echo mounted"
+check = "test -d \"${HEE4_VAULT:-/mnt/storage-10tb/fedora-obsidian-vaults/herdr-engineering-engine-v4.vault}/15 Module Design\" && echo mounted"
 expect = "mounted"
 message = "the v4 vault is not mounted: the trace reads the Module Design Index and system maps"
 

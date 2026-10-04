@@ -44,6 +44,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import os
 import re
 import shutil
 import sys
@@ -53,7 +54,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 HOME = Path.home()
-EV = HOME / "hee4-evidence"
+EV = Path(os.environ.get("HEE4_EVIDENCE", HOME / "hee4-evidence"))
 REF = EV / "reference" / "v3-evidence-b5367bc"
 
 # Source-key legend: KEY -> file. Repo-relative paths are resolved against the repo root.

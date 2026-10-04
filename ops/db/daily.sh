@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # hee4-ops.db daily upkeep (CN-04): keeps the DB current with no human in the loop. Host crontab, 02:30 daily,
-# through the same toolbox wrapper as the roster lines, before curator deep at 02:40 (which reads the DB's answers).
+# through the same wrapper as the roster lines, before curator deep at 02:40 (which reads the DB's answers).
 # Steps, in order, each logged `step=<name> rc=N`:
 #   ingest                      rebuild the derived tables from their file homes (+ FTS sidecar)
 #   runs                        record run --from-logs: backfills any run whose own db_record step failed (idempotent)
@@ -11,8 +11,8 @@
 # refuses as one unit (an rc outside 0/10 in any step is FAIL; any 10 is PASS_WITH_GAPS). Exit codes as hee4db's.
 # Writes only ~/hee4-evidence/db (the DB, its sidecar, daily/*.log). Reads no v3 path (V4-9).
 set -uo pipefail
-HEE4DB=/var/home/Louranicas/herdr-engineering-engine-v4/ops/db/hee4db
-OUT=/var/home/Louranicas/hee4-evidence/db/daily
+HEE4DB=${HEE4_ROOT:-/mnt/storage-10tb/herdr-engineering-engine-v4}/ops/db/hee4db
+OUT=${HEE4_EVIDENCE:-/mnt/storage-10tb/hee4-evidence}/db/daily
 mkdir -p "$OUT" || exit 3
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 LOG="$OUT/daily-$STAMP.log"

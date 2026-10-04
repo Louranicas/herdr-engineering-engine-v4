@@ -10,12 +10,12 @@
 # failures; any other rsync code fails it.
 name = "drill"
 purpose = "Host corpus backup rehearsal and restore drill, then remove only this drill's left-over scratch dir"
-cwd = "/var/home/Louranicas/herdr-engineering-engine-v4"
+cwd = "/mnt/storage-10tb/herdr-engineering-engine-v4"
 
 [[precondition]]
-check = "test -d /var/mnt/STORAGE-10TB/habitat-corpus-backup && echo backup_root"
+check = "test -d \"${HEE4_STORAGE:-/mnt/storage-10tb}/habitat-corpus-backup\" && echo backup_root"
 expect = "backup_root"
-message = "STORAGE-10TB or its habitat-corpus-backup root is not mounted"
+message = "the storage disk or its habitat-corpus-backup root is not mounted"
 
 [[precondition]]
 check = "test -x ~/.local/bin/habitat-corpus-backup && test -x ~/.local/bin/habitat-corpus-drill && echo tools"
@@ -36,10 +36,10 @@ timeout = 3600
 # Read-back: no corpus-drill scratch directory from the last two hours is left on the host.
 [[step]]
 name = "no-new-scratch"
-run = "flatpak-spawn --host bash -c 'n=$(find /tmp -maxdepth 1 -name \"corpus-drill-*\" -mmin -120 | wc -l); echo recent_drill_scratch=$n; test $n -eq 0 && echo no_recent_drill_scratch'"
+run = "bash -c 'n=$(find /tmp -maxdepth 1 -name \"corpus-drill-*\" -mmin -120 | wc -l); echo recent_drill_scratch=$n; test $n -eq 0 && echo no_recent_drill_scratch'"
 expect = "no_recent_drill_scratch"
 
 # The drill pinned and restored a real generation: the backup's current pointer resolves.
 [verify]
-run = "flatpak-spawn --host readlink -f /var/mnt/STORAGE-10TB/habitat-corpus-backup/current"
-contains = "/var/mnt/STORAGE-10TB/habitat-corpus-backup/"
+run = "readlink -f \"${HEE4_STORAGE:-/mnt/storage-10tb}/habitat-corpus-backup/current\""
+contains = "/habitat-corpus-backup/"

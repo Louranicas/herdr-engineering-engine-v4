@@ -34,9 +34,18 @@ import tomllib
 import urllib.parse
 from pathlib import Path
 
-R = Path(os.environ.get("HEE4_TRACE_REPO", Path.home() / "herdr-engineering-engine-v4"))   # override only for the plant control
-E = Path.home() / "hee4-evidence"
-V = Path("/var/mnt/STORAGE-10TB/fedora-obsidian-vaults/herdr-engineering-engine-v4.vault")
+R = Path(os.environ.get("HEE4_TRACE_REPO", os.environ.get("HEE4_ROOT", Path.home() / "herdr-engineering-engine-v4")))   # HEE4_TRACE_REPO: the plant control only
+E = Path(os.environ.get("HEE4_EVIDENCE", Path.home() / "hee4-evidence"))
+V = Path(os.environ.get("HEE4_VAULT", "/mnt/storage-10tb/fedora-obsidian-vaults/herdr-engineering-engine-v4.vault"))
+# The vault's card links were written where the repo lived before (file:///var/home/Louranicas/...). Both sides of
+# every link comparison go through R, so the links are READ through this machine's root, never rewritten in the vault.
+LINK_ROOTS = ("/var/home/Louranicas/herdr-engineering-engine-v4", str(Path.home() / "herdr-engineering-engine-v4"), str(R), str(R.resolve()))
+
+
+def norm_links(text: str) -> str:
+    for old in LINK_ROOTS:
+        text = text.replace(f"file://{old}/", f"file://{R}/")
+    return text
 HOPS = ["mi_index", "card", "backlink", "system_maps", "phases", "h_items", "dc_resolved", "dc_reflected", "migrated", "highway"]
 
 
@@ -82,14 +91,14 @@ def phase_tokens(s: str) -> list[str]:
 
 def main() -> int:
     man = tomllib.loads((R / "modules/MODULES.toml").read_text())["module"]
-    mi = (V / "00 Hub/00 - HEE v4 Master Index.md").read_text()
-    di = (V / "15 Module Design/00 - Module Design Index.md").read_text()
+    mi = norm_links((V / "00 Hub/00 - HEE v4 Master Index.md").read_text())
+    di = norm_links((V / "15 Module Design/00 - Module Design Index.md").read_text())
     rd = (V / "00 Hub/Module Readiness 2026-10-01.md").read_text()
     atlas = (E / "design/DEPLOYMENT_ATLAS.md").read_text()
     s5 = atlas.split("## 5 ·", 1)[1].split("\n## 6 ·", 1)[0]
     atlas_h = set(re.findall(r"^\| (H-\d+[a-z]?)\b", s5, re.M))
     maps = {p.stem: p.read_text() for p in (V / "16 System Maps").glob("*.md")}
-    notes = {p.stem: p.read_text() for p in (V / "15 Module Design").glob("*.md")}
+    notes = {p.stem: norm_links(p.read_text()) for p in (V / "15 Module Design").glob("*.md")}
     q = subprocess.run(["hee4db", "q", "SELECT c.dc_id, c.module, d.status_class, d.recommendation FROM conflict_modules c "
                         "JOIN design_conflicts d ON d.id = c.dc_id"], capture_output=True, text=True)
     dcs: dict[str, list[dict]] = {}

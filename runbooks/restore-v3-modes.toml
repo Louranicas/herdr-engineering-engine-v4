@@ -4,7 +4,7 @@
 # passes it, so running the runbook IS the confirmation. It is a human's act, never an agent's.
 name = "restore-v3-modes"
 purpose = "Undo the v3 write guard from the recorded modes (requires the explicit confirm argument)"
-cwd = "/var/home/Louranicas/herdr-engineering-engine-v4"
+cwd = "/mnt/storage-10tb/herdr-engineering-engine-v4"
 
 [[precondition]]
 check = "test -f ~/hee4-evidence/ops-records/restore-v3-modes.sh && test -s ~/hee4-evidence/ops-records/v3-modes-20261001.tsv && wc -l < ~/hee4-evidence/ops-records/v3-modes-20261001.tsv"

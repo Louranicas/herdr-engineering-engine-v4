@@ -3,7 +3,7 @@
 # funnel. Run with: habitat-runbook run repin --directory runbooks -v KEY=DEC
 name = "repin"
 purpose = "Map KEY cites from the pinned snapshot to the edited file, repin, and re-run the module funnel"
-cwd = "/var/home/Louranicas/herdr-engineering-engine-v4"
+cwd = "/mnt/storage-10tb/herdr-engineering-engine-v4"
 
 [[precondition]]
 check = "python3 -c 'import sys; sys.path.insert(0, \"ops/checks\"); from module_funnel import LEGEND; print(\"key_known\" if \"{{KEY}}\" in LEGEND else \"key_unknown\")'"

@@ -2,12 +2,12 @@
 # stops at the first red step: it collects every exit code and refuses as one unit.
 name = "verify"
 purpose = "Run cite pins, module funnel (+control), hee4db check, DB control, funnel trace and mermaid render; one verdict"
-cwd = "/var/home/Louranicas/herdr-engineering-engine-v4"
+cwd = "/mnt/storage-10tb/herdr-engineering-engine-v4"
 
 [[precondition]]
-check = "test -d '/var/mnt/STORAGE-10TB/fedora-obsidian-vaults/herdr-engineering-engine-v4.vault' && echo mounted"
+check = "test -d \"${HEE4_VAULT:-/mnt/storage-10tb/fedora-obsidian-vaults/herdr-engineering-engine-v4.vault}\" && echo mounted"
 expect = "mounted"
-message = "the v4 vault on STORAGE-10TB is not mounted: the DB check, trace and render read it"
+message = "the v4 vault is not mounted: the DB check, trace and render read it"
 
 [[precondition]]
 check = "command -v hee4db >/dev/null && command -v node >/dev/null && echo tools"

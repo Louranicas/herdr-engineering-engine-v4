@@ -6,6 +6,7 @@ WORLD_GLOBS / EXCLUDED (2026-10-01), not from regen_nudge.py. Whole-list equalit
 """
 from __future__ import annotations
 
+import os
 import re
 import sys
 import tempfile
@@ -19,8 +20,8 @@ import regen_nudge  # noqa: E402
 
 HOOK = "hee4-regen-nudge.sh"
 HOME = Path.home()
-EV = HOME / "hee4-evidence"
-VAULT = Path("/var/mnt/STORAGE-10TB/fedora-obsidian-vaults/herdr-engineering-engine-v4.vault")
+EV = Path(os.environ.get("HEE4_EVIDENCE", HOME / "hee4-evidence"))
+VAULT = Path(os.environ.get("HEE4_VAULT", "/mnt/storage-10tb/fedora-obsidian-vaults/herdr-engineering-engine-v4.vault"))
 
 
 def steps_of(stdout: str) -> list[str] | None:

@@ -37,11 +37,11 @@ HOME = Path.home()
 HERE = Path(__file__).resolve().parent
 SCHEMA_DIR = Path(os.environ.get("HEE4DB_SCHEMA_DIR", HERE / "schema"))
 
-ROOTS = {
-    "repo": Path(os.environ.get("HEE4DB_REPO", HOME / "herdr-engineering-engine-v4")),
-    "evidence": Path(os.environ.get("HEE4DB_EVIDENCE", HOME / "hee4-evidence")),
-    "vault": Path(os.environ.get(
-        "HEE4DB_VAULT", "/var/mnt/STORAGE-10TB/fedora-obsidian-vaults/herdr-engineering-engine-v4.vault")),
+ROOTS = {  # HEE4DB_<ROOT> (the controls' seam) wins over the machine-wide HEE4_* (hee4.env at the repo root)
+    "repo": Path(os.environ.get("HEE4DB_REPO", os.environ.get("HEE4_ROOT", HOME / "herdr-engineering-engine-v4"))),
+    "evidence": Path(os.environ.get("HEE4DB_EVIDENCE", os.environ.get("HEE4_EVIDENCE", HOME / "hee4-evidence"))),
+    "vault": Path(os.environ.get("HEE4DB_VAULT", os.environ.get(
+        "HEE4_VAULT", "/mnt/storage-10tb/fedora-obsidian-vaults/herdr-engineering-engine-v4.vault"))),
 }
 DEFAULT_DB = Path(os.environ.get("HEE4DB_PATH", ROOTS["evidence"] / "db" / "hee4-ops.db"))
 JEV_STATE = Path(os.environ.get("HEE4DB_JEV_STATE", HOME / ".local/state"))
@@ -1815,7 +1815,7 @@ CLAUDE_HOME = Path(os.environ.get("HEE4DB_CLAUDE_HOME", HOME / ".claude"))
 CRONTAB_FILE = os.environ.get("HEE4DB_CRONTAB_FILE")            # unset: the live host crontab
 CRONTAB_LABEL = "crontab:host"
 VERIFY_LOGS = Path(os.environ.get("HEE4DB_VERIFY_LOGS", HOME / ".cache/hee4-just"))
-HANDOFFS = Path(os.environ.get("HEE4DB_HANDOFFS", HOME / "handoffs"))
+HANDOFFS = Path(os.environ.get("HEE4DB_HANDOFFS", os.environ.get("HEE4_HANDOFFS", HOME / "handoffs")))
 REGISTRY_TABLES = ["registry_sources", "skills", "agents", "agent_modes", "agent_schedules", "reflexes"]
 REGISTRY_FILE_CAP = 1024 * 1024                                  # a skill, agent, hook or settings file over 1 MiB is refused
 CRONTAB_CAP = 64 * 1024

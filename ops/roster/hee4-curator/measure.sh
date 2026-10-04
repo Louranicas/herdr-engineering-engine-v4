@@ -5,11 +5,11 @@
 set -uo pipefail
 unset -f grep 2>/dev/null   # a shell function named grep (an interactive wrapper) must not stand in for GNU grep
 STAMP="${1:-UNSET}"
-V4=/var/home/Louranicas/herdr-engineering-engine-v4
-EV=/var/home/Louranicas/hee4-evidence
-STORAGE=/var/mnt/STORAGE-10TB
-VAULT=$STORAGE/fedora-obsidian-vaults/herdr-engineering-engine-v4.vault
-BACKLINKS=/var/home/Louranicas/fedora-arena/scripts/audit/backlinks.py
+V4=${HEE4_ROOT:-/mnt/storage-10tb/herdr-engineering-engine-v4}
+EV=${HEE4_EVIDENCE:-/mnt/storage-10tb/hee4-evidence}
+STORAGE=${HEE4_STORAGE:-/mnt/storage-10tb}
+VAULT=${HEE4_VAULT:-$STORAGE/fedora-obsidian-vaults/herdr-engineering-engine-v4.vault}
+BACKLINKS=$HOME/fedora-arena/scripts/audit/backlinks.py
 EXCLFILE=$V4/ops/v3-independence-exclusions.txt
 V3PAT='herdr-engineering-engine-v3|hee3-evidence|hee3-worktrees|\.cache/hee3|HEE3_[A-Za-z0-9_]+\.md'
 
@@ -111,7 +111,10 @@ else
   ok=0; total=0
   while IFS= read -r u; do
     p=${u#file://}; p=$(printf '%b' "${p//%/\\x}"); total=$((total + 1))
-    if [ -e "$p" ] || [ -e "/run/host$p" ]; then ok=$((ok + 1)); echo "  OK $p"; else echo "  MISSING $p"; fi
+    # links written where the repo lived before are read through this machine's V4 (the vault is not rewritten)
+    p=${p/#\/var\/home\/Louranicas\/herdr-engineering-engine-v4/$V4}
+    p=${p/#\/var\/home\/Louranicas\/hee4-evidence/$EV}; p=${p/#\/var\/home\/Louranicas\/handoffs/${HEE4_HANDOFFS:-/mnt/storage-10tb/handoffs}}
+    if [ -e "$p" ]; then ok=$((ok + 1)); echo "  OK $p"; else echo "  MISSING $p"; fi
   done < <(grep -r -h -o -E 'file://[^) >"`]+' "$VAULT" --include='*.md' 2>/dev/null | sort -u)
   if [ "$total" -eq 0 ]; then echo "links=UNMEASURED (0 file:// links found in $VAULT)"; else echo "links=$ok/$total"; fi
 fi

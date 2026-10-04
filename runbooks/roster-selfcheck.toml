@@ -3,7 +3,7 @@
 #   habitat-runbook run roster-selfcheck --directory runbooks -v AGENT=hee4-curator
 name = "roster-selfcheck"
 purpose = "Run ops/roster/run-agent.sh AGENT selfcheck (about $0.25 per run) and read back its typed exit"
-cwd = "/var/home/Louranicas/herdr-engineering-engine-v4"
+cwd = "/mnt/storage-10tb/herdr-engineering-engine-v4"
 
 [[precondition]]
 check = "test -f ops/roster/{{AGENT}}/modes.conf && test -x ops/roster/{{AGENT}}/measure.sh && test -f .claude/agents/{{AGENT}}.md && echo agent_ok"

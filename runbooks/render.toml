@@ -3,10 +3,10 @@
 # with exit 1 and print control=tripped.
 name = "render"
 purpose = "Render all vault mermaid blocks in headless chromium; render_fail must be 0"
-cwd = "/var/home/Louranicas/herdr-engineering-engine-v4"
+cwd = "/mnt/storage-10tb/herdr-engineering-engine-v4"
 
 [[precondition]]
-check = "test -d '/var/mnt/STORAGE-10TB/fedora-obsidian-vaults/herdr-engineering-engine-v4.vault' && echo mounted"
+check = "test -d \"${HEE4_VAULT:-/mnt/storage-10tb/fedora-obsidian-vaults/herdr-engineering-engine-v4.vault}\" && echo mounted"
 expect = "mounted"
 message = "the v4 vault is not mounted"
 

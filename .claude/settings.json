@@ -7,6 +7,14 @@
       "Edit(//var/home/Louranicas/.cache/hee3-worktrees/**)",
       "Edit(//var/home/Louranicas/.cache/hee3-implementation/**)",
       "Edit(//var/home/Louranicas/.local/lib/herdr-engineering-engine-v3/**)",
+      "Edit(//mnt/storage-10tb/herdr-engineering-engine-v3-t3-backups/**)",
+      "Edit(//mnt/storage-10tb/HEE-v3-SECOND-COPY/**)",
+      "Edit(//mnt/storage-10tb/hee3-backup/**)",
+      "Edit(//mnt/storage-10tb/fedora-obsidian-vaults/herdr-engineering-engine-v3.vault/**)",
+      "Edit(~/hee3-evidence/**)",
+      "Edit(~/.cache/hee3-worktrees/**)",
+      "Edit(~/.cache/hee3-implementation/**)",
+      "Edit(~/.local/lib/herdr-engineering-engine-v3/**)",
       "Bash(hee3-gate:*)",
       "Bash(hee3-recapture:*)"
     ]
@@ -20,6 +28,16 @@
             "type": "command",
             "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/hee4-session-start.sh\"",
             "timeout": 2
+          },
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/context-doctor.sh\"",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/brain-inject.sh\"",
+            "timeout": 2
           }
         ]
       }
@@ -31,6 +49,11 @@
           {
             "type": "command",
             "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/hee4-regen-nudge.sh\"",
+            "timeout": 2
+          },
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/brain-auto-index.sh\"",
             "timeout": 2
           }
         ]

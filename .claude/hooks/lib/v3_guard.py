@@ -2,7 +2,9 @@
 
 Defence in depth only: the v3 trees are already chmod read-only (V4-68) and the project
 settings deny Edit on them. The v3 roots are NOT listed here: they are read from this project's
-`.claude/settings.json` `permissions.deny` `Edit(//<root>/**)` rules, the one home of that list.
+`.claude/settings.json` `permissions.deny` `Edit(//<root>/**)` rules, the one home of that list,
+with the previous machine's home (`/var/home/Louranicas`) read as `$HOME`. The v3 copies that live on
+THIS machine's storage disk are added from HEE4_V3_ROOTS (colon-separated; default: the four local copies).
 
 Policy is pure (`findings`), so the tests choose commands instead of arranging the world (F95).
 A segment (split on ; && || | newlines) is flagged when, after ~/$HOME expansion:
@@ -32,16 +34,28 @@ GIT_WRITE = {"add", "commit", "checkout", "switch", "restore", "reset", "merge",
 BUILD = {"cargo", "just", "make", "cargo-mutants"}
 SPLIT = re.compile(r"\s*(?:&&|\|\||;|\||\n)\s*")
 REDIR = re.compile(r"(?:^|\s)(?:\d?>>?|&>>?)\s*(\S+)")
+OLD_HOME = "/var/home/Louranicas"                 # the home the deny rules were written under
+LOCAL_V3_ROOTS = ":".join(("/mnt/storage-10tb/herdr-engineering-engine-v3-t3-backups", "/mnt/storage-10tb/HEE-v3-SECOND-COPY",
+                           "/mnt/storage-10tb/hee3-backup", "/mnt/storage-10tb/fedora-obsidian-vaults/herdr-engineering-engine-v3.vault"))
 
 
-def roots_from_settings(settings: Path) -> list[str]:
+def roots_from_settings(settings: Path, home: str | None = None) -> list[str]:
+    """One root per Edit deny rule, the old home spelled as this machine's $HOME."""
+    home = (home if home is not None else os.environ.get("HOME", "")).rstrip("/")
     data = json.loads(settings.read_text(encoding="utf-8"))
     out = []
     for rule in (data.get("permissions") or {}).get("deny") or []:
         m = re.fullmatch(r"Edit\(/(/.+?)/\*\*\)", rule)
         if m:
-            out.append(m.group(1).rstrip("/"))
+            root = m.group(1).rstrip("/")
+            if home and (root == OLD_HOME or root.startswith(OLD_HOME + "/")):
+                root = home + root[len(OLD_HOME):]
+            out.append(root)
     return out
+
+
+def local_roots() -> list[str]:
+    return [r.rstrip("/") for r in os.environ.get("HEE4_V3_ROOTS", LOCAL_V3_ROOTS).split(":") if r.strip()]
 
 
 def _expand(tok: str, home: str) -> str:
@@ -117,7 +131,7 @@ def main() -> int:
             return 0
         here = Path(__file__).resolve().parent
         settings = Path(os.environ.get("HEE4_HOOK_SETTINGS") or here.parents[1] / "settings.json")
-        roots = roots_from_settings(settings)
+        roots = roots_from_settings(settings) + local_roots()
         hits = findings(cmd, roots, os.environ.get("HOME", ""))
         if hits:
             msg = ("HEE4 v3-guard (advisory): this command names a FROZEN v3 path with a write verb: "

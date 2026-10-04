@@ -5,10 +5,10 @@
 # (proved 2026-10-01: sha256 of 84 files identical across two runs).
 name = "regen"
 purpose = "Regenerate ATLAS §9, ULTRAMAP §7 and the readiness note from hee4db, repin AT/UM, re-ingest and check"
-cwd = "/var/home/Louranicas/herdr-engineering-engine-v4"
+cwd = "/mnt/storage-10tb/herdr-engineering-engine-v4"
 
 [[precondition]]
-check = "test -d '/var/mnt/STORAGE-10TB/fedora-obsidian-vaults/herdr-engineering-engine-v4.vault/00 Hub' && echo mounted"
+check = "test -d \"${HEE4_VAULT:-/mnt/storage-10tb/fedora-obsidian-vaults/herdr-engineering-engine-v4.vault}/00 Hub\" && echo mounted"
 expect = "mounted"
 message = "the v4 vault is not mounted: the readiness note and the register live there"
 

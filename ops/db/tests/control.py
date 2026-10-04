@@ -27,9 +27,9 @@ HOME = Path.home()
 TURSODB = os.environ.get("HEE4DB_TURSODB", str(HOME / ".local/bin/tursodb"))
 REAL_DB = Path(os.environ.get("HEE4DB_REAL_DB", HOME / "hee4-evidence/db/hee4-ops.db"))
 REAL = {
-    "repo": HOME / "herdr-engineering-engine-v4",
-    "evidence": HOME / "hee4-evidence",
-    "vault": Path("/var/mnt/STORAGE-10TB/fedora-obsidian-vaults/herdr-engineering-engine-v4.vault"),
+    "repo": Path(os.environ.get("HEE4_ROOT", HOME / "herdr-engineering-engine-v4")),
+    "evidence": Path(os.environ.get("HEE4_EVIDENCE", HOME / "hee4-evidence")),
+    "vault": Path(os.environ.get("HEE4_VAULT", "/mnt/storage-10tb/fedora-obsidian-vaults/herdr-engineering-engine-v4.vault")),
     "claude": HOME / ".claude",          # rev 2026-10-01 registry: read only, copied into the case world
 }
 WORLD = {  # every file the ingest world reads (copied, never linked; a matched directory is created empty)

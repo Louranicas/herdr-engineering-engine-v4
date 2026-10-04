@@ -2,7 +2,7 @@
 # Run with: habitat-runbook run highway --directory runbooks -v MODULE=store
 name = "highway"
 purpose = "One module's card, design section, phases, budget, readiness, DCs, held items and ids in one call"
-cwd = "/var/home/Louranicas/herdr-engineering-engine-v4"
+cwd = "/mnt/storage-10tb/herdr-engineering-engine-v4"
 
 [[precondition]]
 check = "grep -q '^name = \"{{MODULE}}\"' modules/MODULES.toml && echo module_known"

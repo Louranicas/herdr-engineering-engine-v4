@@ -30,8 +30,8 @@ from module_funnel import LEGEND, resolve  # noqa: E402  one legend: AT and UM r
 
 REPO = Path(__file__).resolve().parents[2]
 HEE4DB = REPO / "ops/db/hee4db"
-VAULT = Path(os.environ.get(
-    "HEE4DB_VAULT", "/var/mnt/STORAGE-10TB/fedora-obsidian-vaults/herdr-engineering-engine-v4.vault"))
+VAULT = Path(os.environ.get("HEE4DB_VAULT", os.environ.get(
+    "HEE4_VAULT", "/mnt/storage-10tb/fedora-obsidian-vaults/herdr-engineering-engine-v4.vault")))
 ATLAS_HEADING = "## 9 · Phase entry"
 UM_BEGIN, UM_END = "<!-- hee4db:um-amendments:begin -->", "<!-- hee4db:um-amendments:end -->"
 READINESS_NOTE = VAULT / "00 Hub" / "Module Readiness 2026-10-01.md"

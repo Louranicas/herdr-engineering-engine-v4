@@ -4,7 +4,7 @@
 # the door and its loggers were installed. Negative control: ops/db/tests/jev_entry_control.py (a `just verify` step).
 name = "jev-entry"
 purpose = "Read back the P0 Jev entry criteria: v4 text refused by the door, no engine row sent by any sender"
-cwd = "/var/home/Louranicas/herdr-engineering-engine-v4"
+cwd = "/mnt/storage-10tb/herdr-engineering-engine-v4"
 
 [[precondition]]
 check = "command -v jev-boundary >/dev/null && echo door"
