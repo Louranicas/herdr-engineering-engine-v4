@@ -98,7 +98,9 @@ fn contribution(o: &Observation, subject: &Subject) -> Option<Verdict> {
         match o.outcome {
             hee4_contracts::Outcome::Pass => Verdict::Pass,
             hee4_contracts::Outcome::Fail => Verdict::Fail,
-            hee4_contracts::Outcome::Error => Verdict::Refused(Reason::Error),
+            hee4_contracts::Outcome::Refused { .. } => Verdict::Refused(Reason::Invalid),
+            // `Error`, and any conclusion a later `#[non_exhaustive]` variant adds: refuse.
+            _ => Verdict::Refused(Reason::Error),
         }
     })
 }

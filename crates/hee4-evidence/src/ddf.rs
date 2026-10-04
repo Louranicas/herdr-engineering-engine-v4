@@ -6,7 +6,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use hee4_contracts::{Evidence, Observation, Outcome, Sha256Hex, ToolId};
+use hee4_contracts::{Evidence, Observation, Outcome, RefusalText, Sha256Hex, ToolId};
 use hee4_host::clock::Clock;
 use serde_json::Value;
 
@@ -33,12 +33,6 @@ pub enum AdapterError {
     /// The process could not be started or waited on.
     #[error("could not run {BIN}: {0}")]
     Spawn(#[from] std::io::Error),
-    /// Exit 7: the input contract refused the diff (0 files or 0 hunks).
-    #[error("refused: {stderr_line}")]
-    Refused {
-        /// The first stderr line, as the tool printed it.
-        stderr_line: String,
-    },
     /// Any other non-zero exit.
     #[error("{BIN} exited {code:?}: {stderr_line}")]
     Exit {
@@ -73,8 +67,8 @@ pub enum AdapterError {
 /// `subject`. The child is killed when `budget` of wall time has passed.
 ///
 /// # Errors
-/// [`AdapterError`]; exit 7 is [`AdapterError::Refused`]; a run past `budget` is
-/// [`AdapterError::Timeout`].
+/// [`AdapterError`]; a run past `budget` is [`AdapterError::Timeout`]. Exit 7 is not an error:
+/// it is a tier-0 observation with [`Outcome::Refused`].
 pub fn observe(
     diff: &[u8],
     subject: &Subject,
@@ -113,6 +107,47 @@ pub fn timeout_observation(
         advisory: false,
         elapsed_ms: budget_ms.saturating_add(1),
         budget_ms,
+    })
+}
+
+/// The longest reason kept, below `RefusalText`'s 512-byte cap.
+const REASON_MAX: usize = 500;
+
+/// The tier-0 observation for exit 7: outcome `Refused{reason}` (the first stderr line, control
+/// characters dropped, cut to [`REASON_MAX`] bytes; a fixed sentence when nothing is left), one
+/// evidence item (the digest of all of stderr). `decide` maps it to `Refused(Invalid)`.
+fn refused_observation(
+    stderr_line: &str,
+    stderr: &[u8],
+    subject: &Subject,
+    elapsed_ms: u64,
+    budget: Duration,
+) -> Result<Observation, AdapterError> {
+    let bad = |e: hee4_contracts::Refusal| AdapterError::Malformed(e.to_string());
+    let mut reason: String = stderr_line.chars().filter(|c| !c.is_control()).collect();
+    while reason.len() > REASON_MAX {
+        reason.pop();
+    }
+    if reason.trim().is_empty() {
+        reason = format!("{BIN} exited 7 without a message");
+    }
+    let reason: RefusalText = reason.parse().map_err(bad)?;
+    Ok(Observation {
+        source: "deep-diff-forge.rank".parse().map_err(bad)?,
+        input_sha256: subject.input_sha256,
+        tool: ToolId {
+            name: BIN.parse().map_err(bad)?,
+            version: "unknown".parse().map_err(bad)?,
+        },
+        head_sha: subject.head_sha.clone(),
+        outcome: Outcome::Refused { reason },
+        evidence: vec![Evidence {
+            label: "refusal".parse().map_err(bad)?,
+            sha256: Sha256Hex::digest(stderr),
+        }],
+        advisory: false,
+        elapsed_ms,
+        budget_ms: u64::try_from(budget.as_millis()).unwrap_or(u64::MAX),
     })
 }
 
@@ -178,7 +213,9 @@ pub fn observe_with(
         .to_owned();
     match output.status.code() {
         Some(0) => {}
-        Some(7) => return Err(AdapterError::Refused { stderr_line }),
+        Some(7) => {
+            return refused_observation(&stderr_line, &output.stderr, subject, elapsed_ms, budget);
+        }
         code => return Err(AdapterError::Exit { code, stderr_line }),
     }
     let doc: Value = serde_json::from_slice(&output.stdout)

@@ -8,8 +8,8 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hee4_contracts::{
-    Brief, BriefField, Event, GitSha, Observation, Phase, ReceiptId, Resolution, Settlement,
-    Sha256Hex, SourceId, TaskId, Verdict,
+    AbandonReason, Brief, BriefField, Event, GitSha, Observation, Phase, ReceiptId, Resolution,
+    Settlement, Sha256Hex, SourceId, TaskId, Verdict,
 };
 use hee4_core::StoreError;
 use hee4_evidence::{Identities, Identity, Source, Subject, Why, decide_and_seal, observation_id};
@@ -130,10 +130,22 @@ fn apply(engine: &Engine, task: &TaskId, event: Event) -> Result<Phase, StoreErr
     Ok(phase)
 }
 
-fn abandon(engine: &Engine, task: &TaskId, reason: &str) -> Result<Phase, StoreError> {
-    // The Event carries no reason field: the reason is journalled here (DC proposal).
-    eprintln!("dispatch task={task} abandon reason={reason}");
-    apply(engine, task, Event::Resolve(Resolution::Abandon))
+fn abandon(engine: &Engine, task: &TaskId, reason: AbandonReason) -> Result<Phase, StoreError> {
+    eprintln!("dispatch task={task} abandon reason={reason:?}");
+    apply(engine, task, Event::Resolve(Resolution::Abandon(reason)))
+}
+
+/// The abandon reason for a refused route: `floor_unmet` only when the capability floor was
+/// the cause. No wildcard: a new `RouteRefusal` variant must be classified here.
+const fn route_reason(r: &RouteRefusal) -> AbandonReason {
+    AbandonReason::RouteRefused {
+        floor_unmet: match r {
+            RouteRefusal::NoCapableModel { .. } => true,
+            RouteRefusal::OnlyPreviousAttempt(_)
+            | RouteRefusal::NoBaseline { .. }
+            | RouteRefusal::NoDecision => false,
+        },
+    }
 }
 
 /// Route by floor over a one-row roster of the declared model. Availability is probed only
@@ -198,7 +210,7 @@ pub fn step(engine: &Engine, cfg: &Config) -> Result<Option<(TaskId, Phase)>, Di
     else {
         return Ok(Some((
             task.clone(),
-            abandon(engine, &task, "brief_unreadable")?,
+            abandon(engine, &task, AbandonReason::BriefUnreadable)?,
         )));
     };
     let steps = playbook(brief.get(BriefField::Verify));
@@ -215,7 +227,7 @@ pub fn step(engine: &Engine, cfg: &Config) -> Result<Option<(TaskId, Phase)>, Di
         Err(r) => {
             return Ok(Some((
                 task.clone(),
-                abandon(engine, &task, &format!("route: {r}"))?,
+                abandon(engine, &task, route_reason(&r))?,
             )));
         }
     };
@@ -227,23 +239,25 @@ pub fn step(engine: &Engine, cfg: &Config) -> Result<Option<(TaskId, Phase)>, Di
     ) {
         Ok(ns) => ns,
         Err(e) => {
+            eprintln!("dispatch task={task} cause={e}");
             return Ok(Some((
                 task.clone(),
-                abandon(engine, &task, &format!("namespace: {e}"))?,
+                abandon(engine, &task, AbandonReason::NamespaceRefused)?,
             )));
         }
     };
     let plan = plan_for(&ns);
     if let Err(e) = fs::create_dir_all(ns.work_dir()) {
+        eprintln!("dispatch task={task} cause={e}");
         return Ok(Some((
             task.clone(),
-            abandon(engine, &task, &format!("work dir: {e}"))?,
+            abandon(engine, &task, AbandonReason::WorkDirUnavailable)?,
         )));
     }
     let Ok(head) = crate::HEAD.parse::<GitSha>() else {
         return Ok(Some((
             task.clone(),
-            abandon(engine, &task, "head_sha unknown at build")?,
+            abandon(engine, &task, AbandonReason::HeadUnknown)?,
         )));
     };
     let nanos = SystemTime::now()
@@ -265,9 +279,10 @@ pub fn step(engine: &Engine, cfg: &Config) -> Result<Option<(TaskId, Phase)>, Di
     let upstream = match Upstream::parse(MODEL_URL) {
         Ok(u) => u,
         Err(e) => {
+            eprintln!("dispatch task={task} cause={e}");
             return Ok(Some((
                 task.clone(),
-                abandon(engine, &task, &e.to_string())?,
+                abandon(engine, &task, AbandonReason::NoPermit)?,
             )));
         }
     };

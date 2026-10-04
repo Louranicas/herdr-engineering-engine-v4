@@ -322,3 +322,26 @@ fn cache_divergence_is_healed_and_recorded() -> R {
     assert!(!report.complete);
     Ok(())
 }
+
+#[test]
+fn a_foreign_event_spelling_is_unreadable_history_never_repaired() -> R {
+    let path = db("foreign-spelling")?;
+    let store = Store::open(&path)?;
+    assert!(reconcile(&store, &Observations::default())?.complete);
+    let t = tid("task-foreign-1")?;
+    store.apply(&t, Event::Admit)?;
+    {
+        let raw = rusqlite::Connection::open(&path)?;
+        raw.execute(
+            "INSERT INTO events(task_id, event_json, ts) VALUES ('task-foreign-1', '\"queued\"', 0)",
+            [],
+        )?;
+    }
+    let got = store.history(&t);
+    assert!(
+        matches!(&got, Err(StoreError::Corrupt { task, detail })
+            if task == "task-foreign-1" && detail.contains("queued")),
+        "{got:?}"
+    );
+    Ok(())
+}

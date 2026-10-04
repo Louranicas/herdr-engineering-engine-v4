@@ -38,8 +38,8 @@ meta(key PK, value)                                        -- epoch, recovery_co
 cache_heals(seq PK, task_id FK, cached_phase, replayed_phase, ts)   -- v2; heal record
 ```
 
-`event_json` is `hee4_contracts::Event`'s own `Serialize` output; `codec.rs` decodes it by lookup
-over the 32 events, so a foreign spelling (`"queued"`) is unreadable, never repaired (EX-05).
+`event_json` is `hee4_contracts::Event`'s own `Serialize` output; `codec.rs` decodes it with
+`serde_json::from_str::<Event>`, so a foreign spelling (`"queued"`) is `StoreError::Corrupt`, never repaired (EX-05).
 `tasks.phase` is `TaskState::replay(events).phase().as_str()`, rewritten in the same transaction
 as each event; reconcile reports a mismatch as a finding. When `apply_in` finds the cached phase
 divergent from replay it overwrites it (replay wins) and inserts a `cache_heals` row in the same
