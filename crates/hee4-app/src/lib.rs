@@ -8,6 +8,7 @@ pub mod actions;
 pub mod dispatcher;
 pub mod doctor;
 pub mod socket;
+pub mod stream;
 pub mod wire;
 
 use std::os::unix::fs::MetadataExt as _;
@@ -120,7 +121,12 @@ pub fn serve(args: &ServeArgs, cfg: &dispatcher::Config) -> Result<(), ServeErro
     if !report.complete {
         return Err(ServeError::Recovery(report.findings.len()));
     }
-    let engine = Arc::new(actions::Engine::new(store, args.work.clone()));
+    let engine = Arc::new(actions::Engine::new(
+        store,
+        args.ledger.clone(),
+        args.work.clone(),
+        cfg.clone(),
+    ));
     let worker = Arc::clone(&engine);
     let cfg = cfg.clone();
     std::thread::spawn(move || {

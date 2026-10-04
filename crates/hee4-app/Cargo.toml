@@ -22,6 +22,5 @@ hee4-evidence = { path = "../hee4-evidence" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-
-[dev-dependencies]
+rustix = { workspace = true }
 rusqlite = { workspace = true }

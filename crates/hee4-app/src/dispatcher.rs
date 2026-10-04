@@ -137,7 +137,7 @@ fn abandon(engine: &Engine, task: &TaskId, reason: &str) -> Result<Phase, StoreE
 
 /// Route by floor over a one-row roster of the declared model. Availability is probed only
 /// when the model is needed; otherwise it is `Unknown`, which routes to the declared baseline.
-fn route(
+pub(crate) fn route(
     cfg: &Config,
     client: &OllamaClient,
     needs_model: bool,
