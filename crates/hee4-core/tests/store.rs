@@ -290,7 +290,7 @@ fn cache_divergence_is_healed_and_recorded() -> R {
     assert!(reconcile(&store, &Observations::default())?.complete);
     let t = tid("task-heal-1")?;
     store.apply(&t, Event::Admit)?;
-    assert!(store.cache_heals()?.is_empty());
+    assert_eq!(store.cache_heals()?.len(), 0);
     {
         let raw = rusqlite::Connection::open(&path)?;
         raw.execute(
