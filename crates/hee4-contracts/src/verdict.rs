@@ -1,0 +1,55 @@
+//! The verdict, as plain data. K4 `decide` owns the policy that picks one.
+
+use serde::{Deserialize, Serialize};
+
+/// Why a verdict is neither pass nor fail. The spellings are v3's verification domain
+/// (State map §2c S5) plus the State map's `unreconciled`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Reason {
+    /// The candidate or its evidence is malformed.
+    Invalid,
+    /// A check errored before it could judge.
+    Error,
+    /// A check ran out of budget.
+    Timeout,
+    /// The attempt was cancelled; legal only while cancellation is requested.
+    Cancelled,
+    /// The external effect could not be reconciled; the task goes to `effect_unknown`.
+    Unreconciled,
+}
+
+impl Reason {
+    /// Every reason, in declaration order.
+    pub const ALL: [Self; 5] = [
+        Self::Invalid,
+        Self::Error,
+        Self::Timeout,
+        Self::Cancelled,
+        Self::Unreconciled,
+    ];
+
+    /// The canonical spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Invalid => "invalid",
+            Self::Error => "error",
+            Self::Timeout => "timeout",
+            Self::Cancelled => "cancelled",
+            Self::Unreconciled => "unreconciled",
+        }
+    }
+}
+
+/// The one verdict type (UM-P4: one verdict authority, three v3 spellings folded into one).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Verdict {
+    /// Every required observation passed.
+    Pass,
+    /// An observation failed; the task may be repaired.
+    Fail,
+    /// No pass/fail judgement could be made, for this reason.
+    Refused(Reason),
+}
