@@ -221,7 +221,7 @@ def main():
     ap.add_argument("--evidence-root", default=os.path.expanduser("~/.cache/hee4-drive"))
     a = ap.parse_args()
     rc, head, _ = sh("git", "-C", a.repo, "rev-parse", "HEAD")
-    head = head[:12] if rc == 0 and head else "unknown"
+    head = head[:12] if rc == 0 and head else os.environ.get("HEE4_HEAD", "unknown")[:12]  # the gate's export has no .git
 
     if a.doctor_first:
         _, out, _ = sh(os.path.join(HERE, "doctor"), "--socket", a.socket, "--unit", a.unit, "--repo", a.repo, timeout=60)
