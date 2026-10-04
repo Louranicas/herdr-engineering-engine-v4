@@ -3,7 +3,7 @@
 Read this first. Everything else is one link away. State is never asserted here; the commands print it.
 
 ## What this is
-A local engineering engine for this machine. It admits a task through a control socket, dispatches it to the local model inside an isolated namespace, verifies it with **one** verdict authority (`decide`), settles it durably with recovery, and survives a crash, a restart and a restore. Planning only until Luke says **"start coding"** (`CHARTER.md` §2).
+A local engineering engine for this machine. It admits a task through a control socket, dispatches it to the local model inside an isolated namespace, verifies it with **one** verdict authority (`decide`), settles it durably with recovery, and survives a crash, a restart and a restore. Coding since 2026-10-05 (V4-89, "start coding"); the first unit is the walking skeleton below.
 
 **Meta goal (Luke, 2026-10-04): an environment that makes it hard to write bad code.** Every door is ranked — impossible (types) > refused at admission > caught by a check > caught by review > caught in production — and the highest rung wins. `plan/STACK-MAP-2026-10-04.md` §0.
 
@@ -26,7 +26,7 @@ hee4db highway <module>                # everything about one module in one call
 ```
 Then read, in order: `CHARTER.md` → `plan/STACK-MAP-2026-10-04.md` → `plan/INTEGRATION-MAP-2026-10-04.md` → the card `modules/<crate>/<module>/MODULE.md` you are working on → its feature file `gates/features/<action>.md`.
 
-## What to build first (after "start coding")
+## What is being built first (V4-89)
 The walking skeleton, 6 crates, 6–8 slices: `task.submit` → 3-table SQLite store written only through `transition` → synchronous dispatcher to the local model through the spawn door → bwrap candidate → `decide` → `kill -9` and restart drill. `plan/STACK-MAP-2026-10-04.md` §4. Nothing else lands before one task has gone end to end.
 
 ## How to work here

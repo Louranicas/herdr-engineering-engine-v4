@@ -1,6 +1,6 @@
 # Standing orders (pasted verbatim into every brief; Luke owns this file, proposals via hee4-scribe)
 
-1. The HOLD: no engine code until Luke says "start coding" (V4-0). Plan, prototype in the scratchpad, write cards and feature files.
+1. The HOLD is lifted (V4-89, 2026-10-05, "start coding"). The first unit is the walking skeleton and nothing else (STACK-MAP §4); cards and feature files change in the same commit as the code they describe.
 2. The fence: never read-for-edit, build, gate, deploy or edit any HEE v3 path (`CLAUDE.md`). Reference v3 only through `migrated/` and `$HEE4_EVIDENCE/reference/`.
 3. Nothing to Jev, nothing outward (H-10a).
 4. Every claim carries MEASURED, INFERRED or UNMEASURED and its witness command. A gate that looked at nothing is not green.

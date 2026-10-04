@@ -18,8 +18,8 @@
 - **At session start:** `habitat-scope set --session "$HABITAT_SCOPE_SESSION" --charter "HEE v4" ~/herdr-engineering-engine-v4 ~/hee4-evidence "$HEE4_VAULT"` warned on writes outside the fence on the Fedora host. On this machine `habitat-scope` is not installed (its backup copy needs a `runtime` module that was not backed up); the fence is enforced by the `.claude/settings.json` deny rules and `hee4-v3-guard.sh` instead.
 - **No v4 file or process may depend on a v3 path.** (Decision V4-9. The future check prints `v3_refs=0` over the tree, excluding `migrated/` and `.git/`.)
 
-## The HOLD
-No code until Luke says **"start coding"** (V4-0). Planning, maps, reviews and staged verbatim copies are allowed.
+## The HOLD is lifted (V4-89, 2026-10-05)
+Luke said **"start coding"**. The first unit is the walking skeleton and nothing else (`plan/STACK-MAP-2026-10-04.md` §4): six crates under `crates/`, `just gate commit` on every change, `just gate cut` before a tag. The HOLD text stays in history (V4-0); the H-29 freeze ended with it.
 
 ## Before touching a module
 Read its card `modules/<crate>/<module>/MODULE.md`, plus the AP-/EX- entries it names in `docs/ANTIPATTERNS.md` and `docs/EXEMPLARS.md`, and `docs/DRIFT_AND_OVERENGINEERING.md`.
