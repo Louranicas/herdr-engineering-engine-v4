@@ -503,11 +503,15 @@ mod tests {
                 bytes: 3,
                 sha256: Sha256Hex::digest(b"abc"),
                 fate: DoorFate::Forwarded,
+                label: "forwarded",
+                reason: "",
             },
             DoorRequest {
                 bytes: 0,
                 sha256: Sha256Hex::digest(b""),
                 fate: DoorFate::Unreachable,
+                label: "unreachable",
+                reason: "",
             },
         ];
         let ob = a
