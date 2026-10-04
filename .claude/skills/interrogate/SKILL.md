@@ -1,7 +1,6 @@
 ---
 name: interrogate
 description: "Use for \"interrogate\", \"adversarial review\", \"multi-model review\", \"challenge this\", \"stress test this code\", \"find blind spots\", or \"tear this apart\". Multiple LLM reviewers challenge changes from independent angles."
-disable-model-invocation: true
 ---
 
 > Ported note: Only the Claude family is available here; reviewer diversity comes from tier (opus/sonnet/haiku) and prompt framing. Reviewers are `Explore` subagents. Models from `.claude/skills/models.md`.

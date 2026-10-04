@@ -1,7 +1,6 @@
 ---
 name: create-verification-skill
 description: "Generate a project-local verification skill that drives your app the way a user does — any language, framework, or platform. Use for /create-verification-skill, \"make a control skill for this repo\", or when a project has no scripted way to prove UI/CLI/service behavior."
-disable-model-invocation: true
 ---
 
 > Ported note: Writes the verification skill under `.claude/skills/verify-<app>/` here. Cursor's `control-ui`/`control-cli` are not available; use the harness the skill generates, or the bundled `run` skill.

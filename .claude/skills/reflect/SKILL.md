@@ -1,7 +1,6 @@
 ---
 name: reflect
 description: Spawn three parallel review subagents over the active transcript, surface learnings, and route each to a concrete edit on an existing skill. Use when the user says reflect.
-disable-model-invocation: true
 ---
 
 > Ported note: pstack's reflect routes learnings into skill edits. For the brain (build memory) use `brain-reflect`. Transcripts here are Claude Code JSONL under `~/.claude/projects/<slug>/`.

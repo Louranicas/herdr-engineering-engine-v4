@@ -1,7 +1,6 @@
 ---
 name: typescript-best-practices
 description: TypeScript best practices. Use when reading or editing any .ts or .tsx file.
-disable-model-invocation: true
 ---
 
 > Ported note: Cursor's `paths:` frontmatter (auto-attach on `*.ts`) was dropped; Claude Code has no path-scoped trigger, so the description carries it.

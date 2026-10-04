@@ -95,3 +95,6 @@ Hooks (brainmaxxing)
 
 ## 2026-10-05 · flattened
 Claude Code discovers project skills only at `.claude/skills/<name>/SKILL.md` (docs: code.claude.com/docs/en/skills), so the 53 skill directories were moved from `.claude/skills/pstack/<name>/` to `.claude/skills/<name>/` (measured in the 10-minute environment test). `pstack/` keeps LICENSE, PROVENANCE.md, README.md and models.md; references to `.claude/skills/pstack/models.md` are unchanged.
+
+## 2026-10-05 · model invocation
+`disable-model-invocation: true` removed from the workflow and principle skills so the model can load them through the Skill tool as poteto-mode's triggers intend (Cursor invoked them through the mode; Claude Code needs the flag off). Kept on `poteto-mode`, `automate-me`, `setup-pstack`, `make-bot-ui`, which are user-invoked modes/configurators. Luke, 2026-10-05: "make sure you can use the full array of p-stack skills".
