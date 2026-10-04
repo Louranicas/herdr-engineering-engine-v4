@@ -38,6 +38,17 @@ Socket: request `body` `{}`; result `body` `{protocol_version, engine_version, r
 - Custody negative: with a second `hee4 serve` attempted, the second one is refused by name at the CLI (card control-socket §9 #5) and `health` on the first still reads `socket=owned`.
 - `UNWRITTEN: the exact value set of recovery and database (which strings other than complete / ready exist) and the printed text form of the CLI line versus the JSON body.`
 
+Concrete, deployed frame (rev 2026-10-05 drive) (`crates/hee4-app/FLOW.md`; run all of it with `tools/drive`):
+
+```bash
+hee4 health     # ready=true recovery=complete database=ready socket=owned head=<sha12> uptime_s=<n>
+printf '%s\n' '{"request_id":"r1","action":"health","action_version":1,"idempotency_key":null,"body":{}}' | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/hee4/control.sock
+```
+
+- Success: `kind=result`, `replayed=false`, body `{ok:true, head_sha, recovery_complete:true, uptime_s}`.
+- Malformed frame (`{not json`): `invalid_argument` at `/`; unknown action: `unknown_action` at `/action`; `action_version` 2: `unsupported_action_version` at `/action_version`; each retry `never`.
+- Perms: `stat -c '%a'` of the socket dir `700` and of `control.sock` `600`.
+
 ## Gotchas
 
 - `health` has no model field. "Model reachable" is a separate `doctor` row (README); a green health line says nothing about `127.0.0.1:11434`.

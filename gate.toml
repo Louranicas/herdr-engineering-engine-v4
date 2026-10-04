@@ -19,7 +19,7 @@ steps = ["ddf"]
 
 [tier.cut]
 includes = "stack"
-steps = ["drill", "doctor"]
+steps = ["drill", "drive", "doctor"]
 
 [step.fmt]
 cmd = "cargo fmt --all -- --check"
@@ -50,4 +50,9 @@ expect = "tool_rc"
 [step.doctor]
 cmd = "tools/doctor"
 budget_s = 60
+expect = "tool_rc"
+
+[step.drive]
+cmd = "tools/drive --doctor-first --allow-restart"
+budget_s = 120
 expect = "tool_rc"

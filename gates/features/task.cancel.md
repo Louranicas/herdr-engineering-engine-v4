@@ -40,6 +40,14 @@ Socket: request `body` `{reason, note}` (FACT required both) with `idempotency_k
 - Persistence: the `operations` row and the state write commit in one transaction (State map §3 "Atomicity"); after `kill -KILL` between the ack and the driver's next check, the restarted engine still shows `cancellation_requested` or `cancelled`, never `running`.
 - Side effects to read: `tasks.state` (or the `cancel` field), `operations`, `task_stops` and the outbox row after `Stop`, `events` (INTERP).
 
+Concrete, deployed frame (rev 2026-10-05 drive) (run all of it with `tools/drive`):
+
+```bash
+hee4 task.cancel <task_id> --key $(uuidgen)       # raw body: {"task_id":"<id>"}
+```
+
+- The skeleton takes no `precondition`, `reason` or `note`. An admitted task: `phase=cancellation_requested` (or `cancelled` once the dispatcher stops it). A terminal task: `conflict` at `/body/task_id`, retry `after_readback`. Unknown id: `not_found`. No key: `invalid_argument` at `/idempotency_key`.
+
 ## Gotchas
 
 - There is no `tasks.cancellation` column (card store §9 #2). A test reading one is reading a v3 ledger.
