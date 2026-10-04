@@ -1,68 +1,172 @@
-# Herdr Engineering Engine v4: planning repository
+# Herdr Engineering Engine v4
 
-**Status (2026-10-02): PLANNING ONLY. Luke's HOLD: no code until he says "start coding".** This repository holds the v4 charter, decisions, gate intents and the staged v3 modules. It contains no buildable code.
+HEE v4 is a local engineering engine. It admits a task over a Unix control socket, dispatches it to a local model inside an isolated namespace, verifies it with one verdict authority, settles it durably with a hash-chained receipt, and survives a crash, a restart and a restore. It runs on this machine as a systemd user unit.
 
-**Jev (2026-10-02, `plan/DECISIONS.md` V4-74):** no v4 text goes to Jev (ATLAS H-10a). The installed Jev door refuses every HEE v4 name and path for every sender, and `just jev-entry` reads that back. Re-run it at P0 entry and after any Jev or Claude Code update; never quote an old line.
+The repository holds the engine (`crates/`), its gate (`tools/`, `gate.toml`), the behaviour-level feature map it is verified against (`gates/features/`), the planning corpus it was built from (`plan/`, `modules/`, `docs/`), the agent roster that builds it (`.claude/agents/`, `.claude/skills/`), and the orchestration glue for Firstmate (`ops/firstmate/`).
 
-| Path | What | Owner / home |
+Every claim here is labelled. MEASURED means a command ran on this machine and its output is quoted or cited. DESIGN means written and not yet built. HELD means it waits on the owner. Where a number would go stale, a command stands in its place: run it.
+
+## Status (2026-10-05)
+
+| What | State | Witness |
 |---|---|---|
-| `CHARTER.md` | purpose, scope, done-line, authority, the hold | this repo |
-| `plan/DECISIONS.md` | v4 decision register (append-only) | this repo |
-| `gates/REQUIREMENTS.md` | the scaffolding requirements that will become gate steps | this repo |
-| `docs/INDEX.md` | where every design and learning lives | this repo → `~/hee4-evidence`, v4 vault |
-| `migrated/v3-b5367bc/` | verbatim v3 HARDEN modules + tests + schemas, **staged, not wired** (`MIGRATION.md`, `MANIFEST.sha256`) | this repo |
-| `.claude/agents/hee4-*.md`, `ops/roster/` | the agent roster: `hee4-curator` (corpus) and `hee4-workflow-curator` (workflows and loops), one runner `ops/roster/run-agent.sh`; schedule in `ops/roster/README.md` |
-| `justfile`, `runbooks/*.toml`, `ops/checks/` | ops recipes (`just verify`, `regen`, `repin KEY`, `trace`, `render`, `highway MODULE`, `jev-entry [SINCE]`, `roster-selfcheck AGENT`, `drill`, `restore-v3-modes confirm`), one habitat runbook per recipe, the checks they call (`ops/checks/render/README.md`, `ops/checks/regen.py`, `ops/checks/funnel_trace.py`) | this repo |
+| Live unit | `hee4.service` active, `Restart=on-failure` | `systemctl --user is-active hee4.service` |
+| Binary | `hee4 4.0.0-skeleton <sha12>`, the sha baked at build | `hee4 --version` |
+| Health | `recovery_complete=true` after reconcile | `hee4 health` |
+| Crash drill | SIGKILL → systemd restart → recovery complete, socket perms intact | `tools/drill --unit hee4.service --socket $XDG_RUNTIME_DIR/hee4/control.sock --repo .` |
+| Feature drive | health, task.submit, task.get, task.list, task.cancel against the live unit, restart included | `tools/drive --doctor-first --allow-restart` |
+| Gate | commit tier green; cut tier red on one row until a model answers on `127.0.0.1:11434` | `just gate commit`, `just gate cut` |
+| Tags | `skeleton-deployed-2026-10-05`, `hardened-deployed-2026-10-05` | `git tag -n` |
 
-## Quickstart (2026-10-02; commands re-run and expectations updated by V4-67 and V4-74)
+The engine has not yet run a real model attempt. With no model endpoint, `decide` refuses rather than passing work that did not happen. That refusal is the design.
 
-### 1 · Orient (state is computed, never trusted from a note)
-**Verify everything: `just verify`.** It runs cite pins, the module funnel and its control, `hee4db check`, the DB control, the `jev-entry` control, the funnel trace and the mermaid render. It runs every step even after one fails, and ends `verify verdict=PASS|FAIL steps=N/M` (PASS only when N = M; expect it, not a count: a count literal goes stale with the next step, AP-28). `just` (no arguments) lists the recipes. Each recipe has a runbook in `runbooks/<name>.toml` (precondition, step, verify), which `habitat-runbook preview|run <name> --directory runbooks` checks and runs. After a register edit run `just regen`; after editing a cited file run `just repin <KEY>`.
-```bash
-cd ~/herdr-engineering-engine-v4
-just verify                                       # every check, one verdict: expect verify verdict=PASS steps=N/N
-habitat-scope set --session "$HABITAT_SCOPE_SESSION" --charter "HEE v4" ~/herdr-engineering-engine-v4 ~/hee4-evidence /var/mnt/STORAGE-10TB/fedora-obsidian-vaults/herdr-engineering-engine-v4.vault
-python3 ops/checks/module_funnel.py | tail -1     # the planning corpus is coherent: expect verdict=PASS
-hee4db check 2>&1 >/dev/null | tail -1           # ops database + substrate alignment: expect verdict=PASS measured=N/N (17 checks on 2026-10-02)
-hee4db readiness 2>&1 >/dev/null | tail -1       # expect deploy_ready=0/53 ready_to_build=40 arch_review=0 blocked_luke=0 deferred=13 (2026-10-01, after the DC ratification V4-55…V4-66)
-just trace | tail -1                             # (ops/checks/funnel_trace.py; the old evidence path still works) vault index → card → design section → maps → phases → H → DC → migrated → highway, 53 modules: expect verdict=PASS
-hee4db recipe blocks-phase P0 2>/dev/null | python3 -c 'import json,sys; print([r["id"] for r in json.load(sys.stdin)["rows"]])'   # what still blocks P0: each id is held for Luke (ATLAS §5); on 2026-10-02: H-1, H-5, H-27
-just jev-entry                                   # P0 Jev entry: expect verdict=PASS senders_measured=4/4 sent_engine_rows=0/<sent>
+## The one rule
+
+The owner's meta goal: an environment that makes it hard to write bad code. Every door in the engine has a rung, and the highest rung wins:
+
+1. **Impossible.** Types and architecture. A wrong state has no representation.
+2. **Refused at the door.** Admission checks that cost seconds.
+3. **Caught by a check.** Build, tests, plants, the sealed diff observation, the feature drive.
+4. **Caught by review.** Advisory only; never a verdict.
+5. **Caught in production.** The drill, receipts, recovery.
+
+A recurring mistake class moves up a rung, and the new door must be proven to fail on the real past instance before it is admitted (`plan/STACK-MAP-2026-10-04.md` §0; the `correct` skill).
+
+## Architecture
+
+Six crates under `crates/`, one owner each. The arrows are the only ways data crosses a boundary.
+
+```
+task.submit {brief}        events.subscribe
+      │                          ▲
+      ▼                          │
+ hee4-app ── control socket (0700 dir, 0600 socket, SO_PEERCRED) ── actions ── dispatcher
+      │ Store::apply(Event) is the only state writer
+      ▼
+ hee4-core ── SQLite ledger (events are truth; tasks is a replay cache) ── recovery R01–R14 before any dispatch
+      │
+      ▼
+ hee4-worker ── route (capability floor, typed refusal) ── namespace plan ── native attempt
+      │                                                            │
+      ▼                                                            ▼
+ hee4-host ── spawn behind a permit (bwrap, --unshare-net) ── model door (unix socket → 127.0.0.1:11434)
+      │
+      ▼
+ hee4-evidence ── decide: the one verdict (fail-closed lattice over sealed observations) ── receipt chain
+      │
+      ▼
+ hee4-contracts ── TaskState via transition only · parsed newtypes · the eleven-field brief · Receipt::seal
 ```
 
-### 2 · Find anything
-| You need | Go to |
-|---|---|
-| **Everything about one module, in one call** (card, design section, phases, budget, readiness, open DCs, held items, AP/EX/D, migrated paths, decisions, V-reports, maps) | `hee4db highway <module>`; per phase `hee4db highway --phase P3`; per conflict `hee4db highway --dc DC-38`. Skill: `hee-v4-corpus` *(rev 2026-10-01 alignment)* |
-| What v4 is, its scope and done-line | `CHARTER.md`, then `~/hee4-evidence/design/DEPLOYMENT_ATLAS.md` §1 |
-| Architecture (authority) | `~/hee4-evidence/design/ULTRAMAP.md`; its §7 points at the design detail |
-| **Per-module design**: logic flow, interfaces, actions, sockets, loops, refusals, must-nots, size budget | the vault **[Module Design Index](obsidian://open?vault=herdr-engineering-engine-v4.vault&file=15%20Module%20Design%2F00%20-%20Module%20Design%20Index)**; every card links its own section |
-| API (22 actions) · sockets/IPC (S-1…S-11) · CLI commands | vault `16 System Maps/`: `API Map`, `Socket and IPC Map`, `Command Map` |
-| Runtime loops (RL-1…11) · dev workflows (DW-1…7) · end-to-end traces (E2E-01…12) | vault `16 System Maps/`: `Workflow and Loop Map`, `End-to-End Flow Traces` |
-| State tables and transitions · refusals · size budgets | vault `16 System Maps/`: `State and Transition Map`, `Error and Refusal Map`, `Anti-Bloat Budget` |
-| A module's funnel (phase, H-items, v3 basis, done criteria, AP/EX/D) | `modules/<crate>/<module>/MODULE.md` (53 cards, `modules/MODULES.toml`) |
-| Anti-patterns · exemplars · drift controls | `docs/ANTIPATTERNS.md`, `docs/EXEMPLARS.md`, `docs/DRIFT_AND_OVERENGINEERING.md` |
-| Decisions · held-for-Luke items | `plan/DECISIONS.md` (append-only) · ATLAS §5 (the H-list, single home); a phase's open holds: `hee4db recipe blocks-phase Pn` |
-| Jev egress and the P0 Jev entry | `just jev-entry` (`hee4db jev-entry`); per day and sender: `hee4db record jev-daily` then `hee4db recipe jev-egress`; Jev fits: vault `50 Jev/Jev Fit Map`, `hee4db highway --jev` |
-| Query any of it as data | `hee4db help` · `hee4db recipes` · `hee4db search <words>` (see `ops/db/README.md`) |
-| **Restart in a fresh context** | `~/handoffs/HEE4_RESTART.md` (routes + queries), then `hee4db recipe restart` and `just verify` |
-| **Claude tooling for this repo** (hooks, slash commands /verify /restart /highway /module /regen /hee4-status /lessons, project skills, agents) | [`.claude/README.md`](.claude/README.md); the skills and agents are also queryable: `hee4db recipe skills`, `hee4db recipe agents`, `hee4db recipe reflexes` |
-| Lessons by trigger (anti-patterns, exemplars, spells, mistakes from v2/v3/prototypes) | `.claude/skills/hee4-lessons/` (`/lessons <situation>`) |
+| Crate | Owns | Door it holds | Proof |
+|---|---|---|---|
+| `hee4-contracts` | `TaskState`, `Event`, the `transition` whitelist, `Observation`, `Brief`, `Receipt` | rung 1: a `TaskState` cannot be built except by `transition` or `replay`; digests and ids parse or refuse | `cargo test -p hee4-contracts` prints `legal=65/65 illegal=383/383` and the tamper sweep |
+| `hee4-core` | the SQLite ledger, idempotent admission, the receipt chain, recovery | rung 2: no SQL outside `store.rs` (a recursive token census); `Dispatch` refused until reconcile completes | `tests/crash.rs` SIGKILLs a child mid-write in two landing modes and reopens |
+| `hee4-host` | `spawn` behind a `Permit`, `Clock`, the model door | rung 2: no permit, no spawn; no network inside the sandbox; the door refuses by name (400/408/411/413/429/503) | sandbox tests run real `bwrap` and prove the negative paths |
+| `hee4-worker` | route rules R02–R13, namespace plans, attempts | rung 2: no model meets the floor → a typed refusal, never a default; skipped steps stay recorded | `cargo test -p hee4-worker` |
+| `hee4-evidence` | `decide`, the deep-diff-forge adapter | rung 2: zero tier-0 observations → refused; an unbound observation → `Unreconciled`; a census allows sealing only in `decide.rs` | the exhaustive lattice test and `tests/one_sealer.rs` |
+| `hee4-app` | the `hee4` binary: socket, actions, dispatcher, doctor, unit | rung 2: one name per refusal (a test ties every emitted refusal to `FLOW.md`), peer uid must match, connection and frame caps | `tests/e2e.rs` runs the server, submits, SIGKILLs it, restarts, checks recovery |
 
-### 3 · Writing a module, after "start coding" (DW-1)
-1. Read the card, then its design section, then the system maps it names, then `Anti-Bloat Budget`.
-2. Write a one-page FLOW and a compiling skeleton. Run at most 2 design rounds (D-02, D-03).
-3. Write the slice. Tier-1 checks per commit, Tier-2 repo gate plus cold clone per stack (ATLAS §4).
-4. Where the design conflicts with an authority, the authority wins. Record it in the design conflict register (DC-nn).
-5. After editing any file the cards cite: `just repin <KEY>`. After editing a file home the database derives from: `hee4db ingest`; after a design-conflict register edit: `just regen`. Then `just verify`.
+Each crate carries a one-page `FLOW.md` with its types, its doors, and what it may and may not construct. Read those before the code.
 
-### 4 · Rules that do not bend
-- **The HOLD:** no code until Luke says "start coding" (V4-0).
-- **The fence:** never work in v3 (`CLAUDE.md`).
-- **Commits and pushes:** commit only when asked; push only on Luke's word.
-- **Jev:** no v4 text goes to Jev (H-10a); `just jev-entry` must PASS before P0 and after any Jev change.
-- **One topic, one home:** the vault and the database link and index; they never become a second home.
+### The frame
 
-Design and evidence live in `~/hee4-evidence/` (ULTRAMAP, DEPLOYMENT_ATLAS, PROCESS-LEARNINGS, JEV_QUESTION_RESPONSES). Navigation lives in the v4 vault. One topic, one home: the vault links here, never copies.
+One JSON object per line over the socket. Request: `{request_id, action, action_version: 1, idempotency_key, body}`. Reply: `{kind: "result", request_id, replayed, body}` or `{kind: "error", code, retry, field, message}`. Actions in the deployed catalogue: `health`, `task.submit`, `task.get`, `task.list`, `task.cancel`, `task.preview`, `task.resolve`, `events.subscribe`. The refusal names are listed once, in `crates/hee4-app/FLOW.md`, and a test fails if the code can emit one that is not there.
 
-State is computed, never stored here: `ops/roster/run-agent.sh hee4-curator selfcheck` prints it (see `ops/roster/README.md`).
+### The brief
+
+`task.submit` takes a brief with eleven fields: `GOAL SCOPE CONTEXT ACCEPTANCE VERIFY TIMEBOX FORBIDDEN REPORT STANDING RECON RESTATEMENT`. A missing field is refused by name; an empty `RESTATEMENT` is refused. The same brief shape is what the agent roster uses to dispatch work to itself.
+
+## Build, test, gate
+
+Rust 1.99, offline builds (the registry cache is on this machine).
+
+```bash
+cargo build --workspace --release
+cargo test --workspace
+just gate commit        # fmt, clippy -D warnings, test, on a git archive of HEAD, never the live tree
+just gate stack         # commit + a sealed deep-diff-forge observation (--require-files --require-hunks) + doc
+just gate cut           # stack + drill + drive + doctor
+```
+
+`tools/gate` exports the subject at a sha, sets `HEE4_HEAD` for `build.rs`, builds in a per-subject target dir, and prints `step=<name> rc=<n> elapsed=<s>/<budget>s margin=<s>` per step and one verdict line. A step whose expected output is absent (zero tests collected) is marked `looked_at_nothing` and fails. Tiers and budgets live in `gate.toml` only.
+
+## Deploy, drill, drive
+
+```bash
+cargo build -p hee4-app --release
+install -Dm755 target/release/hee4 ~/.local/bin/hee4
+install -Dm644 systemd/hee4.service ~/.config/systemd/user/hee4.service
+systemctl --user daemon-reload && systemctl --user enable --now hee4.service
+hee4 health
+hee4 doctor --repo .                      # unit, socket perms, ledger, model endpoint, binary sha == HEAD
+tools/drill --unit hee4.service --socket $XDG_RUNTIME_DIR/hee4/control.sock --repo .
+tools/drive --doctor-first --allow-restart
+```
+
+The unit runs with `ProtectSystem=strict`, `NoNewPrivileges=yes`, `PrivateTmp=yes`, and writes only under `~/.local/share/hee4` and `$XDG_RUNTIME_DIR/hee4`. The drill sends SIGKILL to the main pid and requires the restart, the socket perms and `recovery=complete` within their budgets. The drive runs each feature file's "Driving it with hee4" procedure (success, cancel, error, empty and persistence paths) and keeps every frame as evidence under `~/.cache/hee4-drive/<sha12>/`.
+
+## Verification, in order of trust
+
+1. **Deterministic observations decide.** Build, tests, plants, the sealed diff observation and the feature drive feed `decide`. Model-based review is advisory and can only refuse.
+2. **Every observation is bound to its subject.** `head_sha` and `input_sha256` are mandatory; a mismatch is `Unreconciled`.
+3. **Nothing passes by looking at nothing.** Zero files, zero hunks, zero tests, zero tier-0 observations are refusals.
+4. **Doctor first.** A result against a stale binary is not evidence; `binary_sha == HEAD` is a doctor row.
+5. **Observations are ledgered before the verdict.** Recovery replays them.
+6. **Refuters, not reviewers, close a slice.** Every load-bearing crate was handed to an independent agent whose brief was to refute the builder's claims and attack the code. Their findings became fix slices before the merge was trusted.
+
+## Orchestration
+
+Firstmate is the orchestrator (`~/firstmate`, backend herdr). Each Firstmate home holds one orchestration database, `data/firstmate.db`, written only by `ops/firstmate/fm-db` (units, briefs, spawns, claims, verifications, receipts, exits, andon) and read back with `tursodb --readonly`. Its doors refuse an unlabelled claim, a claim verified by its own author, a spawn past `planned_agents`, and a spawn under an open andon.
+
+The roster (`.claude/agents/ROSTER.md`, bound by `PROTOCOL.md`) is twelve facet specialists, six read-only watchers and three collaboration roles. Builders work in git worktrees under `/mnt/storage-10tb/hee4-wt/`, one branch each, merged only after the first mate re-runs their gates. `treehouse` cuts crew worktrees from the local mirror `origin` (`/mnt/storage-10tb/hee4-origin.git`); GitHub is the remote `github`, pushed on the owner's word.
+
+The craft layer is Lauren Tan's pstack and brainmaxxing, ported under `.claude/skills/` (MIT, provenance recorded). `brain/` is the build memory, injected at session start.
+
+## Planning corpus
+
+`START.md` is the one-hop entry for a fresh agent. `plan/DECISIONS.md` is the append-only register (V4-0 onward). `plan/STACK-MAP-2026-10-04.md` is the end-to-end map with the rung ladder; `plan/INTEGRATION-MAP-2026-10-04.md` assigns one owner per concern across the five repos the stack draws on. `modules/` holds one card per module and the manifest the checks read. `gates/features/` is the feature map. `ops/checks/` and `just verify` keep the corpus coherent with the code: cite pins, the module funnel, the ops database, the mermaid render.
+
+```bash
+bash .claude/hooks/context-doctor.sh   # can a fresh agent reach every home and tool? present|MISSING per row
+just verify                            # every corpus check, one verdict line
+hee4db highway <module>                # everything about one module in one call
+```
+
+## Doors that fired on the builders
+
+Recorded because each is now an instance a future door must fail on:
+
+- The gate refused a zero-test run on the empty workspace (AP-29).
+- The dispatcher refused to run a binary whose baked head sha was `unknown`; the cause was the gate's `git archive` export sharing a target dir with the live tree.
+- A census test bound `CARGO_MANIFEST_DIR` at compile time and broke in a reused export; paths are now read at runtime.
+- A `CLOSED` marker written in the wrong table cell left two held items open in the ops database; `hee4db check=held` now refuses it.
+
+## Not yet
+
+- A model server on `127.0.0.1:11434` (HELD: owner install). The dispatcher runs honest refusals until then; the first real attempt through the door and the first `Pass` verdict follow it.
+- Firstmate live crew in herdr: scouts in `auto` mode parked on Claude Code permission prompts; the current pilot runs in `dontAsk` mode against the repo allow-list (`plan/DECISIONS.md` V4-90 onward).
+- Nineteen release actions beyond the skeleton (`thread.*`, `tools.*`, `service.*`, `roster.*`, `analysis.*`, `judge.inspect`): the drive reports each `UNMEASURED` by name.
+- An attempts table so recovery rules R03, R09 and R13 can fire; socket and door limits as K1 budgets rather than literals.
+- The Jev advisory port: the boundary door is installed and refuses every v4 name; no sender is installed.
+
+## Layout
+
+```
+crates/           hee4-contracts hee4-core hee4-host hee4-worker hee4-evidence hee4-app (each with FLOW.md)
+systemd/          hee4.service
+tools/            gate · doctor · drill · drive · tests/
+gate.toml         tiers and budgets
+gates/features/   one file per release action, four questions each; crash-restart; journeys
+plan/             DECISIONS.md (append-only) · STACK-MAP · INTEGRATION-MAP · FIRSTMATE-ORCHESTRATION
+modules/          53 module cards + MODULES.toml
+docs/             anti-patterns, exemplars, drift controls
+ops/              checks (cite pins, funnel, trace, render) · db (hee4db) · firstmate (fm-db, schema)
+.claude/          agents (the roster), skills (pstack + hee4-*), hooks (context-doctor, brain, v3 guard)
+brain/            build memory, one topic per file
+migrated/         v3 modules staged verbatim, not wired
+```
+
+## Licence and provenance
+
+The engine is UNLICENSED (private). `.claude/skills/pstack/` is MIT (Lauren Tan); its `PROVENANCE.md` lists every porting change. `migrated/` is the v3 engine at `b5367bc` with a manifest.

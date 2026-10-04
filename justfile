@@ -210,3 +210,22 @@ drill-kill9 unit="hee4.service" socket="":
 # Fresh-instance readiness: unit, socket perms, ledger, model, binary sha
 doctor:
     @tools/doctor
+
+# Build the release binary, install it, restart the unit, read health and the doctor. One verdict line.
+deploy:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.cache/hee4-target}"
+    cargo build -q -p hee4-app --release --offline || { echo "deploy verdict=FAIL step=build"; exit 1; }
+    install -Dm755 "$CARGO_TARGET_DIR/release/hee4" "$HOME/.local/bin/hee4" || { echo "deploy verdict=FAIL step=install"; exit 1; }
+    install -Dm644 systemd/hee4.service "$HOME/.config/systemd/user/hee4.service"
+    systemctl --user daemon-reload && systemctl --user restart hee4.service || { echo "deploy verdict=FAIL step=restart"; exit 1; }
+    sleep 2
+    v=$(hee4 --version); h=$(hee4 health 2>&1 | head -1)
+    d=$(hee4 doctor --repo . 2>&1 | tail -1)
+    echo "deploy verdict=PASS binary=\"$v\" health=\"$h\""
+    echo "$d"
+
+# Push main (and tags) to the local mirror that treehouse and Firstmate cut worktrees from. Never GitHub.
+mirror:
+    git push -q origin main --tags && echo "mirror verdict=PASS origin/main=$(git rev-parse --short=12 origin/main)"
