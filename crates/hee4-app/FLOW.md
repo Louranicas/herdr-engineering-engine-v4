@@ -70,9 +70,9 @@ DC proposal below.
 |---|---|---|
 | first `admitted` task | `Store::task_ids`, `phase` | — |
 | brief | `<W>/briefs/<task>.brief`, `Brief::parse` | `Resolve(Abandon(BriefUnreadable))` |
-| playbook | VERIFY lines: absolute path → `Run`; `model: <prompt>` → `Generate`; else `Unsupported` (named skip) | — |
+| playbook | VERIFY lines: absolute path → `Run` (bare argv); `sh: <line>` → `Run{/bin/sh, [-c, line]}` (the line runs inside the sandbox: no network, only `$HEE4_MODEL_SOCKET`); `model: <prompt>` → `Generate`, a recorded skip whose reason names `sh:`; else `Unsupported` (named skip) | — |
 | route | `route::select` over a one-row roster (`HEE4_MODEL`, default `qwen2.5-coder:7b`), floor local-only, baseline = that model; availability probed (`tags`) only when a model step will run | `Resolve(Abandon(RouteRefused{floor_unmet}))` |
-| namespace | `NamespaceTask::new(task, W, needs_model, TIMEBOX)` → `plan_for`; `needs_model` = a `Generate` step and `HEE4_LIVE_MODEL=1` | `Resolve(Abandon(NamespaceRefused))`; work dir → `WorkDirUnavailable`; unknown head → `HeadUnknown`; door upstream unparsable → `NoPermit` |
+| namespace | `NamespaceTask::new(task, W, needs_model, TIMEBOX)` → `plan_for`; `needs_model` = a `Generate` or `sh:` step and `HEE4_LIVE_MODEL=1` | `Resolve(Abandon(NamespaceRefused))`; work dir → `WorkDirUnavailable`; unknown head → `HeadUnknown`; door upstream unparsable → `NoPermit` |
 | permit | `Permit::mint(ReceiptId "r-<task>-<ns>", scope = the Run programs)` | — |
 | dispatch | `Store::apply(Dispatch)` → running (refused before reconcile by K1) | — |
 | attempt | `Attempt::run` (bwrap for Run steps; Generate steps skip with no loopback when not live, `UNMEASURED` printed) | error or a `Failed` step: `Settle(NotReady)` → `Stop` → failed, no receipt |
@@ -82,9 +82,16 @@ DC proposal below.
 | receipt | `Store::append_receipt` (K1 re-runs `verify_chain`) | — |
 | verdict | `apply(Decide(verdict))`; `Pass` → `apply(Accept)` | — |
 
-With `HEE4_LIVE_MODEL` unset no model step runs, so no tier-0 observation exists and `decide`
-returns `Refused(invalid)`: the task ends `failed` with a sealed receipt, never `accepted`.
-I3 has no "unmeasured" outcome, so none is fabricated.
+Every `Run` step records a tier-0 observation (tool `command`): `Pass` on exit 0, `Fail` otherwise,
+evidence `exit` and `stdout`. Every observation's `input_sha256` is the digest of the VERIFY text,
+which is also the receipt subject's input, so `decide` reconciles them (an observation over any
+other input is `Refused(Unreconciled)`: the first live run hit exactly that with the door
+observation's old request-digest input). A step that fails still ends `failed` with no receipt
+(`Settle(NotReady)`, `Stop`); the `Fail` observation is in the outcome only. A `sh:` step that
+exits 0 and reaches the model also adds the door observation (one `model_request` row per
+request): `Pass` → `accepted`. A `/usr/bin/true` brief now ends `accepted` (exit evidence);
+the `live_model_attempt_through_the_door` e2e test (`HEE4_LIVE_MODEL=1`, model on 11434, else an
+`UNMEASURED` line) drives a `curl --unix-socket "$HEE4_MODEL_SOCKET"` line to `accepted`.
 
 ## Peer credentials
 
