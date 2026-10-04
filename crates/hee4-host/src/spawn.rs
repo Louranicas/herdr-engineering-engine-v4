@@ -3,6 +3,7 @@
 //! refuses what contradicts them.
 
 use std::io::Read;
+use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command as Proc, Stdio};
 use std::thread;
@@ -82,8 +83,10 @@ pub struct NamespacePlan {
     pub ro_binds: Vec<PathBuf>,
     /// The one writable work directory; must be listed.
     pub work_dir: PathBuf,
-    /// Share the host network (bwrap `--share-net`); otherwise none.
-    pub allow_loopback: bool,
+    /// The model door's unix socket (see [`crate::model_door`]), bound read-write at the same
+    /// path and named to the candidate as `HEE4_MODEL_SOCKET`. It must be listed, absolute and a
+    /// socket when the plan is built. There is no network: the door is the only path out.
+    pub model_door: Option<PathBuf>,
     /// Kill the child after this long.
     pub timeout: Duration,
 }
@@ -100,7 +103,13 @@ pub enum HostRefusal {
     /// The permit's scope does not cover the program.
     #[error("permit {0:?} does not cover {1}")]
     OutOfScope(PermitId, PathBuf),
+    /// The model door is not a unix socket: binding it would be a second writable tree.
+    #[error("model door is not a socket (a second writable bind): {0}")]
+    DoorNotSocket(PathBuf),
 }
+
+/// The env var naming the model door inside the namespace.
+pub const MODEL_SOCKET_ENV: &str = "HEE4_MODEL_SOCKET";
 
 /// A fully built, permitted spawn.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,8 +128,12 @@ pub struct SpawnPlan {
 
 /// Build the bwrap invocation, or refuse.
 ///
+/// The argv always carries `--unshare-all --unshare-net`; there is no `--share-net` path. The
+/// writable binds are the work dir and, when present, the model door, which must be a socket.
+///
 /// # Errors
-/// [`HostRefusal`] for an out-of-scope command, relative path or unlisted mount.
+/// [`HostRefusal`] for an out-of-scope command, relative path, unlisted mount, or a model door
+/// that is not a socket.
 #[expect(
     clippy::needless_pass_by_value,
     reason = "the door takes the plan by value: one plan, one spawn"
@@ -133,27 +146,45 @@ pub fn plan(
     if !permit.scope.programs.contains(&command.program) {
         return Err(HostRefusal::OutOfScope(permit.id, command.program));
     }
-    for p in ns.ro_binds.iter().chain([&ns.work_dir, &command.program]) {
+    let mounts = || {
+        ns.ro_binds
+            .iter()
+            .chain([&ns.work_dir])
+            .chain(&ns.model_door)
+    };
+    for p in mounts().chain([&command.program]) {
         if !p.is_absolute() {
             return Err(HostRefusal::RelativePath(p.clone()));
         }
     }
-    for p in ns.ro_binds.iter().chain([&ns.work_dir]) {
+    for p in mounts() {
         if !ns.listed_mounts.contains(p) {
             return Err(HostRefusal::UnlistedMount(p.clone()));
         }
     }
-    let s = |p: &Path| p.to_string_lossy().into_owned();
-    let mut argv: Vec<String> = ["--unshare-all", "--die-with-parent", "--new-session"]
-        .map(String::from)
-        .to_vec();
-    if ns.allow_loopback {
-        argv.push("--share-net".into());
+    if let Some(door) = &ns.model_door {
+        let is_socket = std::fs::symlink_metadata(door).is_ok_and(|m| m.file_type().is_socket());
+        if !is_socket {
+            return Err(HostRefusal::DoorNotSocket(door.clone()));
+        }
     }
+    let s = |p: &Path| p.to_string_lossy().into_owned();
+    let mut argv: Vec<String> = [
+        "--unshare-all",
+        "--unshare-net",
+        "--die-with-parent",
+        "--new-session",
+    ]
+    .map(String::from)
+    .to_vec();
     for p in &ns.ro_binds {
         argv.extend(["--ro-bind".into(), s(p), s(p)]);
     }
     argv.extend(["--bind".into(), s(&ns.work_dir), s(&ns.work_dir)]);
+    if let Some(door) = &ns.model_door {
+        argv.extend(["--bind".into(), s(door), s(door)]);
+        argv.extend(["--setenv".into(), MODEL_SOCKET_ENV.into(), s(door)]);
+    }
     argv.extend([
         "--chdir".into(),
         s(&ns.work_dir),
@@ -246,7 +277,7 @@ mod tests {
         PathBuf::from(s)
     }
 
-    fn fixture(program: &str, allow_loopback: bool) -> (Permit, Command, NamespacePlan) {
+    fn fixture(program: &str, model_door: Option<PathBuf>) -> (Permit, Command, NamespacePlan) {
         let permit = Permit::mint(
             ReceiptId("r-1".into()),
             SpawnScope {
@@ -257,39 +288,84 @@ mod tests {
             program: p(program),
             args: vec!["--x".into()],
         };
+        let mut listed_mounts = vec![p("/usr"), p("/lib"), p("/work")];
+        listed_mounts.extend(model_door.clone());
         let ns = NamespacePlan {
-            listed_mounts: vec![p("/usr"), p("/lib"), p("/work")],
+            listed_mounts,
             ro_binds: vec![p("/usr"), p("/lib")],
             work_dir: p("/work"),
-            allow_loopback,
+            model_door,
             timeout: Duration::from_secs(5),
         };
         (permit, cmd, ns)
     }
 
+    /// A real unix socket at a fresh temp path (the listener must outlive the plan call).
+    fn door(name: &str) -> std::io::Result<(std::os::unix::net::UnixListener, PathBuf)> {
+        let path =
+            std::env::temp_dir().join(format!("hee4-spawn-{}-{name}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        Ok((std::os::unix::net::UnixListener::bind(&path)?, path))
+    }
+
     #[test]
     fn argv_for_fixture_is_exact() -> R {
-        let (permit, cmd, ns) = fixture("/usr/bin/true", false);
+        let (_l, d) = door("argv")?;
+        let (permit, cmd, ns) = fixture("/usr/bin/true", Some(d.clone()));
         let sp = plan(&permit, cmd, ns)?;
-        let want = "--unshare-all --die-with-parent --new-session --ro-bind /usr /usr \
-                    --ro-bind /lib /lib --bind /work /work --chdir /work -- /usr/bin/true --x";
+        let d = d.display();
+        let want = format!(
+            "--unshare-all --unshare-net --die-with-parent --new-session --ro-bind /usr /usr \
+             --ro-bind /lib /lib --bind /work /work --bind {d} {d} --setenv HEE4_MODEL_SOCKET {d} \
+             --chdir /work -- /usr/bin/true --x"
+        );
+        println!("argv: bwrap {}", sp.argv.join(" "));
         assert_eq!(sp.argv.join(" "), want);
+        assert!(!sp.argv.iter().any(|a| a == "--share-net"));
         assert_eq!(sp.program, p(BWRAP));
         assert_eq!(sp.receipt, ReceiptId("r-1".into()));
+        let _ = std::fs::remove_file(d.to_string());
         Ok(())
     }
 
     #[test]
-    fn loopback_adds_share_net_only_when_allowed() -> R {
-        let (permit, cmd, ns) = fixture("/usr/bin/true", true);
+    fn no_door_means_no_network_and_one_writable_bind() -> R {
+        let (permit, cmd, ns) = fixture("/usr/bin/true", None);
         let sp = plan(&permit, cmd, ns)?;
-        assert_eq!(sp.argv[3], "--share-net");
+        let want = "--unshare-all --unshare-net --die-with-parent --new-session --ro-bind /usr /usr \
+                    --ro-bind /lib /lib --bind /work /work --chdir /work -- /usr/bin/true --x";
+        assert_eq!(sp.argv.join(" "), want);
+        Ok(())
+    }
+
+    /// The door is the only writable path besides the work dir: a door that is a directory (or
+    /// a regular file, or missing) would be a second writable bind, and is refused.
+    #[test]
+    fn second_writable_bind_is_refused() -> R {
+        let dir = std::env::temp_dir().join(format!("hee4-spawn-{}-dir", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let file = dir.join("plain");
+        std::fs::write(&file, b"x")?;
+        for not_socket in [dir.clone(), file.clone(), dir.join("missing")] {
+            let (permit, cmd, ns) = fixture("/usr/bin/true", Some(not_socket.clone()));
+            assert_eq!(
+                plan(&permit, cmd, ns),
+                Err(HostRefusal::DoorNotSocket(not_socket))
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        let (permit, cmd, mut ns) = fixture("/usr/bin/true", None);
+        ns.model_door = Some(p("/home"));
+        assert_eq!(
+            plan(&permit, cmd, ns),
+            Err(HostRefusal::UnlistedMount(p("/home")))
+        );
         Ok(())
     }
 
     #[test]
     fn unlisted_mount_is_refused() {
-        let (permit, cmd, mut ns) = fixture("/usr/bin/true", false);
+        let (permit, cmd, mut ns) = fixture("/usr/bin/true", None);
         ns.ro_binds.push(p("/etc"));
         assert_eq!(
             plan(&permit, cmd, ns),
@@ -299,7 +375,7 @@ mod tests {
 
     #[test]
     fn uncovered_command_is_refused() {
-        let (permit, mut cmd, ns) = fixture("/usr/bin/true", false);
+        let (permit, mut cmd, ns) = fixture("/usr/bin/true", None);
         cmd.program = p("/usr/bin/false");
         let id = permit.id();
         assert_eq!(
@@ -310,7 +386,7 @@ mod tests {
 
     #[test]
     fn relative_path_is_refused() {
-        let (permit, cmd, mut ns) = fixture("/usr/bin/true", false);
+        let (permit, cmd, mut ns) = fixture("/usr/bin/true", None);
         ns.work_dir = p("work");
         assert_eq!(
             plan(&permit, cmd, ns),
@@ -340,7 +416,7 @@ mod tests {
         }
         let work = std::env::temp_dir().join(format!("hee4-host-w-{}", std::process::id()));
         std::fs::create_dir_all(&work)?;
-        let (permit, cmd, mut ns) = fixture("/usr/bin/true", false);
+        let (permit, cmd, mut ns) = fixture("/usr/bin/true", None);
         ns.args_fix(&work);
         let sp = plan(
             &permit,

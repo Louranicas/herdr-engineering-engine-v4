@@ -14,6 +14,7 @@ use hee4_contracts::{
 use hee4_core::StoreError;
 use hee4_evidence::{Identities, Identity, Source, Subject, Why, decide_and_seal, observation_id};
 use hee4_host::model::OllamaClient;
+use hee4_host::model_door::Upstream;
 use hee4_host::spawn::{self, Permit, SpawnScope};
 use hee4_worker::namespace::{NamespaceTask, plan_for};
 use hee4_worker::native::{Attempt, AttemptOutcome, LIVE_ENV, Step, StepKind, StepStatus};
@@ -24,7 +25,7 @@ use hee4_worker::route::{
 
 use crate::actions::Engine;
 
-/// The model URL (loopback only).
+/// The model URL (loopback only). The candidate never dials it: the attempt's model door does.
 pub const MODEL_URL: &str = "http://127.0.0.1:11434";
 
 /// What the dispatcher needs that is not in the ledger.
@@ -261,9 +262,19 @@ pub fn step(engine: &Engine, cfg: &Config) -> Result<Option<(TaskId, Phase)>, Di
         SpawnScope { programs },
     );
 
+    let upstream = match Upstream::parse(MODEL_URL) {
+        Ok(u) => u,
+        Err(e) => {
+            return Ok(Some((
+                task.clone(),
+                abandon(engine, &task, &e.to_string())?,
+            )));
+        }
+    };
+
     apply(engine, &task, Event::Dispatch)?;
     let attempt =
-        Attempt::new(&selection.model, head.clone()).run(&permit, &plan, &client, &brief, &steps);
+        Attempt::new(&selection.model, head.clone()).run(&permit, &plan, upstream, &brief, &steps);
     let outcome = match attempt {
         Ok(o) => o,
         Err(e) => {

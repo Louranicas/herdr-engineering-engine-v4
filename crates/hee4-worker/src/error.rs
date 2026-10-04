@@ -1,6 +1,7 @@
 //! The crate's one error type for the attempt driver.
 
 use hee4_contracts::Refusal;
+use hee4_host::model_door::DoorError;
 use hee4_host::spawn::{HostRefusal, SpawnError};
 
 /// Why an attempt or a namespace request could not proceed.
@@ -12,6 +13,9 @@ pub enum WorkerError {
     /// The spawn door refused the plan before any process started.
     #[error("host refusal: {0}")]
     Host(#[from] HostRefusal),
+    /// The model door could not open.
+    #[error("model door: {0}")]
+    Door(#[from] DoorError),
     /// A process could not be started or waited on.
     #[error("spawn failed: {0}")]
     Spawn(#[from] SpawnError),
