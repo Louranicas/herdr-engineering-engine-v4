@@ -65,6 +65,11 @@
       "Edit(~/.local/lib/herdr-engineering-engine-v3/**)",
       "Bash(hee3-gate:*)",
       "Bash(hee3-recapture:*)"
+    ],
+    "additionalDirectories": [
+      "/home/louranicas/firstmate/state",
+      "/home/louranicas/firstmate/data",
+      "/mnt/storage-10tb/hee4-evidence/roster"
     ]
   },
   "hooks": {
