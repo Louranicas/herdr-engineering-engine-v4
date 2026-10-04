@@ -11,4 +11,4 @@ pub mod recovery;
 mod store;
 
 pub use recovery::{Observations, ProcessCustody, RecoveryReport, reconcile};
-pub use store::{Admission, CachedRow, OperationKey, SCHEMA_VERSION, Store, StoreError};
+pub use store::{Admission, CacheHeal, CachedRow, OperationKey, SCHEMA_VERSION, Store, StoreError};
