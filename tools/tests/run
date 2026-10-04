@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# The tests runner: `tools/tests/run`. Last line `tools-tests verdict=PASS|FAIL`; refuses zero tests.
+cd "$(dirname "$0")" || exit 2
+out=$(python3 -m unittest discover -s . -p 'test_*.py' 2>&1); rc=$?
+printf '%s\n' "$out" | tail -n 4
+ran=$(printf '%s\n' "$out" | sed -n 's/^Ran \([0-9]*\) test.*/\1/p')
+if [ "$rc" -eq 0 ] && [ "${ran:-0}" -gt 0 ]; then echo "tools-tests verdict=PASS ran=$ran"; exit 0; fi
+echo "tools-tests verdict=FAIL rc=$rc ran=${ran:-none}"; exit 1

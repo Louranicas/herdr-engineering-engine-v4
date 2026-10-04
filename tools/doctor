@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+"""doctor [--unit hee4.service] [--socket PATH] [--model-url URL] [--repo DIR]
+
+Fresh-instance readiness (gates/features/README.md "doctor"). Each check prints
+  check=<name> status=MEASURED|UNMEASURED|FAIL detail=<text>
+UNMEASURED always names its reason; it is never a 0 and it is red. Last line
+  doctor verdict=PASS|FAIL|UNMEASURED measured=k/n unmeasured=u fail=f head=<sha12>
+Exit: 0 PASS (every check MEASURED and ok), 1 FAIL (any check measured bad), 3 UNMEASURED.
+Checks: tool cargo, tool bwrap, unit active, socket perms, ledger opens (hee4 health),
+model reachable (:11434), binary sha = HEAD.
+"""
+import argparse, json, os, re, stat, subprocess, sys, urllib.request
+
+rows = []
+
+def emit(name, status, detail):
+    rows.append(status)
+    print(f"check={name} status={status} detail={detail}")
+
+def sh(*cmd, timeout=10):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout.strip(), r.stderr.strip()
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return None, "", str(e)
+
+def tool(name, args):
+    rc, out, err = sh(name, *args)
+    if rc is None:
+        emit(f"tool_{name}", "FAIL", f"cannot run {name}: {err}")
+    elif rc:
+        emit(f"tool_{name}", "FAIL", f"rc={rc} {err}")
+    else:
+        emit(f"tool_{name}", "MEASURED", out.splitlines()[0] if out else "ran")
+
+def main():
+    ap = argparse.ArgumentParser(prog="doctor", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    xdg = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    ap.add_argument("--unit", default="hee4.service")
+    ap.add_argument("--socket", default=f"{xdg}/hee4/control.sock")
+    ap.add_argument("--model-url", default="http://127.0.0.1:11434")
+    ap.add_argument("--repo", default=os.getcwd())
+    a = ap.parse_args()
+
+    rc, head, _ = sh("git", "-C", a.repo, "rev-parse", "HEAD")
+    head = head[:12] if rc == 0 and head else "unmeasured"
+
+    tool("cargo", ["--version"])
+    tool("bwrap", ["--version"])
+
+    # unit
+    rc, out, err = sh("systemctl", "--user", "show", "-p", "LoadState,ActiveState,MainPID", a.unit)
+    props = dict(l.split("=", 1) for l in out.splitlines() if "=" in l)
+    pid = 0
+    if rc is None:
+        emit("unit", "UNMEASURED", f"systemctl not runnable: {err}")
+    elif props.get("LoadState") != "loaded":
+        emit("unit", "UNMEASURED", f"{a.unit} not loaded (LoadState={props.get('LoadState', '?')}); the unit does not exist yet")
+    elif props.get("ActiveState") != "active":
+        emit("unit", "FAIL", f"{a.unit} ActiveState={props.get('ActiveState')}")
+    else:
+        pid = int(props.get("MainPID", "0") or 0)
+        emit("unit", "MEASURED", f"active MainPID={pid}")
+
+    # socket
+    d = os.path.dirname(a.socket)
+    try:
+        sd, ss = os.stat(d), os.stat(a.socket)
+    except OSError:
+        emit("socket", "UNMEASURED", f"{a.socket} absent; nothing is listening yet")
+    else:
+        md, ms = stat.S_IMODE(sd.st_mode), stat.S_IMODE(ss.st_mode)
+        good = md == 0o700 and ms == 0o600 and stat.S_ISSOCK(ss.st_mode) and ss.st_uid == os.getuid()
+        emit("socket", "MEASURED" if good else "FAIL", f"dir={md:o} sock={ms:o} is_socket={stat.S_ISSOCK(ss.st_mode)} uid_ok={ss.st_uid == os.getuid()}")
+
+    # ledger opens, via the product's own health read
+    rc, out, err = sh("hee4", "health")
+    if rc is None:
+        emit("ledger", "UNMEASURED", "hee4 binary not on PATH; ledger open cannot be read")
+    elif rc == 0 and re.search(r"\bready=true\b", out) and "recovery=complete" in out and "database=ready" in out:
+        emit("ledger", "MEASURED", out.splitlines()[0])
+    else:
+        emit("ledger", "FAIL", f"rc={rc} {out or err}")
+
+    # model endpoint
+    try:
+        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(a.model_url + "/api/ps", timeout=5) as r:
+            models = json.load(r).get("models", [])
+    except (OSError, ValueError) as e:
+        emit("model", "FAIL", f"{a.model_url}/api/ps unreachable: {e}")
+    else:
+        if not models:
+            emit("model", "MEASURED", "endpoint reachable (/api/ps ok); GPU residency UNMEASURED: no model loaded")
+        else:
+            cpu = [m.get("name", "?") for m in models if not m.get("size_vram", 0)]
+            emit("model", "FAIL" if cpu else "MEASURED", f"loaded={len(models)} cpu_only={','.join(cpu) or 'none'}")
+
+    # binary sha = HEAD
+    if not pid:
+        emit("binary_sha", "UNMEASURED", "no running unit, so no /proc/<MainPID>/exe to compare with HEAD")
+    else:
+        rc, out, err = sh("hee4", "--version")
+        if rc == 0 and head != "unmeasured":
+            emit("binary_sha", "MEASURED" if head in out else "FAIL", f"HEAD={head} hee4 --version={out.splitlines()[0] if out else ''}")
+        else:
+            emit("binary_sha", "UNMEASURED", "hee4 --version unavailable or HEAD unknown")
+
+    k, n = rows.count("MEASURED"), len(rows)
+    u, f = rows.count("UNMEASURED"), rows.count("FAIL")
+    v = "FAIL" if f else "UNMEASURED" if u else "PASS"
+    print(f"doctor verdict={v} measured={k}/{n} unmeasured={u} fail={f} head={head}")
+    sys.exit({"PASS": 0, "FAIL": 1, "UNMEASURED": 3}[v])
+
+if __name__ == "__main__":
+    main()

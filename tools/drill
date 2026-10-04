@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+"""drill [--unit hee4.service] [--socket PATH] [--restart-budget S] [--repo DIR]
+
+The kill -9 drill (gates/features/crash-restart.md): SIGKILL the unit's MainPID, then require the
+unit to come back with a new MainPID, the socket to return 0700/0600, and `hee4 health` ready.
+Parameterised on the unit name and socket path. Each step prints
+  drill_step=<name> status=MEASURED|UNMEASURED|FAIL elapsed=<s>/<budget>s detail=<text>
+If the unit is not loaded every step is UNMEASURED with its reason (never a 0, and red).
+Last line
+  drill verdict=PASS|FAIL|UNMEASURED steps=k/n unit=<name> head=<sha12>
+Exit: 0 PASS, 1 FAIL, 3 UNMEASURED.
+"""
+import argparse, os, signal, stat, subprocess, sys, time
+
+rows = []
+STEPS = ["unit_active", "kill9", "unit_restarted", "socket_perms", "health_ready"]
+
+def sh(*cmd, timeout=10):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout.strip(), r.stderr.strip()
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return None, "", str(e)
+
+def emit(name, status, budget, t0, detail):
+    rows.append(status)
+    print(f"drill_step={name} status={status} elapsed={time.monotonic() - t0:.1f}/{budget}s detail={detail}")
+
+def props(unit):
+    rc, out, _ = sh("systemctl", "--user", "show", "-p", "LoadState,ActiveState,MainPID", unit)
+    return rc, dict(l.split("=", 1) for l in out.splitlines() if "=" in l)
+
+def finish(unit, head):
+    k, n = rows.count("MEASURED"), len(STEPS)
+    v = "FAIL" if "FAIL" in rows else "PASS" if k == n else "UNMEASURED"
+    print(f"drill verdict={v} steps={k}/{n} unit={unit} head={head}")
+    sys.exit({"PASS": 0, "FAIL": 1, "UNMEASURED": 3}[v])
+
+def main():
+    ap = argparse.ArgumentParser(prog="drill", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    xdg = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    ap.add_argument("--unit", default="hee4.service")
+    ap.add_argument("--socket", default=f"{xdg}/hee4/control.sock")
+    ap.add_argument("--restart-budget", type=int, default=30, help="seconds to wait for the restart")
+    ap.add_argument("--repo", default=os.getcwd())
+    a = ap.parse_args()
+    rc, head, _ = sh("git", "-C", a.repo, "rev-parse", "HEAD")
+    head = head[:12] if rc == 0 and head else "unmeasured"
+    B = a.restart_budget
+
+    t0 = time.monotonic()
+    rc, p = props(a.unit)
+    if rc is None or p.get("LoadState") != "loaded" or p.get("ActiveState") != "active":
+        why = "systemctl not runnable" if rc is None else f"{a.unit} LoadState={p.get('LoadState')} ActiveState={p.get('ActiveState')}; the unit does not exist or is not running"
+        emit("unit_active", "UNMEASURED", 5, t0, why)
+        for s in STEPS[1:]:
+            emit(s, "UNMEASURED", B, time.monotonic(), "not reached: unit_active was not measured")
+        finish(a.unit, head)
+    old = int(p.get("MainPID", "0") or 0)
+    emit("unit_active", "MEASURED", 5, t0, f"MainPID={old}")
+
+    t0 = time.monotonic()
+    try:
+        os.kill(old, signal.SIGKILL)
+        emit("kill9", "MEASURED", 5, t0, f"SIGKILL sent to {old}")
+    except OSError as e:
+        emit("kill9", "FAIL", 5, t0, f"cannot kill {old}: {e}")
+        for s in STEPS[2:]:
+            emit(s, "UNMEASURED", B, time.monotonic(), "not reached: kill9 failed")
+        finish(a.unit, head)
+
+    t0 = time.monotonic()
+    new = 0
+    while time.monotonic() - t0 < B:
+        rc, p = props(a.unit)
+        pid = int(p.get("MainPID", "0") or 0)
+        if p.get("ActiveState") == "active" and pid and pid != old:
+            new = pid
+            break
+        time.sleep(0.2)
+    emit("unit_restarted", "MEASURED" if new else "FAIL", B, t0, f"old={old} new={new or 'none'}")
+
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < B and not os.path.exists(a.socket):
+        time.sleep(0.2)
+    try:
+        ss, sd = os.stat(a.socket), os.stat(os.path.dirname(a.socket))
+        ms, md = stat.S_IMODE(ss.st_mode), stat.S_IMODE(sd.st_mode)
+        good = ms == 0o600 and md == 0o700 and stat.S_ISSOCK(ss.st_mode)
+        emit("socket_perms", "MEASURED" if good else "FAIL", B, t0, f"dir={md:o} sock={ms:o}")
+    except OSError:
+        emit("socket_perms", "FAIL", B, t0, f"{a.socket} did not return")
+
+    t0 = time.monotonic()
+    out, rc = "", None
+    while time.monotonic() - t0 < B:
+        rc, out, _ = sh("hee4", "health")
+        if rc == 0 and "ready=true" in out:
+            break
+        time.sleep(0.5)
+    if rc is None:
+        emit("health_ready", "UNMEASURED", B, t0, "hee4 binary not on PATH")
+    else:
+        emit("health_ready", "MEASURED" if rc == 0 and "ready=true" in out and "recovery=complete" in out else "FAIL", B, t0, out.splitlines()[0] if out else f"rc={rc}")
+    finish(a.unit, head)
+
+if __name__ == "__main__":
+    main()
