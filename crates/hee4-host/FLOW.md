@@ -30,7 +30,17 @@ candidate (no network) --HTTP/1.1 over $HEE4_MODEL_SOCKET--> model_door::serve -
 `Clock::now() -> Duration since epoch`; `SystemClock`; `TestClock::{new,set,advance}`. `spawn::run` still reads `Instant` for its own deadline.
 
 ## model_door
-`serve(socket_path, Upstream, DoorBudget) -> Door`. `Upstream::parse` accepts only `http://<loopback-ip>:<port>`. One thread, one HTTP/1.1 request per connection: reads head and `Content-Length` body (chunked refused `411`, over-budget body `413`, over `max_requests` `429`), drops hop headers, sends `Host: <upstream>` and `Connection: close`, relays the response to EOF. Upstream connect failure: `503 {"refused":"model unreachable"}`. Every request is logged as `DoorRequest{bytes, sha256, fate}`; `Door::close` stops the thread, removes the socket and returns the log. Budget literals (64 requests, 1 MiB, 120 s) are K1 `budget` stand-ins, UNMEASURED. Tested against std `TcpListener` mocks; no live daemon contacted.
+`serve(socket_path, Upstream, DoorBudget) -> Door`. `Upstream::parse` accepts only `http://<loopback-ip>:<port>`. One HTTP/1.1 request per connection, each connection on its own thread (pool of 8; the accept loop waits for a slot). The request line must be `GET|POST SP /api/... SP HTTP/1.1`; anything else is refused and never forwarded. Header deadline 2 s, body deadline 10 s. Drops hop headers, sends `Host: <upstream>` and `Connection: close`, relays the response to EOF. Every request is logged as `DoorRequest{bytes, sha256, fate, label, reason}`; a refused row carries the bytes the door actually read and `label: "refused"`. `Door::close` stops accepting, joins the connection threads, removes the socket and returns the log.
+
+Refusal table (JSON body `{"refused":"<why>"}`):
+- `400` bad request: bad request line (HTTP/0.9, CONNECT, other method, path outside `/api/`, binary garbage), non-utf-8 header, bad `Content-Length`, early EOF or short body. The reply body is always `bad request`; the log row's `reason` names which.
+- `408` header timeout / body timeout: the client did not finish its header in 2 s or its body in 10 s.
+- `411` chunked bodies are not forwarded: `Transfer-Encoding` present; send `Content-Length`.
+- `413` body over budget (one body over `max_body_bytes`) or byte budget exhausted (sum of bodies over `max_total_bytes`, 8 MiB, for the whole attempt).
+- `429` door request budget exhausted: more than `max_requests` forwarded.
+- `503` model unreachable: the upstream did not accept or write failed.
+
+(`431` header too large also exists: header block over 64 KiB.) Budget literals (64 requests, 1 MiB per body, 8 MiB total, 2 s, 10 s, 120 s) are K1 `budget` stand-ins, UNMEASURED. Tested against std `TcpListener` mocks; no live daemon contacted.
 
 ## model
 Used by the dispatcher's availability probe and doctor only; the attempt path makes no in-process model call. `OllamaClient::new(base)`, `.tags()` (`GET /api/tags`), `.generate(model, prompt, timeout)` (`POST /api/generate`, `stream:false`). Errors: `ModelUnreachable | ModelTimeout | ModelMalformed` (non-200 counts as malformed). Tested only against a std `TcpListener` mock on 127.0.0.1; no live daemon was contacted.
