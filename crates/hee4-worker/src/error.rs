@@ -22,4 +22,12 @@ pub enum WorkerError {
     /// The work root cannot be the writable bind (relative, or inside a read-only system path).
     #[error("work root unusable: {0}")]
     WorkRoot(String),
+    /// The door's socket path would not fit `sun_path`; a bind would fail mid-attempt otherwise.
+    #[error("model door path is {len} bytes, over the {max}-byte unix socket limit")]
+    DoorPath {
+        /// The path's length in bytes.
+        len: usize,
+        /// The most `bind(2)` accepts.
+        max: usize,
+    },
 }

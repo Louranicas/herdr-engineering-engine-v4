@@ -72,7 +72,7 @@ DC proposal below.
 | brief | `<W>/briefs/<task>.brief`, `Brief::parse` | `Resolve(Abandon(BriefUnreadable))` |
 | playbook | VERIFY lines: absolute path → `Run` (bare argv); `sh: <line>` → `Run{/bin/sh, [-c, line]}` (the line runs inside the sandbox: no network, only `$HEE4_MODEL_SOCKET`); `model: <prompt>` → `Generate`, a recorded skip whose reason names `sh:`; else `Unsupported` (named skip) | — |
 | route | `route::select` over a one-row roster (`HEE4_MODEL`, default `qwen2.5-coder:7b`), floor local-only, baseline = that model; availability probed (`tags`) only when a model step will run | `Resolve(Abandon(RouteRefused{floor_unmet}))` |
-| namespace | `NamespaceTask::new(task, W, needs_model, TIMEBOX)` → `plan_for`; `needs_model` = a `Generate` or `sh:` step and `HEE4_LIVE_MODEL=1` | `Resolve(Abandon(NamespaceRefused))`; work dir → `WorkDirUnavailable`; unknown head → `HeadUnknown`; door upstream unparsable → `NoPermit` |
+| namespace | `NamespaceTask::new(task, W, needs_model, TIMEBOX).with_door_root(<control socket dir>)` → `plan_for`; `needs_model` = a `Generate` or `sh:` step and `HEE4_LIVE_MODEL=1` | `Resolve(Abandon(NamespaceRefused))`; work dir → `WorkDirUnavailable`; unknown head → `HeadUnknown`; door upstream unparsable → `NoPermit` |
 | permit | `Permit::mint(ReceiptId "r-<task>-<ns>", scope = the Run programs)` | — |
 | dispatch | `Store::apply(Dispatch)` → running (refused before reconcile by K1) | — |
 | attempt | `Attempt::run` (bwrap for Run steps; Generate steps skip with no loopback when not live, `UNMEASURED` printed) | error or a `Failed` step: `Settle(NotReady)` → `Stop` → failed, no receipt |

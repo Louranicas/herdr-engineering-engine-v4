@@ -125,6 +125,10 @@ pub fn serve(args: &ServeArgs, cfg: &dispatcher::Config) -> Result<(), ServeErro
         store,
         args.ledger.clone(),
         args.work.clone(),
+        // The door root is the control socket's dir: the runtime dir in production, short.
+        args.socket
+            .parent()
+            .map_or_else(|| PathBuf::from("/"), std::path::Path::to_path_buf),
         cfg.clone(),
     ));
     let worker = Arc::clone(&engine);

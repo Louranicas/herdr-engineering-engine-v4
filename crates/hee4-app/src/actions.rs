@@ -29,6 +29,7 @@ pub struct Engine {
     store: Mutex<Store>,
     ledger: PathBuf,
     work: PathBuf,
+    doors: PathBuf,
     cfg: Config,
     started: Instant,
     principal: String,
@@ -36,13 +37,16 @@ pub struct Engine {
 
 impl Engine {
     /// Wrap an opened store. `ledger` is its file (read-only stream readers open it),
-    /// `work` the work root (`<work>/<task_id>` per task), `cfg` what `task.preview` routes by.
+    /// `work` the work root (`<work>/<task_id>` per task), `doors` where each attempt serves its
+    /// model door (`<doors>/<task_id>.model.sock`; the control socket's dir, so it stays short),
+    /// `cfg` what `task.preview` routes by.
     #[must_use]
-    pub fn new(store: Store, ledger: PathBuf, work: PathBuf, cfg: Config) -> Self {
+    pub fn new(store: Store, ledger: PathBuf, work: PathBuf, doors: PathBuf, cfg: Config) -> Self {
         Self {
             store: Mutex::new(store),
             ledger,
             work,
+            doors,
             cfg,
             started: Instant::now(),
             principal: crate::process_uid()
@@ -68,6 +72,12 @@ impl Engine {
     #[must_use]
     pub fn work(&self) -> &Path {
         &self.work
+    }
+
+    /// The door root: where attempts serve their model door sockets.
+    #[must_use]
+    pub fn doors(&self) -> &Path {
+        &self.doors
     }
 
     /// Where a task's admitted brief text lives (the ledger has no brief column; DC proposal).
@@ -467,6 +477,7 @@ mod tests {
             Store::open(&dir.join("ledger.sqlite3"))?,
             dir.join("ledger.sqlite3"),
             dir.join("work"),
+            dir.join("rt"),
             Config {
                 model: "m:1".into(),
                 live: false,

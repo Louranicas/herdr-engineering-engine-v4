@@ -58,7 +58,7 @@ impl NamespaceTask {
                 work_dir.display()
             )));
         }
-        let door = work_root.join(format!("{}.model.sock", task_id.as_str()));
+        let door = door_under(work_root, &task_id)?;
         Ok(Self {
             task_id,
             work_dir,
@@ -66,6 +66,24 @@ impl NamespaceTask {
             needs_model,
             timeout,
         })
+    }
+
+    /// Serve the door from `root` instead of the work root: `<root>/<task_id>.model.sock`. The
+    /// runtime dir (`$XDG_RUNTIME_DIR/hee4`) is short and already the unit's; a work root under
+    /// a deep path pushed the door past [`DOOR_PATH_MAX`] once (the gate's export, 109 bytes).
+    ///
+    /// # Errors
+    /// [`WorkerError::WorkRoot`] for a relative root; [`WorkerError::DoorPath`] when the path
+    /// would not fit.
+    pub fn with_door_root(mut self, root: &Path) -> Result<Self, WorkerError> {
+        if !root.is_absolute() {
+            return Err(WorkerError::WorkRoot(format!(
+                "door root {} is relative",
+                root.display()
+            )));
+        }
+        self.door = door_under(root, &self.task_id)?;
+        Ok(self)
     }
 
     /// The task's id.
@@ -86,6 +104,22 @@ impl NamespaceTask {
     pub fn door_path(&self) -> &Path {
         &self.door
     }
+}
+
+/// The longest socket path `bind(2)` takes on Linux: `sun_path` is 108 bytes with its NUL.
+pub const DOOR_PATH_MAX: usize = 107;
+
+/// `<root>/<task_id>.model.sock`, refused by name when it would not fit `sun_path`.
+fn door_under(root: &Path, task_id: &TaskId) -> Result<PathBuf, WorkerError> {
+    let door = root.join(format!("{}.model.sock", task_id.as_str()));
+    let len = door.as_os_str().len();
+    if len > DOOR_PATH_MAX {
+        return Err(WorkerError::DoorPath {
+            len,
+            max: DOOR_PATH_MAX,
+        });
+    }
+    Ok(door)
 }
 
 /// `$HEE4_WORK`, when set to a non-empty value.
@@ -159,6 +193,51 @@ mod tests {
         assert!(
             with.listed_mounts
                 .contains(&"/var/hee4-work/t-1.model.sock".into())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn door_moves_to_the_door_root_and_the_work_dir_stays() -> R {
+        let t = task(true)?.with_door_root(Path::new("/run/user/1000/hee4"))?;
+        assert_eq!(
+            t.door_path(),
+            Path::new("/run/user/1000/hee4/t-1.model.sock")
+        );
+        assert_eq!(t.work_dir(), Path::new("/var/hee4-work/t-1"));
+        let p = plan_for(&t);
+        assert_eq!(
+            p.model_door.as_deref(),
+            Some(Path::new("/run/user/1000/hee4/t-1.model.sock"))
+        );
+        assert!(
+            !p.listed_mounts
+                .contains(&"/var/hee4-work/t-1.model.sock".into())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_door_path_over_sun_path_is_refused_by_name() -> R {
+        // A 92-byte root plus the 15-byte "/t-1.model.sock" is exactly the limit; one more is not.
+        let fits = PathBuf::from("/").join("d".repeat(DOOR_PATH_MAX - 16));
+        assert!(task(true)?.with_door_root(&fits).is_ok());
+        let deep = PathBuf::from("/").join("d".repeat(DOOR_PATH_MAX - 15));
+        let Err(err) = NamespaceTask::new("t-1".parse()?, &deep, true, Duration::from_secs(5))
+        else {
+            return Err("accepted a door path that cannot bind".into());
+        };
+        assert!(
+            matches!(err, WorkerError::DoorPath { len, max } if len == max + 1 && max == DOOR_PATH_MAX),
+            "{err}"
+        );
+        let Err(err) = task(true)?.with_door_root(&deep) else {
+            return Err("accepted a door root that cannot bind".into());
+        };
+        assert!(matches!(err, WorkerError::DoorPath { .. }), "{err}");
+        assert!(
+            task(true)?.with_door_root(Path::new("rt")).is_err(),
+            "a relative door root"
         );
         Ok(())
     }
