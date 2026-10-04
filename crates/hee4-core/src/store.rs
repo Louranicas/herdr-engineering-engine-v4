@@ -21,7 +21,7 @@ use serde_json::Value;
 use crate::codec;
 
 /// The schema version [`Store::open`] migrates to.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA_V1: &str = "
 CREATE TABLE tasks(
@@ -79,6 +79,17 @@ CREATE TRIGGER receipts_no_delete BEFORE DELETE ON receipts
 CREATE TABLE meta(
   key TEXT PRIMARY KEY NOT NULL,
   value TEXT NOT NULL
+) STRICT;
+";
+
+/// v2: `apply_in` records every time it overwrote a `tasks.phase` that disagreed with replay.
+const SCHEMA_V2: &str = "
+CREATE TABLE cache_heals(
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id TEXT NOT NULL REFERENCES tasks(id),
+  cached_phase TEXT NOT NULL,
+  replayed_phase TEXT NOT NULL,
+  ts INTEGER NOT NULL
 ) STRICT;
 ";
 
@@ -158,6 +169,17 @@ pub struct CachedRow {
     pub generation: u64,
 }
 
+/// One time `apply` found `tasks.phase` divergent from replay and rewrote it (replay wins).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheHeal {
+    /// The task whose cache row diverged.
+    pub task_id: TaskId,
+    /// What `tasks.phase` said before the heal.
+    pub cached_phase: String,
+    /// What replay of the events said (and what the cache now says).
+    pub replayed_phase: String,
+}
+
 /// The ledger.
 #[derive(Debug)]
 pub struct Store {
@@ -223,15 +245,32 @@ fn apply_in(tx: &Transaction<'_>, task: &TaskId, event: Event) -> Result<Phase, 
         return Err(StoreError::RecoveryIncomplete);
     }
     let history = load_events(tx, task)?;
-    let next = transition(replay(task, &history)?, event).map_err(StoreError::Refused)?;
+    let before = replay(task, &history)?;
+    let next = transition(before, event).map_err(StoreError::Refused)?;
     let phase = next.phase();
+    let ts = now_ms();
+    if let Some(prior) = before.map(TaskState::phase) {
+        let cached: Option<String> = tx
+            .query_row(
+                "SELECT phase FROM tasks WHERE id = ?1",
+                [task.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(cached) = cached.filter(|c| c != prior.as_str()) {
+            tx.execute(
+                "INSERT INTO cache_heals(task_id, cached_phase, replayed_phase, ts)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![task.as_str(), cached, prior.as_str(), ts],
+            )?;
+        }
+    }
     let generation = history
         .iter()
         .chain(std::iter::once(&event))
         .filter(|e| **e == Event::Dispatch)
         .count();
     let generation = i64::try_from(generation).map_err(|_| corrupt(task, "generation overflow"))?;
-    let ts = now_ms();
     tx.execute(
         "INSERT INTO tasks(id, phase, cancel, generation, updated_ts) VALUES (?1, ?2, ?3, ?4, ?5)
          ON CONFLICT(id) DO UPDATE SET phase = excluded.phase, cancel = excluded.cancel,
@@ -274,8 +313,13 @@ impl Store {
         match version {
             0 => {
                 tx.execute_batch(SCHEMA_V1)?;
+                tx.execute_batch(SCHEMA_V2)?;
                 tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 meta_set(&tx, "epoch", &format!("{:x}", now_ms()))?;
+            }
+            1 => {
+                tx.execute_batch(SCHEMA_V2)?;
+                tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             }
             SCHEMA_VERSION => {}
             other => return Err(StoreError::UnknownSchema(other)),
@@ -501,6 +545,38 @@ impl Store {
                 },
             )
             .optional()?)
+    }
+
+    /// Every cache heal `apply` has recorded, oldest first.
+    ///
+    /// # Errors
+    /// SQLite errors, or [`StoreError::Corrupt`] for an unparsable id.
+    pub fn cache_heals(&self) -> Result<Vec<CacheHeal>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT task_id, cached_phase, replayed_phase FROM cache_heals ORDER BY seq",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|(id, cached_phase, replayed_phase)| {
+                let task_id = id.parse().map_err(|e| StoreError::Corrupt {
+                    task: id.clone(),
+                    detail: format!("cache_heals.task_id: {e}"),
+                })?;
+                Ok(CacheHeal {
+                    task_id,
+                    cached_phase,
+                    replayed_phase,
+                })
+            })
+            .collect()
     }
 
     /// Every task id in the ledger, in id order. An id that does not parse is returned as the

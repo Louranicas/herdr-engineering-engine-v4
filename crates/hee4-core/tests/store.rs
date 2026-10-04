@@ -282,3 +282,43 @@ fn reconcile_applies_r08_through_apply_and_is_idempotent() -> R {
     assert_eq!(store.event_count()?, before + 2);
     Ok(())
 }
+
+#[test]
+fn cache_divergence_is_healed_and_recorded() -> R {
+    let path = db("heal")?;
+    let store = Store::open(&path)?;
+    assert!(reconcile(&store, &Observations::default())?.complete);
+    let t = tid("task-heal-1")?;
+    store.apply(&t, Event::Admit)?;
+    assert!(store.cache_heals()?.is_empty());
+    {
+        let raw = rusqlite::Connection::open(&path)?;
+        raw.execute(
+            "UPDATE tasks SET phase = 'failed' WHERE id = 'task-heal-1'",
+            [],
+        )?;
+    }
+    assert_eq!(store.apply(&t, Event::Dispatch)?, Phase::Running);
+    let healed = store.cache_heals()?;
+    assert_eq!(healed.len(), 1, "{healed:?}");
+    assert_eq!(healed[0].task_id, t);
+    assert_eq!(healed[0].cached_phase, "failed");
+    assert_eq!(healed[0].replayed_phase, "admitted");
+    let u = tid("task-heal-2")?;
+    store.apply(&u, Event::Admit)?;
+    {
+        let raw = rusqlite::Connection::open(&path)?;
+        raw.execute(
+            "UPDATE tasks SET phase = 'failed' WHERE id = 'task-heal-2'",
+            [],
+        )?;
+    }
+    let report = reconcile(&store, &Observations::default())?;
+    assert_eq!(
+        report.findings.len(),
+        1,
+        "reconcile still reports CacheMismatch"
+    );
+    assert!(!report.complete);
+    Ok(())
+}

@@ -6,9 +6,11 @@ before any dispatch. Sources: `modules/hee4-core/{store,recovery,task}/MODULE.md
 
 ## The rule
 
-**No SQL writes outside `src/store.rs`.** `tests/one_door.rs` scans `src/` for `execute(`,
-`execute_batch(` and `prepare(` outside `store.rs` and fails on a hit (it also proves it catches
-a planted `UPDATE tasks`). Inside `store.rs`, `apply_in` is the only code that writes `events` or
+**No SQL outside `src/store.rs`.** `tests/one_door.rs` walks `src/**` recursively and runs a
+regex-free token census outside `store.rs`: `execute`, `execute_batch`, `prepare`, `query_row`,
+`query_map`, `pragma_update`, `pragma`, each not preceded by an identifier character and followed
+by optional spaces and `(`. It fails on a hit and proves it catches planted calls (including
+`conn.query_row (`). Inside `store.rs`, `apply_in` is the only code that writes `events` or
 `tasks`; `Store::apply` and `Store::admit` are its two callers.
 
 ## Writers (each one transaction, committed under WAL + `synchronous=FULL` before it returns)
@@ -22,7 +24,7 @@ a planted `UPDATE tasks`). Inside `store.rs`, `apply_in` is the only code that w
 | `recovery::reconcile(store, observations)` | events only through `Store::apply`; the `meta.recovery_complete` flag | — |
 | `Store::open(path)` | schema v1 (`user_version`), `meta.epoch`, `meta.recovery_complete=0` | newer `user_version` |
 
-## Schema v1 (all `STRICT`)
+## Schema v2 (v1 plus `cache_heals`; v1 files migrate on open; all `STRICT`)
 
 ```
 tasks(id PK, phase CHECK(11 spellings), cancel 0|1, generation >= 0, updated_ts)   -- cache
@@ -33,12 +35,15 @@ observations(id PK, task_id FK, json, ts)
 receipts(seq PK, id UNIQUE, task_id FK, json, hash_prev, hash_self UNIQUE, ts,
          UNIQUE(task_id, hash_prev))                       -- UPDATE/DELETE abort
 meta(key PK, value)                                        -- epoch, recovery_complete
+cache_heals(seq PK, task_id FK, cached_phase, replayed_phase, ts)   -- v2; heal record
 ```
 
 `event_json` is `hee4_contracts::Event`'s own `Serialize` output; `codec.rs` decodes it by lookup
 over the 32 events, so a foreign spelling (`"queued"`) is unreadable, never repaired (EX-05).
 `tasks.phase` is `TaskState::replay(events).phase().as_str()`, rewritten in the same transaction
-as each event; reconcile reports a mismatch as a finding.
+as each event; reconcile reports a mismatch as a finding. When `apply_in` finds the cached phase
+divergent from replay it overwrites it (replay wins) and inserts a `cache_heals` row in the same
+transaction; `Store::cache_heals()` reads them.
 
 ## Reconcile (pure policy `recovery::decide`, then `Store::apply`)
 
