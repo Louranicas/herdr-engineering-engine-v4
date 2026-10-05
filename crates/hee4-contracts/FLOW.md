@@ -79,20 +79,45 @@ Counted by `tests/transition.rs` over 14 sources × 32 events: `legal=65/65 ille
 | K4 `decide` | build `Verdict`, `Decision`, `ReceiptBody`; call `Receipt::seal` | mutate a sealed `Receipt`; attach `observed` after the seal |
 | K6 host (admission, wire) | `Brief::parse` + `check_restatement` + `check_verify`; parse `Observation`, ids and digests from the wire; load `Budgets` by `parse` at serve start only; host and worker receive the validated value | pass a raw `String` where a newtype is required; admit a brief that failed any check; build a `Budgets` from a literal or write one of its fields after `parse` |
 
+## What `check_verify` refuses beyond the exact table
+
+`VerifyLine::is_no_op` reads a runnable line lexically (never the filesystem) and counts it as
+a no-op when its exit status cannot be non-zero. Pinned as refused by
+`tests/verify.rs::cannot_fail_lines_are_refused`; the refusal stays
+`VacuousVerify{OnlyNoOps}` (every runnable line is a no-op), its text leads with `VERIFY`.
+
+| VERIFY line | Why it cannot fail |
+|---|---|
+| `/usr/bin/env true`, `sh: "true"`, `sh: exit 0;`, `sh: true;`, `/usr/bin/../bin/true`, `//usr/bin/true`, `sh: true # comment` | a listed no-op after normalisation: `//`, `.`, `..` collapsed lexically; quotes removed; a trailing `;` or `# comment` dropped; `env <no-op>` read as the no-op |
+| `/bin/sh -c true`, `sh: sh -c 'cargo test \|\| true'` | `sh -c <script>` (and `bash -c`) is read with the same rules |
+| `sh: true && true`, `sh: true; :` | a compound whose every command is a listed no-op |
+| `sh: cargo test \|\| true`, `sh: cargo test \|\| :`, `sh: cargo test \|\| exit 0` | a forced exit: a no-op after the last `\|\|` always ends at 0 |
+| `sh: /usr/bin/false; exit 0`, `sh: cargo test; true`, `sh: exit 0; cargo test` | a forced exit: the last list is a no-op, or `exit 0` ends the shell |
+| `sh: cargo test &` | a trailing `&` ends at 0 |
+| `sh: cmd \| tail -1`, `sh: cmd \| head -n 5`, `sh: cmd \| true` | no `pipefail`: a pipeline's status is its last command's. MEASURED: the dispatcher runs a `sh:` line as `/bin/sh -c <command>` (`hee4-app/src/dispatcher.rs:89-91`, `playbook`), no `-o pipefail`; `/bin/sh` is bash in POSIX mode on this host, `pipefail` off by default. fm-db refuses the same shape as `pipe_into_tail_head` (V4-105) |
+
+A forced exit next to a real line is admitted like `sh: true` next to a real line: the rule is
+still "every runnable line is a no-op" (`Brief::check_verify`, brief.rs). Refusing any one
+cannot-fail line needs a `VerifyFault` variant raised there; not in this slice.
+
 ## What `check_verify` does not catch
 
 `check_verify` is a rung-2 door: admission reads the text, not the effect; a real command that
-proves nothing is the verdict's business and is deliberately a Pass. Pinned as `Ok` by
-`tests/verify.rs::deliberately_not_caught`:
+can fail and proves nothing is the verdict's business and is deliberately a Pass. Pinned as `Ok`
+by `tests/verify.rs::deliberately_not_caught`:
 
 | VERIFY line | Why it admits |
 |---|---|
-| `sh: true && true`, `sh: true; :` | an operator makes it a compound command, not a listed no-op |
-| `sh: true # comment` | not an exact match of the no-op table |
-| `/bin/sh -c true` | an exec of `/bin/sh`, which is not in the exec no-op table |
 | `sh: printf ok`, `sh: cat /dev/null` | real commands with a trivial effect |
 | `sh: exit 1` | fails, which is not vacuous |
 | `/usr/bin/test -d /usr` | the fixture command of the later waves: real, silent, in `RO_BINDS` |
+| `sh: cargo test --workspace`, `/usr/bin/env cargo test` | real commands; `env <real>` is the real command |
+| `sh: test -f out && true` | the no-op runs only on success, so the line can still fail |
+| `sh: cargo test \|\| true; cargo clippy` | a masked command mid-line: the status is the last command's, which can fail |
+| `sh: cargo test; exit` | a bare `exit` keeps the status before it |
+| `sh: set -e; false; true`, `sh: cargo test \|\| exit 1; true` | a built-in that can end the shell (`set`, `exec`, `eval`, `exit N`, `trap`, ..) before the last command |
+| `sh: (cargo test) \|\| true`, `sh: if cargo test; then :; fi`, `sh: test -n "$(cat f)" \|\| true` | text the reader does not follow (a subshell, a group, a compound keyword, `$(..)`, `${..}`, a backtick, a here-document) counts as a line that may fail: no false refusal, at the cost of these holes |
+| `sh: echo a#b > f`, `sh: grep -q 'a \|\| true' f` | `#` inside a word is not a comment; a quoted operator is not an operator |
 
 Vacuity stays at rung 2 because the brief's VERIFY is free text the worker wrote; a type cannot
 refuse it before it is parsed, and parsing it is this check.
