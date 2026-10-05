@@ -1,6 +1,7 @@
 //! The deep-diff-forge observation adapter: one `rank.v0` run over a diff becomes one tier-0
 //! observation, sealed to the exact diff bytes. Local process only; no network.
 
+use std::fmt;
 use std::io::{Read as _, Write as _};
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -61,6 +62,106 @@ pub enum AdapterError {
     /// The ranking was empty: the run looked at nothing.
     #[error("rank.v0 ranked no files")]
     LookedAtNothing,
+}
+
+/// What the caller hands in for one task: the diff bytes it computed, or the fact that there
+/// was no worktree to diff. This crate never runs git; the bytes are the caller's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Diff<'a> {
+    /// The task has no worktree, so there is nothing to diff.
+    NoWorktree,
+    /// The diff the caller computed; empty bytes mean the worktree had no change.
+    Bytes(&'a [u8]),
+}
+
+/// Why [`for_task`] produced no observation. A skip is not a refusal: the task goes on
+/// without a deep-diff-forge observation, and the dispatcher prints the wire word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Skip {
+    /// [`Diff::NoWorktree`]: nothing to diff.
+    NoWorktree,
+    /// [`Diff::Bytes`] was empty: an empty diff never reaches `--require-files`.
+    NoDiff,
+    /// The binary was not found (`io::ErrorKind::NotFound` at spawn). A present-but-broken
+    /// tool is not absent: every other spawn error stays [`AdapterError::Spawn`].
+    ToolAbsent,
+}
+
+impl Skip {
+    /// The wire word: `no_worktree`, `no_diff` or `tool_absent`.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::NoWorktree => "no_worktree",
+            Self::NoDiff => "no_diff",
+            Self::ToolAbsent => "tool_absent",
+        }
+    }
+}
+
+impl fmt::Display for Skip {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// What [`for_task`] hands the dispatcher: an observation to record, or a named skip.
+/// Never a verdict (AP-29).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskObservation {
+    /// A tier-0 observation bound to the subject; record it before `decide_and_seal`.
+    Observed(Observation),
+    /// No observation, by name.
+    Skipped(Skip),
+}
+
+/// The one task-shaped call: deep-diff-forge from `PATH` over `diff` for `subject`.
+///
+/// - [`Diff::NoWorktree`] → `Skipped(NoWorktree)`, empty bytes → `Skipped(NoDiff)`; neither
+///   spawns;
+/// - a binary not found → `Skipped(ToolAbsent)`;
+/// - a run past `budget` → `Observed` with [`timeout_observation`] (`Refused(timeout)` in
+///   `decide`);
+/// - exit 7 → `Observed` with [`Outcome::Refused`]; a pass → `Observed`, bound to
+///   `subject.input_sha256`.
+///
+/// # Errors
+/// Every other [`AdapterError`] unchanged: `Exit`, `Malformed`, `SealMismatch`,
+/// `LookedAtNothing`, and a `Spawn` whose kind is not `NotFound`.
+pub fn for_task(
+    diff: Diff<'_>,
+    subject: &Subject,
+    clock: &impl Clock,
+    budget: Duration,
+) -> Result<TaskObservation, AdapterError> {
+    for_task_with(Path::new(BIN), diff, subject, clock, budget)
+}
+
+/// [`for_task`] with an explicit binary.
+///
+/// # Errors
+/// As [`for_task`].
+pub fn for_task_with(
+    bin: &Path,
+    diff: Diff<'_>,
+    subject: &Subject,
+    clock: &impl Clock,
+    budget: Duration,
+) -> Result<TaskObservation, AdapterError> {
+    match diff {
+        Diff::NoWorktree => Ok(TaskObservation::Skipped(Skip::NoWorktree)),
+        Diff::Bytes([]) => Ok(TaskObservation::Skipped(Skip::NoDiff)),
+        Diff::Bytes(b) => match observe_with(bin, b, subject, clock, budget) {
+            Ok(o) => Ok(TaskObservation::Observed(o)),
+            Err(AdapterError::Spawn(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                Ok(TaskObservation::Skipped(Skip::ToolAbsent))
+            }
+            Err(AdapterError::Timeout { budget }) => Ok(TaskObservation::Observed(
+                timeout_observation(budget, b, subject)?,
+            )),
+            Err(e) => Err(e),
+        },
+    }
 }
 
 /// Run deep-diff-forge from `PATH` over `diff` and turn its ranking into an observation of
@@ -250,16 +351,41 @@ pub fn observe_with(
     if ranked.is_empty() {
         return Err(AdapterError::LookedAtNothing);
     }
+    pass_observation(tool, &output.stdout, sealed, subject, elapsed_ms, budget)
+}
+
+/// The tier-0 Pass observation for a sealed, non-empty ranking. It is bound to the subject's
+/// `input_sha256` (the VERIFY digest, V4-94) so `decide` reconciles it; the diff the tool
+/// sealed is evidence (`diff`, checked equal to the bytes sent by the caller of this function),
+/// beside `rank.v0` = the digest of stdout.
+///
+/// # Errors
+/// [`AdapterError::Malformed`] if a fixed token fails to parse (a bug, not an input).
+fn pass_observation(
+    tool: ToolId,
+    stdout: &[u8],
+    sealed: Sha256Hex,
+    subject: &Subject,
+    elapsed_ms: u64,
+    budget: Duration,
+) -> Result<Observation, AdapterError> {
+    let bad = |e: hee4_contracts::Refusal| AdapterError::Malformed(e.to_string());
     Ok(Observation {
         source: "deep-diff-forge.rank".parse().map_err(bad)?,
-        input_sha256: sealed,
+        input_sha256: subject.input_sha256,
         tool,
         head_sha: subject.head_sha.clone(),
         outcome: Outcome::Pass,
-        evidence: vec![Evidence {
-            label: "rank.v0".parse().map_err(bad)?,
-            sha256: Sha256Hex::digest(&output.stdout),
-        }],
+        evidence: vec![
+            Evidence {
+                label: "rank.v0".parse().map_err(bad)?,
+                sha256: Sha256Hex::digest(stdout),
+            },
+            Evidence {
+                label: "diff".parse().map_err(bad)?,
+                sha256: sealed,
+            },
+        ],
         advisory: false,
         elapsed_ms,
         budget_ms: u64::try_from(budget.as_millis()).unwrap_or(u64::MAX),

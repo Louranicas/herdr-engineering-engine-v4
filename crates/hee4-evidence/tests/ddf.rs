@@ -1,13 +1,13 @@
-//! The deep-diff-forge adapter against the real binary (skipped, UNMEASURED, when absent) and a
-//! stub that seals the wrong bytes.
+//! The deep-diff-forge adapter against the real binary (skipped, UNMEASURED, when absent), the
+//! stubs under `fixtures/`, and the task shape `for_task` the dispatcher calls.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use hee4_contracts::{Outcome, Sha256Hex};
 use hee4_contracts::{Reason, Verdict};
-use hee4_evidence::ddf::{self, AdapterError};
+use hee4_evidence::ddf::{self, AdapterError, Diff, Skip, TaskObservation};
 use hee4_evidence::{Identities, Identity, Source, Subject, Why, decide};
 use hee4_host::clock::TestClock;
 
@@ -50,8 +50,215 @@ fn real_run_on_fixture_is_a_sealed_tier0_observation() {
     assert_eq!(o.outcome, Outcome::Pass);
     assert!(!o.advisory);
     assert_eq!(o.head_sha, subject().head_sha);
-    assert_eq!(o.evidence.len(), 1);
+    assert_eq!(o.evidence.len(), 2);
+    assert_eq!(labels(&o), ["rank.v0", "diff"]);
+    assert_eq!(o.evidence[1].sha256, Sha256Hex::digest(FIXTURE));
     println!("MEASURED tool={} {}", o.tool.name, o.tool.version);
+}
+
+fn labels(o: &hee4_contracts::Observation) -> Vec<&str> {
+    o.evidence.iter().map(|e| e.label.as_str()).collect()
+}
+
+fn all_wired() -> Identities {
+    let pin = |n: &str| {
+        Identity::Wired(Source {
+            name: n.parse().unwrap(),
+            digest: Sha256Hex::digest(n.as_bytes()),
+        })
+    };
+    Identities {
+        collector: pin("c"),
+        locks: pin("l"),
+        standards: pin("s"),
+    }
+}
+
+#[test]
+fn skip_names_are_the_wire_words() {
+    assert_eq!(Skip::NoWorktree.name(), "no_worktree");
+    assert_eq!(Skip::NoDiff.name(), "no_diff");
+    assert_eq!(Skip::ToolAbsent.name(), "tool_absent");
+    assert_eq!(format!("{}", Skip::ToolAbsent), "tool_absent");
+    assert_eq!(format!("{}", Skip::NoWorktree), "no_worktree");
+    assert_eq!(format!("{}", Skip::NoDiff), "no_diff");
+}
+
+#[test]
+fn no_worktree_is_a_named_skip() {
+    let budget = Duration::from_millis(300);
+    let t0 = Instant::now();
+    let got = ddf::for_task_with(
+        &stub("ddf-sleep5.sh"),
+        Diff::NoWorktree,
+        &subject(),
+        &TestClock::new(0),
+        budget,
+    );
+    let elapsed = t0.elapsed();
+    assert!(elapsed < Duration::from_millis(100), "spawned? {elapsed:?}");
+    assert!(
+        matches!(got, Ok(TaskObservation::Skipped(Skip::NoWorktree))),
+        "{got:?}"
+    );
+}
+
+#[test]
+fn empty_diff_is_a_named_skip() {
+    let budget = Duration::from_millis(300);
+    let t0 = Instant::now();
+    let got = ddf::for_task_with(
+        &stub("ddf-sleep5.sh"),
+        Diff::Bytes(b""),
+        &subject(),
+        &TestClock::new(0),
+        budget,
+    );
+    let elapsed = t0.elapsed();
+    assert!(elapsed < Duration::from_millis(100), "spawned? {elapsed:?}");
+    assert!(
+        matches!(got, Ok(TaskObservation::Skipped(Skip::NoDiff))),
+        "{got:?}"
+    );
+}
+
+#[test]
+fn absent_tool_is_a_named_skip() {
+    let got = ddf::for_task_with(
+        Path::new("/nonexistent/deep-diff-forge"),
+        Diff::Bytes(FIXTURE),
+        &subject(),
+        &TestClock::new(0),
+        BUDGET,
+    );
+    assert!(
+        matches!(got, Ok(TaskObservation::Skipped(Skip::ToolAbsent))),
+        "{got:?}"
+    );
+}
+
+/// A VERIFY-digest subject: the diff digest and the subject's input differ, as in the
+/// dispatcher (`Subject.input_sha256 = digest(brief VERIFY)`, V4-94).
+fn verify_subject() -> Subject {
+    let mut s = subject();
+    s.input_sha256 = Sha256Hex::digest(b"VERIFY: /usr/bin/test -d /usr");
+    s
+}
+
+fn assert_task_pass(got: Result<TaskObservation, AdapterError>) {
+    let subject = verify_subject();
+    let Ok(TaskObservation::Observed(o)) = got else {
+        panic!("expected Observed, got {got:?}");
+    };
+    // The verdict first: an observation bound to the diff digest is `Refused(Unreconciled)`.
+    let verdict = decide(&all_wired(), std::slice::from_ref(&o), &subject).verdict;
+    assert_eq!(verdict, Verdict::Pass);
+    assert_eq!(o.input_sha256, subject.input_sha256);
+    assert_ne!(o.input_sha256, Sha256Hex::digest(FIXTURE));
+    assert_eq!(o.outcome, Outcome::Pass);
+    assert!(!o.advisory);
+    assert_eq!(labels(&o), ["rank.v0", "diff"]);
+    assert_eq!(o.evidence[1].sha256, Sha256Hex::digest(FIXTURE));
+}
+
+#[test]
+fn a_task_pass_reconciles_against_the_verify_digest() {
+    // The deterministic stub always runs; the real binary too when present.
+    assert_task_pass(ddf::for_task_with(
+        &stub("ddf-pass.sh"),
+        Diff::Bytes(FIXTURE),
+        &verify_subject(),
+        &TestClock::new(0),
+        BUDGET,
+    ));
+    if !present() {
+        return;
+    }
+    let got = ddf::for_task(
+        Diff::Bytes(FIXTURE),
+        &verify_subject(),
+        &TestClock::new(0),
+        BUDGET,
+    );
+    if let Ok(TaskObservation::Observed(o)) = &got {
+        println!("MEASURED for_task tool={} {}", o.tool.name, o.tool.version);
+    }
+    assert_task_pass(got);
+}
+
+#[test]
+fn a_timed_out_task_run_is_an_observed_timeout() {
+    let budget = Duration::from_millis(300);
+    let t0 = Instant::now();
+    let got = ddf::for_task_with(
+        &stub("ddf-sleep5.sh"),
+        Diff::Bytes(FIXTURE),
+        &subject(),
+        &TestClock::new(0),
+        budget,
+    );
+    let elapsed = t0.elapsed();
+    println!("MEASURED for_task timeout elapsed={elapsed:?}");
+    assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+    let Ok(TaskObservation::Observed(o)) = got else {
+        panic!("expected Observed timeout, got {got:?}");
+    };
+    assert_eq!(o.outcome, Outcome::Error);
+    assert!(!o.advisory);
+    assert!(o.elapsed_ms > o.budget_ms);
+    assert_eq!(
+        decide(&all_wired(), &[o], &subject()).verdict,
+        Verdict::Refused(Reason::Timeout)
+    );
+}
+
+#[test]
+fn a_wrong_seal_is_an_error_not_a_skip() {
+    let got = ddf::for_task_with(
+        &stub("ddf-wrong-seal.sh"),
+        Diff::Bytes(FIXTURE),
+        &subject(),
+        &TestClock::new(0),
+        BUDGET,
+    );
+    assert!(
+        matches!(got, Err(AdapterError::SealMismatch { .. })),
+        "{got:?}"
+    );
+}
+
+#[test]
+fn an_empty_ranking_is_an_error_not_a_skip() {
+    let got = ddf::for_task_with(
+        &stub("ddf-empty.sh"),
+        Diff::Bytes(FIXTURE),
+        &subject(),
+        &TestClock::new(0),
+        BUDGET,
+    );
+    assert!(matches!(got, Err(AdapterError::LookedAtNothing)), "{got:?}");
+}
+
+#[test]
+fn exit_7_through_the_task_shape_is_observed_refused() {
+    let got = ddf::for_task_with(
+        &stub("ddf-exit7-silent.sh"),
+        Diff::Bytes(FIXTURE),
+        &subject(),
+        &TestClock::new(0),
+        BUDGET,
+    );
+    let Ok(TaskObservation::Observed(o)) = got else {
+        panic!("expected Observed, got {got:?}");
+    };
+    let Outcome::Refused { reason } = &o.outcome else {
+        panic!("expected Refused, got {:?}", o.outcome);
+    };
+    assert_eq!(
+        reason.as_str(),
+        "deep-diff-forge exited 7 without a message"
+    );
+    assert!(!o.advisory);
 }
 
 #[test]

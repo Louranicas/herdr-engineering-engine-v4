@@ -40,18 +40,36 @@ order-independence, advisory-only-refuses, Pass-needs-tier-0, monotonicity),
 
 ## What K6's adapter may hand in
 
-Only an `Observation` (parsed I3, `deny_unknown_fields`) whose `input_sha256` the adapter
-checked against the bytes it sent. `ddf::observe(diff, &subject, &clock, budget)` is the template:
+Only an `Observation` (parsed I3, `deny_unknown_fields`) whose sealed bytes the adapter checked
+against the bytes it sent, or a named skip. The task shape is one call,
+`ddf::for_task(diff, &subject, &clock, budget) -> Result<TaskObservation, AdapterError>`, with
+`diff: Diff::NoWorktree | Diff::Bytes(&[u8])` (the caller computes the diff; this crate never runs
+git) and `TaskObservation::Observed(Observation) | Skipped(Skip)`:
 
-- runs `deep-diff-forge --stdin-patch --rank --json --require-files --require-hunks` as a local
-  process (no network, no shell);
-- exit 7 → a tier-0 observation with `Outcome::Refused{reason}` (first stderr line); any other
-  non-zero exit → `AdapterError::Exit` (no observation); neither can be a Pass;
+- three skips, by wire word, none of which spawns or is a refusal: `no_worktree` when the task
+  has no worktree (`Diff::NoWorktree`); `no_diff` when the bytes are empty (an empty diff must
+  never reach `--require-files`, whose exit 7 would fail a task that merely changed nothing);
+  `tool_absent` when the binary is not found at spawn (`io::ErrorKind::NotFound` only: a
+  present-but-broken tool stays `AdapterError::Spawn`);
+- otherwise runs `deep-diff-forge --stdin-patch --rank --json --require-files --require-hunks`
+  as a local process (no network, no shell);
+- exit 7 → `Observed` with `Outcome::Refused{reason}` (first stderr line; a fixed sentence when
+  silent); any other non-zero exit → `AdapterError::Exit` (no observation); neither is a Pass;
 - stdout must be `deep-diff-forge.rank.v0`; its `input_sha256` must equal
   `Sha256Hex::digest(diff)` or `AdapterError::SealMismatch`; an empty `ranked` is
-  `AdapterError::LookedAtNothing`;
-- fills `tool` from the JSON, `head_sha` from the subject, `advisory: false`, outcome `pass`,
-  one evidence item `rank.v0` = digest of stdout, `budget_ms` = the `budget` argument.
+  `AdapterError::LookedAtNothing`; `Exit`, `Malformed`, `SealMismatch` and `LookedAtNothing`
+  come back as `Err`, refused by name, never as a skip;
+- a run past `budget` is mapped inside to `timeout_observation` (`Observed`, outcome `error`,
+  `elapsed_ms > budget_ms`, so `decide` yields `Refused(timeout)`);
+- the Pass observation is bound to the subject's `input_sha256` (the VERIFY digest, V4-94) and
+  carries two evidence items: `rank.v0` = digest of stdout, `diff` = digest of the bytes sent,
+  which the adapter has checked equal the tool's sealed `input_sha256` (`SealMismatch`
+  otherwise); `tool` comes from the JSON, `head_sha` from the subject, `advisory: false`,
+  `budget_ms` = the `budget` argument.
+
+`ddf::observe(diff, &subject, &clock, budget)` is the bytes-only call under it (no skips: an
+empty diff reaches the tool and comes back exit 7, `Observed(Refused)`); `for_task_with` and
+`observe_with` take an explicit binary for the stubs under `tests/fixtures/`.
 
 ## The deadline
 
@@ -80,4 +98,7 @@ or exit code alone (AP-29).
 
 - `ObservationId` is a content address (`obs-` + SHA-256 of canonical JSON) because I3 carries
   no id; if the ledger (K1) assigns ids, `decide_and_seal` must take them instead.
-- Exit 7 yields no observation, because I3 `Outcome` has no `refused` variant.
+- `ddf::for_task` has no caller until the dispatcher's settle (W4 `dispatcher-backups-ddf`);
+  today the binary runs only as the gate's `ddf` step (gate.toml `[step.ddf]`).
+- Whether W4 records an exit-7 `Observed(Refused{reason})` for a non-empty diff (and so fails
+  the task on `Refused(invalid)`) or treats it as advisory is W4's FLOW row, not this crate's.
