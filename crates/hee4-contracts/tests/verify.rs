@@ -139,6 +139,10 @@ fn cannot_fail_lines_are_refused() {
         "sh: cargo test || echo failed >&2",
         "sh: cargo test || true &>/dev/null",
         "sh: true </dev/null",
+        // `true` and `:` write nothing: a close or a dup onto fd 0 cannot make them fail.
+        "sh: cargo test || true >&-",
+        "sh: cargo test || : >&0",
+        "sh: cargo test || echo failed >/dev/null",
     ];
     for text in cannot_fail {
         assert_eq!(
@@ -184,9 +188,50 @@ fn deliberately_not_caught() {
         "sh: cargo test || true > out",
         "sh: cargo test || true <&3",
         "sh: cargo test || true 2>",
+        // `echo` writes to fd 1: a close or a dup onto fd 0 (read-only for a candidate) makes
+        // the write fail (`echo_redirections_match_the_shell`).
+        "sh: cargo test || echo failed >&-",
+        "sh: cargo test || echo f >&0",
     ];
     for text in not_caught {
         assert_eq!(check(text).as_deref(), Ok(text), "{text:?}");
+    }
+}
+
+/// Admission agrees with the shell on the redirections that differ between `echo` and `true`:
+/// each line's command runs through `/bin/sh -c` the way the host spawns a candidate (stdin
+/// from `/dev/null`, stdout and stderr piped, `hee4-host/src/spawn.rs`), with `false` standing
+/// in for `cargo test`. A line is admitted exactly when the measured status is non-zero.
+#[test]
+fn echo_redirections_match_the_shell() {
+    use std::process::{Command, Stdio};
+    let lines = [
+        ("sh: cargo test || echo failed >&-", true),
+        ("sh: cargo test || echo f >&0", true),
+        ("sh: cargo test || true >&-", false),
+        ("sh: cargo test || : >&0", false),
+        ("sh: cargo test || echo failed >&2", false),
+        ("sh: cargo test || echo failed >/dev/null", false),
+    ];
+    for (line, can_fail) in lines {
+        let script = line
+            .strip_prefix("sh: cargo test")
+            .map(|rest| format!("false{rest}"))
+            .unwrap();
+        let out = Command::new("/bin/sh")
+            .args(["-c", &script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap();
+        assert_eq!(
+            !out.status.success(),
+            can_fail,
+            "{script:?}: {:?}",
+            out.status
+        );
+        assert_eq!(check(line).is_ok(), can_fail, "{line:?}");
     }
 }
 

@@ -216,14 +216,20 @@ enum Token {
     Op(Op),
 }
 
-/// The redirections on one command, as far as they decide whether it can fail.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The redirections on one command, as far as they decide whether it can fail. Ordered: a
+/// command's redirections are the worst of its parts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Redir {
     /// None.
     None,
-    /// Only redirections that cannot fail: to or from `/dev/null`, or a dup onto 0, 1 or 2 (or
-    /// a close, `-`).
+    /// Only redirections that cannot fail for any command: to or from `/dev/null`, or a dup
+    /// onto fd 1 or 2.
     Null,
+    /// A dup onto fd 0 or a close (`-`): harmless for a command that writes nothing (`true`,
+    /// `:`), but a write to the moved or closed fd fails, so `echo` can fail. The fd the
+    /// redirection applies to is not read: `echo x 2>&-` counts as one that can fail, which
+    /// admits a line and never refuses one.
+    Silent,
     /// Any other: a file that may not open, an fd that may be closed, or no target.
     Other,
 }
@@ -232,18 +238,16 @@ impl Redir {
     /// Add one redirection whose target is `target` (`None`: the line ended or an operator came
     /// first).
     fn add(self, dup: bool, target: Option<&Word>) -> Self {
-        let harmless = target.is_some_and(|w| {
-            !w.dynamic
-                && if dup {
-                    matches!(w.text.as_str(), "0" | "1" | "2" | "-")
-                } else {
-                    w.text == "/dev/null"
-                }
-        });
-        match (self, harmless) {
-            (Self::Other, _) | (_, false) => Self::Other,
-            _ => Self::Null,
-        }
+        let this = match target {
+            Some(w) if !w.dynamic && dup => match w.text.as_str() {
+                "1" | "2" => Self::Null,
+                "0" | "-" => Self::Silent,
+                _ => Self::Other,
+            },
+            Some(w) if !w.dynamic && w.text == "/dev/null" => Self::Null,
+            _ => Self::Other,
+        };
+        self.max(this)
     }
 }
 
@@ -474,8 +478,9 @@ fn lists(tokens: Vec<Token>, depth: u8) -> Option<Vec<List>> {
 
 /// Judge one command. `argv` is true for an exec (no shell: no built-ins, no keywords).
 ///
-/// A no-op whose only redirections cannot fail (`true 2>/dev/null`, `echo x >&2`) is still a
-/// no-op; any other redirection makes the command one that can fail.
+/// A no-op whose only redirections cannot fail (`true 2>/dev/null`, `true >&-`, `echo x >&2`)
+/// is still a no-op; any other redirection makes the command one that can fail. `echo` writes,
+/// so a dup onto fd 0 or a close (`Redir::Silent`) makes it one that can fail.
 fn kind(words: &[Word], redirects: Redir, argv: bool, depth: u8) -> Kind {
     let Some((first, rest)) = words.split_first() else {
         return Kind::Other;
@@ -503,7 +508,9 @@ fn kind(words: &[Word], redirects: Redir, argv: bool, depth: u8) -> Kind {
             return Kind::Escape;
         }
     }
-    if (TRUE_WORDS.contains(&p) || ECHO_WORDS.contains(&p)) && redirects != Redir::Other {
+    if (TRUE_WORDS.contains(&p) && redirects != Redir::Other)
+        || (ECHO_WORDS.contains(&p) && redirects <= Redir::Null)
+    {
         return Kind::NoOp;
     }
     if redirects != Redir::None {

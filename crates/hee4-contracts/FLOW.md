@@ -94,7 +94,7 @@ a no-op when its exit status cannot be non-zero. Pinned as refused by
 | `sh: cargo test \|\| true`, `sh: cargo test \|\| :`, `sh: cargo test \|\| exit 0` | a forced exit: a no-op after the last `\|\|` always ends at 0 |
 | `sh: /usr/bin/false; exit 0`, `sh: cargo test; true`, `sh: exit 0; cargo test` | a forced exit: the last list is a no-op, or `exit 0` ends the shell |
 | `sh: cargo test &` | a trailing `&` ends at 0 |
-| `sh: cargo test \|\| true 2>/dev/null`, `sh: cargo test \|\| : >/dev/null 2>&1`, `sh: cargo test \|\| echo failed >&2`, `sh: cargo test \|\| true &>/dev/null` | a no-op whose only redirections cannot fail (to or from `/dev/null`, a dup onto fd 0, 1 or 2, a close) is still a no-op |
+| `sh: cargo test \|\| true 2>/dev/null`, `sh: cargo test \|\| : >/dev/null 2>&1`, `sh: cargo test \|\| echo failed >&2`, `sh: cargo test \|\| echo failed >/dev/null`, `sh: cargo test \|\| true &>/dev/null`, `sh: cargo test \|\| true >&-`, `sh: cargo test \|\| : >&0` | a no-op whose only redirections cannot fail for it is still a no-op. For every no-op: to or from `/dev/null`, a dup onto fd 1 or 2. For `true` and `:` only (they write nothing): also a dup onto fd 0 or a close (`-`). `echo` writes to fd 1, so a dup onto fd 0 or a close makes it a command that can fail (see the table below) |
 | `sh: cmd \| tail -1`, `sh: cmd \|& tail -1`, `sh: cmd \| head -n 5`, `sh: cmd \| true` | `\|&` is read as a pipe (bash pipes stderr too). No `pipefail`: a pipeline's status is its last command's. MEASURED: the dispatcher runs a `sh:` line as `/bin/sh -c <command>` (`hee4-app/src/dispatcher.rs:89-91`, `playbook`), no `-o pipefail`; `/bin/sh` is bash in POSIX mode on this host, `pipefail` off by default. fm-db refuses the same shape as `pipe_into_tail_head` (V4-105) |
 
 A forced exit next to a real line is admitted like `sh: true` next to a real line: the rule is
@@ -120,6 +120,7 @@ by `tests/verify.rs::deliberately_not_caught`:
 | `sh: (cargo test) \|\| true`, `sh: if cargo test; then :; fi`, `sh: test -n "$(cat f)" \|\| true` | text the reader does not follow (a subshell, a group, a compound keyword, `$(..)`, `${..}`, a backtick, a here-document) counts as a line that may fail: no false refusal, at the cost of these holes |
 | `sh: echo a#b > f`, `sh: grep -q 'a \|\| true' f` | `#` inside a word is not a comment; a quoted operator is not an operator |
 | `sh: cargo test \|\| true > out`, `sh: cargo test \|\| true <&3`, `sh: cargo test \|\| true 2>` | a redirection that can fail (a file that may not open, an fd that may be closed, no target) makes the no-op a command that can fail |
+| `sh: cargo test \|\| echo failed >&-`, `sh: cargo test \|\| echo f >&0` | `echo` writes to fd 1; a close, or a dup onto fd 0 (read-only for a candidate: the host spawns it with stdin from `/dev/null`, `hee4-host/src/spawn.rs`), makes the write fail. MEASURED by `tests/verify.rs::echo_redirections_match_the_shell`: `false \|\| echo failed >&-` and `false \|\| echo f >&0` exit non-zero under `/bin/sh`. The reader does not record which fd a redirection applies to, so `echo x 2>&-` and `echo x 0<&0` also count as can-fail: conservative, it admits a line and never refuses one |
 
 Vacuity stays at rung 2 because the brief's VERIFY is free text the worker wrote; a type cannot
 refuse it before it is parsed, and parsing it is this check.
