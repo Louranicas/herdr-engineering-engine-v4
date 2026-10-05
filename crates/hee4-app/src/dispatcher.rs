@@ -686,7 +686,7 @@ mod tests {
     #[test]
     fn timebox_parses_seconds_and_minutes() {
         let attempt = hee4_contracts::Budgets::DEFAULT.attempt;
-        let (default, ceiling) = (attempt.timebox_default(), Duration::from_secs(86_400));
+        let (default, ceiling) = (attempt.timebox_default(), Duration::from_hours(24));
         assert_eq!(timebox("10s", default, ceiling), Duration::from_secs(10));
         assert_eq!(
             timebox("60 min", default, ceiling),
@@ -705,7 +705,7 @@ mod tests {
     fn timebox_overflow_and_excess_clamp_to_the_attempt_deadline() {
         let attempt = hee4_contracts::Budgets::DEFAULT.attempt;
         let (default, ceiling) = (attempt.timebox_default(), attempt.deadline());
-        assert_eq!(ceiling, Duration::from_secs(1200));
+        assert_eq!(ceiling, Duration::from_mins(20));
         let overflow = format!("{} min", u64::MAX / 60 + 1);
         assert_eq!(timebox(&overflow, default, ceiling), ceiling);
         assert_eq!(
