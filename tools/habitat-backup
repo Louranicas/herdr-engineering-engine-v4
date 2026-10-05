@@ -13,12 +13,18 @@ Order of a run:
      created h-<stamp>.partial dir is stat'ed and refused the same way when it lands on a source's device.
   2. under an exclusive flock on <dest>/.lock: copy into h-<stamp>.partial/, write manifest.json LAST
      (tmp + rename; {"objects": n, "files": {rel: sha256}, "dest_dev": n, ...}), then rename the dir to h-<stamp>.
+     A source entry that is not a regular file, a directory or a symlink (a fifo, a socket, a char or block
+     device) is not copied: copying a fifo blocks or raises, and a device node is no backup. It is named on a
+     `habitat-backup skipped special=<type> path=<p>` line and in the manifest as `{rel: "special:<type>"}`,
+     and is not counted in objects or bytes. On any FAIL after the .partial dir exists, that .partial is
+     removed before the verdict is printed.
   3. prune: keep this run's backup (never pruned) and the newest --keep - 1 other complete backups
      (names h-<stamp> holding a manifest), newest by the manifest's ts, not by name; older ones and
      leftover *.partial dirs go. Nothing else under <dest> is touched. PASS is printed only when this
      run's backup still holds its manifest.
 Last line:
   habitat-backup verdict=PASS|FAIL objects=<n> bytes=<b> backup=<id> dest=<p> keep=<k> pruned=<n> [reason=...]
+  (a PASS line ends with skipped_special=<n>, appended after pruned=, so older parses still read it)
 Exit 0 PASS, 20 FAIL (the roster contract: PASS 0, PASS_WITH_GAPS 10, FAIL 20, no verdict line 30).
 --service: what hee4-backup.service runs. Runs this tool as a child, prints and appends a run block to
   --log (default ~/.local/state/hee4/habitat-backup.log): `habitat-backup run ts=<t> invocation=<$INVOCATION_ID|none>
@@ -33,7 +39,7 @@ Exit 0 PASS, 20 FAIL (the roster contract: PASS 0, PASS_WITH_GAPS 10, FAIL 20, n
   there and checks the manifest. Last line
   `habitat-backup control cases=k/n verdict=PASS|FAIL`.
 """
-import argparse, fcntl, hashlib, json, os, re, shutil, subprocess, sys, tempfile, time
+import argparse, fcntl, hashlib, json, os, re, shutil, stat, subprocess, sys, tempfile, time
 
 HOME = os.path.expanduser("~")
 DEFAULTS = {
@@ -108,7 +114,21 @@ def admit(sources, dest):
     return out
 
 
+# The kinds copytree may copy; every other kind is skipped by name. lstat, so a symlink is a symlink.
+SPECIAL_KINDS = ((stat.S_ISFIFO, "fifo"), (stat.S_ISSOCK, "socket"), (stat.S_ISCHR, "char"), (stat.S_ISBLK, "block"))
+
+
+def special_kind(mode):
+    """The special-file kind of an lstat mode, or None for a regular file, a directory or a symlink."""
+    if stat.S_ISREG(mode) or stat.S_ISDIR(mode) or stat.S_ISLNK(mode):
+        return None
+    return next((name for test, name in SPECIAL_KINDS if test(mode)), "other")
+
+
 def copy_sources(sources, into):
+    """Copy every source into `into`; return the skipped special entries as [(rel, kind, source path)],
+    rel being the entry's path inside the backup (the manifest's key)."""
+    skipped = []
     for name, path in sources:
         if name == "codebase":
             r = subprocess.run(["git", "-C", path, "bundle", "create", os.path.join(into, "codebase.bundle"), "--all"],
@@ -116,7 +136,17 @@ def copy_sources(sources, into):
             if r.returncode != 0:
                 raise OSError(f"git bundle rc={r.returncode}: {(r.stderr.strip().splitlines() or ['?'])[-1]}")
         else:  # shutil.copy, not copy2: copies take the run's mtime, so the manifest is provably the newest file
-            shutil.copytree(path, os.path.join(into, name), symlinks=True, copy_function=shutil.copy)
+            def skip_special(d, names, name=name, path=path):
+                out = set()
+                for n in names:
+                    p = os.path.join(d, n)
+                    kind = special_kind(os.lstat(p).st_mode)
+                    if kind is not None:
+                        out.add(n)
+                        skipped.append((os.path.join(name, os.path.relpath(p, path)), kind, p))
+                return out
+            shutil.copytree(path, os.path.join(into, name), symlinks=True, copy_function=shutil.copy, ignore=skip_special)
+    return skipped
 
 
 def manifest_files(root):
@@ -194,10 +224,12 @@ def backup(a):
                 print(f"habitat-backup refused reason=same_device source={hit[0]} dest={a.dest} dev={dest_dev}")
                 print(f"habitat-backup verdict=FAIL objects=0 bytes=0 backup=none {tail} pruned=0 reason=same_device")
                 return EXIT["FAIL"]
-            copy_sources(sources, part)
+            skipped = copy_sources(sources, part)
             files = manifest_files(part)
             size = sum(os.lstat(os.path.join(part, f)).st_size for f in files)
-            man = {"id": bid, "ts": int(now), "objects": len(files), "bytes": size, "files": files, "dest_dev": dest_dev,
+            objects = len(files)  # what was copied; the skipped specials are named in files, not counted
+            files.update({rel: f"special:{kind}" for rel, kind, _ in skipped})
+            man = {"id": bid, "ts": int(now), "objects": objects, "bytes": size, "files": files, "dest_dev": dest_dev,
                    "sources": {n: {"path": p, "dev": os.stat(p).st_dev} for n, p in sources}}
             tmp = os.path.join(part, "manifest.json.tmp")
             with open(tmp, "w") as f:
@@ -209,10 +241,18 @@ def backup(a):
             if not os.path.isfile(os.path.join(dest, bid, "manifest.json")):
                 raise OSError(f"backup {bid} absent after prune")
         except (OSError, subprocess.SubprocessError, shutil.Error) as e:
+            if os.path.lexists(part):  # this run's own .partial only; a failed run leaves nothing behind
+                try:
+                    remove_backup(part)
+                except OSError as ce:
+                    print(f"habitat-backup partial_not_removed path={part} error={str(ce).replace(' ', '_')[:200]}")
             print(f"habitat-backup verdict=FAIL objects=0 bytes=0 backup={bid} {tail} pruned=0 reason=copy_failed "
                   f"detail={str(e).replace(' ', '_')[:200]}")
             return EXIT["FAIL"]
-    print(f"habitat-backup verdict=PASS objects={len(files)} bytes={size} backup={bid} {tail} pruned={pruned}")
+    for rel, kind, src in skipped:
+        print(f"habitat-backup skipped special={kind} path={src}")
+    print(f"habitat-backup verdict=PASS objects={objects} bytes={size} backup={bid} {tail} pruned={pruned} "
+          f"skipped_special={len(skipped)}")
     return EXIT["PASS"]
 
 
