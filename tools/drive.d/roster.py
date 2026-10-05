@@ -5,6 +5,12 @@ the disable path runs last because it disables the engine's only model record (t
 disposable; re-enable is not an action). Every refusal is checked against the FLOW.md table.
 With --ledger the ledger-side checks read `operations` and `roster_revisions` read-only; without
 it they print UNMEASURED naming --ledger.
+
+Against the live unit's socket (the default --socket) the mutating paths (roster.update create and
+revise, roster.disable, task.submit) never run: each prints UNMEASURED "mutating roster paths run
+only against a disposable serve", and only reads and refusals that write nothing are driven. The
+deploy record's id is read from the serve (the ledger's deploy.install row, else the model record
+whose last operation is deploy.install), never from this process's environment.
 """
 import hashlib
 import json
@@ -14,14 +20,48 @@ import uuid
 
 from drive_d import NO_LEDGER_REASON, TERMINAL, is_result, ledger_ro
 
-MODEL = os.environ.get("HEE4_MODEL", "qwen2.5-coder:7b")
-DEPLOY_ID = "model:" + MODEL
 DEPLOY_ACTION = "deploy.install"
 RECORD_ID = "model:drive-" + uuid.uuid4().hex[:8]
 DEFINITION = {"kind": "model", "caps": {"ctx_tokens": 4096, "json_mode": True, "tool_use": False, "local": True},
               "cost_milli": 0, "latency_ms": 0, "quality": 1, "capability": None, "locality": "local"}
 BRIEF = ("GOAL: drive\nSCOPE: s\nCONTEXT: c\nACCEPTANCE: a\nVERIFY: /usr/bin/true\nTIMEBOX: 10s\n"
          "FORBIDDEN: f\nREPORT: r\nSTANDING: s\nRECON: r\nRESTATEMENT: run true\n")
+
+
+LIVE_REASON = "mutating roster paths run only against a disposable serve (socket is the live unit's)"
+
+
+def is_live(F):
+    """True when the driven socket is the live unit's (tools/drive's default --socket)."""
+    xdg = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    return os.path.realpath(F.sock) == os.path.realpath(f"{xdg}/hee4/control.sock")
+
+
+def deploy_id(F, ctx):
+    """The engine's own record id, as the serve holds it; cached in ctx for the later procedures."""
+    if ctx.get("deploy_id"):
+        return ctx["deploy_id"]
+    found = None
+    c = ledger_ro(ctx)
+    if c is not None:
+        try:
+            row = c.execute("select subject from operations where principal = 'deploy' and action = ? "
+                            "order by ts desc limit 1", (DEPLOY_ACTION,)).fetchone()
+            found = row[0] if row else None
+        finally:
+            c.close()
+    if found is None:
+        for rid in ids_of(F.req("roster.list", list_body(include_disabled=True, kinds=["model"]))):
+            r = F.req("roster.inspect", {"selector": {"record_id": rid}})
+            if (((r or {}).get("body") or {}).get("last_operation") or {}).get("action") == DEPLOY_ACTION:
+                found = rid
+                break
+    ctx["deploy_id"] = found
+    return found
+
+
+UNIDENTIFIED = ("deploy record not identifiable: no deploy.install row readable (--ledger not passed) and no model "
+                "record's last operation is deploy.install (an earlier drive retired it)")
 
 
 def list_body(include_disabled=False, kinds=(), capability=None, locality=None, limit=100, cursor=None):
@@ -59,6 +99,9 @@ def count(ctx, sql, *args):
 
 
 def d_list(F, ctx):
+    DEPLOY_ID = deploy_id(F, ctx)
+    if DEPLOY_ID is None:
+        return F.check("deploy_record", False, UNIDENTIFIED, unmeasured=True)
     shown = F.req("roster.list", list_body(include_disabled=True))
     F.check("include_disabled_true", is_result(shown) and DEPLOY_ID in ids_of(shown), f"ids={ids_of(shown)}")
     # A serve an earlier drive already ran roster.disable against holds the deploy record disabled
@@ -85,6 +128,9 @@ def d_list(F, ctx):
 
 
 def d_inspect(F, ctx):
+    DEPLOY_ID = deploy_id(F, ctx)
+    if DEPLOY_ID is None:
+        return F.check("deploy_record", False, UNIDENTIFIED, unmeasured=True)
     r = F.req("roster.inspect", {"selector": {"record_id": DEPLOY_ID}})
     b = (r or {}).get("body") or {}
     rec, last = b.get("record") or {}, b.get("last_operation") or {}
@@ -116,8 +162,17 @@ def d_inspect(F, ctx):
 
 
 def d_update(F, ctx):
-    k = str(uuid.uuid4())
     body = {"record_id": RECORD_ID, "definition": DEFINITION, "audit_reason": "drive create"}
+    # Refusals that write nothing: safe on any serve.
+    F.refuse("empty_definition", F.req("roster.update", dict(body, definition={}), key=str(uuid.uuid4())), "invalid_argument", "/body/definition")
+    F.refuse("missing_key", F.req("roster.update", body), "invalid_argument", "/idempotency_key")
+    F.refuse("bad_record_id", F.req("roster.update", dict(body, record_id="no colon"), key=str(uuid.uuid4())), "invalid_argument", "/body/record_id")
+    remote_local = dict(DEFINITION, locality="remote")
+    F.refuse("locality_contradicts_caps_local", F.req("roster.update", dict(body, definition=remote_local), key=str(uuid.uuid4())),
+             "invalid_argument", "/body/definition")
+    if is_live(F):
+        return F.check("mutating_paths", False, LIVE_REASON, unmeasured=True)
+    k = str(uuid.uuid4())
     before = count(ctx, "select count(*) from roster_revisions where record_id = ?", RECORD_ID)
     r = F.req("roster.update", body, key=k)
     b = (r or {}).get("body") or {}
@@ -140,9 +195,6 @@ def d_update(F, ctx):
     else:
         F.check("replay_adds_no_revision", again == after, f"revisions after replay {again} want {after}")
     F.refuse("conflict", F.req("roster.update", dict(body, audit_reason="other bytes"), key=k), "conflict", "/idempotency_key")
-    F.refuse("empty_definition", F.req("roster.update", dict(body, definition={}), key=str(uuid.uuid4())), "invalid_argument", "/body/definition")
-    F.refuse("missing_key", F.req("roster.update", body), "invalid_argument", "/idempotency_key")
-    F.refuse("bad_record_id", F.req("roster.update", dict(body, record_id="no colon"), key=str(uuid.uuid4())), "invalid_argument", "/body/record_id")
     rev = F.req("roster.update", dict(body, audit_reason="drive revise"), key=str(uuid.uuid4()),
                 precondition={"resource": "roster", "id": RECORD_ID, "generation": 1})
     rb = (rev or {}).get("body") or {}
@@ -151,16 +203,21 @@ def d_update(F, ctx):
                                        precondition={"resource": "roster", "id": RECORD_ID, "generation": 1}),
              "stale_generation", "/precondition/generation", extra={"current_generation": 2})
     F.refuse("precondition_other_id", F.req("roster.update", body, key=str(uuid.uuid4()),
-                                            precondition={"resource": "roster", "id": DEPLOY_ID, "generation": 2}),
+                                            precondition={"resource": "roster", "id": RECORD_ID + "-other", "generation": 2}),
              "invalid_argument", "/precondition/id")
     ins = F.req("roster.inspect", {"selector": {"source_action": "roster.update", "idempotency_key": k}})
     ib = (ins or {}).get("body") or {}
     F.check("readback_by_key", is_result(ins) and (ib.get("record") or {}).get("id") == RECORD_ID
             and (ib.get("record") or {}).get("generation") == 2 and (ib.get("last_operation") or {}).get("action") == "roster.update", f"{ins}")
-    F.check("forbidden_operator_capability", False, "no grant exists; owner: grants slice (gates/features/README.md:67 UNWRITTEN)", unmeasured=True)
+    agent = dict(DEFINITION, kind="agent")
+    F.refuse("kind_is_fixed", F.req("roster.update", dict(body, definition=agent, audit_reason="kind"), key=str(uuid.uuid4())),
+             "invalid_argument", "/body/definition/kind")
 
 
 def d_disable(F, ctx):
+    DEPLOY_ID = deploy_id(F, ctx)
+    if DEPLOY_ID is None:
+        return F.check("deploy_record", False, UNIDENTIFIED, unmeasured=True)
     body = {"record_id": DEPLOY_ID, "active_attempt_policy": "let_finish", "audit_reason": "drive retire"}
     g = ctx.get("roster_generation") or 1
     F.refuse("missing_precondition", F.req("roster.disable", body, key=str(uuid.uuid4())), "invalid_argument", "/precondition")
@@ -172,6 +229,8 @@ def d_disable(F, ctx):
     F.refuse("not_found", F.req("roster.disable", dict(body, record_id="model:no-such-record"), key=str(uuid.uuid4()),
                                 precondition={"resource": "roster", "id": "model:no-such-record", "generation": 1}),
              "not_found", "/body/record_id")
+    if is_live(F):
+        return F.check("mutating_paths", False, LIVE_REASON, unmeasured=True)
     # The last mutating path: it disables the engine's only model record (disposable serve).
     k = str(uuid.uuid4())
     r = F.req("roster.disable", body, key=k, precondition={"resource": "roster", "id": DEPLOY_ID, "generation": g})
@@ -208,7 +267,6 @@ def d_disable(F, ctx):
         if ph not in TERMINAL:
             time.sleep(0.2)
     F.check("dispatch_refuses_disabled_model", ph == "abandoned", f"task={t} phase={ph}")
-    F.check("forbidden_operator_capability", False, "no grant exists; owner: grants slice (gates/features/README.md:67 UNWRITTEN)", unmeasured=True)
 
 
 FEATURES = [("roster.list", d_list), ("roster.inspect", d_inspect), ("roster.update", d_update), ("roster.disable", d_disable)]

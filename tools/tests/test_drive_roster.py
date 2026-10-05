@@ -2,8 +2,10 @@
 
 Each test class starts its own serve (the disable path retires the serve's only model record, so
 a serve is never shared with another family's tests). With --ledger every ledger-side path is
-measured; without it each one is UNMEASURED naming --ledger. The only other non-PASS path allowed
-is the operator-capability `forbidden` path, UNMEASURED by name (no grant exists; grants slice).
+measured and all four features PASS; without it each one is UNMEASURED naming --ledger and no
+other path is non-PASS. Driven against a socket that resolves to the live unit's path, no mutating
+roster path runs: update and disable print UNMEASURED naming the disposable-serve rule and the
+ledger gains no roster.update, roster.disable or task.submit row.
 """
 import json, os, re, shutil, sqlite3, subprocess, sys, tempfile, time, unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # `python3 -m unittest tools/tests/test_drive_roster.py` from the root
@@ -14,7 +16,6 @@ REPO = os.path.dirname(TOOLS)
 TARGET = os.environ.get("CARGO_TARGET_DIR", os.path.expanduser("~/.cache/hee4-target-gate"))
 BIN = os.path.join(TARGET, "debug", "hee4")
 ROSTER = ["roster.list", "roster.inspect", "roster.update", "roster.disable"]
-ALLOWED_UNMEASURED = {"forbidden_operator_capability"}
 
 
 class Serve:
@@ -32,9 +33,17 @@ class Serve:
                 break
             time.sleep(0.1)
 
-    def drive(self, ledger, ev="ev"):
+    def drive(self, ledger, ev="ev", env=None):
         args = [DRIVE, "--socket", self.sock, "--evidence-root", os.path.join(self.d, ev), "--only", ",".join(ROSTER)]
-        return run(*(args + (["--ledger", self.ledger] if ledger else [])), timeout=100)
+        return run(*(args + (["--ledger", self.ledger] if ledger else [])), env=env, timeout=100)
+
+    def as_live(self):
+        """An XDG_RUNTIME_DIR whose hee4/control.sock resolves to this serve's socket."""
+        xdg = os.path.join(self.d, "xdg")
+        os.makedirs(xdg, exist_ok=True)
+        if not os.path.exists(os.path.join(xdg, "hee4")):
+            os.symlink(os.path.join(self.d, "rt"), os.path.join(xdg, "hee4"))
+        return {"XDG_RUNTIME_DIR": xdg}
 
     def stop(self):
         self.srv.kill(); self.srv.wait(); self.log.close()
@@ -90,19 +99,10 @@ class RosterWithLedger(unittest.TestCase):
     def tearDownClass(cls):
         shutil.rmtree(cls.s.d, ignore_errors=True)
 
-    def test_four_features_ran_and_none_failed(self):
-        self.assertEqual(sorted(feature_lines(self.out)), sorted(ROSTER), self.out)
-        self.assertNotIn("FAIL", feature_lines(self.out).values(), self.out)
-        self.assertEqual(feature_lines(self.out)["roster.list"], "PASS", self.out)
-        self.assertEqual(feature_lines(self.out)["roster.inspect"], "PASS", self.out)
-
-    def test_only_the_named_grants_path_is_unmeasured(self):
-        odd = odd_paths(self.out)
-        self.assertTrue(odd, "the forbidden path must be printed UNMEASURED, never dropped: " + self.out)
-        for path, status, detail in odd:
-            self.assertEqual(status, "UNMEASURED", self.out)
-            self.assertIn(path, ALLOWED_UNMEASURED, self.out)
-            self.assertIn("grants slice", detail)
+    def test_four_features_pass_and_drive_exits_zero(self):
+        self.assertEqual(feature_lines(self.out), {name: "PASS" for name in ROSTER}, self.out)
+        self.assertEqual(odd_paths(self.out), [], self.out)
+        self.assertEqual(self.rc, 0, self.out + self.err)
 
     def test_ledger_counts_name_one_deploy_install_and_only_driven_roster_rows(self):
         c = sqlite3.connect("file:" + self.s.ledger + "?mode=ro", uri=True)
@@ -144,7 +144,42 @@ class RosterWithoutLedger(unittest.TestCase):
         self.assertGreaterEqual(len(ledger_side), 1, self.out)
         for path, status, detail in odd:
             self.assertEqual(status, "UNMEASURED", self.out)
-            self.assertTrue("--ledger" in detail or path in ALLOWED_UNMEASURED, self.out)
+            self.assertIn("--ledger", detail, self.out)
+
+
+class RosterAgainstTheLiveSocket(unittest.TestCase):
+    """The socket resolves to the live unit's path: reads and write-nothing refusals only."""
+
+    @classmethod
+    def setUpClass(cls):
+        build()
+        cls.s = Serve()
+        cls.rc, cls.out, cls.err = cls.s.drive(ledger=True, env=cls.s.as_live())
+        cls.s.stop()
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.s.d, ignore_errors=True)
+
+    def test_mutating_paths_are_unmeasured_and_the_ledger_holds_no_drive_write(self):
+        lines = feature_lines(self.out)
+        self.assertEqual(lines["roster.list"], "PASS", self.out)
+        self.assertEqual(lines["roster.inspect"], "PASS", self.out)
+        self.assertNotIn("FAIL", lines.values(), self.out)
+        odd = odd_paths(self.out)
+        self.assertEqual(sorted(p for p, _, _ in odd), ["mutating_paths", "mutating_paths"], self.out)
+        for _, status, detail in odd:
+            self.assertEqual(status, "UNMEASURED", self.out)
+            self.assertIn("disposable serve", detail, self.out)
+        c = sqlite3.connect("file:" + self.s.ledger + "?mode=ro", uri=True)
+        try:
+            actions = sorted(a for (a,) in c.execute("select action from operations").fetchall())
+            disabled = c.execute("select count(*) from roster_records where disabled = 1").fetchone()[0]
+        finally:
+            c.close()
+        self.assertEqual(actions, ["deploy.install"], actions)
+        self.assertEqual(disabled, 0)
+        self.assertEqual(fresh_writes(os.path.join(self.s.d, "ev")), {})
 
 
 class RosterDrivenTwice(unittest.TestCase):
