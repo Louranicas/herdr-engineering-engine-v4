@@ -109,6 +109,35 @@ class HabitatBackupTests(unittest.TestCase):
         bid = re.search(r"backup=(\S+)", out).group(1)
         self.assertEqual(sorted(os.listdir(dest)), sorted([".lock", "h-20000101T000000-000000Z", bid]))
 
+    def test_fifo_in_a_source_is_skipped_by_name_and_the_run_passes(self):
+        # The live run of 2026-10-05T16:22:47Z failed reason=copy_failed on a named pipe in the evidence home
+        # (prototypes/.../fixtures/source.pipe): copytree raises on a fifo. A special file is skipped by name.
+        pipe_dir = os.path.join(self.src, "evidence", "fixtures")
+        os.makedirs(pipe_dir); os.mkfifo(os.path.join(pipe_dir, "source.pipe"))
+        dest = os.path.join(self.other, "dest")
+        rc, out, err = self.hb(dest)
+        self.assertEqual(rc, 0, out + err)
+        last = out.strip().splitlines()[-1]
+        self.assertRegex(last, r"^habitat-backup verdict=PASS objects=4 .* pruned=0 skipped_special=1$")
+        self.assertIn(f"habitat-backup skipped special=fifo path={os.path.join(pipe_dir, 'source.pipe')}", out)
+        bid = re.search(r"backup=(\S+)", last).group(1)
+        man = json.load(open(os.path.join(dest, bid, "manifest.json")))
+        self.assertEqual(man["files"]["evidence/fixtures/source.pipe"], "special:fifo")
+        self.assertEqual(man["objects"], 4)
+        self.assertFalse(os.path.lexists(os.path.join(dest, bid, "evidence", "fixtures", "source.pipe")))
+        self.assertEqual(load().exit_for(out), 0)  # the appended token leaves the roster parse intact
+
+    def test_a_failed_run_leaves_no_partial(self):
+        locked = os.path.join(self.src, "handoffs", "locked.md")
+        open(locked, "w").write("unreadable\n"); os.chmod(locked, 0o000)
+        self.addCleanup(os.chmod, locked, 0o644)
+        self.assertFalse(os.access(locked, os.R_OK), "the fixture needs an unreadable file (not root)")
+        dest = os.path.join(self.other, "dest")
+        rc, out, err = self.hb(dest)
+        self.assertEqual(rc, 20, out + err)
+        self.assertRegex(out.strip().splitlines()[-1], r"^habitat-backup verdict=FAIL objects=0 .* reason=copy_failed ")
+        self.assertEqual([n for n in os.listdir(dest) if n.startswith("h-")], [], "a failed run left its partial")
+
     def test_symlink_dotdot_dest_onto_the_sources_device_refused(self):
         # text: <other>/lnk/../escape is on the other device; kernel: lnk -> <src>/back/sub, so .. is <src>/back
         back = os.path.join(self.src, "back")

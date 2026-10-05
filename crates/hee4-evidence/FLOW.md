@@ -29,7 +29,7 @@ contribution, folded from a floor.
 | tier-0, bound | `evidence` empty | `Refused(invalid)` |
 | tier-0, bound | `elapsed_ms > budget_ms` | `Refused(timeout)` |
 | tier-0, bound | outcome `error` / `fail` / `pass` | `Refused(error)` / `Fail` / `Pass` |
-| tier-0, bound, in budget | outcome `refused{reason}` | `Refused(invalid)`; the reason is in the observation, whose content address is sealed in `observed` (the ddf adapter's exit 7 is advisory, so it takes the advisory row) |
+| tier-0, bound, in budget | outcome `refused{reason}` | `Refused(invalid)`; the reason is in the observation, whose content address is sealed in `observed` (the ddf adapter's exit 7 and its timeout are advisory, so they take the advisory row) |
 
 `decide` never emits `Refused(cancelled)`; it is ranked only so the order is total.
 A missing `input_sha256` or `head_sha` cannot reach `decide`: the I3 type requires both (rung 1).
@@ -71,7 +71,8 @@ git) and `TaskObservation::Observed(Observation) | Skipped(Skip)`:
   `AdapterError::LookedAtNothing`; `Exit`, `Malformed`, `SealMismatch` and `LookedAtNothing`
   come back as `Err`, refused by name, never as a skip;
 - a run past `budget` is mapped inside to `timeout_observation` (`Observed`, outcome `error`,
-  `elapsed_ms > budget_ms`, so `decide` yields `Refused(timeout)`);
+  `elapsed_ms > budget_ms`, `advisory: true`): like exit 7 it adds evidence and does not gate,
+  so `decide` ignores it and the task's verdict comes from its tier-0 observations;
 - the Pass observation is bound to the subject's `input_sha256` (the VERIFY digest, V4-94) and
   carries two evidence items: `rank.v0` = digest of stdout, `diff` = digest of the bytes sent,
   which the adapter has checked equal the tool's sealed `input_sha256` (`SealMismatch`
@@ -84,15 +85,35 @@ empty diff reaches the tool and comes back exit 7, `Observed(Refused)`, advisory
 
 ## The deadline
 
-The caller passes `budget: Duration`. The child is spawned; stdin is written and stdout/stderr
-drained on detached threads; the adapter polls `try_wait` every 10 ms against a wall-clock
-`Instant`. At the deadline it calls `kill()` then `wait()` and returns
-`AdapterError::Timeout{budget}`. `ddf::timeout_observation(budget, diff, &subject)` turns that
-into a tier-0 observation (outcome `error`, `elapsed_ms = budget_ms + 1`, one `deadline`
-evidence item, the digest of the diff). `decide` tests `elapsed_ms > budget_ms` before the outcome,
-so it yields `Refused(timeout)`, never Pass. Test: a `sleep 5` stub with a 300 ms budget returns
-well under 1 s (`tests/ddf.rs`). Detached threads mean a grandchild holding a pipe cannot hold the
-adapter past the deadline; the grandchild itself is not killed (UNMEASURED beyond the stub).
+The caller passes `budget: Duration`. The child is spawned in its own process group
+(`CommandExt::process_group(0)`, so its pgid is its pid). Stdin is written on a detached thread
+that is never joined; stdout and stderr are drained on detached threads that report over a
+channel. Every 10 ms the adapter asks, without reaping (`waitid` with `WNOWAIT`, through `rustix`),
+whether the child has exited, against a wall-clock `Instant`:
+
+- At the deadline it sends `SIGKILL` to the whole group (`killpg`; the direct child alone if the
+  group cannot be signalled), then `wait()`s the child and returns `AdapterError::Timeout{budget}`.
+- On a normal exit the child is still a zombie, so its pid (the pgid) cannot be reused: the
+  adapter sends `SIGKILL` to the group (whatever the tool left behind, such as a grandchild holding
+  the pipes; `ESRCH` means nothing was left), then reaps the child. It then waits for the two
+  drains only until the deadline; a pipe still held at the deadline is `AdapterError::Timeout`.
+
+`ddf::timeout_observation(budget, diff, &subject)` turns a timeout into an advisory observation
+(outcome `error`, `elapsed_ms = budget_ms + 1`, one `deadline` evidence item, the digest of the
+diff). deep-diff-forge is never a second verdict authority (V4-81), so a hung tool does not gate:
+beside a tier-0 Pass the task passes, alone the verdict is the floor `Refused(invalid)`, never
+Pass, and the timeout is sealed in `observed`. Made tier-0, the same row would still be
+`Refused(timeout)`: `decide` is unchanged.
+
+Tests (`tests/ddf.rs`, stub `fixtures/ddf-grandchild.sh` in three modes): a `sleep 5` stub with a
+300 ms budget returns well under 1 s; `a_grandchild_is_gone_after_the_timeout` finds the
+`sleep 30` grandchild gone (`kill(pid, 0)` is `ESRCH`) after the deadline;
+`a_grandchild_holding_the_pipes_after_a_normal_exit_neither_holds_the_call_nor_survives` (exit 0
+at once, grandchild on the pipes, 20 s budget) returns in about 10 ms with the grandchild gone;
+`an_escaped_grandchild_holding_the_pipes_cannot_hold_the_call_past_the_deadline` (the grandchild
+called `setsid`) is a `Timeout` at the 700 ms budget. That escaped grandchild is not killed: it
+left the group, and the adapter kills only by group. Its drain and stdin threads stay parked until
+it closes the pipes.
 
 ## The seal door (census)
 
@@ -118,6 +139,12 @@ or exit code alone (AP-29).
   today the binary runs only as the gate's `ddf` step (gate.toml `[step.ddf]`).
 - Settled for W4: an exit-7 `Observed(Refused{reason})` is advisory at its construction site
   (`ddf::refused_observation`), so the dispatcher records it as it records any observation and
-  `decide` cannot fail the task on it; `decide.rs` is unchanged. Still open: the timeout
-  observation is tier-0 (`Refused(timeout)`), so a hung deep-diff-forge does gate; whether that
-  too should be advisory is a DC for K4, not decided here.
+  `decide` cannot fail the task on it; `decide.rs` is unchanged. Settled for U-harden-05: the
+  timeout observation is advisory too (`ddf::timeout_observation`, from V4-81: deep-diff-forge is
+  never a second verdict authority), so a hung deep-diff-forge does not gate. The DECISIONS row
+  is a hee4-scribe proposal for Luke to append; `decide.rs` is unchanged.
+- Open (U-harden-05 AC9, third clause): the dispatcher's line for a timeout is `ddf=observed`
+  like any observation (`hee4-app` `ddf_observation`), so the journal cannot tell a hung tool from
+  a ranking. The fix is the app's: print `ddf=timeout budget_ms=<n>`, or give `TaskObservation`
+  a typed timeout variant so the app cannot mislabel it. It belongs to a slice that owns
+  `hee4-app` (h5-app-runtime-settle merges after this one).
