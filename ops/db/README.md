@@ -240,3 +240,17 @@ The verifier's v4 rows include this build session's own turns. The user-level St
 - **`db_record` and a busy writer.** The Writer's flock is non-blocking (`writer_busy`): a roster run that finishes while another hee4db writer holds the lock logs `db_record=failed`; the next daily `--from-logs` backfills it. Not yet observed.
 - `decision_mentions` are candidates, not supersession edges.
 - FTS has no stemming and no prefix search. The search falls back to LIKE (exit 10) whenever the sidecar is stale or absent.
+- **Five habitat learnings vanished from the source (2026-10-05, U-stack-04 ops-db-schedule).** The copy in `habitat_learnings` was made on the Fedora host (every row `migrated_at=2026-10-01T03:56:50Z`, 42 rows). On Omarchy the source holds fewer rows than the copy; the five below are the copy's record of them, kept here because `hee4db migrate-habitat` (the only writer of the `habitat_*` tables) re-copies the source as it is and drops them:
+
+  | source_rowid | id | standing | scope | title | sha256(body) first 16 |
+  |---|---|---|---|---|---|
+  | 73 | `learning:ship-is-a-named-act-20260928` | 1 | v3-provenance | Shipping was a human-named act on something already running | `14d588dc5bade4be` |
+  | 74 | `learning:generated-needs-a-reader-20260928` | 1 | general | A generated channel needs a named reader, or it only looks alive | `f888420b92ec012f` |
+  | 75 | `learning:drift-predates-herdr-20260928` | 1 | general | The shipping drift predates herdr and Fedora | `e1b2be8ff00ffd52` |
+  | 76 | `learning:brakes-did-not-travel-20260928` | 1 | general | The verification discipline travelled; the brakes did not | `e2a387d830d496e6` |
+  | 77 | `learning:zellij-services-none-migrate-20260928` | 1 | v3-provenance | No Zellij-era service migrates; re-derive ideas only | `f05bd20e7ee9ba23` |
+
+  - MEASURED (before the re-copy): `hee4db q --table "SELECT source_rowid, id, standing, scope, title FROM habitat_learnings WHERE source_rowid >= 70 ORDER BY source_rowid"` listed rowid 70-77, all `migrated_at=2026-10-01T03:56:50Z`; the body hashes above are `sha256(body)` of those rows, computed in Python over the same query's JSON.
+  - MEASURED: `~/.local/bin/tursodb -q --readonly -m list ~/firstmate/data/habitat-ops.db "SELECT count(*), max(rowid), sum(standing) FROM learnings" </dev/null` → `72|72|37` (the source's last rowid is 72; rowids 73-77 are absent, not changed).
+  - MEASURED: `hee4db stale` before the re-copy → `verdict=FAIL exit=20 measured=41/41 stale_sources=0 absent=0 new_files=0 habitat_stale=5 habitat=checked registry_stale=0`, five lines `stale_habitat_row table=learnings rowid=73..77 state=deleted`; `find /mnt/storage-10tb ~ -maxdepth 4 -name 'habitat-ops.db*'` finds only `~/firstmate/data`.
+  - INFERRED (from the three facts above): the `habitat-ops.db` that came to Omarchy predates, or was trimmed relative to, the Fedora source the 2026-10-01 copy read. The rows cannot be restored here and the source is Firstmate's home (read through `tursodb --readonly` only), so this block is the record; the copy was then re-made with `hee4db migrate-habitat` (`habitat table=learnings rows=72 migrated=37 disposition=partial`) and `hee4db stale` reads `habitat_stale=0`.
