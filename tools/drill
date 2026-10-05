@@ -276,9 +276,15 @@ def main():
 TERMINAL = {"accepted", "failed", "cancelled", "abandoned"}
 
 
+# What the kill can leave a drill task in: effect_unknown when it died mid-attempt (R08), blocked
+# when it died verifying with no Decide and no receipt (R12 quarantine). The smoke soak of
+# 2026-10-06 found the second: the drill's settle step had handled only the first.
+UNSETTLED = ("effect_unknown", "blocked")
+
+
 def settle_rehearsal(a, ids, budget):
     """Step `rehearsal_settled`: the kill lands mid-attempt on purpose, so recovery correctly leaves
-    some of THIS run's tasks `effect_unknown` (R08). The drill resolves those, and only those (its
+    some of THIS run's tasks `effect_unknown` (R08) or `blocked` (R12). The drill resolves those, and only those (its
     own acked ids), through task.resolve abandon with reason attempt_failed, then waits until every
     one of its tasks is terminal. A task it did not submit is never touched. MEASURED only when all
     are terminal within the budget; a refused resolve or a task still open is FAIL by name."""
@@ -289,7 +295,7 @@ def settle_rehearsal(a, ids, budget):
     while True:
         phases = {t: ((frame(a.socket, "task.get", {"task_id": t}) or {}).get("body") or {}).get("phase") for t in ids}
         for t, ph in phases.items():
-            if ph == "effect_unknown" and t not in resolved and t not in refused:
+            if ph in UNSETTLED and t not in resolved and t not in refused:
                 r = frame(a.socket, "task.resolve", {"task_id": t, "resolution": "abandon", "reason": "attempt_failed"},
                           key=f"drill-settle-{t}")
                 (resolved if is_result(r) else refused).append(t)
@@ -299,7 +305,7 @@ def settle_rehearsal(a, ids, budget):
     open_ = [f"{t}:{ph}" for t, ph in phases.items() if ph not in TERMINAL]
     ok = not open_ and not refused
     emit("rehearsal_settled", "MEASURED" if ok else "FAIL", budget, t0,
-         f"terminal={len(ids) - len(open_)}/{len(ids)} resolved_effect_unknown={len(resolved)} refused={','.join(refused) or 'none'} open={','.join(open_) or 'none'}")
+         f"terminal={len(ids) - len(open_)}/{len(ids)} resolved_unsettled={len(resolved)} refused={','.join(refused) or 'none'} open={','.join(open_) or 'none'}")
 
 
 if __name__ == "__main__":

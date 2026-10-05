@@ -259,9 +259,27 @@ class DrillTests(unittest.TestCase):
         w.phases = Unknown(w.phases)
         rc, out, _ = run(DRILL, "--socket", w.sockpath, "--restart-budget", "10", "--repo", TOOLS, "--submit", "3", "--drill-root", root, env=w.env)
         self.assertEqual(rc, 0, out)
-        self.assertRegex(out, r"drill_step=rehearsal_settled status=MEASURED .* detail=terminal=3/3 resolved_effect_unknown=3 refused=none open=none")
+        self.assertRegex(out, r"drill_step=rehearsal_settled status=MEASURED .* detail=terminal=3/3 resolved_unsettled=3 refused=none open=none")
         self.assertEqual(sorted(w.resolved), sorted(w.submitted))
         self.assertNotIn("t-" + "f" * 24, w.resolved)
+
+    def test_fire_rehearsal_settled_resolves_its_own_blocked_tasks_too(self):
+        # A task killed while verifying is quarantined to blocked by R12, not effect_unknown; the
+        # settle step must abandon those of its own as well (the 2026-10-06 smoke soak found it
+        # left one blocked and failed the drill).
+        w = World(); self.addCleanup(w.close)
+        restarter(self, w)
+        w.phases["t-" + "e" * 24] = "blocked"  # a foreign blocked task: never touched
+        class Blocked(dict):
+            def get(self, k, d=None):
+                return dict.get(self, k, "blocked" if k in w.submitted else d)
+        w.phases = Blocked(w.phases)
+        root = tempfile.mkdtemp(prefix="dr-")
+        rc, out, _ = run(DRILL, "--socket", w.sockpath, "--restart-budget", "10", "--repo", TOOLS, "--submit", "3", "--drill-root", root, env=w.env)
+        self.assertEqual(rc, 0, out)
+        self.assertRegex(out, r"drill_step=rehearsal_settled status=MEASURED .* detail=terminal=3/3 resolved_unsettled=3 refused=none open=none")
+        self.assertEqual(sorted(w.resolved), sorted(w.submitted))
+        self.assertNotIn("t-" + "e" * 24, w.resolved)
 
     def test_quiet_submit3_acked_present_and_rehearsal(self):
         w = World(); self.addCleanup(w.close)
