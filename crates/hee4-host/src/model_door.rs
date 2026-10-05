@@ -6,23 +6,21 @@
 //! `127.0.0.1:11434`) with `Connection: close`, then relays the response. When the upstream does
 //! not accept, the door answers `503 {"refused":"model unreachable"}`. Only `GET`/`POST` of
 //! `/api/...` over `HTTP/1.1` is forwarded; anything else is answered `400`. Connections are served
-//! on their own threads (at most eight at once). Every request is logged as a [`DoorRequest`]
-//! (byte count and sha256; for a refused request, of what was actually read).
+//! on their own threads (at most [`DoorBudget::pool`] at once). Every request is logged as a
+//! [`DoorRequest`] (byte count and sha256; for a refused request, of what was actually read).
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use hee4_contracts::Sha256Hex;
-
-/// Largest header block the door reads.
-const MAX_HEADER: usize = 64 * 1024;
+pub use hee4_contracts::DoorBudget;
+use hee4_contracts::{BudgetRefusal, Budgets, Sha256Hex};
 
 /// A loopback HTTP upstream, parsed from `http://<loopback-ip>:<port>`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,36 +64,6 @@ impl Upstream {
     }
 }
 
-/// Limits for one door.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DoorBudget {
-    /// Requests forwarded before the door answers `429`.
-    pub max_requests: u32,
-    /// Largest request body, bytes; a larger one is answered `413`.
-    pub max_body_bytes: usize,
-    /// Sum of request bodies over the whole attempt, bytes; the request that crosses it is
-    /// answered `413`.
-    pub max_total_bytes: u64,
-    /// Time a client has to send its header block; then `408 header timeout`.
-    pub header_deadline: Duration,
-    /// Time a client has to send its body after the header; then `408 body timeout`.
-    pub body_deadline: Duration,
-    /// Read, write and connect timeout on each side.
-    pub io_timeout: Duration,
-}
-
-impl DoorBudget {
-    /// 64 requests, 1 MiB body, 8 MiB total, 2 s header, 10 s body, 120 s io. UNMEASURED stand-ins for K1 `budget`.
-    pub const DEFAULT: Self = Self {
-        max_requests: 64,
-        max_body_bytes: 1024 * 1024,
-        max_total_bytes: 8 * 1024 * 1024,
-        header_deadline: Duration::from_secs(2),
-        body_deadline: Duration::from_secs(10),
-        io_timeout: Duration::from_secs(120),
-    };
-}
-
 /// What happened to a request at the door.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DoorFate {
@@ -131,6 +99,10 @@ pub enum DoorError {
     /// Binding or spawning failed.
     #[error("door io: {0}")]
     Io(#[from] std::io::Error),
+    /// The budget fails the contracts' `door.*` checks (a zero `pool`, a field over its
+    /// ceiling, `max_body_bytes` over `max_total_bytes`): refused before anything is bound.
+    #[error("door budget refused: {0}")]
+    Budget(#[from] BudgetRefusal),
 }
 
 /// A running door. [`Door::close`] stops it and returns the log; dropping it also stops it.
@@ -184,15 +156,22 @@ impl Drop for Door {
 
 /// Open a door at `socket_path` forwarding to `upstream` under `budget`. A stale socket at the
 /// path is replaced; any other file there is refused. One request per connection, each
-/// connection on its own thread, at most eight at once.
+/// connection on its own thread, at most `budget.pool` at once.
 ///
 /// # Errors
-/// [`DoorError`] when the path holds a non-socket or the socket cannot be bound.
+/// [`DoorError::Budget`] when `budget` fails [`Budgets::validate`] as the `door` section (checked
+/// before the path is touched); [`DoorError::Occupied`] when the path holds a non-socket;
+/// [`DoorError::Io`] when the socket cannot be bound.
 pub fn serve(
     socket_path: &Path,
     upstream: Upstream,
     budget: DoorBudget,
 ) -> Result<Door, DoorError> {
+    Budgets {
+        door: budget,
+        ..Budgets::DEFAULT
+    }
+    .validate()?;
     match std::fs::symlink_metadata(socket_path) {
         Ok(m) if m.file_type().is_socket() => std::fs::remove_file(socket_path)?,
         Ok(_) => return Err(DoorError::Occupied(socket_path.to_path_buf())),
@@ -215,16 +194,18 @@ pub fn serve(
     })
 }
 
-/// Connections served at once; the accept loop waits for a free slot.
-const POOL: usize = 8;
-
 /// State shared by every connection thread of one door.
 struct Shared {
     log: Arc<Mutex<Vec<DoorRequest>>>,
     /// Slots reserved for forwarding (against `max_requests`).
-    forwarded: AtomicU32,
+    forwarded: AtomicU64,
     /// Sum of request bodies read in this attempt (against `max_total_bytes`).
     total_bytes: AtomicU64,
+}
+
+/// A contracts byte or count budget (`u64`) as the `usize` the buffers compare against.
+fn as_usize(v: u64) -> usize {
+    usize::try_from(v).unwrap_or(usize::MAX)
 }
 
 fn accept_loop(
@@ -236,19 +217,23 @@ fn accept_loop(
 ) {
     let shared = Arc::new(Shared {
         log,
-        forwarded: AtomicU32::new(0),
+        forwarded: AtomicU64::new(0),
         total_bytes: AtomicU64::new(0),
     });
+    let pool = as_usize(budget.pool);
     let mut live: Vec<thread::JoinHandle<()>> = Vec::new();
-    for conn in listener.incoming() {
+    'accept: for conn in listener.incoming() {
         if stop.load(Ordering::SeqCst) {
             break;
         }
         let Ok(client) = conn else { continue };
         loop {
             live.retain(|h| !h.is_finished());
-            if live.len() < POOL {
+            if live.len() < pool {
                 break;
+            }
+            if stop.load(Ordering::SeqCst) {
+                break 'accept;
             }
             thread::sleep(Duration::from_millis(5));
         }
@@ -333,7 +318,8 @@ fn pull(s: &mut UnixStream, chunk: &mut [u8], deadline: Instant) -> Pull {
 fn read_request(s: &mut UnixStream, budget: DoorBudget) -> Result<Request, Bad> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8192];
-    let header_deadline = Instant::now() + budget.header_deadline;
+    let header_deadline = Instant::now() + budget.header_deadline();
+    let max_header = as_usize(budget.max_header_bytes);
     let mut line_ok = false;
     let end = loop {
         if !line_ok && let Some(i) = buf.windows(2).position(|w| w == b"\r\n") {
@@ -343,9 +329,13 @@ fn read_request(s: &mut UnixStream, budget: DoorBudget) -> Result<Request, Bad> 
             line_ok = true;
         }
         if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            // A block that arrived in one read is measured here, terminator included.
+            if i + 4 > max_header {
+                return Err(bad(431, "header too large", &buf));
+            }
             break i;
         }
-        if buf.len() > MAX_HEADER {
+        if buf.len() > max_header {
             return Err(bad(431, "header too large", &buf));
         }
         match pull(s, &mut chunk, header_deadline) {
@@ -376,10 +366,10 @@ fn read_request(s: &mut UnixStream, budget: DoorBudget) -> Result<Request, Bad> 
                 .map_err(|_| bad(400, "bad content-length", &buf))?;
         }
     }
-    if len > budget.max_body_bytes {
+    if len > as_usize(budget.max_body_bytes) {
         return Err(bad(413, "body over budget", &buf));
     }
-    let body_deadline = Instant::now() + budget.body_deadline;
+    let body_deadline = Instant::now() + budget.body_deadline();
     let mut body = buf[end + 4..].to_vec();
     while body.len() < len {
         match pull(s, &mut chunk, body_deadline) {
@@ -428,7 +418,7 @@ fn handle(
     budget: DoorBudget,
     shared: &Shared,
 ) -> Option<DoorRequest> {
-    let _ = client.set_write_timeout(Some(budget.io_timeout));
+    let _ = client.set_write_timeout(Some(budget.io_timeout()));
     let req = match read_request(&mut client, budget) {
         Ok(r) => r,
         // A connect that sent nothing (the shutdown wake-up): no request, no reply.
@@ -477,11 +467,11 @@ fn handle(
         );
         record(DoorFate::Unreachable, "unreachable")
     };
-    let Ok(mut up) = TcpStream::connect_timeout(&upstream.addr(), budget.io_timeout) else {
+    let Ok(mut up) = TcpStream::connect_timeout(&upstream.addr(), budget.io_timeout()) else {
         return Some(unreachable(&mut client));
     };
-    let _ = up.set_read_timeout(Some(budget.io_timeout));
-    let _ = up.set_write_timeout(Some(budget.io_timeout));
+    let _ = up.set_read_timeout(Some(budget.io_timeout()));
+    let _ = up.set_write_timeout(Some(budget.io_timeout()));
     let mut out = format!("{}\r\n", req.head[0]);
     for h in &req.head[1..] {
         let name = h.split(':').next().unwrap_or("").trim();
@@ -514,6 +504,27 @@ mod tests {
 
     fn sock(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("hee4-door-{}-{name}.sock", std::process::id()))
+    }
+
+    /// A door budget through the K0 door: `door_json` is the `door` section, validated by
+    /// `Budgets::parse` (floors, ceilings, order), never a host-side literal.
+    fn door_budget(door_json: &str) -> Result<DoorBudget, Box<dyn std::error::Error>> {
+        Ok(Budgets::parse(&format!(r#"{{"door":{door_json}}}"#))?.door)
+    }
+
+    /// A 200-byte header block in two writes: the lines without the terminator, then, after
+    /// `gap`, the terminator. The door sees the lines on their own first, so the size check
+    /// runs on them before the end of the block can be found.
+    fn ask_split_header(path: &Path, gap: Duration) -> std::io::Result<String> {
+        let pad = "x".repeat(200 - "GET /api/tags HTTP/1.1\r\nHost: model\r\nX-Pad: \r\n".len());
+        let lines = format!("GET /api/tags HTTP/1.1\r\nHost: model\r\nX-Pad: {pad}\r\n");
+        let mut s = UnixStream::connect(path)?;
+        s.write_all(lines.as_bytes())?;
+        thread::sleep(gap);
+        let _ = s.write_all(b"\r\n");
+        let mut resp = String::new();
+        s.read_to_string(&mut resp)?;
+        Ok(resp)
     }
 
     /// Mock upstream on 127.0.0.1: answers every connection with `body`, and sends each raw
@@ -628,10 +639,117 @@ mod tests {
     }
 
     #[test]
+    fn header_over_budget_in_one_write_answers_431() -> R {
+        let (up, rx) = mock("{}")?;
+        let pad =
+            "x".repeat(200 - "GET /api/tags HTTP/1.1\r\nHost: model\r\nX-Pad: \r\n\r\n".len());
+        let raw = format!("GET /api/tags HTTP/1.1\r\nHost: model\r\nX-Pad: {pad}\r\n\r\n");
+        assert_eq!(raw.len(), 200);
+        let path = sock("431-one");
+        let door = serve(&path, up, door_budget(r#"{"max_header_bytes":64}"#)?)?;
+        let resp = ask(&path, &raw)?;
+        assert!(resp.starts_with("HTTP/1.1 431 "), "{resp}");
+        assert!(resp.contains(r#"{"refused":"header too large"}"#), "{resp}");
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
+        let log = door.close();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].fate, DoorFate::Refused(431));
+        assert_eq!(log[0].reason, "header too large");
+        assert_eq!(log[0].bytes, 200);
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_budget_is_refused_before_bind() -> R {
+        let (up, _rx) = mock("{}")?;
+        let path = sock("pool0");
+        let pool0 = DoorBudget {
+            pool: 0,
+            ..DoorBudget::DEFAULT
+        };
+        let r = serve(&path, up, pool0);
+        assert!(
+            matches!(
+                r,
+                Err(DoorError::Budget(BudgetRefusal::Zero {
+                    field: "door.pool"
+                }))
+            ),
+            "{r:?}"
+        );
+        assert!(std::fs::symlink_metadata(&path).is_err(), "nothing bound");
+        let inverted = DoorBudget {
+            max_body_bytes: 200,
+            max_total_bytes: 100,
+            ..DoorBudget::DEFAULT
+        };
+        assert!(matches!(
+            serve(&path, up, inverted),
+            Err(DoorError::Budget(BudgetRefusal::Order { .. }))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn header_over_budget_answers_431() -> R {
+        let (up, rx) = mock("{}")?;
+        let path = sock("431");
+        let door = serve(&path, up, door_budget(r#"{"max_header_bytes":64}"#)?)?;
+        let resp = ask_split_header(&path, Duration::from_millis(100))?;
+        assert!(resp.starts_with("HTTP/1.1 431 "), "{resp}");
+        assert!(resp.contains(r#"{"refused":"header too large"}"#), "{resp}");
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
+        let log = door.close();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].fate, DoorFate::Refused(431));
+        assert_eq!(log[0].reason, "header too large");
+        assert_eq!(log[0].bytes, 200, "the lines sent before the terminator");
+
+        let path = sock("431-default");
+        let door = serve(&path, up, DoorBudget::DEFAULT)?;
+        let resp = ask_split_header(&path, Duration::from_millis(100))?;
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        let seen = rx.recv_timeout(Duration::from_secs(5))?;
+        assert!(seen.starts_with("GET /api/tags HTTP/1.1\r\n"), "{seen}");
+        let log = door.close();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].fate, DoorFate::Forwarded);
+        Ok(())
+    }
+
+    #[test]
+    fn pool_of_one_waits_for_the_stalled_slot() -> R {
+        let (up, _rx) = mock("{}")?;
+        let path = sock("pool1");
+        let budget = door_budget(r#"{"pool":1,"header_deadline_ms":200}"#)?;
+        let door = serve(&path, up, budget)?;
+        let mut stalled = UnixStream::connect(&path)?;
+        stalled.write_all(b"GET /api/ta")?;
+        let t = Instant::now();
+        let resp = ask(&path, "GET /api/tags HTTP/1.1\r\nHost: model\r\n\r\n")?;
+        let took = t.elapsed();
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        assert!(
+            took >= Duration::from_millis(150),
+            "healthy answered in {took:?}: the stalled slot was not the only one"
+        );
+        assert!(took < Duration::from_secs(5), "healthy took {took:?}");
+        let mut late = String::new();
+        stalled.read_to_string(&mut late)?;
+        assert!(late.starts_with("HTTP/1.1 408 "), "{late}");
+        let log = door.close();
+        assert!(log.iter().any(|r| r.reason == "header timeout"
+            && r.fate == DoorFate::Refused(408)
+            && r.bytes == 11));
+        Ok(())
+    }
+
+    #[test]
     fn cumulative_byte_budget_trips_on_the_nth_request() -> R {
         let (up, _rx) = mock("{}")?;
         let path = sock("cum");
         let budget = DoorBudget {
+            max_body_bytes: 100,
             max_total_bytes: 100,
             ..DoorBudget::DEFAULT
         };

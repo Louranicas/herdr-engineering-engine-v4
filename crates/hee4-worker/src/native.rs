@@ -113,13 +113,22 @@ pub struct Attempt {
 }
 
 impl Attempt {
-    /// An attempt with [`DoorBudget::DEFAULT`].
+    /// An attempt with [`DoorBudget::DEFAULT`]: [`Attempt::with_budget`] with the contracts'
+    /// default door.
     #[must_use]
     pub fn new(model: &str, head_sha: GitSha) -> Self {
+        Self::with_budget(model, head_sha, DoorBudget::DEFAULT)
+    }
+
+    /// An attempt whose model door runs under `door` (a `hee4_contracts::DoorBudget`, handed
+    /// down by the loader). Not checked here: `run` refuses a budget that fails the contracts'
+    /// `door.*` checks through `model_door::serve` (`DoorError::Budget`).
+    #[must_use]
+    pub fn with_budget(model: &str, head_sha: GitSha, door: DoorBudget) -> Self {
         Self {
             model: model.to_owned(),
             head_sha,
-            door_budget: DoorBudget::DEFAULT,
+            door_budget: door,
         }
     }
 
@@ -555,6 +564,65 @@ mod tests {
                 .all(|ob| ob.tool.name.as_str() == "command" && ob.outcome == Outcome::Fail),
             "no request, no door observation; the failed command is a Fail"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn new_is_with_budget_default() -> R {
+        let head: GitSha = "b".repeat(40).parse()?;
+        assert_eq!(
+            Attempt::new("m:1", head.clone()).door_budget,
+            DoorBudget::DEFAULT
+        );
+        let b = hee4_contracts::Budgets::parse(r#"{"door":{"max_requests":1,"pool":2}}"#)?.door;
+        let a = Attempt::with_budget("m:1", head.clone(), b);
+        assert_eq!(a.door_budget, b);
+        assert_eq!((a.model.as_str(), a.head_sha), ("m:1", head));
+        Ok(())
+    }
+
+    /// Sibling of the sandbox test, gated the same way: an attempt built with
+    /// `with_budget(.., max_requests: 1)` whose candidate curls the door twice has its second
+    /// request refused `429` at the door, recorded by name in `model_requests`.
+    #[test]
+    fn sandbox_second_request_is_refused_429_under_with_budget() -> R {
+        if !sandbox_tools() {
+            return Ok(());
+        }
+        let (up, _port, hits) = mock()?;
+        let (permit, plan, brief, a) = fixture("door429", true, &["/usr/bin/sh", "/usr/bin/curl"])?;
+        let one = hee4_contracts::Budgets::parse(r#"{"door":{"max_requests":1}}"#)?.door;
+        let a = Attempt::with_budget(&a.model, a.head_sha.clone(), one);
+        let twice = run_step(
+            "twice",
+            "/usr/bin/sh",
+            &[
+                "-c",
+                r#"/usr/bin/curl -sS -m 5 --unix-socket "$HEE4_MODEL_SOCKET" http://model/api/tags; /usr/bin/curl -sS -m 5 --unix-socket "$HEE4_MODEL_SOCKET" http://model/api/tags"#,
+            ],
+        );
+        let o = a.run(&permit, &plan, up, &brief, &[twice])?;
+        println!(
+            "SANDBOX 429: two curls through the door under max_requests=1 -> {:?} stdout={}",
+            o.steps[0].status,
+            String::from_utf8_lossy(&o.stdout)
+        );
+        assert_eq!(o.steps[0].status, StepStatus::Done { exit: Some(0) });
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "only the first request reached the mock"
+        );
+        let fates: Vec<DoorFate> = o.model_requests.iter().map(|r| r.fate).collect();
+        assert_eq!(fates, vec![DoorFate::Forwarded, DoorFate::Refused(429)]);
+        assert_eq!(o.model_requests[1].reason, "door request budget exhausted");
+        let doors: Vec<_> = o
+            .observations
+            .iter()
+            .filter(|ob| ob.tool.name.as_str() == "model-door")
+            .collect();
+        assert_eq!(doors.len(), 1);
+        assert_eq!(doors[0].outcome, Outcome::Error);
         Ok(())
     }
 
