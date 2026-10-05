@@ -6,10 +6,8 @@ import subprocess
 import time
 import uuid
 
-from drive_d import PHASES, TERMINAL, is_result
+from drive_d import BRIEF, PHASES, TERMINAL, VACUOUS_VERIFY_BRIEF, is_result
 
-BRIEF = ("GOAL: drive\nSCOPE: s\nCONTEXT: c\nACCEPTANCE: a\nVERIFY: /usr/bin/true\nTIMEBOX: 10s\n"
-         "FORBIDDEN: f\nREPORT: r\nSTANDING: s\nRECON: r\nRESTATEMENT: run true\n")
 
 
 def sh(*cmd, timeout=30):
@@ -48,12 +46,20 @@ def d_submit(F, ctx):
         ctx["task"] = b["task_id"]
     rr = F.req("task.submit", {"brief": BRIEF}, key=k)
     F.check("replay", is_result(rr) and rr.get("replayed") is True and (rr.get("body") or {}).get("task_id") == b.get("task_id"), f"{rr}")
-    F.refuse("conflict", F.req("task.submit", {"brief": BRIEF.replace("run true", "other")}, key=k), "conflict", "/idempotency_key")
+    F.refuse("conflict", F.req("task.submit", {"brief": BRIEF.replace("GOAL: drive", "GOAL: other")}, key=k), "conflict", "/idempotency_key")
     F.refuse("empty_brief", F.req("task.submit", {"brief": ""}, key=str(uuid.uuid4())), "invalid_argument", "/body/brief", "GOAL")
-    F.refuse("missing_restatement", F.req("task.submit", {"brief": BRIEF.replace("RESTATEMENT: run true\n", "")}, key=str(uuid.uuid4())),
+    restatement = BRIEF[BRIEF.index("RESTATEMENT:"):]
+    F.refuse("missing_restatement", F.req("task.submit", {"brief": BRIEF.replace(restatement, "")}, key=str(uuid.uuid4())),
              "invalid_argument", "/body/brief", "RESTATEMENT")
-    F.refuse("empty_restatement", F.req("task.submit", {"brief": BRIEF.replace("RESTATEMENT: run true", "RESTATEMENT:")}, key=str(uuid.uuid4())),
+    F.refuse("empty_restatement", F.req("task.submit", {"brief": BRIEF.replace(restatement, "RESTATEMENT:\n")}, key=str(uuid.uuid4())),
              "invalid_argument", "/body/brief")
+    # The V4-94 door, driven: a no-op VERIFY is refused at admission (Refusal::VacuousVerify), no row.
+    before = F.req("task.list", {})
+    F.refuse("vacuous_verify", F.req("task.submit", {"brief": VACUOUS_VERIFY_BRIEF}, key=str(uuid.uuid4())), "invalid_argument",
+             "/body/brief", "VERIFY is vacuous")
+    after = F.req("task.list", {})
+    n0, n1 = (len(((x or {}).get("body") or {}).get("tasks", [])) if is_result(x) else None for x in (before, after))
+    F.check("vacuous_verify_admits_nothing", n0 is not None and n0 == n1, f"task.list rows before={n0} after={n1}")
     F.refuse("missing_key", F.req("task.submit", {"brief": BRIEF}), "invalid_argument", "/idempotency_key")
 
 

@@ -18,6 +18,13 @@ TERMINAL = {"accepted", "failed", "cancelled", "abandoned"}
 # The eleven phases of hee4-contracts FLOW.md: a row in `blocked` or `effect_unknown` is a known phase, not a typing failure.
 PHASES = TERMINAL | {"admitted", "running", "verifying", "cancellation_requested", "repair_pending", "blocked", "effect_unknown"}
 NO_LEDGER_REASON = "--ledger not passed"
+# The one brief the drive submits. Its VERIFY looks at something (the work dir, the sandbox's
+# --chdir, is writable) so admission's Brief::check_verify (V4-94) admits it; it is an absolute
+# path, not `sh:`, so the dispatcher needs no model. VACUOUS_VERIFY_BRIEF is the same brief with
+# a no-op VERIFY: the door must refuse it (invalid_argument at /body/brief, message "VERIFY is vacuous").
+BRIEF = ("GOAL: drive\nSCOPE: s\nCONTEXT: c\nACCEPTANCE: a\nVERIFY: /usr/bin/test -w .\nTIMEBOX: 10s\n"
+         "FORBIDDEN: f\nREPORT: r\nSTANDING: s\nRECON: r\nRESTATEMENT: check the work dir is writable\n")
+VACUOUS_VERIFY_BRIEF = BRIEF.replace("VERIFY: /usr/bin/test -w .", "VERIFY: /usr/bin/true")
 
 
 class PluginFault(Exception):

@@ -18,14 +18,12 @@ import os
 import time
 import uuid
 
-from drive_d import NO_LEDGER_REASON, TERMINAL, is_result, ledger_ro
+from drive_d import BRIEF, NO_LEDGER_REASON, TERMINAL, is_result, ledger_ro
 
 DEPLOY_ACTION = "deploy.install"
 RECORD_ID = "model:drive-" + uuid.uuid4().hex[:8]
 DEFINITION = {"kind": "model", "caps": {"ctx_tokens": 4096, "json_mode": True, "tool_use": False, "local": True},
               "cost_milli": 0, "latency_ms": 0, "quality": 1, "capability": None, "locality": "local"}
-BRIEF = ("GOAL: drive\nSCOPE: s\nCONTEXT: c\nACCEPTANCE: a\nVERIFY: /usr/bin/true\nTIMEBOX: 10s\n"
-         "FORBIDDEN: f\nREPORT: r\nSTANDING: s\nRECON: r\nRESTATEMENT: run true\n")
 
 
 LIVE_REASON = "mutating roster paths run only against a disposable serve (socket is the live unit's)"
