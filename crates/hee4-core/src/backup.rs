@@ -104,6 +104,15 @@ pub enum BackupError {
         /// The manifest-relative path.
         file: String,
     },
+    /// A file the restore would read from the backup dir is not a regular file of that dir: a
+    /// symlink (to anywhere), a directory or a device, or the file changed identity between
+    /// its check and its open. Refused before anything outside the backup dir is read.
+    #[error("{file} in the backup is not a regular file")]
+    NotRegular {
+        /// The backup-relative path (`manifest.json`, `ledger.sqlite3`, `objects`,
+        /// `objects/<name>.brief`).
+        file: String,
+    },
     /// The objects dir is short of the manifest.
     #[error("objects dir holds {n} of the manifest's {total} objects")]
     ObjectsMissing {
@@ -205,6 +214,68 @@ fn sha256_of(path: &Path) -> Result<String, BackupError> {
 fn copy(from: &Path, to: &Path) -> Result<(), BackupError> {
     std::fs::copy(from, to).map_err(|e| io_at(to, e))?;
     Ok(())
+}
+
+/// Open `<backup_dir>/<rel>` only if it is a regular file of its own: `symlink_metadata`
+/// must say regular (a symlink is refused, never followed), and the opened file's
+/// `(dev, ino)` must equal that `lstat`'s, so a swap between the check and the open is
+/// refused too. `None` when nothing is there.
+fn open_regular(backup_dir: &Path, rel: &str) -> Result<Option<std::fs::File>, BackupError> {
+    let path = backup_dir.join(rel);
+    let not_regular = || BackupError::NotRegular {
+        file: rel.to_owned(),
+    };
+    let checked = match std::fs::symlink_metadata(&path) {
+        Ok(meta) if meta.file_type().is_file() => meta,
+        Ok(_) => return Err(not_regular()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(io_at(&path, e)),
+    };
+    let file = std::fs::File::open(&path).map_err(|e| io_at(&path, e))?;
+    let opened = file.metadata().map_err(|e| io_at(&path, e))?;
+    if !opened.file_type().is_file()
+        || (opened.dev(), opened.ino()) != (checked.dev(), checked.ino())
+    {
+        return Err(not_regular());
+    }
+    Ok(Some(file))
+}
+
+/// The checked descriptor of `<backup_dir>/<rel>` and its bytes; `NotFound` as `Io` when it
+/// is gone.
+fn read_regular(backup_dir: &Path, rel: &str) -> Result<(std::fs::File, Vec<u8>), BackupError> {
+    let path = backup_dir.join(rel);
+    let mut file = open_regular(backup_dir, rel)?
+        .ok_or_else(|| io_at(&path, std::io::Error::from(std::io::ErrorKind::NotFound)))?;
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut bytes).map_err(|e| io_at(&path, e))?;
+    Ok((file, bytes))
+}
+
+/// Copy `<backup_dir>/<rel>` to `to` from the descriptor [`open_regular`] checked, keeping the
+/// source's permission bits as `fs::copy` would.
+fn copy_regular(backup_dir: &Path, rel: &str, to: &Path) -> Result<(), BackupError> {
+    let (file, bytes) = read_regular(backup_dir, rel)?;
+    let mode = file
+        .metadata()
+        .map_err(|e| io_at(&backup_dir.join(rel), e))?
+        .permissions();
+    std::fs::write(to, bytes).map_err(|e| io_at(to, e))?;
+    std::fs::set_permissions(to, mode).map_err(|e| io_at(to, e))
+}
+
+/// A backup id this writer produces (`b-{ts_ms:012x}-{boot:08x}`): `b-`, at least 12 lowercase
+/// hex digits, `-`, at least 8 lowercase hex digits. Nothing else can name a path component.
+fn is_backup_id(id: &str) -> bool {
+    let hex = |part: &str, min: usize| {
+        part.len() >= min
+            && part
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    };
+    id.strip_prefix(BACKUP_PREFIX)
+        .and_then(|rest| rest.split_once('-'))
+        .is_some_and(|(ts, boot)| hex(ts, 12) && hex(boot, 8))
 }
 
 /// Every `*.brief` under `<work>/briefs`, by file name; none when the dir is absent.
@@ -454,24 +525,27 @@ fn field<'a>(manifest: &'a Value, name: &'static str) -> Result<&'a Value, Backu
 ///
 /// # Errors
 /// [`BackupError::Manifest`] (`files`) for a key other than `ledger.sqlite3` or
-/// `objects/<name>.brief`, before any file is read;
+/// `objects/<name>.brief`, and (`id`) for an id not of the writer's `b-<hex12>-<hex8>` shape,
+/// both before any backup file other than the manifest is read;
+/// [`BackupError::NotRegular`] when the manifest, the ledger, `objects/` or an object is a
+/// symlink or not a regular file (nothing is followed out of the backup dir);
 /// [`BackupError::Incomplete`] (no manifest, or no ledger), [`BackupError::TargetOccupied`],
 /// [`BackupError::ObjectsMissing`], [`BackupError::DigestMismatch`]; [`BackupError::Store`]
 /// when the staged ledger cannot be opened or reconciled (a snapshot newer than this binary
 /// answers `UnknownMigration`); IO errors.
 pub fn restore(backup_dir: &Path, into: &Path) -> Result<RestoreReport, BackupError> {
     let started = Instant::now();
-    let manifest_path = backup_dir.join(MANIFEST_FILE);
-    if !manifest_path.is_file() {
-        return Err(BackupError::Incomplete {
-            dir: backup_dir.to_path_buf(),
-        });
+    let incomplete = || BackupError::Incomplete {
+        dir: backup_dir.to_path_buf(),
+    };
+    if open_regular(backup_dir, MANIFEST_FILE)?.is_none() {
+        return Err(incomplete());
     }
-    let manifest: Value = serde_json::from_slice(
-        &std::fs::read(&manifest_path).map_err(|e| io_at(&manifest_path, e))?,
-    )?;
+    let manifest: Value = serde_json::from_slice(&read_regular(backup_dir, MANIFEST_FILE)?.1)?;
+    // The id names the staging dir under `into`; only the writer's own shape is joined.
     let backup_id = field(&manifest, "id")?
         .as_str()
+        .filter(|id| is_backup_id(id))
         .ok_or(BackupError::Manifest { field: "id" })?
         .to_owned();
     let old_epoch = field(&manifest, "epoch")?
@@ -498,17 +572,26 @@ pub fn restore(backup_dir: &Path, into: &Path) -> Result<RestoreReport, BackupEr
             path: target_ledger,
         });
     }
-    if !backup_dir.join(LEDGER_FILE).is_file() {
-        return Err(BackupError::Incomplete {
-            dir: backup_dir.to_path_buf(),
-        });
+    if open_regular(backup_dir, LEDGER_FILE)?.is_none() {
+        return Err(incomplete());
     }
     let objects: Vec<&String> = files.keys().filter(|k| *k != LEDGER_FILE).collect();
     let objects_total = objects.len();
-    let present = objects
-        .iter()
-        .filter(|rel| backup_dir.join(rel).is_file())
-        .count();
+    // `objects/` itself must be a real dir: a symlinked one would lead every object outside.
+    if objects_total > 0
+        && !std::fs::symlink_metadata(backup_dir.join(OBJECTS_DIR))
+            .is_ok_and(|m| m.file_type().is_dir())
+    {
+        return Err(BackupError::NotRegular {
+            file: OBJECTS_DIR.to_owned(),
+        });
+    }
+    let mut present = 0_usize;
+    for rel in &objects {
+        if open_regular(backup_dir, rel)?.is_some() {
+            present += 1;
+        }
+    }
     if present != objects_total {
         return Err(BackupError::ObjectsMissing {
             n: present,
@@ -519,7 +602,7 @@ pub fn restore(backup_dir: &Path, into: &Path) -> Result<RestoreReport, BackupEr
         let expected = expected
             .as_str()
             .ok_or(BackupError::Manifest { field: "files" })?;
-        if sha256_of(&backup_dir.join(rel))? != expected {
+        if Sha256Hex::digest(&read_regular(backup_dir, rel)?.1).to_string() != expected {
             return Err(BackupError::DigestMismatch { file: rel.clone() });
         }
     }
@@ -562,11 +645,14 @@ fn stage(
 ) -> Result<(bool, usize), BackupError> {
     let briefs_dir = staging.join("work").join(BRIEFS_DIR);
     std::fs::create_dir_all(&briefs_dir).map_err(|e| io_at(&briefs_dir, e))?;
-    copy(&backup_dir.join(LEDGER_FILE), &staging.join(LEDGER_FILE))?;
+    copy_regular(backup_dir, LEDGER_FILE, &staging.join(LEDGER_FILE))?;
     let mut staged = 0_usize;
     for rel in objects {
-        let src = backup_dir.join(rel);
-        copy(&src, &briefs_dir.join(file_name(&src)?))?;
+        copy_regular(
+            backup_dir,
+            rel,
+            &briefs_dir.join(file_name(Path::new(rel))?),
+        )?;
         staged += 1;
     }
     let store = Store::open(&staging.join(LEDGER_FILE))?;

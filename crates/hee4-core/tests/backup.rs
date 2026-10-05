@@ -457,6 +457,103 @@ fn restore_objects_n_counts_the_staged_briefs() -> R {
     Ok(())
 }
 
+/// A copy of a good backup with two briefs, made in `<base>/tampered`.
+fn tampered_copy(base: &Path) -> Result<PathBuf, Box<dyn Error>> {
+    let (ledger, work) = seed(base, 2)?;
+    let store = Store::open(&ledger)?;
+    store.apply(&"t-000".parse()?, Event::Admit)?;
+    let backup = backup_to(&store, &work, &base.join("backups"), SameDisk::Allow)?;
+    let tampered = base.join("tampered");
+    copy_tree(&backup.dir, &tampered)?;
+    Ok(tampered)
+}
+
+/// Replace `<dir>/<rel>` by a symlink to a file outside the backup with the same bytes (so
+/// its sha matches the manifest), then make that outside file unreadable: a restore that
+/// followed the link would answer `Io` or stage it.
+fn symlink_out(dir: &Path, rel: &str, outside: &Path) -> R {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::copy(dir.join(rel), outside)?;
+    std::fs::remove_file(dir.join(rel))?;
+    std::os::unix::fs::symlink(outside, dir.join(rel))?;
+    std::fs::set_permissions(outside, std::fs::Permissions::from_mode(0o000))?;
+    Ok(())
+}
+
+/// A symlinked object, a symlinked ledger and a symlinked `objects/` dir are each refused as
+/// `NotRegular` naming the file; nothing is read through the link or staged.
+#[test]
+fn restore_refuses_a_symlinked_object() -> R {
+    for (case, rel) in [
+        ("object", "objects/t-000.brief"),
+        ("ledger", "ledger.sqlite3"),
+    ] {
+        let base = scratch(&format!("symlinked-{case}"))?;
+        let tampered = tampered_copy(&base)?;
+        symlink_out(&tampered, rel, &base.join("outside"))?;
+        let into = base.join("into");
+        let err = restore(&tampered, &into);
+        assert!(
+            matches!(&err, Err(BackupError::NotRegular { file }) if file == rel),
+            "{case}: {err:?}"
+        );
+        nothing_staged(&into)?;
+    }
+    let base = scratch("symlinked-objects-dir")?;
+    let tampered = tampered_copy(&base)?;
+    let outside = base.join("outside-objects");
+    std::fs::rename(tampered.join("objects"), &outside)?;
+    std::os::unix::fs::symlink(&outside, tampered.join("objects"))?;
+    let into = base.join("into");
+    let err = restore(&tampered, &into);
+    assert!(
+        matches!(&err, Err(BackupError::NotRegular { file }) if file == "objects"),
+        "{err:?}"
+    );
+    nothing_staged(&into)
+}
+
+/// A manifest `id` is joined into the staging path, so one not of the writer's shape is
+/// refused before anything is joined: an id that climbs out of `into` leaves a pre-existing
+/// directory there (the one a failed restore would `remove_dir_all`) untouched.
+#[test]
+fn restore_refuses_a_traversing_id() -> R {
+    let base = scratch("traversing-id")?;
+    let tampered = tampered_copy(&base)?;
+    let into = base.join("into");
+    // `<into>/.restore-/../../victim.tmp` resolves to `<base>/victim.tmp` once `.restore-`
+    // exists.
+    std::fs::create_dir_all(into.join(".restore-"))?;
+    let victim = base.join("victim.tmp");
+    std::fs::create_dir_all(&victim)?;
+    std::fs::write(victim.join("precious.txt"), b"keep me\n")?;
+    for id in [
+        "/../../victim",
+        "b-000000000000-00000000/../../../victim",
+        "b-../../victim",
+        "b-0000000000AB-00000000",
+        "",
+    ] {
+        let mut m = manifest(&tampered)?;
+        m["id"] = Value::from(id);
+        std::fs::write(
+            tampered.join("manifest.json"),
+            serde_json::to_vec_pretty(&m)?,
+        )?;
+        let err = restore(&tampered, &into);
+        assert!(
+            matches!(&err, Err(BackupError::Manifest { field: "id" })),
+            "{id:?}: {err:?}"
+        );
+        assert_eq!(std::fs::read(victim.join("precious.txt"))?, b"keep me\n");
+        assert!(
+            !into.join("ledger.sqlite3").exists(),
+            "{id:?} staged a ledger"
+        );
+    }
+    Ok(())
+}
+
 /// A complete backup as far as retention can tell: a `b-*` dir whose manifest names it.
 fn plant_backup(root: &Path, id: &str, ts_ms: i64) -> R {
     let dir = root.join(id);
