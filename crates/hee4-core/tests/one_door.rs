@@ -1,12 +1,19 @@
-//! Rung-2 door: no SQL calls outside `src/store/` (FLOW.md). A type cannot stop a module
-//! from holding a `rusqlite::Connection` it was handed, so this is a census of the source.
-//! The walk is recursive over `src/**`; the match is a token census (no regex): an identifier
-//! from `CALLS`, not preceded by an identifier character, followed by optional spaces and `(`.
+//! Rung-2 door: no SQL outside `src/store/` (FLOW.md). A type cannot stop a module from
+//! holding a `rusqlite::Connection` it was handed, so this is a census of the source. The walk
+//! is recursive over `src/**`; the match is a token census (no regex), two families:
+//!
+//! - `IDENTS`: the crate name `rusqlite` as a whole identifier, anywhere (a `use`, a path, a
+//!   type, a comment). A module cannot call a `Connection` method without naming the crate
+//!   somewhere, so this closes the method family (`prepare_cached`, `query`, `query_one`,
+//!   `raw_execute`, ...) instead of chasing names.
+//! - `CALLS`: an identifier followed by optional spaces and `(`: the seven SQL verbs (so a
+//!   planted `conn.execute(` is named by its verb) and `operate`, the one crate-private door
+//!   that hands a `Transaction` to a closure: a closure needs no `rusqlite` token.
 
 use std::error::Error;
 use std::path::{Path, PathBuf};
 
-const CALLS: [&str; 7] = [
+const CALLS: [&str; 8] = [
     "execute",
     "execute_batch",
     "prepare",
@@ -14,7 +21,10 @@ const CALLS: [&str; 7] = [
     "query_map",
     "pragma_update",
     "pragma",
+    "operate",
 ];
+
+const IDENTS: [&str; 1] = ["rusqlite"];
 
 fn is_ident(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
@@ -38,6 +48,22 @@ fn hits(text: &str) -> Vec<&'static str> {
                 found.push(call);
                 break;
             }
+        }
+    }
+    for ident in IDENTS {
+        let mut from = 0;
+        while let Some(at) = text[from..].find(ident) {
+            let start = from + at;
+            let end = start + ident.len();
+            from = end;
+            if start > 0 && is_ident(bytes[start - 1]) {
+                continue;
+            }
+            if bytes.get(end).is_some_and(|b| is_ident(*b)) {
+                continue;
+            }
+            found.push(ident);
+            break;
         }
     }
     found
@@ -119,11 +145,35 @@ fn the_census_catches_planted_calls() {
     assert_eq!(hits("conn.query_row (\"x\", [], f)"), ["query_row"]);
     assert_eq!(hits("c.pragma_update(None, \"a\", 1)"), ["pragma_update"]);
     assert_eq!(hits("c.pragma  (x)"), ["pragma"]);
+    assert_eq!(hits("store.operate(&key, bytes, |tx| f(tx))"), ["operate"]);
     assert_eq!(
         hits("store.apply(&task, Event::Accept)"),
         Vec::<&str>::new()
     );
     assert_eq!(hits("fn my_execute(x: u8)"), Vec::<&str>::new());
+}
+
+/// The identifier census: `rusqlite` is named wherever it appears as a whole token, so the
+/// `Connection` methods `CALLS` does not list are caught by the crate name they need.
+#[test]
+fn the_census_catches_the_crate_name_and_the_methods_calls_does_not_list() {
+    assert_eq!(
+        hits(
+            r#"let mut st = conn.prepare_cached("UPDATE tasks SET phase = 'x'")?; st.query([])?;"#
+        ),
+        Vec::<&str>::new(),
+        "a method outside CALLS alone is not a verb hit (that is the gap the crate name closes)"
+    );
+    assert_eq!(
+        hits("fn f(conn: &rusqlite::Connection) { conn.prepare_cached(\"x\")?.query([]) }"),
+        ["rusqlite"]
+    );
+    assert_eq!(hits("use rusqlite;"), ["rusqlite"]);
+    assert_eq!(hits("// a rusqlite comment"), ["rusqlite"]);
+    assert_eq!(hits("rusqlite"), ["rusqlite"]);
+    assert_eq!(hits("fn my_rusqlite() {}"), Vec::<&str>::new());
+    assert_eq!(hits("let rusqlite2 = 1;"), Vec::<&str>::new());
+    assert_eq!(hits("conn.query_one(\"x\", [], f)"), Vec::<&str>::new());
 }
 
 fn copy_tree(from: &Path, to: &Path) -> Result<(), Box<dyn Error>> {
@@ -141,8 +191,9 @@ fn copy_tree(from: &Path, to: &Path) -> Result<(), Box<dyn Error>> {
 }
 
 /// The walk, not only the matcher: a copy of `src` with one `conn.execute(` planted in
-/// `recovery.rs` and one in `backup.rs` names both as offenders, while `store/mod.rs` (which
-/// holds the real calls) stays exempt.
+/// `recovery.rs` and one `conn.prepare_cached(..)` + `st.query(..)` (no `CALLS` verb) in
+/// `backup.rs` names both as offenders, while `store/mod.rs` (which holds the real calls)
+/// stays exempt.
 #[test]
 fn the_walk_names_planted_offenders_and_exempts_the_store_dir() -> Result<(), Box<dyn Error>> {
     let src = Path::new(&manifest_dir()?).join("src");
@@ -151,16 +202,41 @@ fn the_walk_names_planted_offenders_and_exempts_the_store_dir() -> Result<(), Bo
         std::fs::remove_dir_all(&planted)?;
     }
     copy_tree(&src, &planted)?;
-    for file in ["recovery.rs", "backup.rs"] {
+    let plants = [
+        (
+            "recovery.rs",
+            "\nfn planted(conn: &rusqlite::Connection) { conn.execute(\"x\", []); }\n",
+        ),
+        (
+            "backup.rs",
+            "\nfn planted(conn: &rusqlite::Connection) -> rusqlite::Result<()> {\n    \
+             let mut st = conn.prepare_cached(\"UPDATE tasks SET phase = 'accepted'\")?;\n    \
+             let _rows = st.query([])?;\n    Ok(())\n}\n",
+        ),
+    ];
+    for (file, plant) in plants {
         let path = planted.join(file);
         let mut text = std::fs::read_to_string(&path)?;
-        text.push_str("\nfn planted(conn: &rusqlite::Connection) { conn.execute(\"x\", []); }\n");
+        text.push_str(plant);
         std::fs::write(&path, text)?;
     }
     let c = census(&planted)?;
     let mut names: Vec<&str> = c.offenders.iter().map(|(p, _)| p.as_str()).collect();
     names.sort_unstable();
     assert_eq!(names, ["backup.rs", "recovery.rs"], "{:?}", c.offenders);
+    let calls = |file: &str| -> Vec<&'static str> {
+        c.offenders
+            .iter()
+            .find(|(p, _)| p == file)
+            .map(|(_, calls)| calls.clone())
+            .unwrap_or_default()
+    };
+    assert_eq!(
+        calls("backup.rs"),
+        ["rusqlite"],
+        "the prepare_cached/query plant is named by the crate name alone"
+    );
+    assert_eq!(calls("recovery.rs"), ["execute", "rusqlite"]);
     assert!(
         c.door_files.contains(&"store/mod.rs".to_owned()),
         "{:?}",
