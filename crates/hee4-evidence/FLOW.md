@@ -98,6 +98,11 @@ or exit code alone (AP-29).
 
 - `ObservationId` is a content address (`obs-` + SHA-256 of canonical JSON) because I3 carries
   no id; if the ledger (K1) assigns ids, `decide_and_seal` must take them instead.
+- A Pass whose only tier-0 observations are `command` rows with an empty-stdout digest is a
+  Pass. `decide` branches on no tool name or evidence label (they are K2's vocabulary); silence
+  is the success output of `test`, `grep -q`, `cmp -s`. The vacuity door is at admission (K0
+  `Brief::check_verify`, app `task.submit`/`task.preview`); a real command that proves nothing
+  is the named gap. `tests/lattice.rs::silent_command_pass_stays_pass` pins it.
 - `ddf::for_task` has no caller until the dispatcher's settle (W4 `dispatcher-backups-ddf`);
   today the binary runs only as the gate's `ddf` step (gate.toml `[step.ddf]`).
 - Whether W4 records an exit-7 `Observed(Refused{reason})` for a non-empty diff (and so fails

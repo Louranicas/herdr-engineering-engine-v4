@@ -231,3 +231,41 @@ fn exhaustive_laws_over_triples() {
     }
     assert_eq!(cases, 13_824);
 }
+
+/// Deliberate non-door: `decide` branches on no tool name or evidence label (K2's vocabulary);
+/// silence is the success output of `test` / `grep -q` / `cmp -s`; the vacuity door is
+/// `hee4_contracts::Brief::check_verify` at admission. A K2 `command` row with an empty-stdout
+/// digest is a Pass; the same row with no evidence at all is `Refused(Invalid)`.
+#[test]
+fn silent_command_pass_stays_pass() {
+    let silent = Observation {
+        source: "hee4-worker-native".parse().unwrap(),
+        input_sha256: subject().input_sha256,
+        tool: ToolId {
+            name: "command".parse().unwrap(),
+            version: "bwrap".parse().unwrap(),
+        },
+        head_sha: HEAD.parse().unwrap(),
+        outcome: Outcome::Pass,
+        evidence: vec![
+            Evidence {
+                label: "exit".parse().unwrap(),
+                sha256: Sha256Hex::digest(b"0"),
+            },
+            Evidence {
+                label: "stdout".parse().unwrap(),
+                sha256: Sha256Hex::digest(b""),
+            },
+        ],
+        advisory: false,
+        elapsed_ms: 1,
+        budget_ms: 10,
+    };
+    assert_eq!(
+        v(&all_wired(), std::slice::from_ref(&silent)),
+        Verdict::Pass
+    );
+    let mut empty = silent;
+    empty.evidence.clear();
+    assert_eq!(v(&all_wired(), &[empty]), R(Reason::Invalid));
+}
