@@ -121,8 +121,7 @@ dispatcher-backups-ddf); no trigger policy lives here.
 | running with no open attempt; unreadable row; cache mismatch | any | R14 | — | finding |
 | admitted, blocked, cancellation_requested with no attempt | any | none | — | unchanged |
 
-R03 (both closing records) and R09 (workspace) need facts this ledger does not hold (no
-attempts table); they never fire here. R13 (cursor) has its inputs here now: `epoch`,
+R03 (contradiction between an `attempts` row and the events), R09 (workspace + lease) and R13 (cursor, `recovery::cursor`) fire over the attempts ledger: schema, hook and the reconcile rows are the module doc of `src/store/attempts.rs` (migration `m005_attempts`) and of `src/recovery.rs`; `src/probe.rs` is the only IO. R13 (cursor) has its inputs here now: `epoch`,
 `event_high_water` and `restored_from`, read by `Store::cursor_check` (`PriorEpochOfRestore` →
 `EpochChanged` → `FutureSequence` → `SnapshotOnly`, never a replay authorization); it fires in
 the wave-2 attempts slice's `decide`, and `events.subscribe` answers `resync_required` from it.
