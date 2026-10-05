@@ -439,12 +439,35 @@ mod tests {
         Ok(Upstream::parse("http://127.0.0.1:9")?)
     }
 
+    /// Remove `hee4-nat-<pid>-*` roots left by test processes that have exited. A root is named
+    /// by its process so concurrent test binaries never share one; a dead pid's roots are litter
+    /// (thousands of them once filled the /tmp tmpfs's inodes).
+    fn sweep_dead_fixture_roots() {
+        let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let name = e.file_name();
+            let Some(rest) = name.to_str().and_then(|n| n.strip_prefix("hee4-nat-")) else {
+                continue;
+            };
+            let Some(pid) = rest.split('-').next().and_then(|p| p.parse::<u32>().ok()) else {
+                continue;
+            };
+            if pid != std::process::id() && !std::path::Path::new(&format!("/proc/{pid}")).exists()
+            {
+                let _ = std::fs::remove_dir_all(e.path());
+            }
+        }
+    }
+
     /// A fresh work root per test (`name`), so concurrent tests never share a door path.
     fn fixture(
         name: &str,
         needs_model: bool,
         programs: &[&str],
     ) -> Result<(Permit, NamespacePlan, Brief, Attempt), Box<dyn std::error::Error>> {
+        sweep_dead_fixture_roots();
         let root = std::env::temp_dir().join(format!("hee4-nat-{}-{name}", std::process::id()));
         std::fs::create_dir_all(&root)?;
         let permit = Permit::mint(

@@ -1,5 +1,12 @@
-import os, subprocess, tempfile, textwrap
+import atexit, os, shutil, subprocess, tempfile, textwrap
 TOOLS = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# Every tempfile.mkdtemp() without an explicit dir= lands in one directory per test run, removed
+# at exit. Before this, fixtures (throwaway git repos, fake worlds) were never removed: 12,893 of
+# them filled the /tmp tmpfs's inodes (2026-10-05, V4-103).
+RUN_TMP = tempfile.mkdtemp(prefix="hee4-tools-tests-")
+tempfile.tempdir = RUN_TMP
+atexit.register(shutil.rmtree, RUN_TMP, True)
 
 def run(*cmd, env=None, cwd=None, timeout=60):
     e = dict(os.environ); e.update(env or {})
