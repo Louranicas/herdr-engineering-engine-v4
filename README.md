@@ -20,7 +20,7 @@ Every claim here is labelled. MEASURED means a command ran on this machine and i
 | First live Pass | one task through the deployed unit: `admitted -> accepted` in 0.2 s, receipt `71a15c2b…`, `command` and `model-door` observations, one `model_request` row | `plan/DECISIONS.md` V4-94 |
 | Tags | `skeleton-deployed-2026-10-05`, `hardened-deployed-2026-10-05`, `live-model-deployed-2026-10-05` | `git tag -n` |
 
-The engine has run a real model attempt: a `sh:` VERIFY step inside the sandbox curled the model door, the door forwarded one request to ollama on loopback, and `decide` sealed `Pass` over two observations bound to the brief's VERIFY digest. Before the model existed, the same path ended in a refusal, not a Pass; that refusal is the design, and the Pass is the same code with a model behind the door. This is still not the ATLAS D10 version cut: that tag has its own field list (`tools/check-deployed` over D1–D9, a cold clone, `push-scan`, `apparatus_ratio=`) and none of those tools exist yet.
+The engine has run a real model attempt: a `sh:` VERIFY step inside the sandbox curled the model door, the door forwarded one request to ollama on loopback, and `decide` sealed `Pass` over two observations bound to the brief's VERIFY digest. Before the model existed, the same path ended in a refusal, not a Pass; that refusal is the design, and the Pass is the same code with a model behind the door. This is still not the ATLAS D10 version cut: that tag has its own field list (`tools/check-deployed` over D1–D9, a cold clone, `push-scan`, `apparatus_ratio=`), composed by `just cut-check` only from the lines those tools print in one run, and laid by `just tag NAME confirm`; no such tag exists yet.
 
 ## The one rule
 
@@ -89,6 +89,8 @@ cargo test --workspace
 just gate commit        # fmt, clippy -D warnings, test, on a git archive of HEAD, never the live tree
 just gate stack         # commit + a sealed deep-diff-forge observation (--require-files --require-hunks) + doc
 just gate cut           # stack + drill + drive + doctor
+just cut-check          # refuses unless the installed binary's head = HEAD; then mirror, gate cut, check-deployed (control first), cold-clone, push-scan, layers, watch -> one verdict and $HEE4_CUT_ROOT/<sha12>/cut-check.json
+just tag NAME confirm   # an annotated tag at HEAD from HEAD's PASS cut-check record, laid locally and read back; never pushed
 ```
 
 `tools/gate` exports the subject at a sha, sets `HEE4_HEAD` for `build.rs`, builds in a per-subject target dir, and prints `step=<name> rc=<n> elapsed=<s>/<budget>s margin=<s>` per step and one verdict line. A step whose expected output is absent (zero tests collected) is marked `looked_at_nothing` and fails. Tiers and budgets live in `gate.toml` only.
@@ -133,6 +135,8 @@ The craft layer is Lauren Tan's pstack and brainmaxxing, ported under `.claude/s
 bash .claude/hooks/context-doctor.sh   # can a fresh agent reach every home and tool? present|MISSING per row
 just verify                            # every corpus check, one verdict line
 hee4db highway <module>                # everything about one module in one call
+just watch                             # the roster watchers' deterministic detectors (tools/watch): no spend, no fix, writes nothing
+just prune [apply]                     # build-cache prune (tools/prune): dry run lists candidates; `apply` removes exactly those
 ```
 
 ## Doors that fired on the builders
@@ -149,7 +153,7 @@ Recorded because each is now an instance a future door must fail on:
 
 ## Not yet
 
-- The D10 version cut as the ATLAS defines it: `tools/check-deployed` (D1–D9 aggregate and its `--control`), the cold clone, `push-scan` and `apparatus_ratio=` are unbuilt, so no `v4.0.0` tag exists and none is claimed.
+- The D10 version cut as the ATLAS defines it: `tools/check-deployed` (with `--control`), `tools/cold-clone`, `tools/push-scan`, `tools/layers`, `tools/watch`, `tools/prune`, `just cut-check` and `just tag` exist. A `v4.0.0` tag is laid only by `just tag v4.0.0 confirm` after a `cut-check` PASS at a deployed sha; none has been laid and none is claimed. Pushing it is Luke's word (`github_push=UNMEASURED`: no credential).
 - Shipped: a VERIFY that looks at nothing (empty, nothing runnable, or only `true`/`:`/`exit 0`/`echo` lines) is refused at admission by name (`invalid_argument` at `/body/brief`, `Refusal::VacuousVerify`); a real command that proves nothing is still a Pass, as named in the app FLOW (crates/hee4-app/FLOW.md).
 - Firstmate live crew in herdr: decided (V4-93) as captain-supervised on this harness; zero-touch work runs through the Agent-tool roster recorded in `firstmate.db`. Revisit when herdr gains a key-send or Firstmate delivers briefs to raw launches.
 - Nineteen release actions beyond the skeleton (`thread.*`, `tools.*`, `roster.*`, `analysis.*`, `judge.inspect`): the drive reports each `UNMEASURED` by name.
