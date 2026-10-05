@@ -27,7 +27,7 @@ hee4 task.resolve --key $(uuidgen) --body '{"task_id":"t-<24 hex>","resolution":
 
 The deployed body is `{task_id, resolution: "quarantine"|"abandon", reason?}` + `idempotency_key` (crates/hee4-app/FLOW.md Families); there is no `obligation_id`, `disposition` or `evidence` (the UNWRITTEN obligation_id below is resolved by its absence). The catalogue gives task.resolve `PreconditionRule::None` (crates/hee4-contracts/src/catalogue.rs:351), so no `precondition` is sent and `stale_generation` is unreachable: the drive prints `note=stale_generation unreachable reason=task.resolve PreconditionRule::None (catalogue.rs:351)`. Paths (`d_resolve`, E2E-09; the briefs are `drive_d.BRIEF` and `SLEEP_BRIEF`, VERIFY `/usr/bin/sleep 5`):
 
-- `cancel_then_abandon`: submit SLEEP_BRIEF → `task.cancel` → `cancellation_requested` → resolve abandon `attempt_failed` → `cancelled`; `task.get` → `cancelled`.
+- `cancel_then_abandon`: submit SLEEP_BRIEF → poll `task.get` until `running` (bound `RUNNING_WAIT_S` = 10 s) → `task.cancel` → `cancellation_requested` → resolve abandon `attempt_failed` → `cancelled`; `task.get` → `cancelled`. The wait is the procedure, not the engine: since wave 5 (c5-cancel-before-dispatch) a cancel that lands before dispatch is Stopped to `cancelled` by the dispatcher, so the abandon met `conflict` at `/body/task_id` (live unit at 9ba0429). A task not `running` within the bound is UNMEASURED naming the bound and the last phase, and no cancel is sent.
 - `quarantine`: a second SLEEP_BRIEF task, resolve quarantine, reason omitted → `blocked`; `task.get` → `blocked`.
 - `abandon_blocked`: resolve abandon on it → `abandoned`.
 - `resolve_terminal`: abandon again → `conflict` at `/body/task_id`.
@@ -35,7 +35,7 @@ The deployed body is `{task_id, resolution: "quarantine"|"abandon", reason?}` + 
 - `bad_resolution`: `"retry"` → `invalid_argument` at `/body/resolution`.
 - `bad_reason`: quarantine with reason `attempt_failed` → `invalid_argument` at `/body/reason`.
 - `missing_key`: no key → `invalid_argument` at `/idempotency_key`.
-- A lifecycle path whose task the dispatcher abandoned before the drive's frame (no eligible model, e.g. roster.disable earlier in the run) is UNMEASURED naming that, never PASS.
+- A lifecycle path whose task the dispatcher abandoned before the drive's frame (no eligible model, e.g. roster.disable earlier in the run), or stopped to `cancelled` because the cancel landed before dispatch (the cancel-before-dispatch race), is UNMEASURED naming that, never PASS (`raced()`).
 
 Preconditions: README shared preconditions; a `RecordDisposition` grant with the operator capability; a task id, generation and `obligation_id` (`RESOLVED (rev 2026-10-05 drive: the deployed body has no obligation_id), was UNWRITTEN: where a caller obtains obligation_id for quarantine/abandon; task.cancel returns cancellation_obligation_id, but no v4.0 read returns the obligations of an effect_unknown or blocked task`).
 
