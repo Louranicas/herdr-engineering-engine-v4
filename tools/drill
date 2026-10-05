@@ -11,7 +11,8 @@ detail acked=N/N ids=...), and after health_ready one task.list that must list e
 `acked_present`, detail k/N missing=...). The rehearsal record
   <drill-root>/<sha12>/rehearsal.json      (default ~/.cache/hee4-drill; written on every run but KEPT)
 holds {tree, unit, submitted, acked_present, task_ids, steps, ts}: D7 reads it, D9 excludes its ids.
-It is written atomically (temp file, fsync, rename). A run with submitted=0 never replaces a record with
+It is written atomically (temp file, fsync, rename). submitted is the number of acked task ids
+(requested holds --submit N). A run that acked no task (plain, or --submit N with the unit down or the socket gone) never replaces a record with
 submitted>0 at the same tree: it prints `drill rehearsal=KEPT(...)` and the submitting record stands.
 task_ids is the union with the record already there (a second run at the same tree loses no id, so no
 drill task ever counts as use) and the record is written right after the submit step, before the kill.
@@ -19,7 +20,7 @@ unit_active refuses MainPID=0 by name (an active unit without a main process): n
 unit_restarted waits for Restart=on-failure; if no new MainPID by half the budget it runs
 `systemctl --user start <unit>` once and records explicit_start=yes (V4-37).
 Last line
-  drill verdict=PASS|FAIL|UNMEASURED steps=k/n unit=<name> head=<sha12> [submitted=N acked_present=k/N]
+  drill verdict=PASS|FAIL|UNMEASURED steps=k/n unit=<name> head=<sha12> [submitted=N acked_present=k/N [requested=M]]
 Exit: 0 PASS, 1 FAIL, 3 UNMEASURED.
 """
 import argparse, json, os, signal, socket, stat, subprocess, sys, tempfile, time, uuid
@@ -114,8 +115,9 @@ class Run:
 
     def save(self, ap):
         """Write the record: this run's steps and ack count, task_ids merged with the record already there.
-        A run that submitted nothing never replaces a record that submitted (D7 and watch-recovery would
-        read UNMEASURED): the overwrite is refused by name and the submitting record is kept."""
+        The door is keyed on what was acked, not on --submit: a run that acked no task (plain, unit down,
+        socket gone) never replaces a record that submitted (D7 and watch-recovery would read UNMEASURED);
+        the overwrite is refused by name and the submitting record is kept."""
         p = os.path.join(self.a.drill_root, self.head, "rehearsal.json")
         try:
             with open(p) as f:
@@ -124,12 +126,12 @@ class Run:
             prior = {}
         prior = prior if isinstance(prior, dict) else {}
         prior_sub = prior.get("submitted")
-        if self.a.submit < 1 and isinstance(prior_sub, int) and prior_sub > 0:
-            print(f"drill rehearsal=KEPT(prior submitted={prior_sub} at tree={self.head}; this run submitted=0 does not replace it)")
+        if not self.ids and isinstance(prior_sub, int) and prior_sub > 0:
+            print(f"drill rehearsal=KEPT(prior submitted={prior_sub} at tree={self.head}; this run acked=0 requested={self.a.submit} does not replace it)")
             return
         ids = list(dict.fromkeys([*(prior.get("task_ids") or []), *self.ids]))  # append-only: no earlier run's id is ever dropped
-        rec = {"tree": self.head, "unit": self.a.unit, "submitted": self.a.submit, "acked_present": ap,
-               "task_ids": ids, "steps": rows, "ts": time.time()}
+        rec = {"tree": self.head, "unit": self.a.unit, "submitted": len(self.ids), "requested": self.a.submit,
+               "acked_present": ap, "task_ids": ids, "steps": rows, "ts": time.time()}
         try:
             write_atomic(p, json.dumps(rec))
         except OSError as e:
@@ -138,9 +140,10 @@ class Run:
     def finish(self):
         k, n = sum(1 for r in rows if r["status"] == "MEASURED"), len(self.steps)
         v = "FAIL" if any(r["status"] == "FAIL" for r in rows) else "PASS" if k == n else "UNMEASURED"
-        ap = f"{self.acked}/{self.a.submit}"
+        ap = f"{self.acked}/{len(self.ids)}"
         self.save(ap)
-        tail = f" submitted={self.a.submit} acked_present={ap}" if self.a.submit > 0 else ""
+        tail = (f" submitted={len(self.ids)} acked_present={ap}" + (f" requested={self.a.submit}" if len(self.ids) != self.a.submit else "")
+                if self.a.submit > 0 else "")
         print(f"drill verdict={v} steps={k}/{n} unit={self.a.unit} head={self.head}{tail}")
         sys.exit({"PASS": 0, "FAIL": 1, "UNMEASURED": 3}[v])
 
@@ -198,7 +201,7 @@ def main():
         if not ok:
             run.not_reached("submit", "submit failed")
             run.finish()
-        run.save(f"0/{a.submit}")  # the ids are on disk before the kill: a drill killed mid-way loses none
+        run.save(f"0/{len(run.ids)}")  # the ids are on disk before the kill: a drill killed mid-way loses none
 
     t0 = time.monotonic()
     try:

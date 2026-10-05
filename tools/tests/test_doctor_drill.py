@@ -223,7 +223,7 @@ class DrillTests(unittest.TestCase):
             restarter(self, w)
             rc, out, _ = run(DRILL, "--socket", w.sockpath, "--restart-budget", "10", "--repo", TOOLS, *extra, "--drill-root", root, env=w.env)
             self.assertEqual(rc, 0, out)
-        self.assertIn(f"drill rehearsal=KEPT(prior submitted=3 at tree={head_of(TOOLS)}; this run submitted=0 does not replace it)", out)
+        self.assertIn(f"drill rehearsal=KEPT(prior submitted=3 at tree={head_of(TOOLS)}; this run acked=0 requested=0 does not replace it)", out)
         rec = json.load(open(os.path.join(root, head_of(TOOLS), "rehearsal.json")))
         self.assertEqual(rec["submitted"], 3); self.assertEqual(rec["acked_present"], "3/3")
         self.assertEqual(sorted(rec["task_ids"]), sorted(w.submitted))
@@ -251,6 +251,30 @@ class DrillTests(unittest.TestCase):
         rec = json.load(open(p))
         self.assertEqual((rec["submitted"], rec["acked_present"], rec["task_ids"]), (2, "2/2", ["t-old", "t-new1", "t-new2"]))
         self.assertEqual(os.listdir(tree), ["rehearsal.json"])
+
+    def test_fire_submit_run_that_acked_nothing_keeps_the_submitting_record(self):
+        # the cut tier always passes --submit 3: with the unit down (UNMEASURED, rc=3) or the socket gone
+        # (submit FAIL, rc=1) it acks no task, and the door is keyed on what was acked, not on --submit
+        for case in ("unit_inactive", "socket_gone"):
+            with self.subTest(case=case):
+                w = World(); self.addCleanup(w.close)
+                root = tempfile.mkdtemp(prefix="dr-")
+                restarter(self, w)
+                rc, out, _ = run(DRILL, "--socket", w.sockpath, "--restart-budget", "10", "--repo", TOOLS, "--submit", "3", "--drill-root", root, env=w.env)
+                self.assertEqual(rc, 0, out)
+                sock = w.sockpath
+                if case == "unit_inactive":
+                    stub(w.bin, "systemctl", "echo LoadState=loaded; echo ActiveState=inactive; echo MainPID=0\n")
+                else:
+                    sock = os.path.join(w.d, "rt", "gone.sock")
+                rc, out, _ = run(DRILL, "--socket", sock, "--restart-budget", "1", "--repo", TOOLS, "--submit", "3", "--drill-root", root, env=w.env)
+                self.assertEqual(rc, 3 if case == "unit_inactive" else 1, out)
+                self.assertIn(f"drill rehearsal=KEPT(prior submitted=3 at tree={head_of(TOOLS)}; this run acked=0 requested=3 does not replace it)", out)
+                self.assertRegex(out.strip().splitlines()[-1], r" submitted=0 acked_present=0/0 requested=3$")
+                rec = json.load(open(os.path.join(root, head_of(TOOLS), "rehearsal.json")))
+                self.assertEqual((rec["submitted"], rec["acked_present"]), (3, "3/3"))
+                self.assertEqual([s["status"] for s in rec["steps"]], ["MEASURED"] * 7)
+                self.assertEqual(sorted(rec["task_ids"]), sorted(w.submitted))
 
     def test_cut_tier_drill_step_submits(self):
         import re, tomllib
