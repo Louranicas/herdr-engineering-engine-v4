@@ -325,6 +325,43 @@ def main() -> int:
                                      ("timeout-env-S", "timeout 60 env -S \"bash -c 'cargo test --offline | tail -1'\"",
                                       "shape=pipe_into_tail_head"),
                                      ("unknown-wrapper-bash-c", "mywrap --opt bash -c 'cargo test --offline | tail -1'",
+                                      "shape=pipe_into_tail_head"),
+                                     # chrt -o/-b/-i take no PRIORITY: an operand is skipped only when the word has its form
+                                     ("chrt-o-bash-c", "chrt -o bash -c 'cargo test --offline | tail -1'",
+                                      "shape=pipe_into_tail_head"),
+                                     ("chrt-b-sh-c", "chrt -b sh -c 'cargo test --offline || true'",
+                                      "shape=or_true"),
+                                     # the shell's own options that take the next word, directly and behind a wrapper
+                                     ("bash-O-c", "bash -O extglob -c 'cargo test --offline | tail -1'",
+                                      "shape=pipe_into_tail_head"),
+                                     ("bash-rcfile-c", "bash --rcfile /dev/null -c 'cargo test --offline | tail -1'",
+                                      "shape=pipe_into_tail_head"),
+                                     ("nice-bash-O-c", "nice bash +O extglob -c 'cargo test --offline | tail -1'",
+                                      "shape=pipe_into_tail_head"),
+                                     # a quoted or escaped shell name, other shells, and commands that run a string of their own
+                                     ("quoted-bash-c", "nice \"bash\" -c 'cargo test --offline | tail -1'",
+                                      "shape=pipe_into_tail_head"),
+                                     ("escaped-bash-c", "\\bash -c 'cargo test --offline | tail -1'",
+                                      "shape=pipe_into_tail_head"),
+                                     ("zsh-c", "zsh -c 'cargo test --offline | tail -1'",
+                                      "shape=pipe_into_tail_head"),
+                                     ("dash-c", "dash -c 'cargo test --offline | tail -1'",
+                                      "shape=pipe_into_tail_head"),
+                                     ("ksh-c", "ksh -c 'cargo test --offline | tail -1'",
+                                      "shape=pipe_into_tail_head"),
+                                     ("mksh-c", "mksh -c 'cargo test --offline | tail -1'",
+                                      "shape=pipe_into_tail_head"),
+                                     ("busybox-sh-c", "busybox sh -c 'cargo test --offline | tail -1'",
+                                      "shape=pipe_into_tail_head"),
+                                     ("eval", "eval 'cargo test --offline | tail -1'",
+                                      "shape=pipe_into_tail_head"),
+                                     ("su-c", "su -c 'cargo test --offline | tail -1' louranicas",
+                                      "shape=pipe_into_tail_head"),
+                                     ("runuser-c", "runuser -u louranicas -- -c 'cargo test --offline | tail -1'",
+                                      "shape=pipe_into_tail_head"),
+                                     ("script-c", "script -qc 'cargo test --offline | tail -1' /dev/null",
+                                      "shape=pipe_into_tail_head"),
+                                     ("flock-c", "flock /tmp/fm.lock -c 'cargo test --offline | tail -1'",
                                       "shape=pipe_into_tail_head")):
                 text = brief_text(verify=["python3 ops/firstmate/tests/control.py", bad])
                 n = text.splitlines().index(bad) + 1
@@ -345,7 +382,10 @@ def main() -> int:
                                ("bash-o-pipefail-c", "bash -o pipefail -c 'cargo test --offline | tail -1' 2>&1"),
                                ("timeout-bash-c-can-fail", "timeout 60 bash -c 'cargo test --offline'"),
                                ("nice-bash-c-can-fail", "nice bash -c 'cargo test --offline | grep -q \"test result: ok\"'"),
-                               ("timeout-plain", "timeout 600 cargo test --workspace --offline")):
+                               ("timeout-plain", "timeout 600 cargo test --workspace --offline"),
+                               ("chrt-o-bash-c-can-fail", "chrt -o bash -c 'cargo test --offline'"),
+                               ("bash-O-c-can-fail", "bash -O extglob -c 'cargo test --offline'"),
+                               ("su-c-can-fail", "su -c 'cargo test --offline' louranicas")):
                 p = w.brief_file(brief_text(verify=[good]))
                 rc, j = w.fm("record", "brief", "--unit", "U1", "--path", str(p), "--head-sha", HEAD)
                 case(f"brief-verify-{name}", "quiet", rc, j, 0, None)
