@@ -423,6 +423,25 @@ def main() -> int:
         case("readiness-note-real-change-still-fails", "fault", plant_rs_and_row,
              ["check"], 20, ["check=readiness_note verdict=FAIL", "readiness_note_differs"])
 
+        # U-harden-05: with HEE4DB_REPO and HEE4_ROOT unset, the repo is the tree the tool ships in, never ~/herdr-engineering-engine-v4
+        n += 1
+        w = World(base, f"c{n:02d}", frozen)
+        w.copy_db_from(snap)
+        try:
+            tool = w.root / "repo/ops/db/hee4db"
+            tool.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(HEE4DB, tool)
+            env = dict(w.env, HEE4DB_SCHEMA_DIR=str(HEE4DB.parent / "schema"))
+            env.pop("HEE4DB_REPO", None)
+            env.pop("HEE4_ROOT", None)
+            p = subprocess.run([sys.executable, str(tool), "recipe", "restart"], env=env, capture_output=True, text=True, timeout=300)
+            want = json.dumps(str((w.root / "repo").resolve() / "CLAUDE.md"))
+            ok = p.returncode == 0 and f'"path": {want}' in p.stdout
+            got = re.findall(r'"path": "([^"]*/CLAUDE\.md)"', p.stdout)[:1]   # the v4 CLAUDE.md route, not the whole doc
+            results.append(("fault", "repo-root-is-the-tools-own-tree", ok, f"rc={p.returncode} want_path={want}"
+                            + ("" if ok else f" got={got}")))
+        except Exception as e:
+            results.append(("fault", "repo-root-is-the-tools-own-tree", False, f"setup_error {type(e).__name__}: {str(e)[:200]}"))
         case("register-unknown-module", "fault",
              lambda w: add_register_row(w, "| DC-96 | **Planted unknown module.** control fixture | control | P2 | roster, storr | **PROPOSED**: planted |"),
              ["ingest"], 20, ["ingest_malformed", "DC-96 names unknown module 'storr'"])
