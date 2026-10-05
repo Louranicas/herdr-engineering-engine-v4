@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use hee4_contracts::ModelBudget;
 use serde_json::{Value, json};
 
 /// Why a model call failed.
@@ -44,12 +45,22 @@ impl OllamaClient {
         }
     }
 
-    /// Names of the models the daemon lists at `/api/tags`.
+    /// Names of the models the daemon lists at `/api/tags`, within the contracts' default
+    /// tags deadline ([`ModelBudget::DEFAULT`]); [`OllamaClient::tags_within`] takes the
+    /// caller's.
     ///
     /// # Errors
     /// [`ModelError`] when unreachable, slow, or the JSON lacks `models[].name`.
     pub fn tags(&self) -> Result<Vec<String>, ModelError> {
-        let timeout = Duration::from_secs(10);
+        self.tags_within(ModelBudget::DEFAULT.tags_timeout())
+    }
+
+    /// Names of the models the daemon lists at `/api/tags`, giving up after `timeout`.
+    ///
+    /// # Errors
+    /// [`ModelError`] when unreachable, past `timeout` (`ModelTimeout(timeout)`), or the JSON
+    /// lacks `models[].name`.
+    pub fn tags_within(&self, timeout: Duration) -> Result<Vec<String>, ModelError> {
         let body = self.call("/api/tags", None, timeout)?;
         let models = body
             .get("models")
@@ -224,6 +235,15 @@ mod tests {
         let url = mock(http("{}"), Duration::from_secs(3))?;
         let t = Duration::from_millis(200);
         let e = OllamaClient::new(&url).generate("m", "p", t);
+        assert_eq!(e, Err(ModelError::ModelTimeout(t)));
+        Ok(())
+    }
+
+    #[test]
+    fn tags_times_out_within_caller_deadline() -> R {
+        let url = mock(http(r#"{"models":[]}"#), Duration::from_secs(3))?;
+        let t = Duration::from_millis(200);
+        let e = OllamaClient::new(&url).tags_within(t);
         assert_eq!(e, Err(ModelError::ModelTimeout(t)));
         Ok(())
     }
