@@ -54,7 +54,7 @@ budget_s = 60
 expect = "ddf_sealed"
 
 [step.drill]
-cmd = "tools/drill"
+cmd = "tools/drill --submit 3"
 budget_s = 120
 expect = "tool_rc"
 

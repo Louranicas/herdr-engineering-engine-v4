@@ -252,5 +252,13 @@ class DrillTests(unittest.TestCase):
         self.assertEqual((rec["submitted"], rec["acked_present"], rec["task_ids"]), (2, "2/2", ["t-old", "t-new1", "t-new2"]))
         self.assertEqual(os.listdir(tree), ["rehearsal.json"])
 
+    def test_cut_tier_drill_step_submits(self):
+        import re, tomllib
+        with open(os.path.join(os.path.dirname(TOOLS), "gate.toml"), "rb") as f:
+            cmd = tomllib.load(f)["step"]["drill"]["cmd"]
+        m = re.search(r"(?:^|\s)--submit[ =](\d+)(?:\s|$)", cmd)
+        self.assertIsNotNone(m, f"[step.drill] cmd does not submit: {cmd!r}")
+        self.assertGreater(int(m.group(1)), 0, cmd)
+
 if __name__ == "__main__":
     unittest.main()
