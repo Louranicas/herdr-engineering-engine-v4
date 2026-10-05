@@ -141,8 +141,11 @@ class CheckDeployedTests(unittest.TestCase):
                  "drive feature=c verdict=UNMEASURED paths=1/3 evidence=e",
                  "drive feature=d verdict=FAIL paths=2/3 evidence=e",
                  "drive feature=e verdict=FAIL paths=2/3 evidence=e reason=a FAIL is never excused",
-                 "drive feature=f verdict=PASS_WITH_GAPS paths=2/3 evidence=e"]
-        self.assertEqual(m.feature_counts(feats), (1, 2, 4))
+                 "drive feature=f verdict=PASS_WITH_GAPS paths=2/3 evidence=e",
+                 "drive feature=g verdict=PASS paths=2/2 evidence=e scope=v4.2 (refused by release scope, as catalogued)",
+                 "drive feature=h verdict=FAIL paths=1/2 evidence=e scope=v4.2 (refused by release scope, as catalogued)"]
+        # g is a reasoned out-of-release flow (scope named), not l2; h, a scoped FAIL, is unexplained
+        self.assertEqual(m.feature_counts(feats), (1, 3, 5))
 
     # A ledger backup manifest's top-level keys as hee4-core backup.rs writes them (live b-01a10b4a227a-0000001c, 2026-10-05).
     LEDGER_MANIFEST = {"boot": 28, "epoch": "1a107794ef1", "id": "b-01a10b4a227a-0000001c", "objects_bound": 1024,
