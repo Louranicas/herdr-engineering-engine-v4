@@ -14,7 +14,12 @@ non-empty objects of positive integers whose key=value set equals the
 or a bad shape is FAIL naming the code or field; a binary without the reply line or row is UNMEASURED),
 model_endpoint (/api/ps parses), model_gpu (the pinned model listed with size_vram > 0; a CPU copy
 is FAIL; not resident or no name is UNMEASURED with scope=advisory, excluded from the verdict and
-counted in advisory=, unless --require-gpu), binary sha = HEAD.
+counted in advisory=, unless --require-gpu), binary sha = HEAD,
+tmp_usage (space% and inode% of the filesystem holding --tmp-dir, default $TMPDIR else /tmp, read by
+`df --output=pcent,ipcent`, plus the three largest entries there owned by this user, by `du -sk -x`;
+never another user's; scope=advisory: it never decides the verdict, and it is counted in advisory=
+when either percentage is above 70 or df cannot read it). /tmp is a RAM-backed tmpfs: build output
+belongs under ~/.cache, sockets under $XDG_RUNTIME_DIR.
 """
 import argparse, json, os, re, stat, subprocess, sys, urllib.request
 
@@ -94,6 +99,44 @@ def budgets_check(out, unit):
     inert = body.get("budgets_inert")
     return "MEASURED", rendered + (f" inert={','.join(inert)}" if isinstance(inert, list) and inert else "")
 
+TMP_ADVISORY_PCT = 70
+
+def tmp_top(tmp, n=3):
+    """The `n` largest entries directly under `tmp` owned by this user, as `name:<KiB>k`, largest
+    first; entries of other users are never read."""
+    try:
+        mine = [e.path for e in os.scandir(tmp) if e.stat(follow_symlinks=False).st_uid == os.getuid()]
+    except OSError as e:
+        return f"unreadable({e.strerror})"
+    if not mine:
+        return "none"
+    # du exits non-zero when a subtree is unreadable; the sizes it did print still stand.
+    _, out, _ = sh("du", "-sk", "-x", "--", *mine, timeout=30)
+    sizes = []
+    for l in out.splitlines():
+        kb, _, path = l.partition("\t")
+        if kb.isdigit():
+            sizes.append((int(kb), os.path.basename(path)))
+    sizes.sort(reverse=True)
+    return ",".join(f"{name}:{kb}k" for kb, name in sizes[:n]) or "unmeasured"
+
+def tmp_usage(tmp):
+    """Emit the advisory tmp_usage row: never counted in the verdict; counted in advisory= when
+    space% or inode% is above TMP_ADVISORY_PCT, or when df cannot read them."""
+    rc, out, err = sh("df", "--output=pcent,ipcent", "--", tmp)
+    lines = out.splitlines()
+    vals = re.findall(r"(\d+)%", lines[-1]) if rc == 0 and len(lines) >= 2 else []
+    if len(vals) != 2:
+        emit("tmp_usage", "UNMEASURED", f"path={tmp} df unreadable: rc={rc} {err or out} scope=advisory", excluded=True)
+        return
+    space, inodes = map(int, vals)
+    over = [k for k, v in (("space", space), ("inodes", inodes)) if v > TMP_ADVISORY_PCT]
+    detail = (f"path={tmp} space={space}% inodes={inodes}% threshold={TMP_ADVISORY_PCT}% "
+              f"over={','.join(over) or 'none'} top={tmp_top(tmp)} scope=advisory")
+    print(f"check=tmp_usage status=MEASURED detail={detail}")
+    if over:
+        advisory.append("MEASURED")
+
 def main():
     ap = argparse.ArgumentParser(prog="doctor", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     xdg = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
@@ -102,6 +145,7 @@ def main():
     ap.add_argument("--model-url", default="http://127.0.0.1:11434")
     ap.add_argument("--repo", default=os.getcwd())
     ap.add_argument("--model", default="", help="the pinned model name; default HEE4_MODEL, else the unit's Environment")
+    ap.add_argument("--tmp-dir", default=os.environ.get("TMPDIR") or "/tmp", help="the temp dir whose filesystem tmp_usage reads")
     ap.add_argument("--require-gpu", action="store_true", help="count an unmeasured model_gpu row in the verdict")
     a = ap.parse_args()
 
@@ -195,6 +239,8 @@ def main():
             emit("binary_sha", "MEASURED" if head in out else "FAIL", f"HEAD={head} hee4 --version={out.splitlines()[0] if out else ''}")
         else:
             emit("binary_sha", "UNMEASURED", "hee4 --version unavailable or HEAD unknown")
+
+    tmp_usage(a.tmp_dir)
 
     k, n = rows.count("MEASURED"), len(rows)
     u, f = rows.count("UNMEASURED"), rows.count("FAIL")
