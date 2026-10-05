@@ -1,6 +1,6 @@
 # hee4-contracts: flow
 
-K0. Rung 1: a value of each type here is already legal. Sources: State and Transition Map §2c,
+K0. Rung 1: each type here is built through its checked constructor (`Budgets`: see its row). Sources: State and Transition Map §2c,
 STACK-MAP §2 (I1, I3, I4), `gates/features/crash-restart.md` (R01–R14).
 
 ## Types
@@ -22,7 +22,7 @@ STACK-MAP §2 (I1, I3, I4), `gates/features/crash-restart.md` (R01–R14).
 | `Receipt` (I4) | `seal(prev, ReceiptBody)` hashes decision + observed + `hash_prev` together over canonical JSON (keys sorted, no whitespace); read-only fields; `checkpoint(leaves)` is the RFC 6962 Merkle Tree Hash (`merkle_root`, leaf `0x00`, node `0x01`, built from `Sha256Hex::digest` only) over `hash_self` digests in order | `Receipt::seal`; `verify_chain` returns the first `ChainBreak{index, cause}`; `Receipt::checkpoint` (K1 stores it) |
 | `Refusal` | `#[non_exhaustive]`, named variants with typed fields, never strings | this crate |
 | `VerifyLine` | one VERIFY line after normalisation: Shell / Exec / Unsupported (`model:` is Unsupported{model}); the only home of the VERIFY line grammar (K6 playbook maps it) | `VerifyLine::parse_all` |
-| `Budgets` | validated only through `Budgets::parse` (and `Deserialize`, the same path): the top value and every section an object (a positional array is refused, never read as the default), unknown key refused, every field non-zero, under its ceiling in budgets.rs, ordered. Fields are `pub` for reading; a literal, a field write after `parse`, or a section parsed alone (`DoorBudget`) is not checked: rung 2, for a later slice with private fields | `Budgets::DEFAULT`, `Budgets::parse` |
+| `Budgets` | validated only through `Budgets::parse` (and `Deserialize`, the same path: one streaming read of the text): the top value and every section an object (a positional array is refused, never read as the default), unknown key refused, a key named twice refused by name (`duplicate field`, never last-wins), every field non-zero, under its ceiling in budgets.rs, ordered. A section has no `Deserialize`, so it cannot be read alone (`lib.rs` `compile_fail` doctest). Fields are `pub` for reading; a literal or a field write after `parse` is not checked: rung 2, pending a DC row for private fields | `Budgets::DEFAULT`, `Budgets::parse` |
 | `catalogue::{Action, Owner, Effect, Scope, CATALOGUE, find, revision}` | the 22 action ids as data: owner, effect (`mutates()`), scope (`because()`), readback, precondition rule; `revision()` is the content digest; `Judge`/`Deploy` owners are held | this crate (`CATALOGUE` const; tests compare it to `gates/features`) |
 
 ## Whitelist (`transition`)
