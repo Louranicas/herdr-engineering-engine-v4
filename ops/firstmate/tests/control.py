@@ -8,7 +8,8 @@ accepted from the caller). fm-db runs as a subprocess with FM_HOME=<tempdir> (FM
 holding agents/standing-orders.md copied from the repo>; --head-sha is always passed except in the case that proves
 its absence is refused. Read-back goes through `fm-db status` and `fm-db q` only (never sqlite3 against any DB).
 The init-atomicity case SIGKILLs fm-db between a migration's DDL and its schema_migrations row (fm-db's
-FM_DB_CONTROL_KILL_BEFORE_ROW seam) and requires the rerun to apply that migration whole.
+FM_DB_CONTROL_KILL_BEFORE_ROW seam) and requires the rerun to apply that migration whole. The curator-parity case reads
+the roster briefs ($FM_ROSTER) and the workflow curator's detector ($WFC_BIN) read-only, importing both scripts' functions.
 
 Prints one line per case, then `fm-db-control cases=k/n quiet=q/q real_db_unchanged=yes verdict=PASS|FAIL`.
 Exit 0 on PASS, 20 on FAIL, 3 on setup failure.
@@ -16,6 +17,8 @@ Exit 0 on PASS, 20 on FAIL, 3 on setup failure.
 from __future__ import annotations
 
 import hashlib
+import importlib.machinery
+import importlib.util
 import json
 import os
 import shutil
@@ -24,6 +27,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from types import ModuleType
 
 HERE = Path(__file__).resolve().parent
 FM_DB_BIN = HERE.parent / "fm-db"
@@ -37,6 +41,9 @@ DRIVE_LINES = ["GOAL: drive", "SCOPE: s", "CONTEXT: c", "ACCEPTANCE: a", "VERIFY
 HEAD = "0123456789abcdef0123456789abcdef01234567"
 # fm-db's control seam for the init-atomicity case: SIGKILL after the named migration's DDL, before its row.
 KILL_SEAM = "FM_DB_CONTROL_KILL_BEFORE_ROW"
+# The parity case's two worlds, outside this repo: the curator's detector and the roster briefs it was measured on.
+CURATOR_BIN = Path(os.environ.get("WFC_BIN") or "/mnt/storage-10tb/workflow-curator/bin/workflow-curator")
+ROSTER = Path(os.environ.get("FM_ROSTER") or "/mnt/storage-10tb/hee4-evidence/roster")
 MIGRATIONS = sorted(p.name for p in (HERE.parent / "schema").glob("*.sql"))
 FIRST_MIGRATION, LATER_MIGRATION = MIGRATIONS[0], MIGRATIONS[-1]
 
@@ -66,6 +73,35 @@ def brief_text(standing: list[str] | None = None, drop: str | None = None, inden
         if label == "STANDING":
             out.extend(standing if standing is not None else standing_body())
     return "\n".join(out) + "\n"
+
+
+def load_script(name: str, path: Path) -> ModuleType:
+    """A stdlib-only script without a .py suffix, imported for its functions; its `__main__` block does not run."""
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(name, loader))
+    loader.exec_module(mod)
+    return mod
+
+
+def curator_parity() -> tuple[bool, str]:
+    """fm-db owns the cannot-fail detector; the curator's `cannot_fail` is an older copy in another repo. Over every VERIFY
+    line of the roster briefs (the curator's own section reader picks them), a line the curator flags and the door admits
+    fails the case. Absent curator or roster, or zero lines looked at, fails it too: a parity that read nothing is not one."""
+    if not CURATOR_BIN.is_file() or not ROSTER.is_dir():
+        return False, f"unmeasured: curator={CURATOR_BIN.is_file()} roster={ROSTER.is_dir()}"
+    fm, wfc = load_script("fm_db", FM_DB_BIN), load_script("workflow_curator", CURATOR_BIN)
+    briefs = sorted(ROSTER.glob("*/*.md"))
+    curator = door = 0
+    only: list[str] = []
+    for p in briefs:
+        for ln in wfc.brief_sections(p.read_text(errors="replace")).get("VERIFY", []):
+            c = [s for s in wfc.cannot_fail(ln) if s != "informational"]
+            d = fm.verify_cannot_fail(ln)
+            curator, door = curator + bool(c), door + bool(d)
+            if c and not d:
+                only.append(f"{p.name}: {ln.strip()[:80]}")
+    ok = curator > 0 and not only
+    return ok, f"briefs={len(briefs)} curator={curator} door={door} curator_only={len(only)} {'; '.join(only[:3])}".strip()
 
 
 class World:
@@ -195,23 +231,45 @@ def main() -> int:
 
             # A VERIFY line that cannot fail is refused naming its file line and shape; the line sits after a can-fail
             # line so the number is the offender's own. The fixture's line is found, never pinned.
+            # A trailing `#` comment or `  (..)` annotation never hides the line before it (the first comment case is
+            # roster/U-stack-04/app-runtime-budgets-attempts.md:67, verbatim); pipefail turned off, a PIPESTATUS mention,
+            # `|&`, `; exit 0`, `|| echo` and a real subshell are each still refused.
             for name, bad, shape in (("tail", "cargo test --offline | tail -1", "shape=pipe_into_tail_head"),
                                      ("echo-rc", "cargo test --offline; echo rc=$?", "shape=echo_rc"),
-                                     ("or-true", "cargo test --offline || true", "shape=or_true")):
+                                     ("or-true", "cargo test --offline || true", "shape=or_true"),
+                                     ("echo-rc-comment", "tools/doctor; echo rc=$?   # against the installed unit; the budgets row "
+                                      "is MEASURED only if the deployed binary carries this slice, else UNMEASURED by name (do not "
+                                      "deploy)", "shape=echo_rc"),
+                                     ("or-true-comment", "cargo test --offline || true  # x", "shape=or_true"),
+                                     ("tail-comment", "cargo test --offline | tail -1  # pipefail", "shape=pipe_into_tail_head"),
+                                     ("tail-annotation", "cargo test --offline | tail -1  (rc=0; ...)", "shape=pipe_into_tail_head"),
+                                     ("pipefail-off", "set +o pipefail; cargo test --offline | tail -1", "shape=pipe_into_tail_head"),
+                                     ("pipestatus-mention", "echo PIPESTATUS; cargo test --offline | tail -1",
+                                      "shape=pipe_into_tail_head"),
+                                     ("pipe-amp", "cargo test --offline |& tail -1", "shape=pipe_into_tail_head"),
+                                     ("exit-0", "cargo test --offline; exit 0", "shape=trailing_true"),
+                                     ("or-echo", "cargo test --offline || echo FAILED", "shape=or_true"),
+                                     ("subshell", "(cargo test --offline | tail -1)", "shape=pipe_into_tail_head")):
                 text = brief_text(verify=["python3 ops/firstmate/tests/control.py", bad])
                 n = text.splitlines().index(bad) + 1
                 p = w.brief_file(text)
                 rc, j = w.fm("record", "brief", "--unit", "U1", "--path", str(p), "--head-sha", HEAD)
                 case(f"brief-verify-{name}", "fault", rc, j, 20, f"verify_line_cannot_fail line={n} {shape}")
-            # Lines that can fail pass: a pipe into `grep -q`, a stated pipefail, a plain command, and a parenthesised
-            # description (not a command: fm-db verify_cannot_fail documents the rule).
+            # Lines that can fail pass: a pipe into `grep -q`, a stated pipefail, a PIPESTATUS read, a plain command, a
+            # subshell whose status is its check's, and a parenthesised description (fm-db verify_cannot_fail has the rule).
+            # Then every line the workflow curator flags across the roster briefs must be refused by the door.
             for name, good in (("grep-q", "cargo test --offline | grep -q PASS"),
                                ("pipefail", "set -o pipefail; cargo test --offline | tail -1"),
+                               ("pipefail-flags", "set -euo pipefail; cargo test --offline | tail -1"),
+                               ("pipestatus-read", "cargo test --offline | tail -1 && exit ${PIPESTATUS[0]}"),
                                ("plain", "cargo fmt --all --check"),
+                               ("subshell-can-fail", "(cd tools/tests && python3 -m unittest discover -s . -p 'test_*.py')"),
                                ("described", "(from the worktree root; each line judged by its own exit code, never | tail)")):
                 p = w.brief_file(brief_text(verify=[good]))
                 rc, j = w.fm("record", "brief", "--unit", "U1", "--path", str(p), "--head-sha", HEAD)
                 case(f"brief-verify-{name}", "quiet", rc, j, 0, None)
+            parity_ok, parity = curator_parity()
+            case("brief-verify-curator-parity", "fault", 0, {}, 0, None, parity_ok, parity)
 
             p = w.brief_file(brief_text())
             rc, j = w.fm("record", "brief", "--unit", "U1", "--path", str(p))     # no git under the temp HEE4_ROOT

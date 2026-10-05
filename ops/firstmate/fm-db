@@ -157,10 +157,19 @@ def collapsed(text: str) -> list[str]:
     return [" ".join(ln.split()) for ln in text.splitlines()]
 
 
-# A VERIFY line whose exit status is not its check's: the shape names why (the workflow curator's detector, bin/workflow-curator
-# cannot_fail, mirrored for the door; `informational` is not refused here).
+# A VERIFY line whose exit status is not its check's: the shape names why. fm-db owns this detector: it is the door, the
+# highest rung. The workflow curator's `cannot_fail` (bin/workflow-curator) is an older, looser copy; control.py's
+# `brief-verify-curator-parity` case requires every line the curator flags across the roster briefs to be refused here.
 VERIFY_SINKS = {"tail": "pipe_into_tail_head", "head": "pipe_into_tail_head", "wc": "pipe_into_sink", "cat": "pipe_into_sink",
                 "sort": "pipe_into_sink", "uniq": "pipe_into_sink", "tee": "pipe_into_sink"}
+VERIFY_SWALLOWERS = ("echo", "printf", "true", ":")              # each exits 0 whatever ran before it
+# A whole-line `( ... )` is a description, not a subshell, only when it opens with one of these prose words. `at`, `as`,
+# `expect` and `see` are left out because each is also a command name.
+VERIFY_DESCRIPTION = re.compile(r"^\(\s*(from|run from|the|each|every|all|in|on|with|expected|note|where|after|before|per|"
+                                r"using|judged|this|these|only)\b", re.IGNORECASE)
+PIPEFAIL_ON = re.compile(r"(?:^|\s)-[A-Za-z]*o\s+pipefail\b")
+PIPEFAIL_OFF = re.compile(r"(?:^|\s)\+[A-Za-z]*o\s+pipefail\b")
+PIPESTATUS_READ = re.compile(r"^(exit|test|\[\[?)\s+.*\$\{PIPESTATUS\[[^\]]*\]\}")
 
 
 def _first_word(seg: str) -> str:
@@ -170,47 +179,108 @@ def _first_word(seg: str) -> str:
     return os.path.basename(w[0]) if w else ""
 
 
+def _mask(s: str) -> str:
+    """`s` with quoted text, `$(..)` and process substitution `<(..)`/`>(..)` blanked to `Q`s of the same length: none of
+    them splits, pipes, comments or sets the line's status, and every index into the mask is an index into `s`."""
+    out = re.sub(r"'[^']*'|\"[^\"]*\"", lambda m: "Q" * len(m.group(0)), s)
+    for m in reversed(list(re.finditer(r"[$<>]\(", out))):          # last opened first: a nested one goes before its parent
+        depth, end = 0, len(out)
+        for i in range(m.start() + 1, len(out)):
+            depth += {"(": 1, ")": -1}.get(out[i], 0)
+            if depth == 0:
+                end = i + 1
+                break
+        out = out[:m.start()] + "Q" * (end - m.start()) + out[end:]
+    return out
+
+
+def _split(bare: str, raw: str, sep: str) -> list[tuple[str, str, str]]:
+    """(operator before, masked piece, raw piece) for each piece of `bare` between matches of `sep`; the first operator is ''."""
+    out, start, op = [], 0, ""
+    for m in re.finditer(sep, bare):
+        out.append((op, bare[start:m.start()], raw[start:m.start()]))
+        start, op = m.end(), m.group(0)
+    out.append((op, bare[start:], raw[start:]))
+    return out
+
+
+def _pipefail(bare: str, on: bool) -> bool:
+    """The pipefail setting after one command: only `set -o pipefail` (or `-eo`, `-euo` ...) sets it, `set +o` clears it."""
+    if _first_word(bare) != "set":
+        return on
+    return False if PIPEFAIL_OFF.search(bare) else (True if PIPEFAIL_ON.search(bare) else on)
+
+
+def _judge(bare: str, raw: str) -> set[str]:
+    """The cannot-fail shapes of one command text (masked and raw, same length), subshell parentheses read as spaces."""
+    bare = bare.replace("(", " ").replace(")", " ")
+    chunks = [(b.strip(), r.strip()) for _, b, r in _split(bare, raw, r";") if b.strip()]
+    if not chunks:
+        return set()
+    on = False
+    for b, _ in chunks[:-1]:
+        on = _pipefail(b, on)
+    last_b, last_r = chunks[-1]
+    shapes: set[str] = set()
+    if len(chunks) > 1 and (_first_word(last_b) in VERIFY_SWALLOWERS or re.match(r"^exit\s+0$", last_b)):
+        shapes.add("echo_rc" if "$?" in last_b else "trailing_true")
+    parts = [(op, b.strip(), r.strip()) for op, b, r in _split(last_b, last_r, r"&&|\|\|")]
+    if len(parts) > 1 and parts[-1][0] == "||" and (_first_word(parts[-1][1]) in VERIFY_SWALLOWERS
+                                                    or re.match(r"^exit\s+0$", parts[-1][1])):
+        shapes.add("or_true")
+    for i, (_, b, _r) in enumerate(parts):
+        on = _pipefail(b, on)
+        segs = [x.strip() for x in re.split(r"\|&?", b) if x.strip()]   # `|&` pipes stderr too; its sink is the next word
+        if not segs:
+            continue
+        sink = _first_word(segs[-1])
+        read = i + 1 < len(parts) and parts[i + 1][0] == "&&" and bool(PIPESTATUS_READ.match(parts[i + 1][2]))
+        if len(segs) > 1 and not on and not read and sink in VERIFY_SINKS:
+            shapes.add(VERIFY_SINKS[sink])
+        if sink in ("grep", "egrep", "rg") and any(re.match(r"^-[A-Za-z]*v", o) for o in segs[-1].split()[1:]):
+            shapes.add("inverted_grep")
+    return shapes
+
+
 def verify_cannot_fail(line: str) -> list[str]:
     """The shapes that keep one VERIFY line from failing; [] when its exit status is its check's.
 
-    Rule for what is a command: a markdown bullet (`- `, `* `, `1. `) and a backtick wrapper are stripped; a line that then
-    opens with `(` and closes with `)` is a description (`(from the worktree root; ...)`), never a command, so it is not
-    judged. `a; b` exits with b, so only the last `;` command counts; in it every `&&`/`||` part must carry its status to
-    the end: a pipeline is judged by its LAST stage (`x | tail -1` cannot fail, `x | grep -q PASS` can) unless the line
-    states `set -o pipefail` or reads `${PIPESTATUS[..]}`; `|| true`, `; true` and a trailing `echo rc=$?` swallow the
-    status; `grep -v` succeeds whenever any line differs."""
+    What is judged: a markdown bullet (`- `, `* `, `1. `) and a backtick wrapper are stripped; quoted text and `$(..)` are
+    masked; an unquoted `#` at the start or after whitespace starts a comment, which is dropped; a whole line `( ... )`
+    that opens with a prose word (VERIFY_DESCRIPTION: `(from the worktree root; ...)`) is a description and is not judged,
+    and any other parenthesised text is a subshell, judged as a command. A trailing annotation after two or more spaces,
+    `x  (rc=0; ...)`, is cut off, and the line before it and the annotation (unless a description) are judged apart.
+
+    How: `a; b` exits with b, so only the last `;` command counts; in it every `&&`/`||` part must carry its status to
+    the end. A pipeline (`|` or `|&`) is judged by its LAST stage (`x | tail -1` cannot fail, `x | grep -q PASS` can)
+    unless an earlier command ran `set -o pipefail` (and no later `set +o pipefail`), or the next part is `&& exit
+    ${PIPESTATUS[..]}` or a `test`/`[` of it. `|| true`, `|| :`, `|| exit 0`, `|| echo ..`, a trailing `; true`, `; exit
+    0` or `; echo rc=$?` swallow the status; `grep -v` succeeds whenever any line differs."""
     s = line.strip()
     s = re.sub(r"^(-|\*|\d+[.)])\s+", "", s)
     if s.startswith("`") and s.count("`") >= 2:
         s = s[1:s.index("`", 1)].strip()
-    if not s or (s.startswith("(") and s.endswith(")")):
+    bare = _mask(s)
+    comment = re.search(r"(?:^|\s)#", bare)
+    if comment:
+        s, bare = s[:comment.start()].rstrip(), bare[:comment.start()].rstrip()
+    if not s:
         return []
-    bare = re.sub(r"'[^']*'|\"[^\"]*\"|\$\([^)]*\)", "Q", s)            # quoted text and $(..) cannot split the line
-    status_read = "pipefail" in bare or "PIPESTATUS" in s                 # a quoted "pipefail" is a mention, not a setting
-    chunks = [c.strip() for c in bare.split(";") if c.strip()]
-    if not chunks:
+    if s.startswith("(") and s.endswith(")") and VERIFY_DESCRIPTION.match(s):
         return []
-    last = chunks[-1]
-    shapes: set[str] = set()
-    if len(chunks) > 1 and _first_word(last) in ("echo", "printf", "true", ":"):
-        shapes.add("echo_rc" if "$?" in last else "trailing_true")
-    if re.search(r"\|\|\s*(true|:|exit 0)\s*$", last):
-        shapes.add("or_true")
-    for part in re.split(r"&&|\|\|", last):
-        segs = [x.strip() for x in part.split("|") if x.strip()]
-        if not segs:
-            continue
-        sink = _first_word(segs[-1])
-        if len(segs) > 1 and not status_read and sink in VERIFY_SINKS:
-            shapes.add(VERIFY_SINKS[sink])
-        if sink in ("grep", "egrep", "rg") and any(re.match(r"^-[A-Za-z]*v", o) for o in segs[-1].split()[1:]):
-            shapes.add("inverted_grep")
+    note = re.search(r"\s{2,}\(", bare)
+    if not note:
+        return sorted(_judge(bare, s))
+    cut = note.end() - 1
+    shapes = _judge(bare[:cut], s[:cut])
+    if not (s.endswith(")") and VERIFY_DESCRIPTION.match(s[cut:])):
+        shapes |= _judge(bare[cut:], s[cut:])
     return sorted(shapes)
 
 
-def verify_refusal(text: str) -> str | None:
-    """The first VERIFY line (file line number) that cannot fail, as the typed refusal; None when every line can fail."""
-    in_verify = False
+def verify_findings(text: str) -> list[tuple[int, list[str], str]]:
+    """(file line number, shapes, line) for every VERIFY line of a brief that cannot fail."""
+    out, in_verify = [], False
     for n, ln in enumerate(text.splitlines(), start=1):
         label = next((f for f in BRIEF_FIELDS if ln.startswith(f + ":")), None)   # column 0, `LABEL:` — brief.rs:63-64
         if label is not None:
@@ -219,7 +289,14 @@ def verify_refusal(text: str) -> str | None:
         if in_verify:
             shapes = verify_cannot_fail(ln)
             if shapes:
-                return f"verify_line_cannot_fail line={n} shape={','.join(shapes)}: {ln.strip()}"
+                out.append((n, shapes, ln.strip()))
+    return out
+
+
+def verify_refusal(text: str) -> str | None:
+    """The first VERIFY line (file line number) that cannot fail, as the typed refusal; None when every line can fail."""
+    for n, shapes, ln in verify_findings(text):
+        return f"verify_line_cannot_fail line={n} shape={','.join(shapes)}: {ln}"
     return None
 
 
