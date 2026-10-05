@@ -85,7 +85,7 @@ module: their ids are catalogued, listed by `tools.list`, inspected by `tools.in
 
 | Action | Body | Result body | Door |
 |---|---|---|---|
-| `health` | `{}` | `{ok, head_sha, recovery_complete, uptime_s, schema_version, serve_cgroup, budgets, budgets_inert}`; `schema_version` is `Store::schema_version`, `serve_cgroup` is `Store::serve_cgroup`; `budgets` is `Engine::budgets` serialised, and re-parses through `Budgets::parse`; `budgets_inert` is `crate::INERT_BUDGETS`: `attempt.ctx_tokens` and `ledger.busy_timeout_ms`, which nothing reads yet, and `ledger.checkpoint_every`, which the dispatcher reads (checkpoint row below) but which stays listed until the `actions/task.rs` health test that pins the list drops it (Gaps) (`hee4 doctor` row `budgets`, `tools/doctor` check `budgets`) | `Store::recovery_complete` |
+| `health` | `{}` | `{ok, head_sha, recovery_complete, uptime_s, schema_version, serve_cgroup, budgets, budgets_inert}`; `schema_version` is `Store::schema_version`, `serve_cgroup` is `Store::serve_cgroup`; `budgets` is `Engine::budgets` serialised, and re-parses through `Budgets::parse`; `budgets_inert` is `crate::INERT_BUDGETS`: `attempt.ctx_tokens` and `ledger.busy_timeout_ms`, which nothing reads yet (`ledger.checkpoint_every` is read by the checkpoint row below and is not listed; `actions::task::tests::health_carries_the_engine_budgets_and_they_re_parse_through_the_contracts` pins the list from the reply) (`hee4 doctor` row `budgets`, `tools/doctor` check `budgets`) | `Store::recovery_complete` |
 | `tools.list` | `{query: null\|string ≤ 256 bytes, page: {limit 1..100, cursor}}` | `{catalogue_revision, page: {items: [{id, version, purpose, effect}], cursor}}`; items = entries whose id or purpose contains `query`, sorted by id, keyset-paged (`actions/page.rs`; cursor `{after_key, boot, filter_sha256}` pinned to `Engine::boot` and the query digest) | `catalogue::CATALOGUE`, `revision()`; no store |
 | `tools.inspect` | `{action, version}` | `{action, version, purpose, effect, request_schema_sha256, result_schema_sha256, error_schema_sha256, max_request_bytes, max_deadline_ms, readback_action, scope, served}`; the digests are descriptor digests (SHA-256 over canonical `{action, version, fields}`); `scope` is the entry's `Scope::wire_name`; `served` is `Registry::serve(entry).is_some()` (the owner is composed in this binary; false is exactly the ids dispatch refuses `unavailable`); a held id inspects as a result | `catalogue::find`, `Registry::serve`; no store |
 | `task.submit` | `{brief: "<eleven fields>"}` + `idempotency_key` | `{task_id, phase}`; `replayed` | `Brief::parse`, `check_restatement`, then `check_verify` (the one door for a vacuous VERIFY: refused `invalid_argument` at `/body/brief`, nothing admitted, no brief file written; the dispatcher does not re-check), then `Store::admit` |
@@ -255,10 +255,6 @@ three threads. Resume with `since_seq` = the last `seq` received: exactly-once b
 - `Engine::boot` (the page-cursor epoch) is unix nanoseconds drawn once in `Engine::new`;
   K1-store-foundation's `Store::boot()` replaces the source in a later wave (one line in
   `actions/mod.rs`, `page.rs` unchanged).
-- `ledger.checkpoint_every` is read (checkpoint row) but `crate::INERT_BUDGETS` still lists it:
-  `actions::task::tests::health_carries_the_engine_budgets_and_they_re_parse_through_the_contracts`
-  pins the three-name list, and `actions/task.rs` is h5-k0-verify-budgets' file. Dropping the
-  name from `INERT_BUDGETS` and from that test is one change, proposed for that file's owner.
 - `Brief::check_verify` admits lines that are vacuous but not yet named by K0 (pinned by
   `actions::task::tests::vacuous_verify_lines_k0_does_not_catch_yet_are_admitted_by_name`);
   the table of named lines is hee4-contracts FLOW's.
