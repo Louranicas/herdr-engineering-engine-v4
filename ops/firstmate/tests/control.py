@@ -7,6 +7,8 @@ recomputes brief_sha and standing_sha with hashlib and compares them with what f
 accepted from the caller). fm-db runs as a subprocess with FM_HOME=<tempdir> (FM_DB unset) and HEE4_ROOT=<temp tree
 holding agents/standing-orders.md copied from the repo>; --head-sha is always passed except in the case that proves
 its absence is refused. Read-back goes through `fm-db status` and `fm-db q` only (never sqlite3 against any DB).
+The init-atomicity case SIGKILLs fm-db between a migration's DDL and its schema_migrations row (fm-db's
+FM_DB_CONTROL_KILL_BEFORE_ROW seam) and requires the rerun to apply that migration whole.
 
 Prints one line per case, then `fm-db-control cases=k/n quiet=q/q real_db_unchanged=yes verdict=PASS|FAIL`.
 Exit 0 on PASS, 20 on FAIL, 3 on setup failure.
@@ -17,6 +19,7 @@ import hashlib
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -32,6 +35,10 @@ TURSODB = Path(os.environ.get("HEE4DB_TURSODB", str(Path.home() / ".local/bin/tu
 DRIVE_LINES = ["GOAL: drive", "SCOPE: s", "CONTEXT: c", "ACCEPTANCE: a", "VERIFY: /usr/bin/true", "TIMEBOX: 10s",
                "FORBIDDEN: f", "REPORT: r", "STANDING:", "RECON: r", "RESTATEMENT: run true"]
 HEAD = "0123456789abcdef0123456789abcdef01234567"
+# fm-db's control seam for the init-atomicity case: SIGKILL after the named migration's DDL, before its row.
+KILL_SEAM = "FM_DB_CONTROL_KILL_BEFORE_ROW"
+MIGRATIONS = sorted(p.name for p in (HERE.parent / "schema").glob("*.sql"))
+FIRST_MIGRATION, LATER_MIGRATION = MIGRATIONS[0], MIGRATIONS[-1]
 
 
 def sha(p: Path) -> str:
@@ -73,8 +80,9 @@ class World:
     def standing(self) -> Path:
         return self.hee4_root / "agents" / "standing-orders.md"
 
-    def fm(self, *args: str) -> tuple[int, dict]:
-        p = subprocess.run([sys.executable, str(FM_DB_BIN), *args], env=self.env, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    def fm(self, *args: str, env: dict[str, str] | None = None) -> tuple[int, dict]:
+        p = subprocess.run([sys.executable, str(FM_DB_BIN), *args], env={**self.env, **(env or {})}, capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL)
         last = [ln for ln in p.stdout.splitlines() if ln.startswith("{")]
         try:
             j = json.loads(last[-1]) if last else {}
@@ -223,6 +231,26 @@ def main() -> int:
 
             rc, j = w.fm("close-unit", "--id", "U-none", "--by", "captain")
             case("close-no-unit", "fault", rc, j, 20, "no unit")
+
+            # --- init atomicity: a migration after 001 commits its DDL and its row together or not at all ----------
+            w = World(base, "init-kill")
+            rc, j = w.fm("init", env={KILL_SEAM: LATER_MIGRATION})           # SIGKILL after 002's DDL, before its row
+            killed = rc == -signal.SIGKILL and "verb" not in j
+            rc, j = w.fm("init")                                              # the rerun must apply 002 whole
+            case("init-killed-before-row-rerun-applies", "fault", rc, j, 0, None,
+                 killed and j.get("applied") == [LATER_MIGRATION] and j.get("already") == [FIRST_MIGRATION],
+                 f"killed={killed} applied={j.get('applied')} already={j.get('already')}")
+            rc, j = w.fm("init")
+            case("init-twice", "quiet", rc, j, 0, None, j.get("applied") == [] and j.get("already") == [FIRST_MIGRATION, LATER_MIGRATION],
+                 f"applied={j.get('applied')} already={j.get('already')}")
+            rc, j = w.fm("status")
+            case("init-rerun-status", "quiet", rc, j, 0, None, j.get("open_units") == [], f"open_units={j.get('open_units')}")
+            w = World(base, "init-kill-first")                                # 001 runs outside a transaction: IF NOT EXISTS carries it
+            rc, j = w.fm("init", env={KILL_SEAM: FIRST_MIGRATION})
+            killed = rc == -signal.SIGKILL and "verb" not in j
+            rc, j = w.fm("init")
+            case("init-killed-before-first-row-rerun-applies", "fault", rc, j, 0, None, killed and j.get("applied") == MIGRATIONS,
+                 f"killed={killed} applied={j.get('applied')}")
         except RuntimeError as e:
             print(f"setup: {e}")
             return 3

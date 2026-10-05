@@ -2,7 +2,8 @@
 """fm-db: the ONE writer for a Firstmate home's orchestration database ($FM_HOME/data/firstmate.db).
 
 Verbs (each one transaction, BEGIN IMMEDIATE, under the writer flock; stdlib only):
-  init                                   create/migrate the DB from schema/*.sql (idempotent; refuses a changed applied file)
+  init                                   create/migrate the DB from schema/*.sql (idempotent; each migration after 001 is one
+                                         transaction with its schema_migrations row; refuses a changed or half-applied file)
   record unit|brief|spawn|claim|verify|receipt|exit|andon  --k v ...   one row; refusals are typed (exit 20)
   record brief --unit U --path P [--head-sha S]   brief_sha, standing_sha (and head_sha from git) are computed, never typed;
                                          refuses a missing `LABEL:` field or summarised standing orders (PROTOCOL §2)
@@ -22,6 +23,7 @@ import fcntl
 import hashlib
 import json
 import os
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -92,7 +94,14 @@ class Writer:
         return False
 
 
+FIRST_MIGRATION = "001_init.sql"   # sets PRAGMA journal_mode (illegal inside a transaction) and is IF NOT EXISTS throughout
+KILL_SEAM = "FM_DB_CONTROL_KILL_BEFORE_ROW"   # control seam: SIGKILL ourselves after this file's DDL, before its row
+
+
 def init() -> int:
+    """Apply schema/*.sql in order. Every migration after 001 is ONE transaction holding its DDL and its
+    schema_migrations row, so a crash in between leaves nothing and the rerun applies it whole. 001 runs outside a
+    transaction (PRAGMA journal_mode cannot run inside one) and is IF NOT EXISTS throughout, so its rerun is safe too."""
     applied = {}
     with Writer(script=True) as con:
         con.executescript("CREATE TABLE IF NOT EXISTS schema_migrations (file TEXT PRIMARY KEY, sha256 TEXT NOT NULL, applied_ts TEXT NOT NULL)")
@@ -105,8 +114,24 @@ def init() -> int:
                 if applied[p.name] != sha:
                     return out("init", "REFUSED", 20, detail=f"applied migration changed: {p.name}")
                 continue
-            con.executescript(p.read_text())
-            con.execute("INSERT INTO schema_migrations VALUES (?,?,?)", (p.name, sha, ts()))
+            atomic = p.name != FIRST_MIGRATION
+            try:
+                # One executescript per migration, issued while no transaction is pending: under legacy transaction
+                # control executescript COMMITs a pending transaction first, so a second call here would split the migration.
+                con.executescript(("BEGIN;\n" if atomic else "") + p.read_text())
+                if os.environ.get(KILL_SEAM) == p.name:
+                    os.kill(os.getpid(), signal.SIGKILL)
+                con.execute("INSERT INTO schema_migrations VALUES (?,?,?)", (p.name, sha, ts()))
+                if atomic:
+                    con.execute("COMMIT")
+            except sqlite3.OperationalError as e:
+                if con.in_transaction:
+                    con.execute("ROLLBACK")
+                # "duplicate column name" / "already exists": a DDL step of this file is in the DB without its row, the
+                # pre-atomic crash window; anything else is the migration itself failing (rolled back when atomic).
+                kind = "migration_half_applied" if ("duplicate column" in str(e) or "already exists" in str(e)) else "migration_failed"
+                return out("init", "REFUSED", 20, detail=f"{kind}={p.name} rolled_back={'yes' if atomic else 'no'}: {e}",
+                           applied=done, already=sorted(applied))
             done.append(p.name)
     return out("init", "PASS", 0, applied=done, already=sorted(applied))
 
