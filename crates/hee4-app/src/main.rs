@@ -6,6 +6,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use hee4_app::{ServeArgs, catalogue12, dispatcher, doctor, head12, socket, wire};
 use hee4_contracts::catalogue::{self, CATALOGUE};
@@ -13,7 +14,7 @@ use hee4_core::Store;
 use hee4_core::receipts::VerifyError;
 use serde_json::{Value, json};
 
-const USAGE: &str = "usage: hee4 --version | serve --socket P --ledger P --work D [--budgets F] | doctor [--unit U] [--socket P] [--repo D] | verify-ledger --ledger P
+const USAGE: &str = "usage: hee4 --version | serve --socket P --ledger P --work D [--budgets F] [--backups D] | restore --into D ID [--backups D] | doctor [--unit U] [--socket P] [--repo D] | verify-ledger --ledger P
        | health | task.list | task.get ID | task.cancel ID --key K | task.submit --brief-file F --key K   [--socket P]
        | <action> [--key K] [--body JSON | --body-file F] [--precondition JSON] [--socket P]   (any catalogued action)";
 
@@ -69,6 +70,8 @@ fn main() -> ExitCode {
                 budgets: flag(&args, "--budgets")
                     .map(PathBuf::from)
                     .or_else(|| std::env::var_os("HEE4_BUDGETS").map(PathBuf::from)),
+                backups: flag(&args, "--backups").map(PathBuf::from),
+                require_backups: std::env::var("HEE4_REQUIRE_BACKUPS").as_deref() == Ok("1"),
             };
             match hee4_app::serve(&serve, &dispatcher::Config::from_env()) {
                 Ok(()) => ExitCode::SUCCESS,
@@ -89,6 +92,17 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         }
+        "restore" => {
+            let Some(into) = flag(&args, "--into") else {
+                return fail("restore needs --into DIR and a backup ID");
+            };
+            let Some(id) = restore_id(&args) else {
+                return fail("restore needs a backup ID");
+            };
+            let root =
+                flag(&args, "--backups").map_or_else(|| PathBuf::from(BACKUP_ROOT), PathBuf::from);
+            restore(&root, &id, Path::new(&into))
+        }
         "verify-ledger" => {
             let Some(ledger) = flag(&args, "--ledger") else {
                 return fail("verify-ledger needs --ledger");
@@ -97,6 +111,79 @@ fn main() -> ExitCode {
         }
         _ => client(verb, &args, &sock),
     }
+}
+
+/// `hee4 restore`'s default backup root (the unit's `--backups`).
+const BACKUP_ROOT: &str = "/mnt/storage-10tb/hee4-backups";
+
+/// The restore's one positional: the first argument after the verb that is neither a flag nor
+/// a flag's value.
+fn restore_id(args: &[String]) -> Option<String> {
+    let mut rest = args.iter().skip(1);
+    while let Some(a) = rest.next() {
+        if a.starts_with("--") {
+            rest.next();
+        } else {
+            return Some(a.clone());
+        }
+    }
+    None
+}
+
+/// K1's `restore` of `<root>/<id>` into `into`: one `restore ... verdict=` line printed and
+/// appended to `<root>/restore.log`; exit 0 only on PASS. An id that names no backup directory
+/// (or is not one path component) is `reason=not_found`; a K1 refusal is its name.
+fn restore(root: &Path, id: &str, into: &Path) -> ExitCode {
+    let started = std::time::Instant::now();
+    let one_component = !id.is_empty() && id != "." && id != ".." && !id.contains('/');
+    let dir = root.join(id);
+    let (line, pass) = if one_component && dir.is_dir() {
+        match hee4_core::backup::restore(&dir, into) {
+            Ok(r) => (
+                format!(
+                    "restore backup={} ledger={} objects={}/{} rto_s={:.3} verdict=PASS",
+                    r.backup_id,
+                    r.ledger_sha256.get(..12).unwrap_or(&r.ledger_sha256),
+                    r.objects_n,
+                    r.objects_total,
+                    Duration::from_millis(r.rto_ms).as_secs_f64()
+                ),
+                true,
+            ),
+            Err(e) => {
+                eprintln!("hee4 restore: {e}");
+                (
+                    restore_fail(id, started, dispatcher::backup_error_name(&e)),
+                    false,
+                )
+            }
+        }
+    } else {
+        (restore_fail(id, started, "not_found"), false)
+    };
+    println!("{line}");
+    let log = root.join("restore.log");
+    let appended = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, format!("{line}\n").as_bytes()));
+    if let Err(e) = appended {
+        eprintln!("hee4 restore: cannot append {}: {e}", log.display());
+        return ExitCode::from(1);
+    }
+    if pass {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
+}
+
+fn restore_fail(id: &str, started: std::time::Instant, reason: &str) -> String {
+    format!(
+        "restore backup={id} ledger=none objects=none rto_s={:.3} verdict=FAIL reason={reason}",
+        started.elapsed().as_secs_f64()
+    )
 }
 
 /// The offline verifier (no socket, no engine): open the ledger file read-only and re-derive
