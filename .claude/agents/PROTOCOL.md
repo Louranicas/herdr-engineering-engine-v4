@@ -8,6 +8,19 @@ A report, a hand-back, a ledger row, a brain note: each sentence that asserts a 
 ## 2 · The brief is the only way work starts
 No agent acts on a chat sentence. The coordinator writes the brief (I1, eleven fields: GOAL, SCOPE, CONTEXT, ACCEPTANCE, VERIFY, TIMEBOX, FORBIDDEN, REPORT, STANDING, RECON, RESTATEMENT). The receiving agent's first output is its RESTATEMENT in its own words; a RESTATEMENT that conflicts with ACCEPTANCE is refused back to the coordinator before any work (narrative principle 13). STANDING orders (`agents/standing-orders.md`) are pasted verbatim into every brief, never summarised.
 
+**RECON through Poteto Weave, when it is fresh.** Poteto Weave
+(`/mnt/storage-10tb/hee4-evidence/prototypes/turso-tool-context/assimilation-20261005/`) is the
+habitat's generation-pinned, read-only context layer over HEE v4, pstack, deep-diff-forge,
+LoomLattice and Firstmate (`context.search`, `context.read`, `hee4.catalogue`, `hee4.inspect`). A
+coordinator or builder first runs its `snapshots.py ... status`; when it prints `"fresh":true,
+"qualified":true`, cross-codebase lookups go through it and the brief or report cites the
+generation id beside each fact it supplied. When it refuses (`stale_source`,
+`catalogue_contract_changed`, or not fresh), the report records `poteto-weave=UNMEASURED(<refusal>)`
+and reads the sources directly. A retrieval is context, never a verdict: Poteto Weave's own
+contract says a successful plan is not an HEE result. It is used read-only; its runtime root
+and active pointer belong to its owner, and a captain builds any generation of its own in a
+separate root under `~/.cache`.
+
 ## 3 · Fresh, bounded, counted
 - Every spawn is a fresh agent with consolidated scope; resuming is allowed only to answer a refuter's question about the agent's own prior output.
 - `planned_agents=N` is written to the ledger **before** any fan-out; a fan-out beyond N is a STOP.
