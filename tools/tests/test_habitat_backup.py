@@ -68,6 +68,22 @@ class HabitatBackupTests(unittest.TestCase):
             self.assertEqual(rc, 0, out + err); ids.append(re.search(r"backup=(\S+)", out).group(1))
         self.assertEqual(sorted(os.listdir(dest)), sorted([".lock", "keep-me", *ids[1:]]))
 
+    def test_prune_removes_a_backup_holding_a_read_only_dir(self):
+        # The live evidence home holds a 0555 directory; a backup keeps that mode, so prune must
+        # still remove the old backup (V4-103: the second run failed with EACCES before this).
+        ro = os.path.join(self.src, "evidence", "ro")
+        os.makedirs(ro); open(os.path.join(ro, "f.txt"), "w").write("ro\n"); os.chmod(ro, 0o555)
+        self.addCleanup(os.chmod, ro, 0o755)
+        dest = os.path.join(self.other, "dest")
+        ids = []
+        for _ in range(2):
+            rc, out, err = self.hb(dest, "--keep", "1")
+            self.assertEqual(rc, 0, out + err); ids.append(re.search(r"backup=(\S+)", out).group(1))
+        self.assertEqual(sorted(os.listdir(dest)), sorted([".lock", ids[1]]))
+        kept_ro = os.path.join(dest, ids[1], "evidence", "ro")
+        self.assertEqual(os.stat(kept_ro).st_mode & 0o777, 0o555, "the backup keeps the source's mode")
+        os.chmod(kept_ro, 0o755)  # let the fixture cleanup remove it
+
     def test_prune_never_drops_this_runs_backup_under_future_dated_names(self):
         # clock skew left two complete backups whose names sort after any backup taken today
         dest = os.path.join(self.other, "dest")
