@@ -5,8 +5,10 @@ Proves a sha gates the same on a fresh clone of the LOCAL bare mirror as it did 
 (REQUIREMENTS rank 5). Clones <origin> (--no-hardlinks) into a temp dir under ~/.cache, checks out
 the sha, runs `<gate> <tier> --repo <clone> --subject <sha> --target-dir <target>` there relaying
 its stdout unchanged, loads the cold run's summary.json (the gate prints summary=<path>) and
-matches it against the newest warm run `<warm-root>/*-<sha12>/summary.json` of the same tier and
-subject: matched = cold steps whose (name, ok) equals the warm step of that name. Prints
+matches it against the newest warm run `<warm-root>/*-<sha12>/summary.json` of the same subject
+whose tier is <tier> or a tier that includes it in the sha's gate.toml (cut-check's warm run is
+`gate cut`, which includes commit): matched = cold steps whose (name, ok) equals the warm step of
+that name. Prints
   gate=<path> registry=host_cache   (method limits: the gate runner is the invoking tree's; cargo's
                                      registry is the host's ~/.cargo until tools/offline-bundle.lock exists)
 and last
@@ -19,7 +21,7 @@ the live unit, forbidden in a clone. Never GitHub, never the network.
 A cold run's own summary dir gets a `cold-clone` marker file and is never read back as the warm
 reference, so a second cold run without a warm run stays UNMEASURED (prints cold=<path>).
 """
-import argparse, glob, json, os, re, shutil, subprocess, sys, tempfile
+import argparse, glob, json, os, re, shutil, subprocess, sys, tempfile, tomllib
 
 def die(msg, code=2):
     print(f"cold-clone: {msg}", file=sys.stderr)
@@ -35,8 +37,28 @@ def resolve(repo, rev):
 
 COLD_MARK = "cold-clone"  # written beside a cold run's summary.json: a cold run is never a warm reference
 
-def warm_summary(root, sha, tier):
-    """The newest `<root>/*-<sha12>/summary.json` by stamp of the same tier and subject, never a cold run's."""
+def covering_tiers(origin, sha, tier):
+    """<tier> and every tier of the sha's gate.toml whose `includes` chain reaches it (the gate ran its steps)."""
+    r = subprocess.run(["git", "-C", origin, "show", f"{sha}:gate.toml"], capture_output=True)
+    try:
+        tiers = tomllib.loads(r.stdout.decode()).get("tier", {}) if r.returncode == 0 else {}
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError):
+        tiers = {}
+    if not isinstance(tiers, dict):
+        tiers = {}
+    out = {tier}
+    for t in tiers:
+        seen, cur = set(), t
+        while isinstance(cur, str) and cur not in seen:
+            if cur == tier:
+                out.add(t)
+                break
+            seen.add(cur)
+            cur = tiers.get(cur, {}).get("includes") if isinstance(tiers.get(cur), dict) else None
+    return out
+
+def warm_summary(root, sha, tiers):
+    """The newest `<root>/*-<sha12>/summary.json` by stamp whose tier is in <tiers> and subject is sha, never a cold run's."""
     for p in sorted(glob.glob(os.path.join(root, f"*-{sha[:12]}", "summary.json")), reverse=True):
         if os.path.exists(os.path.join(os.path.dirname(p), COLD_MARK)):
             continue
@@ -45,7 +67,7 @@ def warm_summary(root, sha, tier):
                 s = json.load(f)
         except (OSError, ValueError):
             continue
-        if s.get("tier") == tier and s.get("subject") == sha:
+        if isinstance(s, dict) and isinstance(s.get("tier"), str) and s["tier"] in tiers and s.get("subject") == sha:
             return p, s
     return None, None
 
@@ -104,7 +126,7 @@ def main():
         shutil.rmtree(tmp, ignore_errors=True)
     steps = cold.get("steps", [])
     head = f"cold-clone sha={sha[:12]} origin={a.origin} tier={a.tier} steps={len(steps)}"
-    warm_path, warm = warm_summary(os.path.expanduser(a.warm_root), sha, a.tier)
+    warm_path, warm = warm_summary(os.path.expanduser(a.warm_root), sha, covering_tiers(a.origin, sha, a.tier))
     if warm is None:
         print(f"{head} matched=UNMEASURED(no warm run at {sha[:12]}) verdict=UNMEASURED")
         sys.exit(3)

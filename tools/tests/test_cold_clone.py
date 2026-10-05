@@ -6,16 +6,20 @@ GATE, COLD = os.path.join(TOOLS, "gate"), os.path.join(TOOLS, "cold-clone")
 def toml(cmd):
     return f'[gate]\nbase = "HEAD~1"\n[tier.t]\nsteps = ["s"]\n[step.s]\ncmd = {cmd!r}\nbudget_s = 5\nexpect = "none"\n'
 
+# tier `big` includes `t` (as cut includes stack includes commit); tier `other` holds the same step but not `t`
+NESTED = toml("true") + '[tier.big]\nincludes = "t"\nsteps = ["u"]\n[tier.other]\nsteps = ["s"]\n' \
+    + '[step.u]\ncmd = "true"\nbudget_s = 5\nexpect = "none"\n'
+
 class ColdWorld:
     """A throwaway repo, its bare mirror, and a private HOME so every cache lands under the test."""
-    def __init__(self, cmd="true"):
-        self.repo, self.sha = make_repo(toml(cmd))
+    def __init__(self, cmd="true", gate_toml=None):
+        self.repo, self.sha = make_repo(gate_toml or toml(cmd))
         self.bare = tempfile.mkdtemp(prefix="gt-bare-") + "/origin.git"
         subprocess.run(["git", "clone", "-q", "--bare", self.repo, self.bare], check=True, capture_output=True)
         self.home = tempfile.mkdtemp(prefix="gt-home-")
         self.env = {"HOME": self.home}
-    def warm(self):
-        return run(GATE, "t", "--repo", self.repo, env=self.env, cwd=self.repo)
+    def warm(self, tier="t"):
+        return run(GATE, tier, "--repo", self.repo, env=self.env, cwd=self.repo)
     def cold(self, *extra):
         return run(COLD, "--sha", self.sha, "--origin", self.bare, "--tier", "t", "--repo", self.repo, *extra, env=self.env, cwd=self.repo)
     def cache_entries(self):
@@ -79,6 +83,25 @@ class ColdCloneTests(unittest.TestCase):
             self.assertEqual(rc, 0, out)
             self.assertIn(f"warm={warm_summary}\n", out)
             self.assertNotIn(f"cold={warm_summary}\n", out)
+
+    def test_warm_run_of_an_including_tier_is_the_reference(self):
+        # cut-check's only warm run at the sha is `gate cut`; its commit-tier steps are the reference
+        w = ColdWorld(gate_toml=NESTED)
+        rc, out, _ = w.warm("big")
+        self.assertEqual(rc, 0, out)
+        warm_summary = [l for l in out.splitlines() if l.startswith("summary=")][0][len("summary="):]
+        rc, out, err = w.cold()
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn(f"warm={warm_summary}\n", out)
+        self.assertEqual(out.strip().splitlines()[-1], f"cold-clone sha={w.sha[:12]} origin={w.bare} tier=t steps=1 matched=1 verdict=PASS")
+
+    def test_fire_warm_run_of_a_tier_not_including_it_is_unmeasured(self):
+        w = ColdWorld(gate_toml=NESTED)
+        rc, out, _ = w.warm("other")
+        self.assertEqual(rc, 0, out)
+        rc, out, _ = w.cold()
+        self.assertEqual(rc, 3, out)
+        self.assertIn(f"matched=UNMEASURED(no warm run at {w.sha[:12]})", out.strip().splitlines()[-1])
 
     def test_fire_unknown_sha_refused(self):
         w = ColdWorld()
