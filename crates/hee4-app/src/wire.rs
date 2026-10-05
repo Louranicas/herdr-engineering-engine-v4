@@ -6,6 +6,7 @@
 //! message, field}` plus `because`, `current_generation`, `readback` when set and
 //! `effect:"unknown"` for `effect_unknown`.
 
+use hee4_contracts::bounds::MAX_TOKEN_BYTES;
 use serde_json::{Value, json};
 
 /// Every member an error frame may carry, in emission order: what `tools.inspect` digests as the
@@ -52,8 +53,9 @@ pub enum Code {
     FrameTooLarge,
     /// The server already holds its cap of concurrent connections.
     TooManyConnections,
-    /// The action is catalogued but its owner is not registered in this release (`because`
-    /// names the scope). The one emission site is the registry miss in dispatch.
+    /// The action is catalogued but its owner is not registered in this release (the registry
+    /// miss in dispatch, `because` names the scope), or `service.*` cannot make its call
+    /// (`because` names why).
     Unavailable,
     /// The precondition's generation is behind the resource's (`current_generation` is set).
     StaleGeneration,
@@ -241,24 +243,44 @@ pub struct Request {
     pub body: Value,
 }
 
+/// A token member: non-empty and at most [`MAX_TOKEN_BYTES`] bytes.
+fn is_token(s: &str) -> bool {
+    !s.is_empty() && s.len() <= MAX_TOKEN_BYTES
+}
+
+/// The refusal message for a token member.
+fn token_refusal() -> String {
+    format!("non-empty string of at most {MAX_TOKEN_BYTES} bytes")
+}
+
 /// `/precondition`: absent or null is `None`; an object with exactly `resource` (string), `id`
-/// (string) and `generation` (unsigned integer) is `Some`; any other shape is refused.
-fn precondition_of(v: Option<&Value>) -> Result<Option<Precondition>, &'static str> {
+/// (string) and `generation` (unsigned integer) is `Some`; any other shape is refused at
+/// `/precondition`, and a `resource` or `id` that is not a token at its own pointer.
+fn precondition_of(v: Option<&Value>) -> Result<Option<Precondition>, (&'static str, String)> {
+    let shape = |msg: &str| ("/precondition", msg.to_owned());
     let obj = match v {
         None | Some(Value::Null) => return Ok(None),
         Some(Value::Object(obj)) => obj,
-        Some(_) => return Err("object or null"),
+        Some(_) => return Err(shape("object or null")),
     };
     if obj.len() != 3 {
-        return Err("exactly resource, id and generation");
+        return Err(shape("exactly resource, id and generation"));
     }
     let (Some(Value::String(resource)), Some(Value::String(id)), Some(generation)) = (
         obj.get("resource"),
         obj.get("id"),
         obj.get("generation").and_then(Value::as_u64),
     ) else {
-        return Err("resource: string, id: string, generation: unsigned integer");
+        return Err(shape(
+            "resource: string, id: string, generation: unsigned integer",
+        ));
     };
+    if !is_token(resource) {
+        return Err(("/precondition/resource", token_refusal()));
+    }
+    if !is_token(id) {
+        return Err(("/precondition/id", token_refusal()));
+    }
     Ok(Some(Precondition {
         resource: resource.clone(),
         id: id.clone(),
@@ -303,11 +325,11 @@ pub fn parse(line: &str) -> Result<Request, (String, Fault)> {
         .ok_or_else(|| bad("/action_version", "unsigned integer required"))?;
     let idempotency_key = match obj.get("idempotency_key") {
         None | Some(Value::Null) => None,
-        Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
-        Some(_) => return Err(bad("/idempotency_key", "non-empty string or null")),
+        Some(Value::String(s)) if is_token(s) => Some(s.clone()),
+        Some(_) => return Err(bad("/idempotency_key", &token_refusal())),
     };
     let precondition =
-        precondition_of(obj.get("precondition")).map_err(|msg| bad("/precondition", msg))?;
+        precondition_of(obj.get("precondition")).map_err(|(field, msg)| bad(field, &msg))?;
     let body = match obj.remove("body") {
         None | Some(Value::Null) => json!({}),
         Some(b @ Value::Object(_)) => b,
@@ -399,7 +421,9 @@ pub fn request_with(
 
 #[cfg(test)]
 mod tests {
-    use super::{Code, ERROR_MEMBERS, Fault, Precondition, error, parse, request_with};
+    use super::{
+        Code, ERROR_MEMBERS, Fault, MAX_TOKEN_BYTES, Precondition, error, parse, request_with,
+    };
     use serde_json::json;
     use std::collections::BTreeSet;
 
@@ -466,6 +490,44 @@ mod tests {
                 "{bad}: {parsed:?}"
             );
         }
+    }
+
+    /// `idempotency_key`, `precondition.resource` and `precondition.id` are tokens: empty or
+    /// over `MAX_TOKEN_BYTES` is `invalid_argument` at the member's own pointer; exactly
+    /// `MAX_TOKEN_BYTES` is accepted.
+    #[test]
+    fn token_members_are_bounded_at_their_pointers() {
+        let max = "k".repeat(MAX_TOKEN_BYTES);
+        let over = "k".repeat(MAX_TOKEN_BYTES + 1);
+        let refused_at = |line: String, at: &str| {
+            let parsed = parse(&line);
+            assert!(
+                matches!(&parsed, Err((id, f)) if id == "r" && f.code == Code::InvalidArgument && f.field == at),
+                "{at}: {parsed:?}"
+            );
+        };
+        let keyed = |k: &str| request_with("r", "a", Some(k), json!({}), None).to_string();
+        assert_eq!(
+            parse(&keyed(&max)).map(|r| r.idempotency_key),
+            Ok(Some(max.clone()))
+        );
+        refused_at(keyed(&over), "/idempotency_key");
+        refused_at(keyed(""), "/idempotency_key");
+        let pre = |resource: &str, id: &str| {
+            request_with(
+                "r",
+                "a",
+                None,
+                json!({}),
+                Some(json!({"resource": resource, "id": id, "generation": 1})),
+            )
+            .to_string()
+        };
+        assert!(parse(&pre(&max, &max)).is_ok());
+        refused_at(pre("", "x"), "/precondition/resource");
+        refused_at(pre(&over, "x"), "/precondition/resource");
+        refused_at(pre("roster", ""), "/precondition/id");
+        refused_at(pre("roster", &over), "/precondition/id");
     }
 
     #[test]
