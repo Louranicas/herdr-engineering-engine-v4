@@ -151,9 +151,13 @@ class CheckDeployedTests(unittest.TestCase):
         self.assertEqual(m.manifest_objects({"objects": [1, 2]}), (None, None))  # the key D5 used to read: never None silently
         self.assertEqual(m.manifest_objects({"objects_n": True, "objects_bound": -1}), (None, None))
 
-    def _d5(self, enabled, verdict_line, status="0", result="success"):
+    INV = "0123456789abcdef0123456789abcdef"
+
+    def _d5(self, enabled, verdict_line, status="0", result="success", exit_ts="Mon 2026-10-05 03:15:09 AEDT",
+            unit_inv=INV, log_text=None):
         """d5() against a fixture world: a ledger backup on another device than HOME, a stubbed systemctl
-        (is-enabled answers `enabled`), a stub restore, and the habitat tool's log."""
+        (is-enabled answers `enabled`; show answers Result, ExecMainStatus, ExecMainExitTimestamp, InvocationID),
+        a stub restore, and the habitat tool's log (one run block of the unit's invocation, unless log_text)."""
         m = load()
         os.makedirs(os.path.expanduser("~/.cache/hee4-host"), exist_ok=True)
         home = tempfile.mkdtemp(prefix="cd-d5-home-", dir=os.path.expanduser("~/.cache/hee4-host"))
@@ -173,15 +177,17 @@ class CheckDeployedTests(unittest.TestCase):
             os.chmod(os.path.join(bindir, name), 0o755)
         script("systemctl", f"""case " $* " in
   *" is-enabled hee4-backup.timer "*) {'echo enabled' if enabled else 'echo "Failed to get unit file state for hee4-backup.timer: No such file or directory" >&2; exit 1'} ;;
-  *" show "*) echo Result={result}; echo ExecMainStatus={status} ;;
+  *" show "*) echo Result={result}; echo ExecMainStatus={status}; echo "ExecMainExitTimestamp={exit_ts}"; echo InvocationID={unit_inv} ;;
   *) exit 1 ;;
 esac
 """)
         script("hee4", f'[ "$1" = restore ] && echo "restore backup={bid} ledger=e9580e780f40 objects=120/120 rto_s=0.01 verdict=PASS"\n')
         log = os.path.join(home, "habitat-backup.log")
-        if verdict_line is not None:
+        if log_text is None and verdict_line is not None:
+            log_text = f"habitat-backup run ts=2026-10-05T03:15:00Z invocation={self.INV} child_rc=0 exit=0\n{verdict_line}\n"
+        if log_text is not None:
             with open(log, "w") as f:
-                f.write("habitat-backup run ts=2026-10-05T03:15:00Z child_rc=0 exit=0\n" + verdict_line + "\n")
+                f.write(log_text)
         env = {"HOME": home, "PATH": bindir + ":" + os.environ["PATH"]}
         with unittest.mock.patch.dict(os.environ, env):
             r = m.d5(types.SimpleNamespace(backups=other, habitat_log=log), {"bin": os.path.join(bindir, "hee4")})
@@ -197,10 +203,34 @@ esac
         line, kv = self._d5(True, self.PASS_LINE)
         self.assertEqual((kv["objects"], kv["objects_bound"], kv["timer"]), ("120", "1024", "enabled"))
         self.assertEqual((kv["habitat_verdict"], kv["habitat_agree"], kv["last_run"]), ("PASS", "yes", "success/0"))
+        self.assertEqual((kv["unit_ran"], kv["habitat_run"]), ("yes", "unit"))
         self.assertTrue(line.endswith(" PASS"), line)
 
+    def test_d5_never_run_unit_fails_even_with_a_manual_pass_in_the_log(self):
+        # the live never-run shape (measured 2026-10-05): Result=success ExecMainStatus=0, empty timestamp and InvocationID;
+        # the log holds a manual `--service` PASS from a shell whose INVOCATION_ID is some other unit's
+        manual = ("habitat-backup run ts=2026-10-05T09:00:00Z invocation=1552d8453bb040148a87f6cfd8af62f0 child_rc=0 exit=0\n"
+                  + self.PASS_LINE + "\n")
+        line, kv = self._d5(True, None, exit_ts="", unit_inv="", log_text=manual)
+        self.assertEqual((kv["unit_ran"], kv["habitat_verdict"]), ("never", "PASS"))
+        self.assertTrue(kv["habitat_run"].startswith("other("), kv["habitat_run"])
+        self.assertTrue(line.endswith(" FAIL"), line)
+
+    def test_d5_crash_block_after_a_pass_fails(self):
+        crash = (f"habitat-backup run ts=2026-10-04T03:15:00Z invocation=aaaa child_rc=0 exit=0\n{self.PASS_LINE}\n"
+                 f"habitat-backup run ts=2026-10-05T03:15:00Z invocation={self.INV} child_rc=1 exit=30\n"
+                 "habitat-backup child_stderr='NotADirectoryError: /x/verdict=PASS'\n")
+        line, kv = self._d5(True, None, status="30", result="exit-code", log_text=crash)
+        self.assertEqual((kv["habitat_verdict"], kv["habitat_run"]), ("absent", "unit"))
+        self.assertTrue(line.endswith(" FAIL"), line)
+
+    def test_d5_log_block_from_another_invocation_fails(self):
+        line, kv = self._d5(True, self.PASS_LINE, unit_inv="ffffffffffffffffffffffffffffffff")
+        self.assertEqual(kv["habitat_verdict"], "PASS"); self.assertEqual(kv["habitat_run"], "other(log=0123456789ab,unit=ffffffffffff)")
+        self.assertTrue(line.endswith(" FAIL"), line)
+
     def test_d5_timer_absent_fails(self):
-        line, kv = self._d5(False, None, status="", result="")
+        line, kv = self._d5(False, None, status="", result="", exit_ts="", unit_inv="")
         self.assertEqual(kv["timer"], "rc=1"); self.assertEqual(kv["habitat_verdict"], "absent")
         self.assertTrue(line.endswith(" FAIL"), line)
 
