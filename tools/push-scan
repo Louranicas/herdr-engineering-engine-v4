@@ -1,0 +1,251 @@
+#!/usr/bin/env python3
+"""push-scan [RANGE] [--repo DIR] [--exclusions FILE] | push-scan --control
+
+Scans the ADDED lines of a commit range (default github/main..HEAD when a `github` remote exists)
+and its commit messages for three classes: secret (V4-76), v3_path (the fence) and outward_name
+(H-10a). Each hit prints
+  hit class=<secret|v3_path|outward_name> file=<path|commit:<sha12>> line=<n> rule=<name>
+and last
+  push-scan range=<a>..<b> commits=N files=N hits=N verdict=PASS|FAIL
+Exit 0 only when hits=0; 1 otherwise; 2 refused (no range, unknown rev, unreadable exclusions);
+3 with hits=UNMEASURED(empty range|reversed range: ...) when the range holds no commit.
+Paths ending .md are scanned for secret and outward_name only (CLAUDE.md names v3 paths to forbid
+them). Exclusions come from ops/v3-independence-exclusions.txt (`repo:<path or glob> | reason`;
+a row without a reason excludes nothing) plus one built-in: this script, whose RULES table holds
+the literals it hunts. v3 roots are read through .claude/hooks/lib/v3_guard.py, never copied.
+--control builds a throwaway repo with one runtime-assembled plant per class, scans HEAD~1..HEAD
+and prints `push-scan control cases=k/3 verdict=PASS|FAIL` (exit 1 unless every class fires).
+No network: every read is `git -C <repo>`. The patch text is pinned, not trusted: the diff runs
+with prefixes, colour, external diff, textconv, renames and quoting fixed on the command line (a
+host's diff.noprefix, color.ui=always or diff.external cannot blank it), a `+++ `/`--- ` line is a
+header only between hunks (a content line `++ x` stays content), and the files the headers name
+are cross-checked against `git diff --name-only -z`: a mismatch is refused (rc 2), never a green.
+"""
+import argparse, fnmatch, importlib.util, os, re, shutil, subprocess, sys, tempfile
+
+CLASSES = ("secret", "v3_path", "outward_name")
+SELF = "tools/push-scan"
+RULES = [
+    ("secret", "aws_akia", re.compile(r"AKIA[0-9A-Z]{16}")),
+    ("secret", "github_token", re.compile(r"gh[pousr]_[A-Za-z0-9]{36}")),
+    ("secret", "github_pat", re.compile(r"github_pat_[A-Za-z0-9_]{22,}")),
+    ("secret", "slack", re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}")),
+    ("secret", "anthropic", re.compile(r"sk-ant-[A-Za-z0-9_-]{20,}")),
+    ("secret", "private_key", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
+    ("secret", "generic_assignment", re.compile(r"(?i)(api[_-]?key|secret|token)\s*[:=]\s*['\"][A-Za-z0-9_\-]{20,}")),
+    ("v3_path", "fence", re.compile(r"/var/home/herdr-engineering-engine-v3|/run/host/var/home|hee3-evidence"
+                                    r"|hee3-worktrees|hee3-implementation|/lib/herdr-engineering-engine-v3")),
+    ("outward_name", "home_path", re.compile(r"/home/louranicas|/var/home/Louranicas")),
+    ("outward_name", "owner_email", re.compile(r"lukeomahoney@")),
+]
+HUNK = re.compile(r"^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+# Every switch that a host's git config or environment could otherwise flip on the patch text.
+DIFF_PIN = ["-c", "core.quotePath=false", "-c", "color.ui=never", "-c", "diff.suppressBlankEmpty=false",
+            "diff", "--no-ext-diff", "--no-color", "--no-textconv", "--no-renames", "--no-relative", "--text",
+            "--src-prefix=a/", "--dst-prefix=b/", "--unified=0", "--inter-hunk-context=0"]
+DIFF_ENV = {k: v for k, v in os.environ.items() if k not in ("GIT_DIFF_OPTS", "GIT_EXTERNAL_DIFF")}
+
+def die(msg, code=2):
+    print(f"push-scan: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+def git(repo, *args, env=None):
+    r = subprocess.run(["git", "-C", repo, *args], capture_output=True, env=env)
+    return r.returncode, r.stdout.decode("utf-8", "replace"), r.stderr.decode("utf-8", "replace")
+
+def v3_root_rules(repo):
+    """One extra v3_path rule from v3_guard's two functions, or None when the repo has no guard."""
+    guard = os.path.join(repo, ".claude", "hooks", "lib", "v3_guard.py")
+    settings = os.path.join(repo, ".claude", "settings.json")
+    if not (os.path.isfile(guard) and os.path.isfile(settings)):
+        return None, f"fence_only(no {os.path.relpath(guard, repo)} in {repo})"
+    spec = importlib.util.spec_from_file_location("v3_guard", guard)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    from pathlib import Path
+    roots = mod.roots_from_settings(Path(settings), home=os.environ.get("HOME", "")) + mod.local_roots()
+    roots = sorted({r for r in roots if r}, key=len, reverse=True)
+    return ("v3_path", "deny_root", re.compile("|".join(re.escape(r) for r in roots))), str(len(roots))
+
+def load_exclusions(path):
+    """Reasoned repo: rows only; returns (patterns, rows_read, note)."""
+    if path is None or not os.path.isfile(path):
+        return [], f"absent({path})"
+    pats = []
+    with open(path, encoding="utf-8") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith("#") or "|" not in line:
+                continue
+            target, reason = (s.strip() for s in line.split("|", 1))
+            if not reason or not target.startswith("repo:"):
+                continue
+            pats.append(target[len("repo:"):].strip())
+    return pats, str(len(pats))
+
+def excluded(path, pats):
+    for pat in pats:
+        if path == pat or fnmatch.fnmatchcase(path, pat) or fnmatch.fnmatchcase(path, pat.rstrip("/") + "/*"):
+            return True
+    return False
+
+def parse_diff(diff_text):
+    """Returns (files, added): files as the `diff --git` headers name them, added as (path, new_line_no, text)
+    for every `+` content line. The hunk header's counts are consumed line by line, so `+++ `/`--- ` are
+    headers only while no hunk is open. Raises ValueError on text the grammar does not cover."""
+    files, added = [], []
+    path, n, old_left, new_left = None, 0, 0, 0
+    for line in diff_text.splitlines():
+        if old_left > 0 or new_left > 0:  # inside a hunk every line is content (`\ No newline` consumes nothing)
+            if line.startswith("+"):
+                if path is None:
+                    raise ValueError(f"added line before a +++ header: {line!r}")
+                added.append((path, n, line[1:])); n += 1; new_left -= 1
+            elif line.startswith("-"):
+                old_left -= 1
+            elif line.startswith(" "):
+                n += 1; old_left -= 1; new_left -= 1
+            elif not line.startswith("\\"):
+                raise ValueError(f"unexpected line inside a hunk: {line!r}")
+            continue
+        if line.startswith("diff --git a/"):
+            rest = line[len("diff --git a/"):]
+            name = rest[:(len(rest) - len(" b/")) // 2]
+            if rest != f"{name} b/{name}":
+                raise ValueError(f"unparsable file header: {line!r}")
+            files.append(name); path = None
+        elif line.startswith("+++ b/"):
+            path = line[len("+++ b/"):].removesuffix("\t")
+        elif line.startswith("@@"):
+            m = HUNK.match(line)
+            if not m:
+                raise ValueError(f"unparsable hunk header: {line!r}")
+            old_left, n, new_left = int(m.group(1) or 1), int(m.group(2)), int(m.group(3) or 1)
+    if old_left > 0 or new_left > 0:
+        raise ValueError("patch ends inside a hunk")
+    return files, added
+
+def scan(repo, base, head, exclusions):
+    """Returns (hits, commits, files, notes); a hit is (class, file, line, rule)."""
+    rules, notes = list(RULES), {}
+    extra, note = v3_root_rules(repo)
+    notes["v3_roots"] = note
+    if extra:
+        rules.append(extra)
+    pats, note = load_exclusions(exclusions)
+    notes["exclusions"] = note
+    pats.append(SELF)
+    rc, diff, err = git(repo, *DIFF_PIN, f"{base}..{head}", env=DIFF_ENV)
+    if rc:
+        die(f"cannot diff {base}..{head}: {err.strip()}")
+    rc, names, err = git(repo, "diff", "--name-only", "-z", "--no-renames", f"{base}..{head}", env=DIFF_ENV)
+    if rc:
+        die(f"cannot list {base}..{head}: {err.strip()}")
+    rc, log, err = git(repo, "log", "--format=%H%x00%B", "-z", f"{base}..{head}")
+    if rc:
+        die(f"cannot log {base}..{head}: {err.strip()}")
+    try:
+        files, added = parse_diff(diff)
+    except ValueError as e:
+        die(f"patch text of {base}..{head} is not what the parser covers: {e}")
+    listed = sorted(n for n in names.split("\0") if n)
+    if sorted(files) != listed:
+        die(f"diff headers name {len(files)} files but --name-only lists {len(listed)}: refusing to scan a patch the parser cannot follow")
+    hits = []
+    for path, n, text in added:
+        if excluded(path, pats):
+            continue
+        for cls, name, rx in rules:
+            if cls == "v3_path" and path.endswith(".md"):
+                continue
+            if rx.search(text):
+                hits.append((cls, path, n, name))
+    parts = log.split("\0")
+    commits = 0
+    for i in range(0, len(parts) - 1, 2):
+        sha, body = parts[i], parts[i + 1]
+        if not sha:
+            continue
+        commits += 1
+        for n, text in enumerate(body.splitlines(), 1):
+            for cls, name, rx in rules:
+                if rx.search(text):
+                    hits.append((cls, f"commit:{sha[:12]}", n, name))
+    return hits, commits, len(files), notes
+
+def resolve(repo, rev):
+    rc, out, _ = git(repo, "rev-parse", "--verify", "--quiet", rev + "^{commit}")
+    if rc or not out.strip():
+        die(f"rev {rev!r} does not resolve in {repo}")
+    return out.strip()
+
+def plant(classes):
+    """A throwaway repo whose second commit adds one line per class, assembled at runtime."""
+    samples = {
+        "secret": "let key = " + '"' + "AKIA" + "Q" * 16 + '"' + ";",
+        "v3_path": "// read from ~/" + "hee3-" + "evidence" + "/notes",
+        "outward_name": "// owner " + "/home/" + "louranicas" + "/x",
+    }
+    d = tempfile.mkdtemp(prefix="hee4-push-control-")
+    g = lambda *a: subprocess.run(["git", "-C", d, "-c", "user.name=t", "-c", "user.email=t@t", *a],
+                                  check=True, capture_output=True)
+    with open(os.path.join(d, "one.txt"), "w") as f:
+        f.write("one\n")
+    g("init", "-q"); g("add", "-A"); g("commit", "-qm", "one")
+    with open(os.path.join(d, "planted.rs"), "w") as f:
+        f.write("".join(samples[c] + "\n" for c in classes))
+    g("add", "-A"); g("commit", "-qm", "two")
+    return d
+
+def control():
+    d = plant(CLASSES)
+    try:
+        hits, _, _, _ = scan(d, "HEAD~1", "HEAD", None)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    for h in hits:
+        print("hit class=%s file=%s line=%d rule=%s" % h)
+    found = [c for c in CLASSES if any(h[0] == c for h in hits)]
+    v = "PASS" if len(found) == len(CLASSES) else "FAIL"
+    print(f"push-scan control cases={len(found)}/{len(CLASSES)} verdict={v}")
+    sys.exit(0 if v == "PASS" else 1)
+
+def main():
+    ap = argparse.ArgumentParser(prog="push-scan", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("range", nargs="?", help="<base>..<head> (default github/main..HEAD when a github remote exists)")
+    ap.add_argument("--repo", default=os.getcwd())
+    ap.add_argument("--exclusions", help="reasoned exclusion rows (default <repo>/ops/v3-independence-exclusions.txt)")
+    ap.add_argument("--control", action="store_true", help="plant one hit per class in a throwaway repo and prove each fires")
+    a = ap.parse_args()
+    if a.control:
+        control()
+    rng = a.range
+    if rng is None:
+        rc, remotes, _ = git(a.repo, "remote")
+        if rc or "github" not in remotes.split():
+            die("no range given and no github remote")
+        rng = "github/main..HEAD"
+    if ".." not in rng:
+        die(f"range {rng!r} is not <base>..<head>")
+    base_rev, head_rev = rng.split("..", 1)
+    base, head = resolve(a.repo, base_rev), resolve(a.repo, head_rev)
+    exclusions = a.exclusions or os.path.join(a.repo, "ops", "v3-independence-exclusions.txt")
+    if a.exclusions and not os.path.isfile(a.exclusions):
+        die(f"exclusions file {a.exclusions} is not readable")
+    hits, commits, files, notes = scan(a.repo, base, head, exclusions)
+    print(" ".join(f"{k}={v}" for k, v in notes.items()))
+    for h in hits:
+        print("hit class=%s file=%s line=%d rule=%s" % h)
+    head_line = f"push-scan range={base_rev}..{head_rev} commits={commits} files={files}"
+    if commits == 0:
+        # Nothing in base..head: an empty range looked at nothing, a reversed one (head behind base) would
+        # scan the removals as additions. Neither is a green (STANDING 4, AP-29).
+        why = "empty range" if files == 0 else "reversed range: head is behind base"
+        print(f"{head_line} hits=UNMEASURED({why}) verdict=UNMEASURED")
+        sys.exit(3)
+    v = "PASS" if not hits else "FAIL"
+    print(f"{head_line} hits={len(hits)} verdict={v}")
+    sys.exit(0 if v == "PASS" else 1)
+
+if __name__ == "__main__":
+    main()
