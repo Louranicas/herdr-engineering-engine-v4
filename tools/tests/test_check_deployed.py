@@ -1,4 +1,4 @@
-import importlib.machinery, importlib.util, os, signal, subprocess, sys, time, unittest
+import importlib.machinery, importlib.util, os, shutil, signal, subprocess, sys, tempfile, time, types, unittest
 from common import TOOLS, run
 
 CD = os.path.join(TOOLS, "check-deployed")
@@ -91,6 +91,55 @@ class CheckDeployedTests(unittest.TestCase):
     def test_fire_control_skip_unknown_row_refused(self):
         rc, out, _ = run(CD, "--control", "--control-skip", "D10")
         self.assertEqual(rc, 2); self.assertIn("refused", out)
+
+    def test_parse_version_new_and_old_lines(self):
+        m = load()  # `hee4 --version` since the catalogue landed (live 2026-10-05), and the line before it
+        new = m.parse_version("hee4 4.0.0-skeleton d0bebb274a11 catalogue=74c45f9bd2d2")
+        old = m.parse_version("hee4 4.0.0-skeleton d0bebb274a11")
+        self.assertEqual(new, {"version": "4.0.0-skeleton", "head": "d0bebb274a11", "catalogue": "74c45f9bd2d2"})
+        self.assertEqual(old, {"version": "4.0.0-skeleton", "head": "d0bebb274a11", "catalogue": None})
+        self.assertEqual(m.parse_version("hee4 4.0.0 d0bebb274a117257abeb544ddca1003aab1016bc")["head"], "d0bebb274a11")
+        for bad in ("", "Python 3.13.1", "hee4 4.0.0-skeleton", "hee4 4.0.0 catalogue=74c45f9bd2d2", "hee4 4.0.0 xyz"):
+            self.assertIsNone(m.parse_version(bad), bad)
+
+    def _d1(self, bin_line, exe_line, tree):
+        """d1() against a fake unit: argv[0] and /proc/<pid>/exe are two scripts printing the given lines."""
+        m, d = load(), tempfile.mkdtemp(prefix="cd-d1-")
+        self.addCleanup(shutil.rmtree, d, True)
+        def script(name, line):
+            p = os.path.join(d, name)
+            with open(p, "w") as f:
+                f.write(f"#!/bin/sh\necho '{line}'\n")
+            os.chmod(p, 0o755); return p
+        binp, exe = script("hee4", bin_line), script("exe-hee4", exe_line)
+        os.makedirs(os.path.join(d, "proc", "42")); os.symlink(exe, os.path.join(d, "proc", "42", "exe"))
+        r = m.d1(types.SimpleNamespace(proc=os.path.join(d, "proc")), {"pid": 42, "bin": binp, "tree": tree})
+        return r.line(), dict(t.split("=", 1) for t in r.line().split() if "=" in t)
+
+    def test_d1_new_line_heads_agree_pass(self):
+        line, kv = self._d1("hee4 4.0.0-skeleton d0bebb274a11 catalogue=74c45f9bd2d2",
+                            "hee4 4.0.0-skeleton d0bebb274a11 catalogue=74c45f9bd2d2", "d0bebb274a11")
+        self.assertEqual((kv["binary"], kv["exe_head"], kv["catalogue"]), ("d0bebb274a11", "d0bebb274a11", "74c45f9bd2d2"))
+        self.assertEqual(kv["identity"], "match")  # the two scripts print the same line, so their bytes match
+        self.assertNotIn("version_head", kv); self.assertTrue(line.endswith(" PASS"), line)
+
+    def test_d1_planted_exe_version_head_differs_fails_naming_it(self):
+        line, kv = self._d1("hee4 4.0.0-skeleton d0bebb274a11 catalogue=74c45f9bd2d2",
+                            "hee4 4.0.0-skeleton 54fd592aaaaa catalogue=74c45f9bd2d2", "d0bebb274a11")
+        self.assertEqual(kv["binary"], "d0bebb274a11"); self.assertEqual(kv["exe_head"], "54fd592aaaaa")
+        self.assertEqual(kv["version_head"], "mismatch(binary=d0bebb274a11,exe=54fd592aaaaa)")
+        self.assertTrue(line.endswith(" FAIL"), line)
+
+    def test_feature_counts_every_line_lands_once(self):
+        m = load()
+        feats = ["drive feature=health verdict=PASS paths=6/6 evidence=e",
+                 "drive feature=a verdict=UNMEASURED paths=0/0 evidence=e scope=unserved reason=no procedure in tools/drive.d",
+                 "drive feature=b verdict=UNMEASURED paths=0/0 evidence=e reason=procedure UNWRITTEN",
+                 "drive feature=c verdict=UNMEASURED paths=1/3 evidence=e",
+                 "drive feature=d verdict=FAIL paths=2/3 evidence=e",
+                 "drive feature=e verdict=FAIL paths=2/3 evidence=e reason=a FAIL is never excused",
+                 "drive feature=f verdict=PASS_WITH_GAPS paths=2/3 evidence=e"]
+        self.assertEqual(m.feature_counts(feats), (1, 2, 4))
 
     def test_no_declaration_is_parsed(self):
         src = open(CD).read()
