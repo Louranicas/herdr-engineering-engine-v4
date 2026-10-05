@@ -150,7 +150,7 @@ Recorded because each is now an instance a future door must fail on:
 ## Not yet
 
 - The D10 version cut as the ATLAS defines it: `tools/check-deployed` (D1–D9 aggregate and its `--control`), the cold clone, `push-scan` and `apparatus_ratio=` are unbuilt, so no `v4.0.0` tag exists and none is claimed.
-- A brief whose VERIFY is trivially true (`sh: true`) now reaches `accepted`, since a ran-and-exited-0 step is a Pass with exit evidence. That is a rung-2 gap at admission (refuse a VERIFY that looks at nothing), not at the verdict.
+- Shipped: a VERIFY that looks at nothing (empty, nothing runnable, or only `true`/`:`/`exit 0`/`echo` lines) is refused at admission by name (`invalid_argument` at `/body/brief`, `Refusal::VacuousVerify`); a real command that proves nothing is still a Pass, as named in the app FLOW (crates/hee4-app/FLOW.md).
 - Firstmate live crew in herdr: decided (V4-93) as captain-supervised on this harness; zero-touch work runs through the Agent-tool roster recorded in `firstmate.db`. Revisit when herdr gains a key-send or Firstmate delivers briefs to raw launches.
 - Nineteen release actions beyond the skeleton (`thread.*`, `tools.*`, `roster.*`, `analysis.*`, `judge.inspect`): the drive reports each `UNMEASURED` by name.
 - An attempts table so recovery rules R03, R09 and R13 can fire; socket and door limits as K1 budgets rather than literals.
