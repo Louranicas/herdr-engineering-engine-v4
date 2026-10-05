@@ -875,6 +875,99 @@ mod tests {
         Ok(())
     }
 
+    /// The live ledger's parked state, planted exactly: a foundation-era file whose task ran
+    /// `Admit`, `Dispatch`, `Settle(Ready)` and stopped in `verifying` with no `attempts` row and
+    /// no receipt. Recovery quarantines it by name (R12, `EffectUnknownPermanent`), completes,
+    /// and a second pass applies nothing; a task past its `Decide(Pass)` is left for `Accept`.
+    #[test]
+    fn a_verifying_task_with_no_attempt_or_receipt_is_quarantined_by_name() -> R {
+        let dir = std::env::temp_dir().join(format!("hee4-core-parked-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("parked.sqlite");
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+        let ready = Event::Settle(Settlement::Ready);
+        {
+            let old = Store::open_with(&path, &MIGRATIONS[..4])?;
+            for (task, events) in [
+                ("parked", vec![Event::Admit, Event::Dispatch, ready]),
+                (
+                    "decided",
+                    vec![
+                        Event::Admit,
+                        Event::Dispatch,
+                        ready,
+                        Event::Decide(hee4_contracts::Verdict::Pass),
+                    ],
+                ),
+            ] {
+                old.conn.execute(
+                    "INSERT INTO tasks(id, phase, cancel, generation, updated_ts) VALUES (?1, 'verifying', 0, 1, 1)",
+                    [task],
+                )?;
+                for event in events {
+                    old.conn.execute(
+                        "INSERT INTO events(task_id, event_json, ts) VALUES (?1, ?2, 1)",
+                        params![task, codec::encode(event)?],
+                    )?;
+                }
+            }
+        }
+        let store = Store::open(&path)?;
+        let parked: TaskId = "parked".parse()?;
+        let decided: TaskId = "decided".parse()?;
+        assert_eq!(
+            (store.attempts(&parked)?, store.receipt_count(&parked)?),
+            (Vec::new(), 0)
+        );
+        assert_eq!(store.phase(&parked)?, Some(Phase::Verifying));
+
+        let report = reconcile(&store, &Observations::worker_absent())?;
+        let row = |t: &TaskId| report.rows.iter().find(|r| r.task_id == *t).cloned();
+        let p = row(&parked).ok_or("parked row")?;
+        assert_eq!(
+            (p.rule, p.before, p.after),
+            (
+                Some(RecoveryRule::R12VerificationBoundary),
+                Phase::Verifying,
+                Phase::Blocked { cancel: false }
+            )
+        );
+        let d = row(&decided).ok_or("decided row")?;
+        assert_eq!(
+            (d.rule, d.after),
+            (
+                Some(RecoveryRule::R12VerificationBoundary),
+                Phase::Verifying
+            )
+        );
+        assert_eq!(
+            (report.applied, report.complete),
+            (1, true),
+            "{:?}",
+            report.findings
+        );
+        assert_eq!(
+            store.history(&parked)?.last(),
+            Some(&Event::Resolve(hee4_contracts::Resolution::Quarantine(
+                hee4_contracts::QuarantineReason::EffectUnknownPermanent {
+                    rule: RecoveryRule::R12VerificationBoundary
+                }
+            )))
+        );
+        assert_eq!(store.attempts(&parked)?, Vec::new(), "never backfilled");
+
+        // Converges: a second pass applies nothing and the task stays blocked.
+        let again = reconcile(&store, &Observations::worker_absent())?;
+        assert_eq!((again.applied, again.complete), (0, true));
+        assert_eq!(
+            store.phase(&parked)?,
+            Some(Phase::Blocked { cancel: false })
+        );
+        Ok(())
+    }
+
     #[test]
     fn a_pre_ledger_open_attempt_recovers_and_settles() -> R {
         let dir = std::env::temp_dir().join(format!("hee4-core-attempts-{}", std::process::id()));
@@ -921,9 +1014,22 @@ mod tests {
                 Phase::EffectUnknown { cancel: false }
             )
         );
+        // `settles` sits in `verifying` with no receipt: R12 quarantines it by name.
+        let held = report
+            .rows
+            .iter()
+            .find(|r| r.task_id == settles)
+            .ok_or("settles row")?;
+        assert_eq!(
+            (held.rule, held.after),
+            (
+                Some(RecoveryRule::R12VerificationBoundary),
+                Phase::Blocked { cancel: false }
+            )
+        );
         assert_eq!(
             (report.applied, report.complete),
-            (1, true),
+            (2, true),
             "{:?}",
             report.findings
         );

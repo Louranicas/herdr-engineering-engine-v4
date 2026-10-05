@@ -245,8 +245,9 @@ fn reconcile_applies_r08_through_apply_and_is_idempotent() -> R {
     let before = store.event_count()?;
     let report = reconcile(&store, &Observations::worker_absent())?;
     assert!(report.complete, "{:?}", report.findings);
-    assert_eq!(report.applied, 2);
-    assert_eq!(store.event_count()?, before + 2);
+    // R08 twice, and R12's quarantine of the verification nothing sealed (no receipt).
+    assert_eq!(report.applied, 3);
+    assert_eq!(store.event_count()?, before + 3);
     let got: Vec<_> = report
         .rows
         .iter()
@@ -266,7 +267,7 @@ fn reconcile_applies_r08_through_apply_and_is_idempotent() -> R {
                 "c-verifying".into(),
                 Some(RecoveryRule::R12VerificationBoundary),
                 Phase::Verifying,
-                Phase::Verifying
+                Phase::Blocked { cancel: false }
             ),
             (
                 "d-cancel".into(),
@@ -305,7 +306,7 @@ fn reconcile_applies_r08_through_apply_and_is_idempotent() -> R {
     }
     let second = reconcile(&store, &Observations::worker_absent())?;
     assert_eq!((second.applied, second.complete), (0, true));
-    assert_eq!(store.event_count()?, before + 2);
+    assert_eq!(store.event_count()?, before + 3);
     Ok(())
 }
 
