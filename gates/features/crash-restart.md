@@ -10,7 +10,7 @@ The charter's "survives a crash, a restart and a restore" (CHARTER §1) as one f
 - restore-from-backup: `hee4 restore --into <dir> <backup-id>` writes a fresh generation from a backup/2 (manifest-last, chained page digests), runs recovery to `complete` inside the verb, persists `restored_from`, prints `restore backup=<id> ledger=<d> objects=<n>/<n> rto_s=<t> verdict=PASS`.
 - effect-unknown-visibility: an attempt whose effect cannot be proven becomes task `effect_unknown{cancel}` and stays readable in `task.get` until `task.resolve`.
 - custody-after-crash: a stale `control.sock` with no live holder is replaced only after the liveness probe; a live holder refuses a second `serve` by name.
-- no-auto-restart: no `Restart=` is configured anywhere in the atlas (D7, CN-06); the drill starts the unit explicitly.
+- auto-restart-with-explicit-fallback: the unit carries `Restart=on-failure RestartSec=2` (systemd/hee4.service:12-13, V4-91), so a `kill -KILL` is followed by systemd's own restart in ~2 s; the drill still starts the unit explicitly (`systemctl --user start`) when it is not back within half its budget and records `explicit_start=yes` (V4-37: the drill never relies on `Restart=`).
 
 ## How to get to it (user POV)
 
@@ -26,19 +26,21 @@ A socket caller sees: connection refused during the gap; after restart, `health`
 
 Preconditions: README `doctor` green before the drill; the unit installed (D2); a recent verified backup on the other disk for the restore leg; the rehearsal record open to receive each step's `rc=`.
 
-Kill -9 mid-task (ATLAS D7 real-kill step, verbatim where the atlas spells it):
+Kill -9 mid-task (ATLAS D7 real-kill step; the executable form is `tools/drill --submit N` (rev 2026-10-05 drill), which runs exactly this over the JSON-line frame on `$XDG_RUNTIME_DIR/hee4/control.sock`):
 
 ```bash
-for i in $(seq 1 $N); do hee4-sh task.submit 'spec:={…}' @idempotency_key=$(uuidgen); done   # N acks; record the task ids
+tools/drill --submit N          # the steps below, one drill_step= line each; last line drill verdict=... submitted=N acked_present=N/N
+# what it does, step by step:
+for i in $(seq 1 $N); do printf '%s\n' '{"request_id":"...","action":"task.submit","action_version":1,"idempotency_key":"<uuid4>","body":{"brief":"<eleven fields>"}}' | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/hee4/control.sock; done   # N acks (phase=admitted); the task ids are recorded
 MAINPID=$(systemctl --user show -p MainPID --value hee4.service)
 kill -KILL $MAINPID                                                                           # rc recorded
-systemctl --user start hee4.service                                                          # explicit; no Restart= exists
+# Restart=on-failure RestartSec=2 brings the unit back; if no new MainPID by half the budget the drill runs the explicit start (V4-37) and records explicit_start=yes
+systemctl --user start hee4.service                                                          # explicit fallback only
 hee4 health                                                                                  # ready=true recovery=complete database=ready socket=owned
-hee4-sh task.list 'states:=["admitted","running","effect_unknown","accepted"]' task_class:=null parent_task_id:=null 'page:={"limit":100,"cursor":null}'   # acked_present=N/N over the recorded ids
-hee4-sh task.get 'selector:={"task_id":"<the one that was running>"}' evidence=none            # reconciled state
+printf '%s\n' '{"request_id":"...","action":"task.list","action_version":1,"idempotency_key":null,"body":{}}' | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/hee4/control.sock   # acked_present=N/N over the recorded ids
 ```
 
-- Evidence: `acked_present=N/N` (D7); the rehearsal record lists the N ids so D9 excludes them; `/proc/<MainPID>/exe` digest unchanged across the restart (D2).
+- Evidence: `acked_present=N/N` (D7); the rehearsal record `~/.cache/hee4-drill/<sha12>/rehearsal.json` (`{tree, unit, submitted, acked_present, task_ids, steps, ts}`, written on every drill run) is what `tools/check-deployed` D7 reads and whose `task_ids` D9 excludes; `/proc/<MainPID>/exe` digest unchanged across the restart (D2).
 - Side effects: `tasks` rows for all N present in a host `mode=ro` read; the running attempt's row is `unknown` or `settled` per the policy; no `operations` row lost.
 
 Unit restart (RL-10 then RL-7):

@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
-"""doctor [--unit hee4.service] [--socket PATH] [--model-url URL] [--repo DIR]
+"""doctor [--unit hee4.service] [--socket PATH] [--model-url URL] [--model NAME] [--require-gpu] [--repo DIR]
 
 Fresh-instance readiness (gates/features/README.md "doctor"). Each check prints
   check=<name> status=MEASURED|UNMEASURED|FAIL detail=<text>
 UNMEASURED always names its reason; it is never a 0 and it is red. Last line
-  doctor verdict=PASS|FAIL|UNMEASURED measured=k/n unmeasured=u fail=f head=<sha12>
-Exit: 0 PASS (every check MEASURED and ok), 1 FAIL (any check measured bad), 3 UNMEASURED.
+  doctor verdict=PASS|FAIL|UNMEASURED measured=k/n unmeasured=u fail=f advisory=a head=<sha12>
+Exit: 0 PASS (every counted check MEASURED and ok), 1 FAIL (any check measured bad), 3 UNMEASURED.
 Checks: tool cargo, tool bwrap, unit active, socket perms, ledger opens (hee4 health),
-model reachable (:11434), binary sha = HEAD.
+model_endpoint (/api/ps parses), model_gpu (the pinned model listed with size_vram > 0; a CPU copy
+is FAIL; not resident or no name is UNMEASURED with scope=advisory, excluded from the verdict and
+counted in advisory=, unless --require-gpu), binary sha = HEAD.
 """
 import argparse, json, os, re, stat, subprocess, sys, urllib.request
 
-rows = []
+rows = []      # counted statuses
+advisory = []  # excluded from the verdict (scope=advisory), as tools/drive excludes scope=unserved
 
-def emit(name, status, detail):
-    rows.append(status)
+def emit(name, status, detail, excluded=False):
+    (advisory if excluded else rows).append(status)
     print(f"check={name} status={status} detail={detail}")
 
 def sh(*cmd, timeout=10):
@@ -40,6 +43,8 @@ def main():
     ap.add_argument("--socket", default=f"{xdg}/hee4/control.sock")
     ap.add_argument("--model-url", default="http://127.0.0.1:11434")
     ap.add_argument("--repo", default=os.getcwd())
+    ap.add_argument("--model", default="", help="the pinned model name; default HEE4_MODEL, else the unit's Environment")
+    ap.add_argument("--require-gpu", action="store_true", help="count an unmeasured model_gpu row in the verdict")
     a = ap.parse_args()
 
     # Under the gate the tree is a `git archive` export with no .git: the gate passes the subject
@@ -87,18 +92,33 @@ def main():
     else:
         emit("ledger", "FAIL", f"rc={rc} {out or err}")
 
-    # model endpoint
+    # model endpoint: /api/ps parses
+    models = None
     try:
         with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(a.model_url + "/api/ps", timeout=5) as r:
             models = json.load(r).get("models", [])
     except (OSError, ValueError) as e:
-        emit("model", "FAIL", f"{a.model_url}/api/ps unreachable: {e}")
+        emit("model_endpoint", "FAIL", f"{a.model_url}/api/ps unreachable: {e}")
     else:
-        if not models:
-            emit("model", "MEASURED", "endpoint reachable (/api/ps ok); GPU residency UNMEASURED: no model loaded")
+        emit("model_endpoint", "MEASURED", f"{a.model_url}/api/ps ok loaded={len(models)}")
+
+    # model gpu: the pinned model resident with size_vram > 0; advisory unless --require-gpu
+    model = a.model or os.environ.get("HEE4_MODEL", "")
+    if not model:
+        _, env_out, _ = sh("systemctl", "--user", "show", "-p", "Environment", "--value", a.unit)
+        model = dict(kv.split("=", 1) for kv in env_out.split() if "=" in kv).get("HEE4_MODEL", "")
+    scope = "required" if a.require_gpu else "advisory"
+    if models is None:
+        emit("model_gpu", "UNMEASURED", f"endpoint unreachable, residency unreadable scope={scope}", excluded=not a.require_gpu)
+    elif not model:
+        emit("model_gpu", "UNMEASURED", f"no pinned model name (--model, HEE4_MODEL, or the unit's Environment) scope={scope}", excluded=not a.require_gpu)
+    else:
+        hit = [m for m in models if m.get("name") == model or m.get("model") == model]
+        if not hit:
+            emit("model_gpu", "UNMEASURED", f"model {model} not resident (ollama unloads idle models) scope={scope}", excluded=not a.require_gpu)
         else:
-            cpu = [m.get("name", "?") for m in models if not m.get("size_vram", 0)]
-            emit("model", "FAIL" if cpu else "MEASURED", f"loaded={len(models)} cpu_only={','.join(cpu) or 'none'}")
+            vram = hit[0].get("size_vram", 0) or 0
+            emit("model_gpu", "MEASURED" if vram > 0 else "FAIL", f"model={model} size_vram={vram}" + ("" if vram > 0 else " (CPU copy)"))
 
     # binary sha = HEAD
     if not pid:
@@ -113,7 +133,7 @@ def main():
     k, n = rows.count("MEASURED"), len(rows)
     u, f = rows.count("UNMEASURED"), rows.count("FAIL")
     v = "FAIL" if f else "UNMEASURED" if u else "PASS"
-    print(f"doctor verdict={v} measured={k}/{n} unmeasured={u} fail={f} head={head}")
+    print(f"doctor verdict={v} measured={k}/{n} unmeasured={u} fail={f} advisory={len(advisory)} head={head}")
     sys.exit({"PASS": 0, "FAIL": 1, "UNMEASURED": 3}[v])
 
 if __name__ == "__main__":

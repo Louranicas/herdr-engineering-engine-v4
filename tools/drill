@@ -1,19 +1,33 @@
 #!/usr/bin/env python3
-"""drill [--unit hee4.service] [--socket PATH] [--restart-budget S] [--repo DIR]
+"""drill [--unit hee4.service] [--socket PATH] [--restart-budget S] [--repo DIR] [--submit N] [--drill-root DIR]
 
 The kill -9 drill (gates/features/crash-restart.md): SIGKILL the unit's MainPID, then require the
 unit to come back with a new MainPID, the socket to return 0700/0600, and `hee4 health` ready.
 Parameterised on the unit name and socket path. Each step prints
   drill_step=<name> status=MEASURED|UNMEASURED|FAIL elapsed=<s>/<budget>s detail=<text>
 If the unit is not loaded every step is UNMEASURED with its reason (never a 0, and red).
+--submit N (default 0): N acked task.submit frames over --socket before the kill (step `submit`,
+detail acked=N/N ids=...), and after health_ready one task.list that must list every id (step
+`acked_present`, detail k/N missing=...). The rehearsal record
+  <drill-root>/<sha12>/rehearsal.json      (default ~/.cache/hee4-drill; written on every run)
+holds {tree, unit, submitted, acked_present, task_ids, steps, ts}: D7 reads it, D9 excludes its ids.
+task_ids is the union with the record already there (a second run at the same tree loses no id, so no
+drill task ever counts as use) and the record is written right after the submit step, before the kill.
+unit_active refuses MainPID=0 by name (an active unit without a main process): nothing is killed.
+unit_restarted waits for Restart=on-failure; if no new MainPID by half the budget it runs
+`systemctl --user start <unit>` once and records explicit_start=yes (V4-37).
 Last line
-  drill verdict=PASS|FAIL|UNMEASURED steps=k/n unit=<name> head=<sha12>
+  drill verdict=PASS|FAIL|UNMEASURED steps=k/n unit=<name> head=<sha12> [submitted=N acked_present=k/N]
 Exit: 0 PASS, 1 FAIL, 3 UNMEASURED.
 """
-import argparse, os, signal, stat, subprocess, sys, time
+import argparse, json, os, signal, socket, stat, subprocess, sys, time, uuid
 
 rows = []
-STEPS = ["unit_active", "kill9", "unit_restarted", "socket_perms", "health_ready"]
+BASE_STEPS = ["unit_active", "kill9", "unit_restarted", "socket_perms", "health_ready"]
+# The drill's brief: eleven fields; VERIFY is an absolute path (a Run step, FLOW.md), never a vacuous `true`.
+BRIEF = ("GOAL: drill rehearsal\nSCOPE: s\nCONTEXT: c\nACCEPTANCE: a\nVERIFY: /usr/bin/test -d /usr\nTIMEBOX: 10s\n"
+         "FORBIDDEN: f\nREPORT: r\nSTANDING: s\nRECON: r\nRESTATEMENT: test that /usr is a directory\n")
+
 
 def sh(*cmd, timeout=10):
     try:
@@ -22,19 +36,87 @@ def sh(*cmd, timeout=10):
     except (OSError, subprocess.TimeoutExpired) as e:
         return None, "", str(e)
 
+
 def emit(name, status, budget, t0, detail):
-    rows.append(status)
-    print(f"drill_step={name} status={status} elapsed={time.monotonic() - t0:.1f}/{budget}s detail={detail}")
+    elapsed = time.monotonic() - t0
+    rows.append({"name": name, "status": status, "elapsed": round(elapsed, 1), "detail": detail})
+    print(f"drill_step={name} status={status} elapsed={elapsed:.1f}/{budget}s detail={detail}")
+
 
 def props(unit):
     rc, out, _ = sh("systemctl", "--user", "show", "-p", "LoadState,ActiveState,MainPID", unit)
     return rc, dict(l.split("=", 1) for l in out.splitlines() if "=" in l)
 
-def finish(unit, head):
-    k, n = rows.count("MEASURED"), len(STEPS)
-    v = "FAIL" if "FAIL" in rows else "PASS" if k == n else "UNMEASURED"
-    print(f"drill verdict={v} steps={k}/{n} unit={unit} head={head}")
-    sys.exit({"PASS": 0, "FAIL": 1, "UNMEASURED": 3}[v])
+
+def frame(sock_path, action, body, key=None, timeout=10):
+    """One JSON line over AF_UNIX (the tools/drive client shape); the parsed reply or None."""
+    raw = json.dumps({"request_id": "drill-" + uuid.uuid4().hex[:12], "action": action, "action_version": 1,
+                      "idempotency_key": key, "body": body}, separators=(",", ":"))
+    s = socket.socket(socket.AF_UNIX); s.settimeout(timeout)
+    buf = b""
+    try:
+        s.connect(sock_path)
+        s.sendall(raw.encode() + b"\n")
+        while not buf.endswith(b"\n"):
+            c = s.recv(65536)
+            if not c:
+                break
+            buf += c
+    except OSError:
+        return None
+    finally:
+        s.close()
+    try:
+        return json.loads(buf.decode(errors="replace")) if buf else None
+    except ValueError:
+        return None
+
+
+def is_result(r):
+    return bool(r) and r.get("kind") == "result"
+
+
+class Run:
+    """This run's step list (submit/acked_present only with --submit), its ids, and the record."""
+    def __init__(self, a, head):
+        self.a, self.head = a, head
+        self.steps = list(BASE_STEPS)
+        if a.submit > 0:
+            self.steps.insert(1, "submit")
+            self.steps.append("acked_present")
+        self.ids, self.acked = [], 0
+
+    def not_reached(self, after, why):
+        for s in self.steps[self.steps.index(after) + 1:]:
+            emit(s, "UNMEASURED", self.a.restart_budget, time.monotonic(), f"not reached: {why}")
+
+    def save(self, ap):
+        """Write the record: this run's steps and ack count, task_ids merged with the record already there."""
+        p = os.path.join(self.a.drill_root, self.head, "rehearsal.json")
+        try:
+            prior = json.load(open(p)).get("task_ids") or []
+        except (OSError, ValueError):
+            prior = []
+        ids = list(dict.fromkeys([*prior, *self.ids]))  # append-only: no earlier run's id is ever dropped
+        rec = {"tree": self.head, "unit": self.a.unit, "submitted": self.a.submit, "acked_present": ap,
+               "task_ids": ids, "steps": rows, "ts": time.time()}
+        try:
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p + ".tmp", "w") as f:
+                json.dump(rec, f)
+            os.replace(p + ".tmp", p)
+        except OSError as e:
+            print(f"drill rehearsal=UNWRITTEN({p}: {e})")
+
+    def finish(self):
+        k, n = sum(1 for r in rows if r["status"] == "MEASURED"), len(self.steps)
+        v = "FAIL" if any(r["status"] == "FAIL" for r in rows) else "PASS" if k == n else "UNMEASURED"
+        ap = f"{self.acked}/{self.a.submit}"
+        self.save(ap)
+        tail = f" submitted={self.a.submit} acked_present={ap}" if self.a.submit > 0 else ""
+        print(f"drill verdict={v} steps={k}/{n} unit={self.a.unit} head={self.head}{tail}")
+        sys.exit({"PASS": 0, "FAIL": 1, "UNMEASURED": 3}[v])
+
 
 def main():
     ap = argparse.ArgumentParser(prog="drill", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -43,21 +125,53 @@ def main():
     ap.add_argument("--socket", default=f"{xdg}/hee4/control.sock")
     ap.add_argument("--restart-budget", type=int, default=30, help="seconds to wait for the restart")
     ap.add_argument("--repo", default=os.getcwd())
+    ap.add_argument("--submit", type=int, default=0, help="N acked task.submit frames before the kill")
+    ap.add_argument("--drill-root", default=os.path.expanduser("~/.cache/hee4-drill"))
     a = ap.parse_args()
-    rc, head, _ = sh("git", "-C", a.repo, "rev-parse", "HEAD")
-    head = head[:12] if rc == 0 and head else "unmeasured"
+    head = os.environ.get("HEE4_HEAD", "").strip()  # the gate's export has no .git: HEE4_HEAD wins
+    if not head:
+        rc, head, _ = sh("git", "-C", a.repo, "rev-parse", "HEAD")
+        head = head if rc == 0 else ""
+    head = head[:12] if head else "unmeasured"
     B = a.restart_budget
+    run = Run(a, head)
 
     t0 = time.monotonic()
     rc, p = props(a.unit)
     if rc is None or p.get("LoadState") != "loaded" or p.get("ActiveState") != "active":
         why = "systemctl not runnable" if rc is None else f"{a.unit} LoadState={p.get('LoadState')} ActiveState={p.get('ActiveState')}; the unit does not exist or is not running"
         emit("unit_active", "UNMEASURED", 5, t0, why)
-        for s in STEPS[1:]:
-            emit(s, "UNMEASURED", B, time.monotonic(), "not reached: unit_active was not measured")
-        finish(a.unit, head)
+        run.not_reached("unit_active", "unit_active was not measured")
+        run.finish()
     old = int(p.get("MainPID", "0") or 0)
+    if old <= 0:  # os.kill(0, ...) would signal this drill's own process group: refused by name, nothing is killed
+        emit("unit_active", "FAIL", 5, t0, f"MainPID={old}: active unit without a main process; nothing to kill")
+        run.not_reached("unit_active", "no MainPID to kill")
+        run.finish()
     emit("unit_active", "MEASURED", 5, t0, f"MainPID={old}")
+
+    if a.submit > 0:
+        t0 = time.monotonic()
+        up = None
+        while time.monotonic() - t0 < B and not is_result(up):  # poll health first: not_ready precedes reconcile
+            up = frame(a.socket, "health", {})
+            if not is_result(up):
+                time.sleep(0.5)
+        refused = None
+        for _ in range(a.submit):
+            r = frame(a.socket, "task.submit", {"brief": BRIEF}, key=str(uuid.uuid4()))
+            if is_result(r) and (r.get("body") or {}).get("task_id"):
+                run.ids.append(r["body"]["task_id"])
+            else:
+                refused = (r or {}).get("code", "no_reply")
+                break
+        ok = len(run.ids) == a.submit
+        emit("submit", "MEASURED" if ok else "FAIL", B, t0,
+             f"acked={len(run.ids)}/{a.submit} ids={','.join(run.ids) or 'none'}" + ("" if ok else f" refused={refused}"))
+        if not ok:
+            run.not_reached("submit", "submit failed")
+            run.finish()
+        run.save(f"0/{a.submit}")  # the ids are on disk before the kill: a drill killed mid-way loses none
 
     t0 = time.monotonic()
     try:
@@ -65,20 +179,22 @@ def main():
         emit("kill9", "MEASURED", 5, t0, f"SIGKILL sent to {old}")
     except OSError as e:
         emit("kill9", "FAIL", 5, t0, f"cannot kill {old}: {e}")
-        for s in STEPS[2:]:
-            emit(s, "UNMEASURED", B, time.monotonic(), "not reached: kill9 failed")
-        finish(a.unit, head)
+        run.not_reached("kill9", "kill9 failed")
+        run.finish()
 
     t0 = time.monotonic()
-    new = 0
+    new, explicit = 0, "no"
     while time.monotonic() - t0 < B:
         rc, p = props(a.unit)
         pid = int(p.get("MainPID", "0") or 0)
         if p.get("ActiveState") == "active" and pid and pid != old:
             new = pid
             break
+        if explicit == "no" and time.monotonic() - t0 >= B / 2:  # V4-37: the drill never relies on Restart=
+            sh("systemctl", "--user", "start", a.unit, timeout=30)
+            explicit = "yes"
         time.sleep(0.2)
-    emit("unit_restarted", "MEASURED" if new else "FAIL", B, t0, f"old={old} new={new or 'none'}")
+    emit("unit_restarted", "MEASURED" if new else "FAIL", B, t0, f"old={old} new={new or 'none'} explicit_start={explicit}")
 
     t0 = time.monotonic()
     while time.monotonic() - t0 < B and not os.path.exists(a.socket):
@@ -102,7 +218,16 @@ def main():
         emit("health_ready", "UNMEASURED", B, t0, "hee4 binary not on PATH")
     else:
         emit("health_ready", "MEASURED" if rc == 0 and "ready=true" in out and "recovery=complete" in out else "FAIL", B, t0, out.splitlines()[0] if out else f"rc={rc}")
-    finish(a.unit, head)
+
+    if a.submit > 0:
+        t0 = time.monotonic()
+        r = frame(a.socket, "task.list", {})
+        listed = {t.get("task_id") for t in ((r or {}).get("body") or {}).get("tasks", [])}
+        missing = [t for t in run.ids if t not in listed]
+        run.acked = len(run.ids) - len(missing)
+        emit("acked_present", "MEASURED" if not missing else "FAIL", B, t0, f"{run.acked}/{a.submit} missing={','.join(missing) or 'none'}")
+    run.finish()
+
 
 if __name__ == "__main__":
     main()
