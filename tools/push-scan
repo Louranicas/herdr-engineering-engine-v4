@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""push-scan [RANGE] [--repo DIR] [--exclusions FILE] | push-scan --control
+"""push-scan [RANGE] [--repo DIR] [--exclusions FILE] [--exceptions FILE] | push-scan --control
 
 Scans the ADDED lines of a commit range (default github/main..HEAD when a `github` remote exists)
 and its commit messages for three classes: secret (V4-76), v3_path (the fence) and outward_name
@@ -12,8 +12,13 @@ Exit 0 only when hits=0; 1 otherwise; 2 refused (no range, unknown rev, unreadab
 Paths ending .md are scanned for secret and outward_name only (CLAUDE.md names v3 paths to forbid
 them). Exclusions come from ops/v3-independence-exclusions.txt (`repo:<path or glob> | reason`;
 a row without a reason excludes nothing) plus one built-in: this script, whose RULES table holds
-the literals it hunts. v3 roots are read through .claude/hooks/lib/v3_guard.py, never copied.
---control builds a throwaway repo with one runtime-assembled plant per class, scans HEAD~1..HEAD
+the literals it hunts. Reasoned exceptions come from tools/push-scan-exceptions.txt, one row per hit:
+  <file or commit:<sha12>> | <line> | <rule> | <one-sentence reason>
+A row covers the one hit with exactly that file, line and rule, so a new hit in the same file is still a
+hit; a malformed row, a duplicate row or a row with an empty reason is refused (rc 2), never skipped.
+Rows that cover no hit in the range are counted as stale= (a narrower range leaves rows unused). v3 roots are read through .claude/hooks/lib/v3_guard.py, never copied.
+--control builds a throwaway repo with one runtime-assembled plant per class, scans HEAD~1..HEAD with this
+repo's exceptions loaded
 and prints `push-scan control cases=k/3 verdict=PASS|FAIL` (exit 1 unless every class fires).
 No network: every read is `git -C <repo>`. The patch text is pinned, not trusted: the diff runs
 with prefixes, colour, external diff, textconv, renames and quoting fixed on the command line (a
@@ -38,6 +43,8 @@ RULES = [
     ("outward_name", "home_path", re.compile(r"/home/louranicas|/var/home/Louranicas")),
     ("outward_name", "owner_email", re.compile(r"lukeomahoney@")),
 ]
+RULE_NAMES = {name for _, name, _ in RULES} | {"deny_root"}
+EXCEPTIONS = os.path.join("tools", "push-scan-exceptions.txt")
 HUNK = re.compile(r"^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 # Every switch that a host's git config or environment could otherwise flip on the patch text.
 DIFF_PIN = ["-c", "core.quotePath=false", "-c", "color.ui=never", "-c", "diff.suppressBlankEmpty=false",
@@ -83,6 +90,34 @@ def load_exclusions(path):
             pats.append(target[len("repo:"):].strip())
     return pats, str(len(pats))
 
+def load_exceptions(path, required):
+    """Reasoned rows keyed (file, line, rule); returns ({key: reason}, note). Refuses (rc 2) a bad row."""
+    if path is None or not os.path.isfile(path):
+        if required:
+            die(f"exceptions file {path} is not readable")
+        return {}, f"absent({path})"
+    rows = {}
+    with open(path, encoding="utf-8") as f:
+        for n, raw in enumerate(f, 1):
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = [s.strip() for s in line.split("|", 3)]
+            if len(parts) != 4:
+                die(f"{path}:{n}: exception row is not <file> | <line> | <rule> | <reason>")
+            target, num, rule, reason = parts
+            if not reason:
+                die(f"{path}:{n}: exception row has an empty reason")
+            if not target or not num.isdigit() or int(num) < 1:
+                die(f"{path}:{n}: exception row needs a file and a positive line number")
+            if rule not in RULE_NAMES:
+                die(f"{path}:{n}: exception row names unknown rule {rule!r}")
+            key = (target, int(num), rule)
+            if key in rows:
+                die(f"{path}:{n}: duplicate exception row for {target}:{num} {rule}")
+            rows[key] = reason
+    return rows, str(len(rows))
+
 def excluded(path, pats):
     for pat in pats:
         if path == pat or fnmatch.fnmatchcase(path, pat) or fnmatch.fnmatchcase(path, pat.rstrip("/") + "/*"):
@@ -125,8 +160,9 @@ def parse_diff(diff_text):
         raise ValueError("patch ends inside a hunk")
     return files, added
 
-def scan(repo, base, head, exclusions):
-    """Returns (hits, commits, files, notes); a hit is (class, file, line, rule)."""
+def scan(repo, base, head, exclusions, exceptions=None):
+    """Returns (hits, commits, files, notes); a hit is (class, file, line, rule). A hit whose (file, line, rule)
+    is a key of <exceptions> is printed as excepted, not counted."""
     rules, notes = list(RULES), {}
     extra, note = v3_root_rules(repo)
     notes["v3_roots"] = note
@@ -171,7 +207,12 @@ def scan(repo, base, head, exclusions):
             for cls, name, rx in rules:
                 if rx.search(text):
                     hits.append((cls, f"commit:{sha[:12]}", n, name))
-    return hits, commits, len(files), notes
+    rows = exceptions or {}
+    kept = [h for h in hits if (h[1], h[2], h[3]) not in rows]
+    used = len(hits) - len(kept)
+    notes["exceptions"] = f"{used}/{len(rows)}"
+    notes["stale"] = str(len(rows) - used)
+    return kept, commits, len(files), notes
 
 def resolve(repo, rev):
     rc, out, _ = git(repo, "rev-parse", "--verify", "--quiet", rev + "^{commit}")
@@ -198,9 +239,11 @@ def plant(classes):
     return d
 
 def control():
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    rows, _ = load_exceptions(os.path.join(here, EXCEPTIONS), False)
     d = plant(CLASSES)
     try:
-        hits, _, _, _ = scan(d, "HEAD~1", "HEAD", None)
+        hits, _, _, _ = scan(d, "HEAD~1", "HEAD", None, rows)
     finally:
         shutil.rmtree(d, ignore_errors=True)
     for h in hits:
@@ -215,6 +258,7 @@ def main():
     ap.add_argument("range", nargs="?", help="<base>..<head> (default github/main..HEAD when a github remote exists)")
     ap.add_argument("--repo", default=os.getcwd())
     ap.add_argument("--exclusions", help="reasoned exclusion rows (default <repo>/ops/v3-independence-exclusions.txt)")
+    ap.add_argument("--exceptions", help="reasoned per-hit rows (default <repo>/tools/push-scan-exceptions.txt)")
     ap.add_argument("--control", action="store_true", help="plant one hit per class in a throwaway repo and prove each fires")
     a = ap.parse_args()
     if a.control:
@@ -232,7 +276,9 @@ def main():
     exclusions = a.exclusions or os.path.join(a.repo, "ops", "v3-independence-exclusions.txt")
     if a.exclusions and not os.path.isfile(a.exclusions):
         die(f"exclusions file {a.exclusions} is not readable")
-    hits, commits, files, notes = scan(a.repo, base, head, exclusions)
+    rows, note = load_exceptions(a.exceptions or os.path.join(a.repo, EXCEPTIONS), a.exceptions is not None)
+    hits, commits, files, notes = scan(a.repo, base, head, exclusions, rows)
+    notes["exception_rows"] = note
     print(" ".join(f"{k}={v}" for k, v in notes.items()))
     for h in hits:
         print("hit class=%s file=%s line=%d rule=%s" % h)

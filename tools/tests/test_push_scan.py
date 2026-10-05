@@ -76,6 +76,58 @@ class PushScanTests(unittest.TestCase):
         rc, out, _ = scan(d, "--exclusions", exc)
         self.assertEqual(rc, 0, out); self.assertEqual(hits(out), [])
 
+    def write_exceptions(self, d, body):
+        path = os.path.join(d, "exceptions.txt")
+        with open(path, "w") as f:
+            f.write(body)
+        return path
+
+    def test_exception_row_covers_exactly_one_hit(self):
+        d = planted({"ops/x.rs": f"// {OUTWARD}\n// clean\n"})
+        exc = self.write_exceptions(d, "ops/x.rs | 1 | home_path | the planted line is reviewed\n")
+        rc, out, _ = scan(d, "--exceptions", exc)
+        self.assertEqual(rc, 0, out); self.assertEqual(hits(out), [])
+        self.assertIn("exceptions=1/1 stale=0", out)
+        # a new hit in the same file, same rule, another line is still a hit
+        commit_files(d, {"ops/x.rs": f"// {OUTWARD}\n// clean\n// {OUTWARD}\n"})
+        rc, out, _ = run(SCAN, "HEAD~2..HEAD", "--repo", d, "--exceptions", exc, cwd=d)
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(hits(out), ["hit class=outward_name file=ops/x.rs line=3 rule=home_path"])
+        self.assertIn("exceptions=1/1 stale=0", out)
+        self.assertRegex(out.strip().splitlines()[-1], r" hits=1 verdict=FAIL$")
+
+    def test_exception_row_names_its_rule(self):
+        d = planted({"ops/x.rs": f"let k = \"{AKIA}\"; // {OUTWARD}\n"})
+        exc = self.write_exceptions(d, "ops/x.rs | 1 | home_path | the home path is reviewed, the key is not\n")
+        rc, out, _ = scan(d, "--exceptions", exc)
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(hits(out), ["hit class=secret file=ops/x.rs line=1 rule=aws_akia"])
+
+    def test_exception_row_with_empty_reason_is_refused(self):
+        d = planted({"ops/x.rs": f"// {OUTWARD}\n"})
+        for body, why in (("ops/x.rs | 1 | home_path |\n", "empty reason"),
+                          ("ops/x.rs | 1 | home_path |   \n", "empty reason"),
+                          ("ops/x.rs | 1 | home_path\n", "is not <file>"),
+                          ("ops/x.rs | one | home_path | r\n", "positive line number"),
+                          ("ops/x.rs | 1 | nosuch | r\n", "unknown rule"),
+                          ("ops/x.rs | 1 | home_path | r\nops/x.rs | 1 | home_path | r\n", "duplicate")):
+            rc, out, err = scan(d, "--exceptions", self.write_exceptions(d, body))
+            self.assertEqual(rc, 2, body); self.assertIn(why, err); self.assertNotIn("verdict=", out)
+        rc, _, err = scan(d, "--exceptions", os.path.join(d, "absent.txt"))
+        self.assertEqual(rc, 2); self.assertIn("not readable", err)
+
+    def test_stale_row_is_counted_not_applied(self):
+        d = planted({"ops/x.rs": f"// clean\n// {OUTWARD}\n"})
+        exc = self.write_exceptions(d, "ops/x.rs | 1 | home_path | reviewed when the hit was on line 1\n")
+        rc, out, _ = scan(d, "--exceptions", exc)
+        self.assertEqual(rc, 1, out); self.assertIn("exceptions=0/1 stale=1", out)
+        self.assertEqual(hits(out), ["hit class=outward_name file=ops/x.rs line=2 rule=home_path"])
+
+    def test_repo_exceptions_file_is_well_formed(self):
+        rc, out, err = run(SCAN, "HEAD..HEAD", "--repo", os.path.dirname(TOOLS),
+                           "--exceptions", os.path.join(TOOLS, "push-scan-exceptions.txt"))
+        self.assertEqual(rc, 3, out + err); self.assertRegex(out, r"exception_rows=[1-9]\d*")
+
     def test_commit_message_is_scanned(self):
         d = planted({"p.rs": "fn main() {}\n"})
         with open(os.path.join(d, "q.rs"), "w") as f:
