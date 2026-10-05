@@ -106,13 +106,24 @@ pub fn rows(unit: &str, sock: &Path, repo: &Path) -> Vec<Row> {
 }
 
 /// `budgets` is present iff `health`'s `body.budgets` re-parses through [`Budgets::parse`]
-/// (validation and rendering stay the contracts'); the detail is [`Budgets::render`].
+/// (validation and rendering stay the contracts') AND serialises back to the same JSON: a
+/// served value always names every field, so `{}` or a partial object (which `parse` would fill
+/// with defaults) is not what the engine serves and is `MISSING`. The detail is
+/// [`Budgets::render`].
 fn budgets_row(budgets: &Value) -> Row {
     if budgets.is_null() {
         return row("budgets", false, "health carries no budgets".into());
     }
     match Budgets::parse(&budgets.to_string()) {
-        Ok(b) => row("budgets", true, b.render()),
+        Ok(b) => match serde_json::to_value(b) {
+            Ok(full) if full == *budgets => row("budgets", true, b.render()),
+            Ok(full) => row(
+                "budgets",
+                false,
+                format!("health budgets are not the full served value: {budgets} != {full}"),
+            ),
+            Err(e) => row("budgets", false, e.to_string()),
+        },
         Err(e) => row("budgets", false, e.to_string()),
     }
 }
@@ -154,6 +165,19 @@ mod tests {
         assert!(!zero.present, "{zero:?}");
         assert!(zero.detail.contains("door.max_body_bytes"), "{zero:?}");
         assert!(!budgets_row(&Value::Null).present);
+        // `parse` fills these with defaults; the engine never serves them.
+        for partial in [
+            json!({}),
+            json!({"socket": {"max_connections": 2}}),
+            json!({"socket": {}, "stream": {}}),
+        ] {
+            let r = budgets_row(&partial);
+            assert!(!r.present, "{partial} -> {r:?}");
+            assert!(r.detail.contains("not the full served value"), "{r:?}");
+        }
+        for wrong in [json!({"bogus": {}}), json!({"socket": 5}), json!([1])] {
+            assert!(!budgets_row(&wrong).present, "{wrong}");
+        }
         Ok(())
     }
 }
