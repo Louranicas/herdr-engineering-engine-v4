@@ -1,16 +1,14 @@
-//! The control actions behind one `answer(line)` door: `health`, `task.{submit,get,list,
-//! cancel,preview,resolve}` answer one frame; `events.subscribe` turns the connection into a
-//! stream (`crate::stream`).
-//!
-//! Every state change goes through `Store::admit` or `Store::apply`. A mutating action before
-//! startup reconcile completed is refused `not_ready`, read from the ledger's own flag.
+//! The skeleton's handlers, moved verbatim from `actions.rs`: `health` (owner `App`), the six
+//! `task.*` (owner `Task`) and `events.subscribe` (owner `Notify`), each registered through a
+//! [`Family`] table that `composed()` names. Every state change goes through `Store::admit` or
+//! `Store::apply`; the mutating gates (`idempotency_key`, `not_ready`) are dispatch's, from the
+//! catalogue's `Effect::mutates()`.
 
 use std::fs;
 use std::io::Write as _;
-use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
-use std::time::Instant;
+use std::path::Path;
 
+use hee4_contracts::catalogue::Owner;
 use hee4_contracts::{
     AbandonReason, Brief, BriefField, Event, Phase, QuarantineReason, RecoveryRule, Resolution,
     Sha256Hex, TaskId,
@@ -20,175 +18,51 @@ use hee4_host::model::OllamaClient;
 use hee4_worker::native::StepKind;
 use serde_json::{Value, json};
 
-use crate::dispatcher::{self, Config};
-use crate::wire::{self, Code, Fault, Request};
+use super::registry::Family;
+use super::{Answer, Engine, Reply, internal};
+use crate::dispatcher;
+use crate::wire::{Code, Fault, Request};
 
-/// The engine one `serve` process holds: the ledger (one connection, one process) and paths.
-#[derive(Debug)]
-pub struct Engine {
-    store: Mutex<Store>,
-    ledger: PathBuf,
-    work: PathBuf,
-    doors: PathBuf,
-    cfg: Config,
-    started: Instant,
-    principal: String,
+/// A one-frame handler's reply as dispatch's `Answer`.
+fn frame(reply: Reply) -> Result<Answer, Fault> {
+    reply.map(|(replayed, body)| Answer::Frame(replayed, body))
 }
 
-impl Engine {
-    /// Wrap an opened store. `ledger` is its file (read-only stream readers open it),
-    /// `work` the work root (`<work>/<task_id>` per task), `doors` where each attempt serves its
-    /// model door (`<doors>/<task_id>.model.sock`; the control socket's dir, so it stays short),
-    /// `cfg` what `task.preview` routes by.
-    #[must_use]
-    pub fn new(store: Store, ledger: PathBuf, work: PathBuf, doors: PathBuf, cfg: Config) -> Self {
-        Self {
-            store: Mutex::new(store),
-            ledger,
-            work,
-            doors,
-            cfg,
-            started: Instant::now(),
-            principal: crate::process_uid()
-                .map_or_else(|| "uid:unknown".into(), |u| format!("uid:{u}")),
-        }
-    }
+/// `health`: owner `App`.
+pub const HEALTH: Family = Family {
+    owner: Owner::App,
+    handlers: &[("health", |engine, _| frame(health(engine)))],
+    on_serve_start: None,
+};
 
-    /// The ledger, locked for one call. A poisoned lock is still the same ledger: every write
-    /// in it is its own committed transaction.
-    pub fn store(&self) -> MutexGuard<'_, Store> {
-        self.store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
+/// The six `task.*` handlers: owner `Task`.
+pub const FAMILY: Family = Family {
+    owner: Owner::Task,
+    handlers: &[
+        ("task.submit", |engine, req| frame(submit(engine, req))),
+        ("task.get", |engine, req| frame(get(engine, &req.body))),
+        ("task.list", |engine, _| frame(list(engine))),
+        ("task.cancel", |engine, req| {
+            frame(cancel(engine, &req.body))
+        }),
+        ("task.preview", |engine, req| {
+            frame(preview(engine, &req.body))
+        }),
+        ("task.resolve", |engine, req| {
+            frame(resolve(engine, &req.body))
+        }),
+    ],
+    on_serve_start: None,
+};
 
-    /// The ledger file.
-    #[must_use]
-    pub fn ledger(&self) -> &Path {
-        &self.ledger
-    }
-
-    /// The work root.
-    #[must_use]
-    pub fn work(&self) -> &Path {
-        &self.work
-    }
-
-    /// The door root: where attempts serve their model door sockets.
-    #[must_use]
-    pub fn doors(&self) -> &Path {
-        &self.doors
-    }
-
-    /// Where a task's admitted brief text lives (the ledger has no brief column; DC proposal).
-    #[must_use]
-    pub fn brief_path(&self, task: &TaskId) -> PathBuf {
-        self.work.join("briefs").join(format!("{task}.brief"))
-    }
-}
-
-/// What one request line asks of the connection.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Outcome {
-    /// Write this frame and read the next request.
-    Frame(Value),
-    /// Write `ack`, then stream ledger events after `since_seq` until close.
-    Subscribe {
-        /// The result frame acknowledging the subscription.
-        ack: Value,
-        /// Events with `seq > since_seq` are streamed.
-        since_seq: i64,
-    },
-}
-
-/// Answer one request line.
-#[must_use]
-pub fn answer(engine: &Engine, line: &str) -> Outcome {
-    match wire::parse(line) {
-        Err((id, fault)) => Outcome::Frame(wire::error(&id, &fault)),
-        Ok(req) => match dispatch(engine, &req) {
-            Ok(Answer::Frame(replayed, body)) => {
-                Outcome::Frame(wire::result(&req.request_id, replayed, body))
-            }
-            Ok(Answer::Subscribe(since_seq)) => Outcome::Subscribe {
-                ack: wire::result(
-                    &req.request_id,
-                    false,
-                    json!({ "since_seq": since_seq, "stream": "events" }),
-                ),
-                since_seq,
-            },
-            Err(fault) => Outcome::Frame(wire::error(&req.request_id, &fault)),
-        },
-    }
-}
-
-/// Answer one request line with one frame (a subscription's frame is its ack).
-#[must_use]
-pub fn handle(engine: &Engine, line: &str) -> Value {
-    match answer(engine, line) {
-        Outcome::Frame(v) | Outcome::Subscribe { ack: v, .. } => v,
-    }
-}
-
-type Reply = Result<(bool, Value), Fault>;
-
-enum Answer {
-    Frame(bool, Value),
-    Subscribe(i64),
-}
-
-fn dispatch(engine: &Engine, req: &Request) -> Result<Answer, Fault> {
-    let mutating = match req.action.as_str() {
-        "health" | "task.get" | "task.list" | "task.preview" | "events.subscribe" => false,
-        "task.submit" | "task.cancel" | "task.resolve" => true,
-        _ => {
-            return Err(Fault::new(
-                Code::UnknownAction,
-                "/action",
-                "not in the skeleton catalogue",
-            ));
-        }
-    };
-    if req.action_version != 1 {
-        return Err(Fault::new(
-            Code::UnsupportedActionVersion,
-            "/action_version",
-            "only 1",
-        ));
-    }
-    if mutating {
-        if req.idempotency_key.is_none() {
-            return Err(Fault::new(
-                Code::InvalidArgument,
-                "/idempotency_key",
-                "required for a mutating action",
-            ));
-        }
-        if !engine
-            .store()
-            .recovery_complete()
-            .map_err(|e| internal(&e))?
-        {
-            return Err(Fault::new(
-                Code::NotReady,
-                "/action",
-                "startup reconcile has not completed",
-            ));
-        }
-    }
-    let frame = match req.action.as_str() {
-        "events.subscribe" => return since_seq_of(&req.body).map(Answer::Subscribe),
-        "health" => health(engine),
-        "task.submit" => submit(engine, req),
-        "task.get" => get(engine, &req.body),
-        "task.list" => list(engine),
-        "task.preview" => preview(engine, &req.body),
-        "task.resolve" => resolve(engine, &req.body),
-        _ => cancel(engine, &req.body),
-    };
-    frame.map(|(replayed, body)| Answer::Frame(replayed, body))
-}
+/// `events.subscribe`: owner `Notify`; its handler turns the connection into a stream.
+pub const EVENTS: Family = Family {
+    owner: Owner::Notify,
+    handlers: &[("events.subscribe", |_, req| {
+        since_seq_of(&req.body).map(Answer::Subscribe)
+    })],
+    on_serve_start: None,
+};
 
 fn since_seq_of(body: &Value) -> Result<i64, Fault> {
     match body.get("since_seq") {
@@ -204,10 +78,6 @@ fn since_seq_of(body: &Value) -> Result<i64, Fault> {
                 )
             }),
     }
-}
-
-fn internal(e: &StoreError) -> Fault {
-    Fault::new(Code::Internal, "/", e.to_string())
 }
 
 fn health(engine: &Engine) -> Reply {
@@ -465,25 +335,10 @@ fn resolve(engine: &Engine, body: &Value) -> Reply {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::actions::testing::{BRIEF, engine};
+    use crate::actions::{Outcome, answer, handle};
+    use crate::wire;
     use hee4_core::{Observations, reconcile};
-
-    const BRIEF: &str = "GOAL: g\nSCOPE: s\nCONTEXT: c\nACCEPTANCE: a\nVERIFY: /usr/bin/true\nTIMEBOX: 10s\nFORBIDDEN: f\nREPORT: r\nSTANDING: s\nRECON: r\nRESTATEMENT: run true\n";
-
-    fn engine(name: &str) -> Result<Engine, Box<dyn std::error::Error>> {
-        let dir = PathBuf::from(env!("OUT_DIR")).join(format!("actions-{name}"));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir)?;
-        Ok(Engine::new(
-            Store::open(&dir.join("ledger.sqlite3"))?,
-            dir.join("ledger.sqlite3"),
-            dir.join("work"),
-            dir.join("rt"),
-            Config {
-                model: "m:1".into(),
-                live: false,
-            },
-        ))
-    }
 
     fn submit_line(key: &str, brief: &str) -> String {
         wire::request("r1", "task.submit", Some(key), json!({ "brief": brief })).to_string()

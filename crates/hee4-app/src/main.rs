@@ -1,14 +1,19 @@
-//! `hee4`: `serve`, `doctor`, `--version`, and the one-frame client verbs
-//! (`health`, `task.submit`, `task.get`, `task.list`, `task.cancel`).
+//! `hee4`: `serve`, `doctor`, `--version`, and the one-frame client. The five positional verbs
+//! (`health`, `task.list`, `task.get ID`, `task.cancel ID --key K`, `task.submit --brief-file F
+//! --key K`) keep their forms; every catalogued action is reachable as `hee4 <action> [--key K]
+//! [--body JSON | --body-file F] [--precondition JSON]`. An action the catalogue does not carry
+//! is exit 2 with the catalogue's ids.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use hee4_app::{ServeArgs, dispatcher, doctor, head12, socket, wire};
+use hee4_app::{ServeArgs, catalogue12, dispatcher, doctor, head12, socket, wire};
+use hee4_contracts::catalogue::{self, CATALOGUE};
 use serde_json::{Value, json};
 
 const USAGE: &str = "usage: hee4 --version | serve --socket P --ledger P --work D | doctor [--unit U] [--socket P] [--repo D]
-       | health | task.list | task.get ID | task.cancel ID --key K | task.submit --brief-file F --key K   [--socket P]";
+       | health | task.list | task.get ID | task.cancel ID --key K | task.submit --brief-file F --key K   [--socket P]
+       | <action> [--key K] [--body JSON | --body-file F] [--precondition JSON] [--socket P]   (any catalogued action)";
 
 fn default_socket() -> PathBuf {
     let rt =
@@ -41,7 +46,12 @@ fn main() -> ExitCode {
     let sock = flag(&args, "--socket").map_or_else(default_socket, PathBuf::from);
     match verb {
         "--version" | "version" => {
-            println!("hee4 {} {}", hee4_app::VERSION, head12());
+            println!(
+                "hee4 {} {} catalogue={}",
+                hee4_app::VERSION,
+                head12(),
+                catalogue12()
+            );
             ExitCode::SUCCESS
         }
         "serve" => {
@@ -77,23 +87,63 @@ fn main() -> ExitCode {
     }
 }
 
+/// `--body JSON` or `--body-file F`, parsed; `None` when neither is given.
+fn body_flag(args: &[String]) -> Result<Option<Value>, String> {
+    let text = match (flag(args, "--body"), flag(args, "--body-file")) {
+        (Some(_), Some(_)) => return Err("--body or --body-file, not both".into()),
+        (Some(text), None) => text,
+        (None, Some(path)) => {
+            std::fs::read_to_string(&path).map_err(|e| format!("body file: {e}"))?
+        }
+        (None, None) => return Ok(None),
+    };
+    match serde_json::from_str::<Value>(&text) {
+        Ok(v @ Value::Object(_)) => Ok(Some(v)),
+        Ok(_) => Err("body must be a JSON object".into()),
+        Err(e) => Err(format!("body: {e}")),
+    }
+}
+
 fn client(verb: &str, args: &[String], sock: &std::path::Path) -> ExitCode {
+    if catalogue::find(verb).is_none() {
+        let ids: Vec<&str> = CATALOGUE.iter().map(|a| a.id).collect();
+        return fail(&format!(
+            "unknown action {verb}; the catalogue: {}",
+            ids.join(" ")
+        ));
+    }
     let key = flag(args, "--key");
+    let given = match body_flag(args) {
+        Ok(b) => b,
+        Err(e) => return fail(&e),
+    };
+    // The positional forms, byte-compatible with the skeleton's client.
     let body = match verb {
-        "health" | "task.list" => json!({}),
-        "task.get" | "task.cancel" => match positional(args) {
-            Some(id) => json!({ "task_id": id }),
-            None => return fail("task id required"),
+        "task.get" | "task.cancel" => match (positional(args), given) {
+            (Some(id), _) => json!({ "task_id": id }),
+            (None, Some(b)) => b,
+            (None, None) => return fail("task id required"),
         },
-        "task.submit" => match flag(args, "--brief-file").map(std::fs::read_to_string) {
-            Some(Ok(brief)) => json!({ "brief": brief }),
-            Some(Err(e)) => return fail(&format!("brief file: {e}")),
-            None => return fail("--brief-file required"),
+        "task.submit" => match (
+            flag(args, "--brief-file").map(std::fs::read_to_string),
+            given,
+        ) {
+            (Some(Ok(brief)), _) => json!({ "brief": brief }),
+            (Some(Err(e)), _) => return fail(&format!("brief file: {e}")),
+            (None, Some(b)) => b,
+            (None, None) => return fail("--brief-file required"),
         },
-        other => return fail(&format!("unknown verb {other}")),
+        _ => given.unwrap_or_else(|| json!({})),
+    };
+    let precondition = match flag(args, "--precondition").map(|p| serde_json::from_str::<Value>(&p))
+    {
+        None => None,
+        Some(Ok(v)) => Some(v),
+        Some(Err(e)) => return fail(&format!("precondition: {e}")),
     };
     let id = format!("cli-{}", std::process::id());
-    let reply = match socket::request(sock, &wire::request(&id, verb, key.as_deref(), body)) {
+    let frame = wire::request_with(&id, verb, key.as_deref(), body, precondition);
+    let reply = match socket::request(sock, &frame) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("hee4: cannot reach {}: {e}", sock.display());

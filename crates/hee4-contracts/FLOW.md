@@ -23,6 +23,7 @@ STACK-MAP §2 (I1, I3, I4), `gates/features/crash-restart.md` (R01–R14).
 | `Refusal` | `#[non_exhaustive]`, named variants with typed fields, never strings | this crate |
 | `VerifyLine` | one VERIFY line after normalisation: Shell / Exec / Unsupported (`model:` is Unsupported{model}); the only home of the VERIFY line grammar (K6 playbook maps it) | `VerifyLine::parse_all` |
 | `Budgets` | validated only through `Budgets::parse` (and `Deserialize`, the same path): the top value and every section an object (a positional array is refused, never read as the default), unknown key refused, every field non-zero, under its ceiling in budgets.rs, ordered. Fields are `pub` for reading; a literal, a field write after `parse`, or a section parsed alone (`DoorBudget`) is not checked: rung 2, for a later slice with private fields | `Budgets::DEFAULT`, `Budgets::parse` |
+| `catalogue::{Action, Owner, Effect, Scope, CATALOGUE, find, revision}` | the 22 action ids as data: owner, effect (`mutates()`), scope (`because()`), readback, precondition rule; `revision()` is the content digest; `Judge`/`Deploy` owners are held | this crate (`CATALOGUE` const; tests compare it to `gates/features`) |
 
 ## Whitelist (`transition`)
 

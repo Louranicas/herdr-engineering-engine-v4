@@ -1,7 +1,8 @@
-//! `hee4-app` (K6): the `hee4` binary's parts. Startup order, the control socket, the actions,
-//! the synchronous dispatcher and `doctor`. See `FLOW.md`.
+//! `hee4-app` (K6): the `hee4` binary's parts. Startup order, the control socket, the actions
+//! (catalogue + owner registry), the synchronous dispatcher and `doctor`. See `FLOW.md`.
 //!
-//! Startup: `Store::open` → `recovery::reconcile` → dispatcher thread → bind → serve. A
+//! Startup: `Store::open` → `recovery::reconcile` → `Engine::new` (composes the registry) →
+//! the families' `on_serve_start` → dispatcher thread → bind → serve. A
 //! mutating action is refused `not_ready` while the ledger's `recovery_complete` is false.
 
 pub mod actions;
@@ -31,6 +32,13 @@ pub const GATE_TOML: &[u8] = include_bytes!("../../../gate.toml");
 #[must_use]
 pub fn head12() -> &'static str {
     HEAD.get(..12).unwrap_or(HEAD)
+}
+
+/// The first 12 digits of the catalogue revision (`hee4_contracts::catalogue::revision`).
+#[must_use]
+pub fn catalogue12() -> String {
+    let revision = hee4_contracts::catalogue::revision().to_string();
+    revision.get(..12).unwrap_or(&revision).to_owned()
 }
 
 /// This process's uid, read from `/proc/self` (no `libc`, no `unsafe`).
@@ -96,6 +104,12 @@ pub enum ServeError {
     /// IO.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    /// The family set did not compose (a held owner, a duplicate, an unknown id, a mismatch).
+    #[error("compose: {0}")]
+    Compose(#[from] actions::RegistryFault),
+    /// A family's startup hook refused; the engine does not listen.
+    #[error("start: {0}")]
+    Start(#[from] actions::StartFault),
 }
 
 /// Open, reconcile, start the dispatcher, then listen. Does not return while serving.
@@ -130,7 +144,8 @@ pub fn serve(args: &ServeArgs, cfg: &dispatcher::Config) -> Result<(), ServeErro
             .parent()
             .map_or_else(|| PathBuf::from("/"), std::path::Path::to_path_buf),
         cfg.clone(),
-    ));
+    )?);
+    engine.registry().on_serve_start(&engine)?;
     let worker = Arc::clone(&engine);
     let cfg = cfg.clone();
     std::thread::spawn(move || {
@@ -147,11 +162,12 @@ pub fn serve(args: &ServeArgs, cfg: &dispatcher::Config) -> Result<(), ServeErro
     });
     let listener = socket::bind(&args.socket)?;
     eprintln!(
-        "hee4 {VERSION} {} serving socket={} peer_check={:?} recovery_applied={}",
+        "hee4 {VERSION} {} serving socket={} peer_check={:?} recovery_applied={} catalogue={}",
         head12(),
         args.socket.display(),
         socket::PEER_CHECK,
-        report.applied
+        report.applied,
+        catalogue12()
     );
     socket::serve(&listener, &engine);
     Ok(())

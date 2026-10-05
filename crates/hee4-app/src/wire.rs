@@ -1,13 +1,30 @@
 //! The control frame: one compact JSON object per line, in and out, and the refusal names.
 //!
-//! Request: `{request_id, action, action_version, idempotency_key, body}` (other envelope fields
-//! of the API Map are accepted and ignored by the skeleton). Reply: `{kind:"result", request_id,
-//! replayed, body}` or `{kind:"error", request_id, code, retry, message, field}`.
+//! Request: `{request_id, action, action_version, idempotency_key, precondition, body}` (other
+//! envelope fields of the API Map are accepted and ignored by the skeleton). Reply:
+//! `{kind:"result", request_id, replayed, body}` or `{kind:"error", request_id, code, retry,
+//! message, field}` plus `because`, `current_generation`, `readback` when set and
+//! `effect:"unknown"` for `effect_unknown`.
 
 use serde_json::{Value, json};
 
 /// The longest frame read, in bytes (Socket and IPC Map "Bound").
 pub const MAX_FRAME_BYTES: usize = 1_048_576;
+
+/// Every member an error frame may carry, in emission order: what `tools.inspect` digests as the
+/// error schema descriptor.
+pub const ERROR_MEMBERS: [&str; 10] = [
+    "kind",
+    "request_id",
+    "code",
+    "retry",
+    "field",
+    "message",
+    "because",
+    "current_generation",
+    "readback",
+    "effect",
+];
 
 /// Every refusal the socket answers with, one name each (Error and Refusal Map vocabulary;
 /// `not_ready` is this slice's addition, see FLOW.md and the DC proposal).
@@ -15,7 +32,7 @@ pub const MAX_FRAME_BYTES: usize = 1_048_576;
 pub enum Code {
     /// The line is not a JSON object, or a required member is absent or mistyped.
     InvalidArgument,
-    /// The action is not in the skeleton's catalogue.
+    /// The action is not in the catalogue.
     UnknownAction,
     /// The action exists, the version does not.
     UnsupportedActionVersion,
@@ -37,11 +54,22 @@ pub enum Code {
     FrameTooLarge,
     /// The server already holds its cap of concurrent connections.
     TooManyConnections,
+    /// The action is catalogued but its owner is not registered in this release (`because`
+    /// names the scope). The one emission site is the registry miss in dispatch.
+    Unavailable,
+    /// The precondition's generation is behind the resource's (`current_generation` is set).
+    StaleGeneration,
+    /// A page cursor from another boot or filter; start the listing again.
+    ResyncRequired,
+    /// A bound on work or storage was reached.
+    ResourceExhausted,
+    /// The effect could not be confirmed by readback (`readback` names the read that settles it).
+    EffectUnknown,
 }
 
 impl Code {
     /// Every name, in declaration order (`ALL[c.ordinal()] == c`).
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 17] = [
         Self::InvalidArgument,
         Self::UnknownAction,
         Self::UnsupportedActionVersion,
@@ -54,6 +82,11 @@ impl Code {
         Self::SlowConsumer,
         Self::FrameTooLarge,
         Self::TooManyConnections,
+        Self::Unavailable,
+        Self::StaleGeneration,
+        Self::ResyncRequired,
+        Self::ResourceExhausted,
+        Self::EffectUnknown,
     ];
 
     /// Position in [`Code::ALL`]. No wildcard arm: a new variant does not compile until it has
@@ -73,6 +106,11 @@ impl Code {
             Self::SlowConsumer => 9,
             Self::FrameTooLarge => 10,
             Self::TooManyConnections => 11,
+            Self::Unavailable => 12,
+            Self::StaleGeneration => 13,
+            Self::ResyncRequired => 14,
+            Self::ResourceExhausted => 15,
+            Self::EffectUnknown => 16,
         }
     }
 
@@ -92,6 +130,11 @@ impl Code {
             Self::SlowConsumer => "slow_consumer",
             Self::FrameTooLarge => "frame_too_large",
             Self::TooManyConnections => "too_many_connections",
+            Self::Unavailable => "unavailable",
+            Self::StaleGeneration => "stale_generation",
+            Self::ResyncRequired => "resync_required",
+            Self::ResourceExhausted => "resource_exhausted",
+            Self::EffectUnknown => "effect_unknown",
         }
     }
 
@@ -99,22 +142,27 @@ impl Code {
     #[must_use]
     pub const fn retry(self) -> &'static str {
         match self {
-            Self::NotReady | Self::NoRoute | Self::SlowConsumer | Self::TooManyConnections => {
-                "after_condition"
-            }
-            Self::Conflict => "after_readback",
-            Self::Internal => "same_exact_request",
+            Self::NotReady
+            | Self::NoRoute
+            | Self::SlowConsumer
+            | Self::TooManyConnections
+            | Self::Unavailable => "after_condition",
+            Self::Conflict | Self::EffectUnknown => "after_readback",
+            Self::Internal | Self::ResourceExhausted => "same_exact_request",
             Self::InvalidArgument
             | Self::UnknownAction
             | Self::UnsupportedActionVersion
             | Self::NotFound
             | Self::Forbidden
-            | Self::FrameTooLarge => "never",
+            | Self::FrameTooLarge
+            | Self::StaleGeneration
+            | Self::ResyncRequired => "never",
         }
     }
 }
 
-/// A refusal: its one name, the JSON pointer it is about, and a static message.
+/// A refusal: its one name, the JSON pointer it is about, a static message, and the optional
+/// members a few names carry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fault {
     /// The name.
@@ -123,18 +171,59 @@ pub struct Fault {
     pub field: &'static str,
     /// Detail (never an echo of request bytes beyond a refusal's own text).
     pub message: String,
+    /// Why the condition holds (`unavailable`: the scope; `resync_required`: what moved).
+    pub because: Option<&'static str>,
+    /// `stale_generation`: the resource's generation now.
+    pub current_generation: Option<u64>,
+    /// `effect_unknown`: the read that settles the effect.
+    pub readback: Option<&'static str>,
 }
 
 impl Fault {
-    /// A fault at `field`.
+    /// A fault at `field`, with no optional member.
     #[must_use]
     pub fn new(code: Code, field: &'static str, message: impl Into<String>) -> Self {
         Self {
             code,
             field,
             message: message.into(),
+            because: None,
+            current_generation: None,
+            readback: None,
         }
     }
+
+    /// With `because`.
+    #[must_use]
+    pub const fn with_because(mut self, because: &'static str) -> Self {
+        self.because = Some(because);
+        self
+    }
+
+    /// With `current_generation`.
+    #[must_use]
+    pub const fn with_generation(mut self, generation: u64) -> Self {
+        self.current_generation = Some(generation);
+        self
+    }
+
+    /// With `readback`.
+    #[must_use]
+    pub const fn with_readback(mut self, readback: &'static str) -> Self {
+        self.readback = Some(readback);
+        self
+    }
+}
+
+/// The envelope's `precondition`: the generation a mutating request was formed against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Precondition {
+    /// `task | thread | roster | service | analysis`.
+    pub resource: String,
+    /// The resource's id.
+    pub id: String,
+    /// The generation the caller read.
+    pub generation: u64,
 }
 
 /// A parsed request.
@@ -148,8 +237,35 @@ pub struct Request {
     pub action_version: u32,
     /// Present for a mutating action.
     pub idempotency_key: Option<String>,
+    /// Present when the action requires one (`catalogue::PreconditionRule::Required`).
+    pub precondition: Option<Precondition>,
     /// The action's body.
     pub body: Value,
+}
+
+/// `/precondition`: absent or null is `None`; an object with exactly `resource` (string), `id`
+/// (string) and `generation` (unsigned integer) is `Some`; any other shape is refused.
+fn precondition_of(v: Option<&Value>) -> Result<Option<Precondition>, &'static str> {
+    let obj = match v {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::Object(obj)) => obj,
+        Some(_) => return Err("object or null"),
+    };
+    if obj.len() != 3 {
+        return Err("exactly resource, id and generation");
+    }
+    let (Some(Value::String(resource)), Some(Value::String(id)), Some(generation)) = (
+        obj.get("resource"),
+        obj.get("id"),
+        obj.get("generation").and_then(Value::as_u64),
+    ) else {
+        return Err("resource: string, id: string, generation: unsigned integer");
+    };
+    Ok(Some(Precondition {
+        resource: resource.clone(),
+        id: id.clone(),
+        generation,
+    }))
 }
 
 /// Parse one line. A line that is not a JSON object is refused `invalid_argument` at `/`.
@@ -192,6 +308,8 @@ pub fn parse(line: &str) -> Result<Request, (String, Fault)> {
         Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
         Some(_) => return Err(bad("/idempotency_key", "non-empty string or null")),
     };
+    let precondition =
+        precondition_of(obj.get("precondition")).map_err(|msg| bad("/precondition", msg))?;
     let body = match obj.remove("body") {
         None | Some(Value::Null) => json!({}),
         Some(b @ Value::Object(_)) => b,
@@ -202,6 +320,7 @@ pub fn parse(line: &str) -> Result<Request, (String, Fault)> {
         action,
         action_version,
         idempotency_key,
+        precondition,
         body,
     })
 }
@@ -214,17 +333,31 @@ pub fn result(request_id: &str, replayed: bool, body: Value) -> Value {
     v
 }
 
-/// An error frame.
+/// An error frame: the six fixed members, then `because`, `current_generation` and `readback`
+/// only when set, and `effect: "unknown"` only for [`Code::EffectUnknown`].
 #[must_use]
 pub fn error(request_id: &str, fault: &Fault) -> Value {
-    json!({
+    let mut v = json!({
         "kind": "error",
         "request_id": request_id,
         "code": fault.code.name(),
         "retry": fault.code.retry(),
         "field": fault.field,
         "message": fault.message,
-    })
+    });
+    if let Some(because) = fault.because {
+        v["because"] = json!(because);
+    }
+    if let Some(generation) = fault.current_generation {
+        v["current_generation"] = json!(generation);
+    }
+    if let Some(readback) = fault.readback {
+        v["readback"] = json!(readback);
+    }
+    if fault.code == Code::EffectUnknown {
+        v["effect"] = json!("unknown");
+    }
+    v
 }
 
 /// A stream's close frame: the last line before the server closes the connection.
@@ -233,7 +366,7 @@ pub fn close(code: Code, message: &str) -> Value {
     json!({"kind": "close", "code": code.name(), "retry": code.retry(), "message": message})
 }
 
-/// A request frame (the CLI's half).
+/// A request frame (the CLI's half), with no precondition.
 #[must_use]
 pub fn request(
     request_id: &str,
@@ -241,19 +374,35 @@ pub fn request(
     idempotency_key: Option<&str>,
     body: Value,
 ) -> Value {
+    request_with(request_id, action, idempotency_key, body, None)
+}
+
+/// A request frame carrying `precondition` when given (the generic CLI's half).
+#[must_use]
+pub fn request_with(
+    request_id: &str,
+    action: &str,
+    idempotency_key: Option<&str>,
+    body: Value,
+    precondition: Option<Value>,
+) -> Value {
     let mut v = json!({
         "request_id": request_id,
         "action": action,
         "action_version": 1,
         "idempotency_key": idempotency_key,
     });
+    if let Some(p) = precondition {
+        v["precondition"] = p;
+    }
     v["body"] = body;
     v
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Code;
+    use super::{Code, ERROR_MEMBERS, Fault, Precondition, error, parse, request_with};
+    use serde_json::json;
     use std::collections::BTreeSet;
 
     /// The names in FLOW.md's "Refusal names" table, first column.
@@ -283,5 +432,68 @@ mod tests {
         assert_eq!(rows.len(), table.len(), "a name appears twice: {table:?}");
         assert_eq!(code.len(), Code::ALL.len(), "two variants share a name");
         assert_eq!(rows, code);
+    }
+
+    #[test]
+    fn precondition_member_is_parsed_or_refused_by_shape() {
+        let line = |p: serde_json::Value| {
+            let mut v = request_with("r", "a", None, json!({}), None);
+            v["precondition"] = p;
+            v.to_string()
+        };
+        let ok = parse(&line(
+            json!({"resource": "roster", "id": "x", "generation": 3}),
+        ));
+        assert_eq!(
+            ok.map(|r| r.precondition),
+            Ok(Some(Precondition {
+                resource: "roster".into(),
+                id: "x".into(),
+                generation: 3
+            }))
+        );
+        assert_eq!(parse(&line(json!(null))).map(|r| r.precondition), Ok(None));
+        let absent = request_with("r", "a", None, json!({}), None).to_string();
+        assert_eq!(parse(&absent).map(|r| r.precondition), Ok(None));
+        for bad in [
+            json!(5),
+            json!("roster"),
+            json!({"resource": "roster"}),
+            json!({"resource": "roster", "id": "x", "generation": -1}),
+            json!({"resource": "roster", "id": "x", "generation": 1, "extra": 0}),
+        ] {
+            let parsed = parse(&line(bad.clone()));
+            assert!(
+                matches!(&parsed, Err((id, f)) if id == "r" && f.code == Code::InvalidArgument && f.field == "/precondition"),
+                "{bad}: {parsed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn error_frame_carries_optional_members_only_when_set() {
+        let plain = error("r", &Fault::new(Code::NotFound, "/body/task_id", "no"));
+        assert!(plain.get("because").is_none());
+        assert!(plain.get("current_generation").is_none());
+        assert!(plain.get("readback").is_none());
+        assert!(plain.get("effect").is_none());
+        let full = error(
+            "r",
+            &Fault::new(Code::EffectUnknown, "/", "unconfirmed")
+                .with_because("why")
+                .with_generation(7)
+                .with_readback("service.inspect"),
+        );
+        assert_eq!(full["because"], "why");
+        assert_eq!(full["current_generation"], 7);
+        assert_eq!(full["readback"], "service.inspect");
+        assert_eq!(full["effect"], "unknown");
+        let keys: Vec<&str> = full
+            .as_object()
+            .map(|o| o.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        for k in keys {
+            assert!(ERROR_MEMBERS.contains(&k), "{k} not in ERROR_MEMBERS");
+        }
     }
 }

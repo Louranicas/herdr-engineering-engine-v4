@@ -16,6 +16,7 @@
 pub mod bounds;
 mod brief;
 mod budgets;
+pub mod catalogue;
 mod hex;
 mod ids;
 mod observation;
