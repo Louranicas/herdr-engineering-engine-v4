@@ -1,6 +1,7 @@
 //! The deep-diff-forge observation adapter: one `rank.v0` run over a diff becomes one tier-0
 //! observation, sealed to the exact diff bytes. Local process only; no network.
 
+use std::fmt;
 use std::io::{Read as _, Write as _};
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -63,12 +64,129 @@ pub enum AdapterError {
     LookedAtNothing,
 }
 
+/// What the caller hands in for one task: the diff bytes it computed, or the fact that there
+/// was no worktree to diff. This crate never runs git; the bytes are the caller's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Diff<'a> {
+    /// The task has no worktree, so there is nothing to diff.
+    NoWorktree,
+    /// The diff the caller computed; empty bytes mean the worktree had no change.
+    Bytes(&'a [u8]),
+}
+
+/// Why [`for_task`] produced no observation. A skip is not a refusal: the task goes on
+/// without a deep-diff-forge observation, and the dispatcher prints the wire word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Skip {
+    /// [`Diff::NoWorktree`]: nothing to diff.
+    NoWorktree,
+    /// [`Diff::Bytes`] was empty: an empty diff never reaches `--require-files`.
+    NoDiff,
+    /// The binary is not on `PATH` (a bare name) or not at the given path. A present file that
+    /// fails to exec (a missing `#!` interpreter or ELF loader is also `NotFound`; permissions
+    /// are `PermissionDenied`) is not absent: it stays [`AdapterError::Spawn`].
+    ToolAbsent,
+}
+
+impl Skip {
+    /// The wire word: `no_worktree`, `no_diff` or `tool_absent`.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::NoWorktree => "no_worktree",
+            Self::NoDiff => "no_diff",
+            Self::ToolAbsent => "tool_absent",
+        }
+    }
+}
+
+impl fmt::Display for Skip {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// What [`for_task`] hands the dispatcher: an observation to record, or a named skip.
+/// Never a verdict (AP-29).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskObservation {
+    /// A tier-0 observation bound to the subject; record it before `decide_and_seal`.
+    Observed(Observation),
+    /// No observation, by name.
+    Skipped(Skip),
+}
+
+/// The one task-shaped call: deep-diff-forge from `PATH` over `diff` for `subject`.
+///
+/// - [`Diff::NoWorktree`] → `Skipped(NoWorktree)`, empty bytes → `Skipped(NoDiff)`; neither
+///   spawns;
+/// - a binary that is not on `PATH` → `Skipped(ToolAbsent)`; a present file that fails to exec
+///   is `Err(Spawn)`;
+/// - a run past `budget` → `Observed` with [`timeout_observation`] (`Refused(timeout)` in
+///   `decide`);
+/// - exit 7 → `Observed` with [`Outcome::Refused`], `advisory: true` (the tool declined to
+///   rank; it does not gate the task); a pass → `Observed`, tier-0, bound to
+///   `subject.input_sha256`.
+///
+/// # Errors
+/// Every other [`AdapterError`] unchanged: `Exit`, `Malformed`, `SealMismatch`,
+/// `LookedAtNothing`, and a `Spawn` whose kind is not `NotFound`.
+pub fn for_task(
+    diff: Diff<'_>,
+    subject: &Subject,
+    clock: &impl Clock,
+    budget: Duration,
+) -> Result<TaskObservation, AdapterError> {
+    for_task_with(Path::new(BIN), diff, subject, clock, budget)
+}
+
+/// [`for_task`] with an explicit binary.
+///
+/// # Errors
+/// As [`for_task`].
+pub fn for_task_with(
+    bin: &Path,
+    diff: Diff<'_>,
+    subject: &Subject,
+    clock: &impl Clock,
+    budget: Duration,
+) -> Result<TaskObservation, AdapterError> {
+    match diff {
+        Diff::NoWorktree => Ok(TaskObservation::Skipped(Skip::NoWorktree)),
+        Diff::Bytes([]) => Ok(TaskObservation::Skipped(Skip::NoDiff)),
+        Diff::Bytes(b) => match observe_with(bin, b, subject, clock, budget) {
+            Ok(o) => Ok(TaskObservation::Observed(o)),
+            // `execve` reports a missing `#!` interpreter or ELF loader as `NotFound` too, so the
+            // kind alone cannot tell an absent tool from a present, broken one: look on disk.
+            Err(AdapterError::Spawn(e))
+                if e.kind() == std::io::ErrorKind::NotFound
+                    && !on_disk(bin, std::env::var_os("PATH").as_deref()) =>
+            {
+                Ok(TaskObservation::Skipped(Skip::ToolAbsent))
+            }
+            Err(AdapterError::Timeout { budget }) => Ok(TaskObservation::Observed(
+                timeout_observation(budget, b, subject)?,
+            )),
+            Err(e) => Err(e),
+        },
+    }
+}
+
+/// Whether `bin` names a file that exists, by `execvp`'s rule: a name with a `/` is taken as
+/// given; a bare name is looked up in each entry of `path`. No `PATH` means no lookup.
+fn on_disk(bin: &Path, path: Option<&std::ffi::OsStr>) -> bool {
+    if bin.as_os_str().as_encoded_bytes().contains(&b'/') {
+        return bin.is_file();
+    }
+    path.is_some_and(|p| std::env::split_paths(p).any(|dir| dir.join(bin).is_file()))
+}
+
 /// Run deep-diff-forge from `PATH` over `diff` and turn its ranking into an observation of
 /// `subject`. The child is killed when `budget` of wall time has passed.
 ///
 /// # Errors
 /// [`AdapterError`]; a run past `budget` is [`AdapterError::Timeout`]. Exit 7 is not an error:
-/// it is a tier-0 observation with [`Outcome::Refused`].
+/// it is an advisory observation with [`Outcome::Refused`].
 pub fn observe(
     diff: &[u8],
     subject: &Subject,
@@ -113,9 +231,15 @@ pub fn timeout_observation(
 /// The longest reason kept, below `RefusalText`'s 512-byte cap.
 const REASON_MAX: usize = 500;
 
-/// The tier-0 observation for exit 7: outcome `Refused{reason}` (the first stderr line, control
-/// characters dropped, cut to [`REASON_MAX`] bytes; a fixed sentence when nothing is left), one
-/// evidence item (the digest of all of stderr). `decide` maps it to `Refused(Invalid)`.
+/// The advisory observation for exit 7: outcome `Refused{reason}` (the first stderr line,
+/// control characters dropped, cut to [`REASON_MAX`] bytes; a fixed sentence when nothing is
+/// left), one evidence item (the digest of all of stderr).
+///
+/// Advisory because deep-diff-forge adds evidence, it does not gate: exit 7 is the tool
+/// declining to rank (`--require-files`, `--require-hunks`, an unparsable patch), and a
+/// mode-only, rename-only or binary-add diff is a legitimate candidate it cannot rank
+/// (MEASURED: all three exit 7 "0 hunks in input"). `decide` ignores an advisory row, so the
+/// task's verdict comes from its tier-0 observations; the reason is still sealed in `observed`.
 fn refused_observation(
     stderr_line: &str,
     stderr: &[u8],
@@ -145,7 +269,7 @@ fn refused_observation(
             label: "refusal".parse().map_err(bad)?,
             sha256: Sha256Hex::digest(stderr),
         }],
-        advisory: false,
+        advisory: true,
         elapsed_ms,
         budget_ms: u64::try_from(budget.as_millis()).unwrap_or(u64::MAX),
     })
@@ -250,18 +374,65 @@ pub fn observe_with(
     if ranked.is_empty() {
         return Err(AdapterError::LookedAtNothing);
     }
+    pass_observation(tool, &output.stdout, sealed, subject, elapsed_ms, budget)
+}
+
+/// The tier-0 Pass observation for a sealed, non-empty ranking. It is bound to the subject's
+/// `input_sha256` (the VERIFY digest, V4-94) so `decide` reconciles it; the diff the tool
+/// sealed is evidence (`diff`, checked equal to the bytes sent by the caller of this function),
+/// beside `rank.v0` = the digest of stdout.
+///
+/// # Errors
+/// [`AdapterError::Malformed`] if a fixed token fails to parse (a bug, not an input).
+fn pass_observation(
+    tool: ToolId,
+    stdout: &[u8],
+    sealed: Sha256Hex,
+    subject: &Subject,
+    elapsed_ms: u64,
+    budget: Duration,
+) -> Result<Observation, AdapterError> {
+    let bad = |e: hee4_contracts::Refusal| AdapterError::Malformed(e.to_string());
     Ok(Observation {
         source: "deep-diff-forge.rank".parse().map_err(bad)?,
-        input_sha256: sealed,
+        input_sha256: subject.input_sha256,
         tool,
         head_sha: subject.head_sha.clone(),
         outcome: Outcome::Pass,
-        evidence: vec![Evidence {
-            label: "rank.v0".parse().map_err(bad)?,
-            sha256: Sha256Hex::digest(&output.stdout),
-        }],
+        evidence: vec![
+            Evidence {
+                label: "rank.v0".parse().map_err(bad)?,
+                sha256: Sha256Hex::digest(stdout),
+            },
+            Evidence {
+                label: "diff".parse().map_err(bad)?,
+                sha256: sealed,
+            },
+        ],
         advisory: false,
         elapsed_ms,
         budget_ms: u64::try_from(budget.as_millis()).unwrap_or(u64::MAX),
     })
+}
+
+#[cfg(test)]
+mod on_disk_tests {
+    use super::on_disk;
+    use std::ffi::OsStr;
+    use std::path::Path;
+
+    #[test]
+    fn a_bare_name_is_looked_up_on_the_given_path_only() {
+        assert!(on_disk(
+            Path::new("sh"),
+            Some(OsStr::new("/nonexistent:/bin"))
+        ));
+        assert!(!on_disk(Path::new("sh"), Some(OsStr::new("/nonexistent"))));
+        assert!(!on_disk(Path::new("sh"), None));
+        assert!(on_disk(Path::new("/bin/sh"), None));
+        assert!(!on_disk(
+            Path::new("/nonexistent/sh"),
+            Some(OsStr::new("/bin"))
+        ));
+    }
 }

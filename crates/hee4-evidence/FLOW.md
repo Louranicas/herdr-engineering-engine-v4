@@ -29,7 +29,7 @@ contribution, folded from a floor.
 | tier-0, bound | `evidence` empty | `Refused(invalid)` |
 | tier-0, bound | `elapsed_ms > budget_ms` | `Refused(timeout)` |
 | tier-0, bound | outcome `error` / `fail` / `pass` | `Refused(error)` / `Fail` / `Pass` |
-| tier-0, bound, in budget | outcome `refused{reason}` (exit 7) | `Refused(invalid)`; the reason is in the observation, whose content address is sealed in `observed` |
+| tier-0, bound, in budget | outcome `refused{reason}` | `Refused(invalid)`; the reason is in the observation, whose content address is sealed in `observed` (the ddf adapter's exit 7 is advisory, so it takes the advisory row) |
 
 `decide` never emits `Refused(cancelled)`; it is ranked only so the order is total.
 A missing `input_sha256` or `head_sha` cannot reach `decide`: the I3 type requires both (rung 1).
@@ -40,18 +40,47 @@ order-independence, advisory-only-refuses, Pass-needs-tier-0, monotonicity),
 
 ## What K6's adapter may hand in
 
-Only an `Observation` (parsed I3, `deny_unknown_fields`) whose `input_sha256` the adapter
-checked against the bytes it sent. `ddf::observe(diff, &subject, &clock, budget)` is the template:
+Only an `Observation` (parsed I3, `deny_unknown_fields`) whose sealed bytes the adapter checked
+against the bytes it sent, or a named skip. The task shape is one call,
+`ddf::for_task(diff, &subject, &clock, budget) -> Result<TaskObservation, AdapterError>`, with
+`diff: Diff::NoWorktree | Diff::Bytes(&[u8])` (the caller computes the diff; this crate never runs
+git) and `TaskObservation::Observed(Observation) | Skipped(Skip)`:
 
-- runs `deep-diff-forge --stdin-patch --rank --json --require-files --require-hunks` as a local
-  process (no network, no shell);
-- exit 7 → a tier-0 observation with `Outcome::Refused{reason}` (first stderr line); any other
-  non-zero exit → `AdapterError::Exit` (no observation); neither can be a Pass;
+- three skips, by wire word, none of which spawns or is a refusal: `no_worktree` when the task
+  has no worktree (`Diff::NoWorktree`); `no_diff` when the bytes are empty (an empty diff must
+  never reach `--require-files`, whose exit 7 would fail a task that merely changed nothing);
+  `tool_absent` when the binary is not found on `PATH` (a bare name) or at the given path; a
+  present file that fails to exec (a missing `#!` interpreter or ELF loader, which `execve`
+  also reports as `NotFound`; permissions, `PermissionDenied`) stays `AdapterError::Spawn`.
+  The adapter checks the disk (`execvp`'s rule: a name with a `/` as given, else each `PATH`
+  entry) before it calls a `NotFound` absent; `tests/fixtures/ddf-badshebang.sh` pins it;
+- otherwise runs `deep-diff-forge --stdin-patch --rank --json --require-files --require-hunks`
+  as a local process (no network, no shell);
+- exit 7 → `Observed` with `Outcome::Refused{reason}` (first stderr line; a fixed sentence when
+  silent), `advisory: true`: the tool declined to rank, which is not a defect of the candidate.
+  Git emits diffs with files but no hunks for a mode-only change, a rename-only change and a
+  binary add, and all three exit 7 `refused: 0 hunks in input (--require-hunks)` (MEASURED,
+  deep-diff-forge 0.2.1; `tests/ddf.rs::exit_7_on_hunkless_diffs_is_advisory_and_a_tier0_pass_still_passes`),
+  so a tier-0 refusal would fail a candidate that only renamed a file or added an image. ddf
+  adds evidence, it does not gate: `decide` ignores the advisory row and the task's verdict
+  comes from its tier-0 observations, while the reason is still sealed in `observed`. The
+  dispatcher records it like any other observation, no branch. Any other non-zero exit →
+  `AdapterError::Exit` (no observation); neither is a Pass;
 - stdout must be `deep-diff-forge.rank.v0`; its `input_sha256` must equal
   `Sha256Hex::digest(diff)` or `AdapterError::SealMismatch`; an empty `ranked` is
-  `AdapterError::LookedAtNothing`;
-- fills `tool` from the JSON, `head_sha` from the subject, `advisory: false`, outcome `pass`,
-  one evidence item `rank.v0` = digest of stdout, `budget_ms` = the `budget` argument.
+  `AdapterError::LookedAtNothing`; `Exit`, `Malformed`, `SealMismatch` and `LookedAtNothing`
+  come back as `Err`, refused by name, never as a skip;
+- a run past `budget` is mapped inside to `timeout_observation` (`Observed`, outcome `error`,
+  `elapsed_ms > budget_ms`, so `decide` yields `Refused(timeout)`);
+- the Pass observation is bound to the subject's `input_sha256` (the VERIFY digest, V4-94) and
+  carries two evidence items: `rank.v0` = digest of stdout, `diff` = digest of the bytes sent,
+  which the adapter has checked equal the tool's sealed `input_sha256` (`SealMismatch`
+  otherwise); `tool` comes from the JSON, `head_sha` from the subject, `advisory: false`,
+  `budget_ms` = the `budget` argument.
+
+`ddf::observe(diff, &subject, &clock, budget)` is the bytes-only call under it (no skips: an
+empty diff reaches the tool and comes back exit 7, `Observed(Refused)`, advisory); `for_task_with` and
+`observe_with` take an explicit binary for the stubs under `tests/fixtures/`.
 
 ## The deadline
 
@@ -80,4 +109,15 @@ or exit code alone (AP-29).
 
 - `ObservationId` is a content address (`obs-` + SHA-256 of canonical JSON) because I3 carries
   no id; if the ledger (K1) assigns ids, `decide_and_seal` must take them instead.
-- Exit 7 yields no observation, because I3 `Outcome` has no `refused` variant.
+- A Pass whose only tier-0 observations are `command` rows with an empty-stdout digest is a
+  Pass. `decide` branches on no tool name or evidence label (they are K2's vocabulary); silence
+  is the success output of `test`, `grep -q`, `cmp -s`. The vacuity door is at admission (K0
+  `Brief::check_verify`, app `task.submit`/`task.preview`); a real command that proves nothing
+  is the named gap. `tests/lattice.rs::silent_command_pass_stays_pass` pins it.
+- `ddf::for_task` has no caller until the dispatcher's settle (W4 `dispatcher-backups-ddf`);
+  today the binary runs only as the gate's `ddf` step (gate.toml `[step.ddf]`).
+- Settled for W4: an exit-7 `Observed(Refused{reason})` is advisory at its construction site
+  (`ddf::refused_observation`), so the dispatcher records it as it records any observation and
+  `decide` cannot fail the task on it; `decide.rs` is unchanged. Still open: the timeout
+  observation is tier-0 (`Refused(timeout)`), so a hung deep-diff-forge does gate; whether that
+  too should be advisory is a DC for K4, not decided here.
