@@ -71,7 +71,8 @@ pub enum ChainCause {
     /// A stored `id`, `task_id`, `hash_prev` or `hash_self` column disagrees with the sealed
     /// receipt's JSON; the fault names the sealed id.
     ColumnMismatch,
-    /// The row's JSON is not a `Receipt`, or a hash column is not 64 lowercase hex digits.
+    /// The row's JSON is not a `Receipt`, a hash column or a checkpoint's `root` is not 64
+    /// lowercase hex digits, or a `task_id` column is not a task id.
     Unparsable,
     /// A checkpoint's `root` or `count` is not what the receipts it covers re-derive to.
     RootMismatch,
@@ -110,9 +111,9 @@ fn receipt_or_none(receipt: Option<&ReceiptId>) -> String {
     receipt.map_or_else(|| "none".to_owned(), ToString::to_string)
 }
 
-/// The first row at which the ledger fails to re-derive. `receipt` is `None` only for
-/// [`ChainCause::RootMismatch`], where `seq` is the checkpoint's; otherwise `seq` is the
-/// receipt row's.
+/// The first row at which the ledger fails to re-derive. `receipt` is `None` only for a
+/// checkpoint row's fault ([`ChainCause::RootMismatch`], or [`ChainCause::Unparsable`] for its
+/// `root`), where `seq` is the checkpoint's; otherwise `seq` is the receipt row's.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("ledger breaks at receipt={} seq={seq} cause={cause}", receipt_or_none(.receipt.as_ref()))]
 pub struct ChainFault {
@@ -202,48 +203,50 @@ fn hash_selfs_upto(conn: &Connection, upto: i64) -> Result<Vec<Sha256Hex>, Store
     Ok(out)
 }
 
-fn checkpoint_rows(conn: &Connection) -> Result<Vec<Checkpoint>, StoreError> {
+/// A `checkpoints` row as SQLite hands it over; `root` is parsed by the verifier, so a bad
+/// root is a verdict on that row, not a read failure.
+struct CheckpointRow {
+    seq: i64,
+    upto_receipt_seq: i64,
+    count: i64,
+    root: String,
+}
+
+fn checkpoint_rows(conn: &Connection) -> Result<Vec<CheckpointRow>, StoreError> {
     let mut stmt =
         conn.prepare("SELECT seq, upto_receipt_seq, count, root FROM checkpoints ORDER BY seq")?;
     let rows = stmt.query_map([], |r| {
-        Ok((
-            r.get::<_, i64>(0)?,
-            r.get::<_, i64>(1)?,
-            r.get::<_, i64>(2)?,
-            r.get::<_, String>(3)?,
-        ))
+        Ok(CheckpointRow {
+            seq: r.get(0)?,
+            upto_receipt_seq: r.get(1)?,
+            count: r.get(2)?,
+            root: r.get(3)?,
+        })
     })?;
-    let mut out = Vec::new();
-    for row in rows {
-        let (seq, upto_receipt_seq, count, root) = row?;
-        let root = root.parse().map_err(|e| StoreError::Corrupt {
-            task: String::new(),
-            detail: format!("checkpoints.seq={seq} root: {e}"),
-        })?;
-        out.push(Checkpoint {
-            seq,
-            upto_receipt_seq,
-            count: u64::try_from(count).unwrap_or(0),
-            root,
-        });
-    }
-    Ok(out)
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+/// One distinct `receipts.task_id`, with the `seq` and `id` of its first receipt (SQLite's
+/// bare-column rule for `min()` picks them from the same row), so an unparsable task id is a
+/// fault named by a receipt.
+struct TaskRow {
+    task_id: String,
+    seq: i64,
+    id: String,
 }
 
 /// Task ids that hold receipts, in the order their first receipt was written.
-fn tasks_with_receipts(conn: &Connection) -> Result<Vec<TaskId>, StoreError> {
-    let mut stmt =
-        conn.prepare("SELECT task_id FROM receipts GROUP BY task_id ORDER BY min(seq)")?;
-    let ids = stmt.query_map([], |r| r.get::<_, String>(0))?;
-    let mut out = Vec::new();
-    for id in ids {
-        let id = id?;
-        out.push(id.parse().map_err(|e| StoreError::Corrupt {
-            task: id.clone(),
-            detail: format!("receipts.task_id: {e}"),
-        })?);
-    }
-    Ok(out)
+fn tasks_with_receipts(conn: &Connection) -> Result<Vec<TaskRow>, StoreError> {
+    let mut stmt = conn
+        .prepare("SELECT task_id, min(seq), id FROM receipts GROUP BY task_id ORDER BY min(seq)")?;
+    let rows = stmt.query_map([], |r| {
+        Ok(TaskRow {
+            task_id: r.get(0)?,
+            seq: r.get(1)?,
+            id: r.get(2)?,
+        })
+    })?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 
 impl Store {
@@ -392,34 +395,42 @@ impl Store {
     ///
     /// # Errors
     /// [`VerifyError::Fault`]: a chain fault as `verify_chain` reports it, or
-    /// [`ChainCause::RootMismatch`] with `receipt: None` and the checkpoint's `seq`;
-    /// [`VerifyError::Store`] when the rows cannot be read.
+    /// [`ChainCause::RootMismatch`] (or [`ChainCause::Unparsable`] for a non-hex `root`) with
+    /// `receipt: None` and the checkpoint's `seq`, or [`ChainCause::Unparsable`] for a
+    /// `task_id` column that is not a task id, named by that task's first receipt;
+    /// [`VerifyError::Store`] when SQLite cannot hand the rows over.
     pub fn verify_ledger(&self) -> Result<LedgerReport, VerifyError> {
         let tasks = tasks_with_receipts(&self.conn)?;
         let mut receipts = 0_u64;
-        for task in &tasks {
-            receipts = receipts.saturating_add(self.verify_chain(task)?.receipts);
+        for row in &tasks {
+            let task: TaskId = row.task_id.parse().map_err(|_| ChainFault {
+                receipt: row.id.parse().ok(),
+                seq: row.seq,
+                cause: ChainCause::Unparsable,
+            })?;
+            receipts = receipts.saturating_add(self.verify_chain(&task)?.receipts);
         }
         let checkpoints = checkpoint_rows(&self.conn)?;
+        let mut root = Receipt::checkpoint(&[]);
         for cp in &checkpoints {
+            let fault = |cause: ChainCause| ChainFault {
+                receipt: None,
+                seq: cp.seq,
+                cause,
+            };
+            let stored: Sha256Hex = cp.root.parse().map_err(|_| fault(ChainCause::Unparsable))?;
             let hashes = hash_selfs_upto(&self.conn, cp.upto_receipt_seq)?;
-            let count = u64::try_from(hashes.len()).unwrap_or(u64::MAX);
-            if count != cp.count || Receipt::checkpoint(&hashes) != cp.root {
-                return Err(ChainFault {
-                    receipt: None,
-                    seq: cp.seq,
-                    cause: ChainCause::RootMismatch,
-                }
-                .into());
+            let count = i64::try_from(hashes.len()).unwrap_or(i64::MAX);
+            root = Receipt::checkpoint(&hashes);
+            if count != cp.count || root != stored {
+                return Err(fault(ChainCause::RootMismatch).into());
             }
         }
         Ok(LedgerReport {
             receipts,
             tasks: u64::try_from(tasks.len()).unwrap_or(u64::MAX),
             checkpoints: u64::try_from(checkpoints.len()).unwrap_or(u64::MAX),
-            root: checkpoints
-                .last()
-                .map_or_else(|| Receipt::checkpoint(&[]), |cp| cp.root),
+            root,
         })
     }
 }

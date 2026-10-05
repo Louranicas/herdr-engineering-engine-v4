@@ -357,6 +357,62 @@ fn chain_moved_to_another_task_is_a_column_mismatch() -> R {
     Ok(())
 }
 
+/// Case 5d: a checkpoint `root` of 64 non-hex characters is a FAIL verdict on that
+/// checkpoint row, not a read failure.
+#[test]
+fn non_hex_checkpoint_root_is_unparsable_by_checkpoint_seq() -> R {
+    let (store, path) = ready("nonhex")?;
+    let t = seed_task(&store, "t1")?;
+    for n in 1..=3 {
+        append(&store, &t, n)?;
+    }
+    let cp = store.checkpoint_if_due(EVERY_THREE)?.ok_or("checkpoint")?;
+    let conn = Connection::open(&path)?;
+    conn.execute_batch("DROP TRIGGER checkpoints_no_update")?;
+    conn.execute(
+        "UPDATE checkpoints SET root = ?1 WHERE seq = ?2",
+        rusqlite::params!["z".repeat(64), cp.seq],
+    )?;
+    let f = fault(store.verify_ledger().err().ok_or("refused")?);
+    assert_eq!(
+        f,
+        ChainFault {
+            receipt: None,
+            seq: cp.seq,
+            cause: ChainCause::Unparsable
+        }
+    );
+    Ok(())
+}
+
+/// Case 5e: a `task_id` column that is not a task id is a FAIL verdict named by that task's
+/// first receipt, not a read failure.
+#[test]
+fn unparsable_task_id_column_is_unparsable_by_receipt_id() -> R {
+    let (store, path) = ready("badtask")?;
+    let t1 = seed_task(&store, "t1")?;
+    let t2 = seed_task(&store, "t2")?;
+    append(&store, &t1, 1)?;
+    let first = append(&store, &t2, 1)?;
+    append(&store, &t2, 2)?;
+    let conn = Connection::open(&path)?;
+    conn.pragma_update(None, "foreign_keys", "OFF")?;
+    conn.execute_batch("DROP TRIGGER receipts_no_update")?;
+    assert_eq!(
+        conn.execute(
+            "UPDATE receipts SET task_id = 'bad id' WHERE task_id = 't2'",
+            []
+        )?,
+        2
+    );
+    let f = fault(store.verify_ledger().err().ok_or("refused")?);
+    assert_eq!(
+        (f.receipt.as_ref(), f.seq, f.cause),
+        (Some(first.id()), 2, ChainCause::Unparsable)
+    );
+    Ok(())
+}
+
 /// Case 6: deleting the last receipt after a checkpoint: every per-task chain still passes
 /// (a shorter prefix is a valid chain), the checkpoint names the truncation.
 #[test]
