@@ -1843,3 +1843,145 @@ fn checkpoints_are_written_every_n_receipts() -> R<()> {
     assert!(!stdout.contains(" checkpoints=0 "), "{stdout}");
     Ok(())
 }
+
+/// `hee4 serve` with `extra` after the base argv over `dir` and `env` set: `(exit code,
+/// stderr)`. A serve still running after 5 s is killed and is an error (the refusal was due).
+fn serve_refusal(dir: &Path, extra: &[&str], env: &[(&str, &str)]) -> R<(Option<i32>, String)> {
+    let mut cmd = Command::new(BIN);
+    cmd.env_remove("HEE4_BUDGETS")
+        .env_remove("HEE4_REQUIRE_BACKUPS");
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let log = dir.join("refusal.log");
+    let mut child = cmd
+        .args(["serve", "--socket"])
+        .arg(dir.join("rt/control.sock"))
+        .arg("--ledger")
+        .arg(dir.join("ledger.sqlite3"))
+        .arg("--work")
+        .arg(dir.join("work"))
+        .args(extra)
+        .stdout(Stdio::null())
+        .stderr(fs::File::create(&log)?)
+        .spawn()?;
+    let t0 = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if t0.elapsed() > Duration::from_secs(5) {
+            child.kill()?;
+            child.wait()?;
+            return Err(format!("serve {extra:?} still running after 5 s").into());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    Ok((status.code(), fs::read_to_string(&log)?))
+}
+
+/// Serve's flags and `HEE4_REQUIRE_BACKUPS` are parsed at the boundary: a flag with no value
+/// (last, or followed by a flag), a repeated flag, a relative `--backups` and a
+/// `HEE4_REQUIRE_BACKUPS` other than 1/0 each exit 2 naming the flag or variable, before the
+/// ledger is opened.
+#[test]
+fn serve_flags_are_refused_by_name_at_the_boundary() -> R<()> {
+    let (_run, dir) = fsync_cheap_dir("e2e-serve-flags")?;
+    let cases: [(&[&str], &[(&str, &str)], &str); 5] = [
+        (&["--budgets"], &[], "--budgets needs a value"),
+        (
+            &["--budgets", "--backups", "/x"],
+            &[],
+            "--budgets needs a value",
+        ),
+        (
+            &["--budgets", "/a.json", "--budgets", "/b.json"],
+            &[],
+            "--budgets is given twice",
+        ),
+        (
+            &["--backups", "rel/path"],
+            &[],
+            "--backups must be an absolute path",
+        ),
+        (
+            &[],
+            &[("HEE4_REQUIRE_BACKUPS", "true")],
+            "HEE4_REQUIRE_BACKUPS must be 1 or 0",
+        ),
+    ];
+    for (extra, env, named) in cases {
+        let (code, stderr) = serve_refusal(&dir, extra, env)?;
+        println!(
+            "{extra:?} {env:?} -> exit={code:?} {}",
+            stderr.lines().next().unwrap_or("")
+        );
+        assert_eq!(code, Some(2), "{extra:?} {env:?}: {stderr}");
+        assert!(stderr.contains(named), "{extra:?} {env:?}: {stderr}");
+        assert!(
+            !dir.join("ledger.sqlite3").exists(),
+            "{extra:?}: refused before Store::open"
+        );
+    }
+    Ok(())
+}
+
+/// The unit's exact `ExecStart` argv, with `%h`/`%t` expanded under this run and its
+/// `--backups` value moved to a cross-device scratch root (never the live one), plus the unit's
+/// `HEE4_REQUIRE_BACKUPS=1`, still parses and serves.
+#[test]
+fn the_unit_exec_start_argv_serves() -> R<()> {
+    let (_run, dir) = fsync_cheap_dir("e2e-unit-argv")?;
+    let (_bk_run, bk) = backup_root(&dir, "unit-argv")?;
+    let unit = include_str!("../../../systemd/hee4.service");
+    let exec = unit
+        .lines()
+        .find_map(|l| l.strip_prefix("ExecStart="))
+        .ok_or("no ExecStart")?;
+    let home = dir.join("home");
+    let rt = dir.join("rt-unit");
+    let mut words: Vec<String> = exec
+        .split_whitespace()
+        .skip(1)
+        .map(|w| {
+            w.replace("%h", &home.to_string_lossy())
+                .replace("%t", &rt.to_string_lossy())
+        })
+        .collect();
+    let at = words
+        .iter()
+        .position(|w| w == "--backups")
+        .ok_or("the unit names no --backups")?;
+    *words.get_mut(at + 1).ok_or("--backups has no value")? = bk.to_string_lossy().into_owned();
+    fs::create_dir_all(home.join(".local/share/hee4"))?;
+    let child = Command::new(BIN)
+        .env_remove("HEE4_LIVE_MODEL")
+        .env_remove("HEE4_BUDGETS")
+        .env("HEE4_REQUIRE_BACKUPS", "1")
+        .args(&words)
+        .stdout(Stdio::null())
+        .stderr(fs::File::create(dir.join("serve.log"))?)
+        .spawn()?;
+    let mut server = Server {
+        child,
+        sock: rt.join("hee4/control.sock"),
+    };
+    let t0 = Instant::now();
+    let healthy = loop {
+        if let Ok(v) = call(&server.sock, "health", None, json!({}))
+            && v["body"]["ok"] == true
+        {
+            break true;
+        }
+        if t0.elapsed() > Duration::from_secs(20) || server.child.try_wait()?.is_some() {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    server.child.kill()?;
+    server.child.wait()?;
+    let log = fs::read_to_string(dir.join("serve.log"))?;
+    println!("argv {words:?}");
+    assert!(healthy, "{log}");
+    Ok(())
+}
