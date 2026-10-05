@@ -230,19 +230,23 @@ deploy:
     echo "deploy verdict=PASS binary=\"$v\" health=\"$h\""
     echo "$d"
 
-# Install and enable the user timers (only ops/db/daily.sh is on a timer; never a roster agent). One verdict line.
+# Install and enable the user timers (ops/db/daily.sh and tools/habitat-backup; never a roster agent). One verdict line.
 install-timers:
     #!/usr/bin/env bash
     set -uo pipefail
     d="$HOME/.config/systemd/user"
-    for u in hee4-daily.service hee4-daily.timer; do
+    for u in hee4-daily.service hee4-daily.timer hee4-backup.service hee4-backup.timer; do
       install -Dm644 "systemd/$u" "$d/$u" || { echo "install-timers verdict=FAIL step=install unit=$u"; exit 1; }
     done
     systemctl --user daemon-reload || { echo "install-timers verdict=FAIL step=daemon-reload"; exit 1; }
-    systemctl --user enable --now hee4-daily.timer || { echo "install-timers verdict=FAIL step=enable"; exit 1; }
-    next=$(systemctl --user list-timers --no-legend hee4-daily.timer | awk 'NR==1 {print $2 "T" $3}')
-    [ -n "$next" ] || { echo "install-timers verdict=FAIL step=list-timers"; exit 1; }
-    echo "install-timers verdict=PASS timers=hee4-daily.timer next=$next"
+    nexts=""
+    for t in hee4-daily.timer hee4-backup.timer; do
+      systemctl --user enable --now "$t" || { echo "install-timers verdict=FAIL step=enable timer=$t"; exit 1; }
+      next=$(systemctl --user list-timers --no-legend "$t" | awk 'NR==1 {print $2 "T" $3}')
+      [ -n "$next" ] || { echo "install-timers verdict=FAIL step=list-timers timer=$t"; exit 1; }
+      nexts="$nexts $t=$next"
+    done
+    echo "install-timers verdict=PASS timers=hee4-daily.timer,hee4-backup.timer next=${nexts# }"
 
 # Push main (and tags) to the local mirror that treehouse and Firstmate cut worktrees from. Never GitHub.
 mirror:
