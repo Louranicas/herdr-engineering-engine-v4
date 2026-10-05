@@ -1,4 +1,4 @@
-import json, os, re, tempfile, unittest
+import json, os, re, shutil, tempfile, unittest
 from common import TOOLS, run
 
 WATCH = os.path.join(TOOLS, "watch")
@@ -46,13 +46,18 @@ class World:
     def check(self, name, line, rc=0):
         write(os.path.join(self.repo, "ops", "checks", name), f"import sys\nprint({line!r})\nsys.exit({rc})\n", 0o644)
 
-    def summary(self, steps):
-        write(os.path.join(self.gate, "20261005T000000Z-abcdef012345", "summary.json"),
-              json.dumps({"subject": HEAD, "tier": "cut", "steps": steps}), 0o644)
+    def summary(self, steps, subject=HEAD, tier="cut", stamp="20261005T000000Z", mtime=None):
+        path = os.path.join(self.gate, f"{stamp}-{subject[:12]}", "summary.json")
+        write(path, json.dumps({"subject": subject, "tier": tier, "steps": steps}), 0o644)
+        if mtime is not None:
+            os.utime(path, (mtime, mtime))
 
-    def rehearsal(self, acked):
+    def rehearsal(self, acked, submitted=None):
+        if submitted is None:
+            submitted = int(acked.split("/")[1])
         write(os.path.join(self.drill, HEAD[:12], "rehearsal.json"),
-              json.dumps({"tree": HEAD[:12], "acked_present": acked, "steps": [{"name": "kill9", "status": "MEASURED"}]}), 0o644)
+              json.dumps({"tree": HEAD[:12], "submitted": submitted, "acked_present": acked,
+                          "steps": [{"name": "kill9", "status": "MEASURED"}]}), 0o644)
 
     def tasks(self, phases):
         body = json.dumps({"body": {"tasks": [{"phase": p, "task_id": f"t-{i}"} for i, p in enumerate(phases)]}})
@@ -111,6 +116,24 @@ class TestWatch(unittest.TestCase):
     def test_gate_step_that_looked_at_nothing_fails_evidence(self):
         w = World(); w.summary([{"name": "test", "rc": 0, "ok": True, "flags": ["looked_at_nothing"]}])
         self.assertIn("not_ok=test", self.assert_only(w, "evidence")["evidence"])
+
+    def test_newer_foreign_subject_pass_never_hides_head_fail(self):
+        w = World(); w.summary([{"name": "test", "rc": 1, "ok": False, "flags": []}], mtime=1_000_000)
+        w.summary([{"name": "test", "rc": 0, "ok": True, "flags": []}], subject="a2036d948d97" + "0" * 28,
+                  tier="t", stamp="20261006T000000Z", mtime=2_000_000)
+        row = self.assert_only(w, "evidence")["evidence"]
+        self.assertIn(f"subject={HEAD[:12]} not_ok=test", row)
+
+    def test_only_a_foreign_subject_summary_is_unmeasured(self):
+        w = World(); shutil.rmtree(w.gate)
+        w.summary([{"name": "test", "rc": 0, "ok": True, "flags": []}], subject="a2036d948d97" + "0" * 28, tier="cut")
+        row = self.assert_only(w, "evidence", "UNMEASURED", 3)["evidence"]
+        self.assertIn(f"UNMEASURED(no gate summary at {HEAD[:12]})", row)
+
+    def test_rehearsal_that_submitted_nothing_is_unmeasured_never_pass(self):
+        w = World(); w.rehearsal("0/0", submitted=0)
+        row = self.assert_only(w, "recovery", "UNMEASURED", 3)["recovery"]
+        self.assertIn("UNMEASURED(rehearsal submitted=0; run tools/drill --submit N)", row)
 
     def test_missing_acked_task_fails_recovery(self):
         w = World(); w.rehearsal("2/3")

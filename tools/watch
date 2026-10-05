@@ -13,9 +13,11 @@ Exit: 0 PASS (every watcher PASS), 1 FAIL (any FAIL), 3 UNMEASURED.
 Detectors:
   drift          tools/layers
   contradiction  python3 ops/checks/cite_pins.py status; python3 ops/checks/module_funnel.py; tools/features-check
-  evidence       newest <gate-logs>/*/summary.json (ok=false or looked_at_nothing is FAIL), plus the
+  evidence       newest <gate-logs>/*/summary.json whose subject is head and tier commit|stack|cut
+                 (ok=false or looked_at_nothing is FAIL; none at head is UNMEASURED), plus the
                  count of `unmeasured` frames in <evidence-root>/<head12>/*.jsonl (informational)
-  recovery       <drill-root>/<head12>/rehearsal.json (acked_present k/N with k=N, every step MEASURED)
+  recovery       <drill-root>/<head12>/rehearsal.json (submitted N>=1, acked_present k/N with k=N=submitted,
+                 every step MEASURED; submitted=0 is UNMEASURED)
                  and `hee4 task.list` (effect_unknown > 0 is FAIL)
   fence          tools/push-scan (default range; commits=0 is UNMEASURED)
   budget         fm-db status (spawned > planned_agents or open_andon > 0 in an open unit is FAIL)
@@ -25,6 +27,8 @@ import argparse, glob, json, os, shutil, subprocess, sys
 AGENT = "agent=UNMEASURED(agent)"
 # The terminal phases of crates/hee4-contracts/src/state.rs Phase::is_terminal (informational count only).
 TERMINAL = {"accepted", "failed", "cancelled", "abandoned"}
+# The tools/gate tiers whose summary speaks for a head (a test fixture's tier does not).
+TIERS = {"commit", "stack", "cut"}
 
 rows = []
 
@@ -127,17 +131,24 @@ def evidence(a, head):
         except OSError:
             continue
     drive = f"drive_unmeasured={unm}"
-    sums = glob.glob(os.path.join(a.gate_logs, "*", "summary.json"))
-    if not sums:
-        emit("evidence", "UNMEASURED", f"UNMEASURED(no gate summary in {a.gate_logs}) {drive}")
+    # only a summary whose subject IS head, at a real tier, speaks for head; a fixture or another
+    # sha's run is someone else's evidence, never this head's PASS
+    mine = []
+    for p in glob.glob(os.path.join(a.gate_logs, "*", "summary.json")):
+        try:
+            with open(p) as f:
+                s = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if isinstance(s, dict) and str(s.get("subject", ""))[:12] == head and s.get("tier") in TIERS:
+            mine.append((os.path.getmtime(p), p, s))
+    if not mine:
+        emit("evidence", "UNMEASURED", f"UNMEASURED(no gate summary at {head}) {drive}")
         return
-    newest = max(sums, key=os.path.getmtime)
-    try:
-        with open(newest) as f:
-            s = json.load(f)
-        steps = s["steps"]
-    except (OSError, ValueError, KeyError, TypeError) as e:
-        emit("evidence", "UNMEASURED", f"UNMEASURED(unreadable {newest}: {type(e).__name__}) {drive}")
+    _, newest, s = max(mine, key=lambda m: m[0])
+    steps = s.get("steps")
+    if not isinstance(steps, list):
+        emit("evidence", "UNMEASURED", f"UNMEASURED(unreadable {newest}: steps) {drive}")
         return
     bad = [st.get("name", "?") for st in steps
            if st.get("ok") is not True or "looked_at_nothing" in (st.get("flags") or [])]
@@ -157,10 +168,16 @@ def recovery(a, head):
         with open(rec) as f:
             r = json.load(f)
         k, _, n = str(r.get("acked_present", "")).partition("/")
+        sub = r.get("submitted")
         notm = [st.get("name", "?") for st in r.get("steps", []) if st.get("status") != "MEASURED"]
-        ok = k.isdigit() and n.isdigit() and k == n and r.get("steps") and not notm
-        vs.append("PASS" if ok else "FAIL")
-        parts.append(f"acked_present={r.get('acked_present')}" + (f" not_measured={','.join(notm)}" if notm else ""))
+        if not (isinstance(sub, int) and not isinstance(sub, bool) and sub >= 1):
+            # a rehearsal that submitted nothing acked nothing: looked at nothing, never PASS (check-deployed D7)
+            vs.append("UNMEASURED")
+            parts.append(f"UNMEASURED(rehearsal submitted={sub}; run tools/drill --submit N)")
+        else:
+            ok = k.isdigit() and n.isdigit() and int(k) == int(n) == sub and r.get("steps") and not notm
+            vs.append("PASS" if ok else "FAIL")
+            parts.append(f"submitted={sub} acked_present={r.get('acked_present')}" + (f" not_measured={','.join(notm)}" if notm else ""))
     except FileNotFoundError:
         vs.append("UNMEASURED"); parts.append(f"UNMEASURED(no rehearsal at {head})")
     except (OSError, ValueError, AttributeError) as e:
