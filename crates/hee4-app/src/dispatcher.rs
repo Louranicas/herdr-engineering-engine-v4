@@ -1149,25 +1149,22 @@ impl Snapshot {
     }
 }
 
-/// The workspace's change since `before`, as a git-style unified patch computed here: `None`
-/// when `<ws>/.git` is absent (no worktree); empty bytes when nothing changed. `<ws>/.git` is
-/// only stat'ed (`symlink_metadata`), never read and never handed to git.
+/// The workspace's change since `before`, as a git-style unified patch computed here, with or
+/// without a `<ws>/.git` (the snapshot needs no git, and the sandbox cannot run one); empty
+/// bytes when nothing changed. A `<ws>/.git` is only stat'ed (`symlink_metadata`), never read
+/// and never handed to git.
 ///
 /// # Errors
-/// [`DiffFault`]: a `.git` that is not a real directory, an unreadable or oversized workspace.
-pub fn workspace_diff(
-    ws: &Path,
-    before: &Snapshot,
-    cap: u64,
-) -> Result<Option<Vec<u8>>, DiffFault> {
+/// [`DiffFault`]: a `.git` that is a file or a symlink, an unreadable or oversized workspace.
+pub fn workspace_diff(ws: &Path, before: &Snapshot, cap: u64) -> Result<Vec<u8>, DiffFault> {
     match fs::symlink_metadata(ws.join(".git")) {
-        Ok(m) if m.is_dir() => {}
-        Ok(_) => return Err(DiffFault::GitDirNotDir),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Ok(m) if !m.is_dir() => return Err(DiffFault::GitDirNotDir),
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
     }
     let after = Snapshot::of(ws, cap)?;
-    Ok(Some(patch(before, &after)))
+    Ok(patch(before, &after))
 }
 
 /// `before` → `after` as a unified patch `git apply` accepts: whole-file hunks, git's path
@@ -1348,8 +1345,12 @@ fn ddf_observation(sealing: &Sealing<'_>) -> Option<Observation> {
         Ok(bytes) => bytes,
         Err(kind) => return skipped(&format!("diff_error:{kind}")),
     };
-    let diff = bytes.as_deref().map_or(Diff::NoWorktree, Diff::Bytes);
-    match ddf::for_task(diff, sealing.subject, &SystemClock, sealing.budget) {
+    match ddf::for_task(
+        Diff::Bytes(&bytes),
+        sealing.subject,
+        &SystemClock,
+        sealing.budget,
+    ) {
         Ok(TaskObservation::Observed(obs)) => {
             eprintln!(
                 "dispatch task={task} ddf=observed tool={} {}",
@@ -1510,19 +1511,18 @@ mod tests {
 
     const CAP: u64 = DDF_DIFF_BYTES;
 
+    /// A workspace with no `.git` is still diffed: the engine never creates one and the
+    /// sandbox cannot run git, so a `.git` gate would skip every live attempt.
     #[test]
-    fn workspace_diff_without_git_dir_is_no_worktree() -> R<()> {
-        let ws = scratch("no-worktree")?;
+    fn workspace_diff_without_git_dir_is_a_patch() -> R<()> {
+        let ws = scratch("no-git-dir")?;
         let before = Snapshot::of(&ws, CAP)?;
-        fs::write(ws.join("f"), "x")?;
-        assert_eq!(workspace_diff(&ws, &before, CAP)?, None);
-        let skip = ddf::for_task(
-            Diff::NoWorktree,
-            &subject()?,
-            &SystemClock,
-            Duration::from_secs(5),
-        )?;
-        assert_eq!(skip, TaskObservation::Skipped(ddf::Skip::NoWorktree));
+        assert!(workspace_diff(&ws, &before, CAP)?.is_empty());
+        fs::write(ws.join("f"), "x\n")?;
+        assert_eq!(
+            String::from_utf8(workspace_diff(&ws, &before, CAP)?)?,
+            "diff --git a/f b/f\nnew file mode 100644\n--- /dev/null\n+++ b/f\n@@ -0,0 +1 @@\n+x\n"
+        );
         let _ = fs::remove_dir_all(&ws);
         Ok(())
     }
@@ -1534,7 +1534,7 @@ mod tests {
         let before = Snapshot::of(&ws, CAP)?;
         // What happens under `.git` is not the workspace's change.
         fs::write(ws.join(".git").join("index"), "staged")?;
-        let bytes = workspace_diff(&ws, &before, CAP)?.ok_or("no worktree")?;
+        let bytes = workspace_diff(&ws, &before, CAP)?;
         assert!(bytes.is_empty(), "{}", String::from_utf8_lossy(&bytes));
         let skip = ddf::for_task(
             Diff::Bytes(&bytes),
@@ -1544,7 +1544,7 @@ mod tests {
         )?;
         assert_eq!(skip, TaskObservation::Skipped(ddf::Skip::NoDiff));
         fs::write(ws.join("f"), "x\n")?;
-        let added = workspace_diff(&ws, &before, CAP)?.ok_or("no worktree")?;
+        let added = workspace_diff(&ws, &before, CAP)?;
         assert_eq!(
             String::from_utf8(added)?,
             "diff --git a/f b/f\nnew file mode 100644\n--- /dev/null\n+++ b/f\n@@ -0,0 +1 @@\n+x\n"
@@ -1580,7 +1580,7 @@ mod tests {
         fs::remove_file(ws.join(".git"))?;
         fs::create_dir(ws.join(".git"))?;
         std::os::unix::fs::symlink(victim.join("secret"), ws.join("s"))?;
-        let bytes = workspace_diff(&ws, &before, CAP)?.ok_or("no worktree")?;
+        let bytes = workspace_diff(&ws, &before, CAP)?;
         let text = String::from_utf8(bytes)?;
         assert!(text.contains("new file mode 120000"), "{text}");
         assert!(!text.contains("SECRET_TOKEN"), "{text}");
@@ -1634,7 +1634,7 @@ mod tests {
         fs::set_permissions(ws.join("run"), fs::Permissions::from_mode(0o755))?;
         fs::write(ws.join("we\"ird\nname"), "q\n")?;
         std::os::unix::fs::symlink("d/mod", ws.join("ln"))?;
-        let bytes = workspace_diff(&ws, &before, CAP)?.ok_or("no worktree")?;
+        let bytes = workspace_diff(&ws, &before, CAP)?;
         let text = String::from_utf8_lossy(&bytes).into_owned();
         assert!(text.contains("diff --git \"a/we\\\"ird\\nname\" \"b/we\\\"ird\\nname\"\n"));
         let patch_file = scratch("apply-patch")?.join("p.diff");
@@ -1654,7 +1654,7 @@ mod tests {
         // A binary change is named, not inlined.
         let before = Snapshot::of(&ws, CAP)?;
         fs::write(ws.join("bin"), b"a\0b")?;
-        let bin = String::from_utf8(workspace_diff(&ws, &before, CAP)?.ok_or("no worktree")?)?;
+        let bin = String::from_utf8(workspace_diff(&ws, &before, CAP)?)?;
         assert!(
             bin.contains("Binary files /dev/null and b/bin differ\n"),
             "{bin}"

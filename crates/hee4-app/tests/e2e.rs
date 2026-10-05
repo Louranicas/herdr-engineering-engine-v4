@@ -1405,7 +1405,8 @@ fn backup_at_start_then_restore_into_round_trip() -> R<()> {
     let (task, done) = run_task(&server.sock, "key-bk", FIXTURE)?;
     assert_eq!(done["body"]["phase"], "accepted", "{done}");
     let serve_log = fs::read_to_string(dir.join("serve.log"))?;
-    let skip = format!("dispatch task={task} ddf=skipped reason=no_worktree");
+    // The fixture writes nothing: the workspace is diffed (no `.git` needed) and is empty.
+    let skip = format!("dispatch task={task} ddf=skipped reason=no_diff");
     println!("serve.log has `{skip}`: {}", serve_log.contains(&skip));
     assert!(serve_log.contains(&skip), "{serve_log}");
     server.child.kill()?;
