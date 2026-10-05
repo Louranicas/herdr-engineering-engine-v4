@@ -230,6 +230,20 @@ deploy:
     echo "deploy verdict=PASS binary=\"$v\" health=\"$h\""
     echo "$d"
 
+# Install and enable the user timers (only ops/db/daily.sh is on a timer; never a roster agent). One verdict line.
+install-timers:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    d="$HOME/.config/systemd/user"
+    for u in hee4-daily.service hee4-daily.timer; do
+      install -Dm644 "systemd/$u" "$d/$u" || { echo "install-timers verdict=FAIL step=install unit=$u"; exit 1; }
+    done
+    systemctl --user daemon-reload || { echo "install-timers verdict=FAIL step=daemon-reload"; exit 1; }
+    systemctl --user enable --now hee4-daily.timer || { echo "install-timers verdict=FAIL step=enable"; exit 1; }
+    next=$(systemctl --user list-timers --no-legend hee4-daily.timer | awk 'NR==1 {print $2 "T" $3}')
+    [ -n "$next" ] || { echo "install-timers verdict=FAIL step=list-timers"; exit 1; }
+    echo "install-timers verdict=PASS timers=hee4-daily.timer next=$next"
+
 # Push main (and tags) to the local mirror that treehouse and Firstmate cut worktrees from. Never GitHub.
 mirror:
     git push -q origin main --tags && echo "mirror verdict=PASS origin/main=$(git rev-parse --short=12 origin/main)"

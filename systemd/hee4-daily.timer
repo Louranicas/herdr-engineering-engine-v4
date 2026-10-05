@@ -1,0 +1,11 @@
+[Unit]
+Description=hee4-ops.db daily upkeep at 02:30 (ops/db/daily.sh; the only HEE v4 job on a timer)
+
+[Timer]
+OnCalendar=*-*-* 02:30:00
+Persistent=true
+RandomizedDelaySec=5m
+Unit=hee4-daily.service
+
+[Install]
+WantedBy=timers.target

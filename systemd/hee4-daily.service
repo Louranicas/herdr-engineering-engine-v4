@@ -1,0 +1,19 @@
+[Unit]
+Description=hee4-ops.db daily upkeep (ops/db/daily.sh)
+Documentation=file:///mnt/storage-10tb/herdr-engineering-engine-v4/ops/db/daily.sh
+
+[Service]
+Type=oneshot
+# systemd does not parse hee4.env's `: ${VAR:=...}` form, so the two homes are spelled here.
+Environment=HEE4_ROOT=/mnt/storage-10tb/herdr-engineering-engine-v4
+Environment=HEE4_EVIDENCE=/mnt/storage-10tb/hee4-evidence
+ExecStart=/usr/bin/bash /mnt/storage-10tb/herdr-engineering-engine-v4/ops/db/daily.sh
+# daily.sh exits 10 (PASS_WITH_GAPS) while jev-daily has senders it cannot measure: a gap, not a failure.
+SuccessExitStatus=10
+UMask=0077
+NoNewPrivileges=true
+Nice=10
+MemoryMax=512M
+TimeoutStartSec=600
+StandardOutput=journal
+StandardError=journal
