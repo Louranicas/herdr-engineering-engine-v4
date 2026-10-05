@@ -1,0 +1,269 @@
+#!/usr/bin/env python3
+"""watch [--repo DIR] [--gate-logs DIR] [--drill-root DIR] [--evidence-root DIR] [--timeout S]
+
+The six roster watchers' deterministic halves (.claude/agents/ROSTER.md "## Watchers", the
+`Detector (tools/watch)` column). Each runs existing doors only, spends nothing, fixes nothing and
+writes no file. One line per watcher
+  watch-<name> verdict=PASS|FAIL|UNMEASURED detail=<text> agent=UNMEASURED(agent)
+`agent=UNMEASURED(agent)` is the prose half (the agent's read) that no detector replaces; it never
+changes the verdict. A detector that is absent or times out is UNMEASURED naming the tool (never
+0, never PASS). Last line
+  watch verdict=PASS|FAIL|UNMEASURED watchers=k/n unmeasured=u head=<sha12>
+Exit: 0 PASS (every watcher PASS), 1 FAIL (any FAIL), 3 UNMEASURED.
+Detectors:
+  drift          tools/layers
+  contradiction  python3 ops/checks/cite_pins.py status; python3 ops/checks/module_funnel.py; tools/features-check
+  evidence       newest <gate-logs>/*/summary.json whose subject is head and tier commit|stack|cut
+                 (ok=false or looked_at_nothing is FAIL; none at head is UNMEASURED), plus the
+                 count of `unmeasured` frames in <evidence-root>/<head12>/*.jsonl (informational)
+  recovery       <drill-root>/<head12>/rehearsal.json (submitted N>=1, acked_present k/N with k=N=submitted,
+                 every step MEASURED; submitted=0 is UNMEASURED)
+                 and `hee4 task.list` (effect_unknown > 0 is FAIL)
+  fence          tools/push-scan (default range; commits=0 is UNMEASURED)
+  budget         fm-db status (spawned > planned_agents or open_andon > 0 in an open unit is FAIL)
+"""
+import argparse, glob, json, os, shutil, subprocess, sys
+
+AGENT = "agent=UNMEASURED(agent)"
+# The terminal phases of crates/hee4-contracts/src/state.rs Phase::is_terminal (informational count only).
+TERMINAL = {"accepted", "failed", "cancelled", "abandoned"}
+# The tools/gate tiers whose summary speaks for a head (a test fixture's tier does not).
+TIERS = {"commit", "stack", "cut"}
+
+rows = []
+
+
+def emit(name, verdict, detail):
+    rows.append(verdict)
+    print(f"watch-{name} verdict={verdict} detail={detail} {AGENT}")
+
+
+def sh(cmd, cwd, timeout):
+    """(rc, stdout, stderr); rc is None when the command could not run or timed out."""
+    try:
+        r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+        return r.returncode, r.stdout, r.stderr
+    except subprocess.TimeoutExpired:
+        return None, "", f"timeout after {timeout}s"
+    except OSError as e:
+        return None, "", str(e)
+
+
+def kv(line):
+    return dict(t.split("=", 1) for t in line.split() if "=" in t)
+
+
+def verdict_line(out):
+    lines = [l for l in out.splitlines() if "verdict=" in l]
+    return lines[-1] if lines else ""
+
+
+def pins_verdict(out):
+    """`cite_pins.py status` ends `pins keys_cited= fresh=k/n stale= ...` and prints no verdict= (its
+    verdict= line is the --control's): PASS iff fresh k=n and stale, unpinned, mismatch, unmapped are 0."""
+    lines = [l for l in out.splitlines() if l.startswith("pins ")]
+    if not lines:
+        return None
+    f = kv(lines[-1])
+    k, _, n = f.get("fresh", "").partition("/")
+    zero = all(f.get(x) == "0" for x in ("stale", "unpinned", "snapshot_mismatch", "unmapped_cites"))
+    return "PASS" if k == n and k.isdigit() and zero else "FAIL"
+
+
+def door(a, label, cmd, path, alt=None):
+    """Run one door that ends in a verdict line (or `alt(out)` reads its own last line).
+    (verdict, detail, last_verdict_line)."""
+    if not os.path.isfile(path):
+        return "UNMEASURED", f"{label} absent", ""
+    rc, out, err = sh(cmd, a.repo, a.timeout)
+    if rc is None:
+        return "UNMEASURED", f"{label} not run ({err.strip()})", ""
+    line = verdict_line(out)
+    v = kv(line).get("verdict")
+    if v is None and alt is not None:
+        v = alt(out)
+    if v == "FAIL" or rc not in (0, 3):
+        return "FAIL", f"{label} rc={rc} verdict={v or 'absent'}", line
+    if v == "UNMEASURED" or rc == 3:
+        return "UNMEASURED", f"{label} rc={rc} verdict={v or 'absent'}", line
+    if v is None:
+        return "UNMEASURED", f"{label} printed no verdict line", line
+    return "PASS", f"{label} verdict={v}", line
+
+
+def worst(vs):
+    return "FAIL" if "FAIL" in vs else "UNMEASURED" if "UNMEASURED" in vs else "PASS"
+
+
+def drift(a):
+    v, detail, line = door(a, "tools/layers", [os.path.join(a.repo, "tools", "layers")], os.path.join(a.repo, "tools", "layers"))
+    f = kv(line)
+    if "apparatus_ratio" in f:
+        detail += f" apparatus_ratio={f['apparatus_ratio']} largest_file={f.get('largest_file', 'absent')}"
+    emit("drift", v, detail)
+
+
+def contradiction(a):
+    doors = [
+        ("cite_pins", ["python3", "ops/checks/cite_pins.py", "status"], os.path.join(a.repo, "ops", "checks", "cite_pins.py"), pins_verdict),
+        ("module_funnel", ["python3", "ops/checks/module_funnel.py"], os.path.join(a.repo, "ops", "checks", "module_funnel.py"), None),
+        ("features-check", [os.path.join(a.repo, "tools", "features-check")], os.path.join(a.repo, "tools", "features-check"), None),
+    ]
+    vs, parts = [], []
+    for label, cmd, path, alt in doors:
+        v, detail, _ = door(a, label, cmd, path, alt)
+        vs.append(v)
+        parts.append(f"{label}=PASS" if v == "PASS" else f"{label}={v}({detail})")
+    emit("contradiction", worst(vs), ",".join(parts))
+
+
+def evidence(a, head):
+    unm = 0
+    for p in glob.glob(os.path.join(a.evidence_root, head, "*.jsonl")):
+        try:
+            with open(p) as f:
+                for l in f:
+                    try:
+                        frame = json.loads(l)
+                    except ValueError:
+                        continue
+                    unm += isinstance(frame, dict) and "unmeasured" in frame
+        except OSError:
+            continue
+    drive = f"drive_unmeasured={unm}"
+    # only a summary whose subject IS head, at a real tier, speaks for head; a fixture or another
+    # sha's run is someone else's evidence, never this head's PASS
+    mine = []
+    for p in glob.glob(os.path.join(a.gate_logs, "*", "summary.json")):
+        try:
+            with open(p) as f:
+                s = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if isinstance(s, dict) and str(s.get("subject", ""))[:12] == head and s.get("tier") in TIERS:
+            mine.append((os.path.getmtime(p), p, s))
+    if not mine:
+        emit("evidence", "UNMEASURED", f"UNMEASURED(no gate summary at {head}) {drive}")
+        return
+    _, newest, s = max(mine, key=lambda m: m[0])
+    steps = s.get("steps")
+    if not isinstance(steps, list):
+        emit("evidence", "UNMEASURED", f"UNMEASURED(unreadable {newest}: steps) {drive}")
+        return
+    bad = [st.get("name", "?") for st in steps
+           if st.get("ok") is not True or "looked_at_nothing" in (st.get("flags") or [])]
+    subject = str(s.get("subject", "?"))[:12]
+    if not steps:
+        emit("evidence", "FAIL", f"summary={newest} subject={subject} steps=0 (looked at nothing) {drive}")
+    elif bad:
+        emit("evidence", "FAIL", f"summary={newest} subject={subject} not_ok={','.join(bad)} {drive}")
+    else:
+        emit("evidence", "PASS", f"summary={newest} subject={subject} steps={len(steps)} {drive}")
+
+
+def recovery(a, head):
+    vs, parts = [], []
+    rec = os.path.join(a.drill_root, head, "rehearsal.json")
+    try:
+        with open(rec) as f:
+            r = json.load(f)
+        k, _, n = str(r.get("acked_present", "")).partition("/")
+        sub = r.get("submitted")
+        notm = [st.get("name", "?") for st in r.get("steps", []) if st.get("status") != "MEASURED"]
+        if not (isinstance(sub, int) and not isinstance(sub, bool) and sub >= 1):
+            # a rehearsal that submitted nothing acked nothing: looked at nothing, never PASS (check-deployed D7)
+            vs.append("UNMEASURED")
+            parts.append(f"UNMEASURED(rehearsal submitted={sub}; run tools/drill --submit N)")
+        else:
+            ok = k.isdigit() and n.isdigit() and int(k) == int(n) == sub and r.get("steps") and not notm
+            vs.append("PASS" if ok else "FAIL")
+            parts.append(f"submitted={sub} acked_present={r.get('acked_present')}" + (f" not_measured={','.join(notm)}" if notm else ""))
+    except FileNotFoundError:
+        vs.append("UNMEASURED"); parts.append(f"UNMEASURED(no rehearsal at {head})")
+    except (OSError, ValueError, AttributeError) as e:
+        vs.append("UNMEASURED"); parts.append(f"UNMEASURED(unreadable rehearsal: {type(e).__name__})")
+    if not shutil.which("hee4"):
+        vs.append("UNMEASURED"); parts.append("UNMEASURED(hee4 absent)")
+    else:
+        rc, out, err = sh(["hee4", "task.list"], a.repo, a.timeout)
+        try:
+            tasks = json.loads(out.strip().splitlines()[-1])["body"]["tasks"] if rc == 0 else None
+        except (ValueError, KeyError, IndexError, TypeError):
+            tasks = None
+        if tasks is None:
+            vs.append("UNMEASURED"); parts.append(f"UNMEASURED(socket: hee4 task.list rc={rc})")
+        else:
+            eu = sum(1 for t in tasks if t.get("phase") == "effect_unknown")
+            nt = sum(1 for t in tasks if t.get("phase") not in TERMINAL)
+            vs.append("FAIL" if eu else "PASS"); parts.append(f"effect_unknown={eu} non_terminal={nt}")
+    emit("recovery", worst(vs), " ".join(parts))
+
+
+def fence(a):
+    path = os.path.join(a.repo, "tools", "push-scan")
+    if not os.path.isfile(path):
+        emit("fence", "UNMEASURED", "tools/push-scan absent")
+        return
+    rc, out, err = sh([path], a.repo, a.timeout)
+    line = verdict_line(out)
+    f = kv(line)
+    if rc is None:
+        emit("fence", "UNMEASURED", f"tools/push-scan not run ({err.strip()})")
+    elif f.get("commits") == "0" or rc == 3:
+        emit("fence", "UNMEASURED", f"UNMEASURED(empty range) range={f.get('range', '?')} rc={rc}")
+    elif rc == 2 or "hits" not in f:
+        why = (err.strip().splitlines() or ["no verdict line"])[-1].replace(" ", "_")
+        emit("fence", "UNMEASURED", f"UNMEASURED(push-scan refused rc={rc}: {why})")
+    elif rc == 0 and f["hits"] == "0" and f.get("verdict") == "PASS":
+        emit("fence", "PASS", f"range={f.get('range')} commits={f.get('commits')} hits=0")
+    else:
+        emit("fence", "FAIL", f"range={f.get('range')} commits={f.get('commits')} hits={f['hits']} rc={rc}")
+
+
+def budget(a):
+    if not shutil.which("fm-db"):
+        emit("budget", "UNMEASURED", "UNMEASURED(fm-db absent)")
+        return
+    rc, out, err = sh(["fm-db", "status"], a.repo, a.timeout)
+    if rc != 0:
+        emit("budget", "UNMEASURED", f"UNMEASURED(fm-db status rc={rc})")
+        return
+    try:
+        units = json.loads(out)["open_units"]
+        per = [(u["unit_id"], int(u["spawned"]), int(u["planned_agents"]), int(u.get("open_andon", 0))) for u in units]
+    except (ValueError, KeyError, TypeError) as e:
+        emit("budget", "UNMEASURED", f"UNMEASURED(fm-db status unparsed: {type(e).__name__})")
+        return
+    over = [u for u, s, p, an in per if s > p or an > 0]
+    detail = f"units={len(per)} " + ",".join(f"{u}:{s}/{p}" + (f":andon={an}" if an else "") for u, s, p, an in per)
+    emit("budget", "FAIL" if over else "PASS", detail + (f" over={','.join(over)}" if over else ""))
+
+
+def main():
+    home = os.path.expanduser("~")
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--repo", default=os.getcwd(), help="tools/ and ops/checks/ are resolved under it (default: cwd)")
+    ap.add_argument("--gate-logs", default=os.path.join(home, ".cache", "hee4-gate"))
+    ap.add_argument("--drill-root", default=os.path.join(home, ".cache", "hee4-drill"))
+    ap.add_argument("--evidence-root", default=os.path.join(home, ".cache", "hee4-drive"))
+    ap.add_argument("--timeout", type=int, default=300, help="seconds per detector before it is UNMEASURED")
+    a = ap.parse_args()
+    a.repo = os.path.abspath(a.repo)
+    head = os.environ.get("HEE4_HEAD", "").strip()
+    if not head:
+        rc, out, _ = sh(["git", "-C", a.repo, "rev-parse", "HEAD"], a.repo, a.timeout)
+        head = out.strip() if rc == 0 else ""
+    head = head[:12] if head else "unmeasured"
+    drift(a)
+    contradiction(a)
+    evidence(a, head)
+    recovery(a, head)
+    fence(a)
+    budget(a)
+    v = worst(rows)
+    print(f"watch verdict={v} watchers={rows.count('PASS')}/{len(rows)} unmeasured={rows.count('UNMEASURED')} head={head}")
+    sys.exit({"PASS": 0, "FAIL": 1, "UNMEASURED": 3}[v])
+
+
+if __name__ == "__main__":
+    main()
