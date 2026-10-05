@@ -15,7 +15,7 @@ paths = ["crates/*/tests/**", "crates/*/examples/**", "tools/tests/**", ".claude
 paths = [
   "tools/**", "ops/checks/**", "ops/db/**", "ops/firstmate/**", "ops/roster/**",
   ".claude/hooks/**", ".claude/commands/**", ".claude/settings.json", ".claude/README.md",
-  "justfile", "gate.toml", "layers.toml", "systemd/**", "hee4.env", ".gitignore",
+  "justfile", "gate.toml", "deny.toml", "layers.toml", "systemd/**", "hee4.env", ".gitignore",
 ]
 
 [layer.governance]
