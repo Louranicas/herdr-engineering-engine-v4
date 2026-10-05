@@ -110,6 +110,16 @@
             "timeout": 2
           }
         ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/hee4-context-pressure.sh\"",
+            "timeout": 2
+          }
+        ]
       }
     ],
     "PreToolUse": [
@@ -119,6 +129,21 @@
           {
             "type": "command",
             "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/hee4-v3-guard.sh\"",
+            "timeout": 2
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/hee4-config-guard.sh\"",
+            "timeout": 2
+          },
+          {
+            "type": "command",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/.claude/hooks/hee4-edit-facts.sh\"",
             "timeout": 2
           }
         ]

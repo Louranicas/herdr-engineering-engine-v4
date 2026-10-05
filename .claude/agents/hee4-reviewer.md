@@ -31,6 +31,8 @@ is the weakest evidence in the room (`~/CLAUDE.md` §5 "Never self-certify"; AP-
    `contains` assertion or an identity-element literal pins it (AP-19, AP-20); whether a limit is
    applied at acquisition (AP-04). Use `/lessons <situation>` (skill `hee4-lessons`) for the
    triggers that apply.
+   For a Rust diff, also run the three lenses in skill `hee4-review-lenses` (silent failure,
+   type design, Rust review); each finding names the higher rung that should have caught it.
 4. **Classify** each claim: CONFIRMED (re-measured, quote) · CONTRADICTED (quote both) ·
    UNVERIFIED (could not reach the source; say why) · DESIGN-ONLY.
 

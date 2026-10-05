@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""lint-ratchet [--repo DIR] [--floor FILE] [--control]
+
+The lint ratchet, the `lints` step of the commit tier. Lints may only get stricter: the levels in
+<repo>/Cargo.toml [workspace.lints] are checked against the floor (tools/lint-floor.toml, the one
+home of the minimum), and the source is checked for the ways a lint is switched off without
+touching Cargo.toml. Assimilated from ECC config-protection (2026-10-05), moved from "refuse the
+edit" to "refuse the weaker tree", so it holds for any editor, not only an agent behind a hook.
+Rules (one finding line each, `finding rule=<R> path=<p> detail=<d>`):
+  R1 floor     every floor lint is present in [workspace.lints.<tool>] at a level >= the floor
+  R2 inherit   every crates/*/Cargo.toml has `[lints]` with `workspace = true`
+  R3 deny-off  no `allow`/`expect` (bare or inside `cfg_attr`) of a deny- or forbid-level floor
+               lint, or of `warnings`, outside crates/*/tests/** (test files may unwrap)
+  R4 unreasoned  `#[allow(...)]` outside tests counted against [allows] src_unreasoned_max
+  R5 flags     no .cargo/config(.toml) passing `--cap-lints` or `-A`
+Last line: `lint-ratchet verdict=PASS|FAIL lints=k/n crates_inherit=a/b deny_off=d src_unreasoned=u/max findings=f`
+Exit 0 PASS, 1 FAIL, 2 refused (no Cargo.toml, no crates, unreadable floor, unknown level).
+--control: plants one weakening per rule into an in-memory copy of the live tree; each must be
+caught by its own rule. Last line `lint-ratchet control cases=k/n verdict=PASS|FAIL`.
+"""
+import argparse, os, re, sys, tomllib
+
+LEVELS = {"allow": 0, "warn": 1, "deny": 2, "forbid": 3}
+ATTR = re.compile(r"#!?\[\s*(?:cfg_attr\s*\([^,\]]*,\s*)?(allow|expect)\s*\(")
+LINT = re.compile(r"\b(?:clippy::)?[a-z][a-z0-9_]*\b")
+
+
+def die(msg):
+    print(f"lint-ratchet: {msg}", file=sys.stderr)
+    sys.exit(2)
+
+
+def load_world(repo):
+    """rel path -> text for every file the rules read; nothing else."""
+    world = {}
+    def take(rel):
+        with open(os.path.join(repo, rel), encoding="utf-8", errors="replace") as f:
+            world[rel] = f.read()
+    if not os.path.isfile(os.path.join(repo, "Cargo.toml")):
+        die(f"no Cargo.toml under {repo}")
+    take("Cargo.toml")
+    for name in (".cargo/config.toml", ".cargo/config"):
+        if os.path.isfile(os.path.join(repo, name)):
+            take(name)
+    crates = os.path.join(repo, "crates")
+    for dirpath, dirs, files in os.walk(crates):
+        dirs[:] = sorted(d for d in dirs if d != "target")
+        for fn in sorted(files):
+            rel = os.path.relpath(os.path.join(dirpath, fn), repo)
+            if fn.endswith(".rs") or rel.count(os.sep) == 2 and fn == "Cargo.toml":
+                take(rel)
+    return world
+
+
+def level_of(v):
+    lv = v.get("level") if isinstance(v, dict) else v
+    if lv not in LEVELS:
+        die(f"unknown lint level {lv!r}")
+    return LEVELS[lv]
+
+
+def attrs(text):
+    """Yield (line, kind, lints, has_reason) for every allow/expect attribute, multi-line included."""
+    for m in ATTR.finditer(text):
+        depth, i = 1, m.end()
+        while i < len(text) and depth:
+            depth += {"(": 1, ")": -1}.get(text[i], 0)
+            i += 1
+        body = text[m.end():i - 1]
+        names = re.sub(r'reason\s*=\s*"(?:[^"\\]|\\.)*"', "", body)
+        lints = set(LINT.findall(names))
+        yield text.count("\n", 0, m.start()) + 1, m.group(1), lints, "reason" in body
+
+
+def is_test(rel):
+    parts = rel.split(os.sep)
+    return len(parts) > 3 and parts[0] == "crates" and parts[2] == "tests"
+
+
+def check(world, floor):
+    findings = []
+    ws = tomllib.loads(world["Cargo.toml"]).get("workspace", {}).get("lints", {})
+    total = met = 0
+    strong = {"warnings"}
+    for tool in ("rust", "clippy"):
+        for lint, want in (floor.get("workspace", {}).get(tool) or {}).items():
+            total += 1
+            w = LEVELS[want]
+            if w >= LEVELS["deny"]:
+                strong.add(f"clippy::{lint}" if tool == "clippy" else lint)
+            have = ws.get(tool, {}).get(lint)
+            if have is None:
+                findings.append(("R1", "Cargo.toml", f"{tool}::{lint}=missing floor={want}"))
+            elif level_of(have) < w:
+                got = have.get("level") if isinstance(have, dict) else have
+                findings.append(("R1", "Cargo.toml", f"{tool}::{lint}={got} floor={want}"))
+            else:
+                met += 1
+    manifests = sorted(p for p in world if p.startswith("crates" + os.sep) and p.endswith("Cargo.toml"))
+    if not manifests:
+        die("no crates/*/Cargo.toml")
+    inherit = 0
+    for p in manifests:
+        lints = tomllib.loads(world[p]).get("lints", {})
+        if lints.get("workspace") is True:
+            inherit += 1
+        else:
+            findings.append(("R2", p, "lints.workspace!=true"))
+    deny_off = unreasoned = 0
+    for p in sorted(world):
+        if not p.endswith(".rs") or is_test(p):
+            continue
+        for line, kind, lints, reason in attrs(world[p]):
+            hit = sorted(lints & strong)
+            if hit:
+                deny_off += 1
+                findings.append(("R3", f"{p}:{line}", f"{kind}({','.join(hit)})"))
+            elif kind == "allow" and not reason:
+                unreasoned += 1
+    cap = int((floor.get("allows") or {}).get("src_unreasoned_max", 0))
+    if unreasoned > cap:
+        findings.append(("R4", "crates", f"src_unreasoned={unreasoned} max={cap}"))
+    for name in (".cargo/config.toml", ".cargo/config"):
+        if name in world and re.search(r"--cap-lints|[\"']-A", world[name]):
+            findings.append(("R5", name, "rustflags weaken lints"))
+    summary = dict(lints=f"{met}/{total}", crates_inherit=f"{inherit}/{len(manifests)}",
+                   deny_off=deny_off, src_unreasoned=f"{unreasoned}/{cap}")
+    return findings, summary
+
+
+def plants(world):
+    """(name, rule, mutated world) — one weakening per rule, all on copies of the live tree."""
+    out = []
+    w = dict(world)
+    w["Cargo.toml"] = re.sub(r'(?m)^unwrap_used\s*=\s*"deny"', 'unwrap_used = "warn"', w["Cargo.toml"], count=1)
+    out.append(("downgrade unwrap_used", "R1", w))
+    w = dict(world)
+    w["Cargo.toml"] = re.sub(r'(?m)^unsafe_code\s*=.*\n', "", w["Cargo.toml"], count=1)
+    out.append(("drop unsafe_code", "R1", w))
+    w = dict(world)
+    crate = sorted(p for p in w if p.startswith("crates" + os.sep) and p.endswith("Cargo.toml"))[0]
+    w[crate] = re.sub(r"(?m)^workspace\s*=\s*true\s*$", "workspace = false", w[crate], count=1)
+    out.append(("crate opts out of workspace lints", "R2", w))
+    src = sorted(p for p in world if p.endswith("lib.rs") and not is_test(p))[0]
+    w = dict(world)
+    w[src] = "#![allow(clippy::unwrap_used)]\n" + w[src]
+    out.append(("allow unwrap in src", "R3", w))
+    w = dict(world)
+    w[src] = "#![expect(\n    clippy::panic,\n    reason = \"x\"\n)]\n" + w[src]
+    out.append(("multi-line expect(panic) in src", "R3", w))
+    w = dict(world)
+    w[src] = "#![cfg_attr(test, allow(clippy::expect_used))]\n" + w[src]
+    out.append(("cfg_attr allow(expect) in src", "R3", w))
+    w = dict(world)
+    w[src] = "#![allow(warnings)]\n" + w[src]
+    out.append(("allow(warnings) in src", "R3", w))
+    w = dict(world)
+    w[src] = "#[allow(dead_code)]\nfn a() {}\n" * 99 + w[src]
+    out.append(("unreasoned allows over the cap", "R4", w))
+    w = dict(world)
+    w[".cargo/config.toml"] = '[build]\nrustflags = ["--cap-lints", "warn"]\n'
+    out.append(("cap-lints in .cargo/config.toml", "R5", w))
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("--repo", default=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    ap.add_argument("--floor")
+    ap.add_argument("--control", action="store_true")
+    a = ap.parse_args()
+    floor_path = a.floor or os.path.join(a.repo, "tools", "lint-floor.toml")
+    try:
+        with open(floor_path, "rb") as f:
+            floor = tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        die(f"floor unreadable: {floor_path}: {e}")
+    for tool in (floor.get("workspace") or {}).values():
+        for v in tool.values():
+            level_of(v)
+    world = load_world(a.repo)
+    if a.control:
+        ok = n = 0
+        for name, rule, w in plants(world):
+            n += 1
+            found, _ = check(w, floor)
+            caught = any(r == rule for r, _, _ in found)
+            ok += caught
+            print(f"plant name={name!r} rule={rule} caught={'yes' if caught else 'no'}")
+        v = "PASS" if n and ok == n else "FAIL"
+        print(f"lint-ratchet control cases={ok}/{n} verdict={v}")
+        return 0 if v == "PASS" else 1
+    findings, s = check(world, floor)
+    for rule, path, detail in findings:
+        print(f"finding rule={rule} path={path} detail={detail}")
+    v = "FAIL" if findings else "PASS"
+    print(f"lint-ratchet verdict={v} lints={s['lints']} crates_inherit={s['crates_inherit']} "
+          f"deny_off={s['deny_off']} src_unreasoned={s['src_unreasoned']} findings={len(findings)}")
+    return 1 if findings else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,19 @@
+# The lint floor (read by tools/lint-ratchet, nothing else). Levels may rise above this floor in
+# Cargo.toml; a level below it, or a lint missing, is a FAIL. Lowering a row here is the only way to
+# weaken a lint, and that diff is what review sees (ECC config-protection, assimilated 2026-10-05).
+# Level order: allow < warn < deny < forbid.
+
+[workspace.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.clippy]
+pedantic = "warn"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+
+[allows]
+# Unreasoned `#[allow(...)]` attributes outside test files (crates/*/tests/**). `#[expect(.., reason = ..)]`
+# does not count: the compiler re-checks it and the reason travels with it. Lower this as allows are removed.
+src_unreasoned_max = 4

@@ -11,7 +11,7 @@
 base = "HEAD~1"            # `stack` diffs <base>..<subject>; override with --base
 
 [tier.commit]
-steps = ["features", "fmt", "clippy", "test"]
+steps = ["features", "lints", "fmt", "clippy", "test"]
 
 [tier.stack]
 includes = "commit"
@@ -23,6 +23,12 @@ steps = ["drill", "drive", "doctor"]
 
 [step.features]
 cmd = "tools/features-check --served"
+budget_s = 30
+expect = "tool_rc"
+
+[step.lints]
+# lints only get stricter: Cargo.toml against tools/lint-floor.toml, plus allow/cfg_attr/rustflags in the tree
+cmd = "tools/lint-ratchet"
 budget_s = 30
 expect = "tool_rc"
 
