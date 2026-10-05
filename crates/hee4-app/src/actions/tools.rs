@@ -91,7 +91,9 @@ fn list(engine: &Engine, req: &Request) -> Result<Answer, Fault> {
     ))
 }
 
-/// `{action, version}` -> the entry in full. An unknown id is `unknown_action` at
+/// `{action, version}` -> the entry in full, with its catalogue `scope` (wire name) and
+/// `served`: whether this binary's composed registry serves it (`Registry::serve`, the same
+/// lookup whose miss is dispatch's `unavailable`). An unknown id is `unknown_action` at
 /// `/body/action` (Error map F-2; DC proposal in FLOW.md); a known id at another version is
 /// `unsupported_action_version` at `/body/version`.
 fn inspect(engine: &Engine, req: &Request) -> Result<Answer, Fault> {
@@ -133,6 +135,8 @@ fn inspect(engine: &Engine, req: &Request) -> Result<Answer, Fault> {
             "max_request_bytes": engine.budgets().socket.frame_bytes,
             "max_deadline_ms": MAX_DEADLINE_MS,
             "readback_action": entry.readback_action,
+            "scope": entry.scope.wire_name(),
+            "served": engine.registry().serve(entry).is_some(),
         }),
     ))
 }
@@ -303,6 +307,8 @@ mod tests {
             json!({"action": "judge.inspect", "version": 1}),
         );
         assert_eq!(held["kind"], "result");
+        assert_eq!(held["body"]["scope"], "held");
+        assert_eq!(held["body"]["served"], false);
         let unknown = call(
             &e,
             "tools.inspect",
@@ -321,6 +327,48 @@ mod tests {
             call(&e, "tools.inspect", json!({"action": app}))["field"],
             "/body/version"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn inspect_says_scope_and_whether_this_binary_serves_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let e = engine("tools-served")?;
+        let composed = call(
+            &e,
+            "tools.inspect",
+            json!({"action": "tools.inspect", "version": 1}),
+        );
+        assert_eq!(composed["kind"], "result", "{composed}");
+        assert_eq!(composed["body"]["served"], true);
+        assert_eq!(composed["body"]["scope"], "v40");
+        let thread = call(
+            &e,
+            "tools.inspect",
+            json!({"action": "thread.get", "version": 1}),
+        );
+        assert_eq!(thread["kind"], "result", "{thread}");
+        assert_eq!(thread["body"]["served"], false);
+        assert_eq!(thread["body"]["scope"], "v42");
+        // `served` is the registry's own answer for every entry, and an unserved one invoked is
+        // `unavailable` at `/action` with its scope's `because` (served handlers are not run here).
+        for a in CATALOGUE.iter() {
+            let inspected = call(&e, "tools.inspect", json!({"action": a.id, "version": 1}));
+            let served = inspected["body"]["served"].as_bool();
+            assert_eq!(
+                served,
+                Some(e.registry().serve(a).is_some()),
+                "{}: {inspected}",
+                a.id
+            );
+            if served == Some(false) {
+                let invoked = call(&e, a.id, json!({}));
+                assert_eq!(invoked["code"], "unavailable", "{}: {invoked}", a.id);
+                assert_eq!(invoked["field"], "/action");
+                assert_eq!(invoked["because"], a.scope.because());
+            }
+            assert_eq!(inspected["body"]["scope"], a.scope.wire_name());
+        }
         Ok(())
     }
 

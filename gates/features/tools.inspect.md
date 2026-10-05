@@ -4,10 +4,11 @@ A-03. One catalogue entry in full: purpose, effect, the SHA-256 of its request, 
 
 ## Sub-features
 
-- entry-detail: `{action, version, purpose, effect, request_schema_sha256, result_schema_sha256, error_schema_sha256, max_request_bytes, max_deadline_ms, readback_action}`.
+- entry-detail: `{action, version, purpose, effect, request_schema_sha256, result_schema_sha256, error_schema_sha256, max_request_bytes, max_deadline_ms, readback_action, scope, served}`.
 - schema-digests: the digests of the K0-emitted schemas; `hee4-sh --inspect <action>` must show the same arguments for the same digests. (UNMEASURED: hee4-sh exists in no crate)
 - readback-selector-source: `readback_action` is where a client learns which read to issue after a lost reply (CD RC03 §6 "Readback selectors"); mutating actions name one, reads name none.
 - bounds-per-action: `max_request_bytes` and `max_deadline_ms` from K0 bounds, never a literal in the client.
+- scope-and-served: `scope` is the catalogue entry's `Scope` wire name (`v40`, `v41`, `v42`, `held`); `served` is whether this binary's composed registry serves the id (`Registry::serve`, the same lookup whose miss is dispatch's `unavailable`). A catalogued id with `served=false` invoked is `unavailable` at `/action` with its scope's `because`; `tools/drive.d/scoped.py` drives exactly those ids by that refusal. Rust test `inspect_says_scope_and_whether_this_binary_serves_it`.
 - unknown-and-version: an unknown id, or a known id at an unsupported version, is refused by name.
 
 ## How to get to it (user POV)
@@ -23,7 +24,7 @@ hee4 tools.inspect --body '{"action":"task.submit","version":1}'
 # raw: {"request_id":"r","action":"tools.inspect","action_version":1,"idempotency_key":null,"body":{"action":"task.submit","version":1}}
 ```
 
-Result `{action, version, purpose, effect, request_schema_sha256, result_schema_sha256, error_schema_sha256, max_request_bytes, max_deadline_ms, readback_action}`. An unknown id is `unknown_action` at `/body/action` (the UNWRITTEN below is resolved). Paths (`d_tools_inspect`):
+Result `{action, version, purpose, effect, request_schema_sha256, result_schema_sha256, error_schema_sha256, max_request_bytes, max_deadline_ms, readback_action, scope, served}`. An unknown id is `unknown_action` at `/body/action` (the UNWRITTEN below is resolved). Paths (`d_tools_inspect`):
 
 - `task_submit`: `effect` `durable_admission`, `readback_action` `task.get`, the three digests 64 hex, both bounds positive ints.
 - `health`: `readback_action` null. `judge_inspect`: a result with `action` `judge.inspect` (held ids inspect as results).
@@ -42,10 +43,11 @@ hee4-sh tools.inspect action=no.such.action version:=1  # UNMEASURED: hee4-sh ex
 hee4-sh --inspect task.submit  # UNMEASURED: hee4-sh exists in no crate
 ```
 
-Socket: request `body` `{action, version}` (FACT `BodyRequest_tools_inspect` required both); result `body` `{action, version, purpose, effect, request_schema_sha256, result_schema_sha256, error_schema_sha256, max_request_bytes, max_deadline_ms, readback_action}` (API Map A-03).
+Socket: request `body` `{action, version}` (FACT `BodyRequest_tools_inspect` required both); result `body` `{action, version, purpose, effect, request_schema_sha256, result_schema_sha256, error_schema_sha256, max_request_bytes, max_deadline_ms, readback_action, scope, served}` (API Map A-03).
 
 - Success: for `task.submit`, `effect` is `DurableAdmission` and `readback_action` is `task.get`; for `health`, `readback_action` is null. `max_deadline_ms` ≤ 60000 for every action (deadline window, Error map class 7).
-- Held id: `judge.inspect` inspects successfully (it is catalogued) while invoking it is `unavailable` (judge.inspect.md). Assert both in one run.
+- Held id: `judge.inspect` inspects successfully (it is catalogued, `scope` `held`, `served` false) while invoking it is `unavailable` (judge.inspect.md). Assert both in one run.
+- Served: `tools.inspect` itself inspects `served` true, `scope` `v40`; `thread.get` inspects `served` false, `scope` `v42` (no thread family is composed).
 - Error: unknown id → `unknown_action` at `/body/action` (Error map F-2: `tools.inspect` calls the same `Catalogue::find`, and its case asserts its own `field`). Known id, wrong `version` → `unsupported_action_version` (F-3).
 - Empty: none; both fields are required, a missing one is `invalid_argument` at its pointer.
 - Side effect: none; no `operations` row.

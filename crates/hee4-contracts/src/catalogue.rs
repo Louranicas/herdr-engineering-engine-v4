@@ -278,6 +278,8 @@ pub const CATALOGUE: [Action; 22] = [
             "max_request_bytes",
             "max_deadline_ms",
             "readback_action",
+            "scope",
+            "served",
         ],
     },
     Action {
