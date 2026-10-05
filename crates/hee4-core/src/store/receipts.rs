@@ -68,7 +68,8 @@ pub enum ChainCause {
     Link,
     /// `hash_self` is not the digest of the receipt's canonical body (K0 [`BreakCause::SelfHash`]).
     SelfHash,
-    /// The stored `hash_prev` or `hash_self` column disagrees with the receipt's JSON.
+    /// A stored `id`, `task_id`, `hash_prev` or `hash_self` column disagrees with the sealed
+    /// receipt's JSON; the fault names the sealed id.
     ColumnMismatch,
     /// The row's JSON is not a `Receipt`, or a hash column is not 64 lowercase hex digits.
     Unparsable,
@@ -323,7 +324,8 @@ impl Store {
     }
 
     /// Re-derive `task`'s chain from its rows in `seq` order: each row's JSON must parse as a
-    /// `Receipt`, its `hash_prev`/`hash_self` columns must equal the parsed values, and the
+    /// `Receipt`, its `id`, `task_id`, `hash_prev` and `hash_self` columns must equal the
+    /// sealed values (`task_id` must be `task`), and the
     /// whole chain must pass [`Receipt::verify_chain`] from `GENESIS`.
     ///
     /// # Errors
@@ -350,11 +352,23 @@ impl Store {
                 .hash_self
                 .parse()
                 .map_err(|_| fault(ChainCause::Unparsable))?;
-            if prev != parsed.hash_prev() || own != parsed.hash_self() {
-                return Err(fault(ChainCause::ColumnMismatch).into());
+            // Every sealed field that has its own column must agree with it: `chain_head` and
+            // `append_receipt` select by `task_id`, and a fault names the receipt by `id`.
+            let sealed = Some(parsed.id().clone());
+            if row.id != parsed.id().as_str()
+                || parsed.task_id() != task
+                || prev != parsed.hash_prev()
+                || own != parsed.hash_self()
+            {
+                return Err(ChainFault {
+                    receipt: sealed,
+                    seq: row.seq,
+                    cause: ChainCause::ColumnMismatch,
+                }
+                .into());
             }
             chain.push(parsed);
-            ids.push((receipt, row.seq));
+            ids.push((sealed, row.seq));
         }
         if let Err(brk) = Receipt::verify_chain(&chain) {
             let (receipt, seq) = ids.get(brk.index).cloned().unwrap_or((None, 0));

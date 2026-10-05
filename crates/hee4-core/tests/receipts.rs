@@ -245,11 +245,12 @@ fn planted_byte_is_refused_by_receipt_id() -> R {
         |r| r.get(0),
     )?;
     let mut bytes = json.into_bytes();
-    let marker = b"\"task_id\":\"";
+    // A byte inside the sealed body that no column mirrors, so only the seal can see it.
+    let marker = b"\"observed\":[\"";
     let at = bytes
         .windows(marker.len())
         .position(|w| w == marker)
-        .ok_or("task_id in json")?
+        .ok_or("observed in json")?
         + marker.len();
     let t = twin(bytes[at]);
     assert_ne!(t, bytes[at]);
@@ -296,6 +297,62 @@ fn tampered_hash_self_column_is_a_column_mismatch() -> R {
         (Some(last.id()), 2, ChainCause::ColumnMismatch)
     );
     let g = fault(store.verify_chain(&t).err().ok_or("chain")?);
+    assert_eq!(g, f);
+    Ok(())
+}
+
+/// Case 5b: the `id` column renamed under an intact seal: `ColumnMismatch` naming the sealed
+/// id, not the forged column.
+#[test]
+fn renamed_id_column_is_a_column_mismatch_by_sealed_id() -> R {
+    let (store, path) = ready("renamed")?;
+    let t = seed_task(&store, "t1")?;
+    append(&store, &t, 1)?;
+    let middle = append(&store, &t, 2)?;
+    append(&store, &t, 3)?;
+    let conn = Connection::open(&path)?;
+    conn.execute_batch("DROP TRIGGER receipts_no_update")?;
+    assert_eq!(
+        conn.execute(
+            "UPDATE receipts SET id = 'r-forged' WHERE id = ?1",
+            [middle.id().as_str()],
+        )?,
+        1
+    );
+    let f = fault(store.verify_ledger().err().ok_or("refused")?);
+    assert_eq!(
+        (f.receipt.as_ref(), f.seq, f.cause),
+        (Some(middle.id()), 2, ChainCause::ColumnMismatch)
+    );
+    assert_eq!(fault(store.verify_chain(&t).err().ok_or("chain")?), f);
+    Ok(())
+}
+
+/// Case 5c: a whole sealed chain moved to another (seeded, empty) task by its `task_id`
+/// column: the moved chain is internally valid, so only the sealed `task_id` can refuse it.
+#[test]
+fn chain_moved_to_another_task_is_a_column_mismatch() -> R {
+    let (store, path) = ready("moved")?;
+    let t1 = seed_task(&store, "t1")?;
+    let t2 = seed_task(&store, "t2")?;
+    append(&store, &t1, 1)?;
+    let first = append(&store, &t2, 1)?;
+    append(&store, &t2, 2)?;
+    let empty: TaskId = "tempty".parse()?;
+    store.apply(&empty, Event::Admit)?;
+    let conn = Connection::open(&path)?;
+    conn.execute_batch("DROP TRIGGER receipts_no_update")?;
+    assert_eq!(
+        conn.execute(
+            "UPDATE receipts SET task_id = 'tempty' WHERE task_id = 't2'",
+            []
+        )?,
+        2
+    );
+    let want = (Some(first.id()), 2, ChainCause::ColumnMismatch);
+    let f = fault(store.verify_chain(&empty).err().ok_or("chain")?);
+    assert_eq!((f.receipt.as_ref(), f.seq, f.cause), want);
+    let g = fault(store.verify_ledger().err().ok_or("refused")?);
     assert_eq!(g, f);
     Ok(())
 }
