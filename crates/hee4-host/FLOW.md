@@ -8,8 +8,9 @@ admission --mint--> Permit{PermitId, ReceiptId, SpawnScope}
 Command + NamespacePlan --> spawn::plan(&Permit, ..) --> SpawnPlan{argv}   or HostRefusal
                                                            |   (OutOfScope | UnlistedMount | RelativePath | DoorNotSocket)
                                                            v
-                                         spawn::run(SpawnPlan) --> SpawnOutcome{exit,stdout,stderr,elapsed}
-                                                                   or SpawnError::TimedOut (child killed, reaped)
+                                         spawn::start(SpawnPlan) --> Started{pid,start_ticks} --wait--> SpawnOutcome{exit,stdout,stderr,elapsed}
+                                              or SpawnError::Identity (child killed, reaped)       or SpawnError::TimedOut (child killed, reaped)
+                                         spawn::run(SpawnPlan) == start then wait
 
 candidate (no network) --HTTP/1.1 over $HEE4_MODEL_SOCKET--> model_door::serve --TCP--> 127.0.0.1:11434
                                                                   |  503 {"refused":"model unreachable"} if upstream refuses
@@ -22,7 +23,9 @@ candidate (no network) --HTTP/1.1 over $HEE4_MODEL_SOCKET--> model_door::serve -
 - argv: `--unshare-all --unshare-net --die-with-parent --new-session --ro-bind p p ... --bind work work [--bind door door --setenv HEE4_MODEL_SOCKET door] --chdir work -- program args`. There is no network option: the candidate never has a network, and the model door is its only path to the model.
 - Writable binds: the work dir and, when `model_door` is set, the door socket. Nothing else can be writable.
 - Refused before any process starts: program not in `scope.programs`; a bind, work dir or door not in `listed_mounts`; a relative path; a door that is not a unix socket at plan time (a directory, file or missing path would be a second writable bind) — `DoorNotSocket`.
-- `run` polls `try_wait` every 10 ms, kills and reaps at `timeout`. Stdout and stderr drain in threads.
+- `start(SpawnPlan) -> Started{pid, start_ticks}` spawns the program (bwrap for a planned spawn; the candidate dies with it under `--die-with-parent`) and reads the child's identity once, before any wait: `pid` is the child's pid and `start_ticks` is field 22 (`starttime`, clock ticks since boot) of `/proc/<pid>/stat`, parsed after the last `)` from a read bounded to 4 KiB. The pair is the custody identity a later probe compares (R06 `LiveSameIdentity` / R07 `PidReused`): a pid reused after reap carries a different `start_ticks`. If the identity cannot be read or parsed, the child is killed and reaped and the door refuses `SpawnError::Identity{pid, reason}`; no child outlives an unknown identity.
+- `Started::wait(self)` polls `try_wait` every 10 ms, kills and reaps at `timeout` (`SpawnError::TimedOut`). Stdout and stderr drain in threads.
+- `run(SpawnPlan)` equals `start` then `wait`, nothing else; the worker and dispatcher stay on `run` until the attempts ledger (K1) persists the pair.
 - Gap: the candidate inherits the worker's environment (bwrap does not clear it); no env allowlist yet.
 - Gap: no cgroup accounting, no TERM-then-KILL grace, no env allowlist yet (K0h cgroup-io and later phases).
 
