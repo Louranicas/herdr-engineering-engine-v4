@@ -53,6 +53,49 @@ def ledger_ro(ctx):
     return sqlite3.connect(uri, uri=True)
 
 
+NO_REASON = "UNMEASURED path gave no reason (a path that cannot run names why)"
+
+
+def reasoned(proc):
+    """`proc` with the no-silent-UNMEASURED rule applied after it runs (crash or not).
+
+    An UNMEASURED path whose detail is blank becomes a FAIL path naming NO_REASON, and a procedure
+    that ran no path gets a FAIL path, so a feature line can never be UNMEASURED without the
+    reason feature_reason() prints.
+    """
+    def run(F, ctx):
+        try:
+            proc(F, ctx)
+        finally:
+            F.paths[:] = [(n, "FAIL", f"{NO_REASON}: {n}") if st == "UNMEASURED" and not str(d).strip() else (n, st, d)
+                          for n, st, d in F.paths]
+        if not F.paths:  # a procedure that looked at nothing is not green and not silently UNMEASURED
+            F.check("driver", False, "procedure ran no path")
+    run.__wrapped__ = proc
+    return run
+
+
+def feature_reason(paths):
+    """' reason=<the distinct UNMEASURED details>' for a feature's paths, or '' when none is UNMEASURED.
+
+    tools/drive appends it to an UNMEASURED feature line, so tools/check-deployed D8 counts the
+    line as reasoned only because each path that could not run said why (reasoned() guarantees it).
+    """
+    seen = []
+    for _, st, d in paths:
+        d = " ".join(str(d).split())
+        if st == "UNMEASURED" and d not in seen:
+            seen.append(d)
+    return f" reason={'; '.join(seen)[:300]}" if seen else ""
+
+
+def unexplained(lines):
+    """The `drive feature=` lines tools/check-deployed D8 counts as unexplained: UNMEASURED or FAIL
+    with neither scope=unserved nor reason= (the same test as D8's `explained`)."""
+    return [l for l in lines if l.startswith("drive feature=") and (" verdict=UNMEASURED" in l or " verdict=FAIL" in l)
+            and "scope=unserved" not in l and "reason=" not in l]
+
+
 def _features_of(stem, mod):
     feats = getattr(mod, "FEATURES", None)
     shape = (isinstance(feats, list)
@@ -90,5 +133,5 @@ def load_plugins(plugins_dir, features_dir):
                 raise PluginFault(stem, f"duplicate feature {name}")
             if not os.path.isfile(os.path.join(features_dir, name + ".md")):
                 raise PluginFault(stem, f"feature {name} has no file {name}.md in {features_dir}")
-            served[name] = proc
+            served[name] = reasoned(proc)
     return served

@@ -84,6 +84,16 @@ hee4-sh task.list 'states:=["admitted","running","verifying","repair_pending","c
 - Side effects: a disposition row per quarantined task (`task_dispositions`, S8) written by `transition` on `Resolve{quarantine}` with `by=recovery` (PROPOSED DC-nn, Gotchas); no `operations` row, because recovery is not a socket caller.
 - Must not: the drill never issues `task.resolve` by hand before the second read; a hand-resolved task proves nothing about recovery.
 
+Drive leg (`tools/drive --only crash-restart`, plugin `tools/drive.d/crash.py`) (rev 2026-10-05 drive): on a disposable serve only. The plugin starts its own `hee4 serve` (the binary of the serve behind `--socket`, read by SO_PEERCRED and `/proc/<pid>/exe`) on a socket, ledger and work dir under `~/.cache/hee4-crash/<run>/`, submits one task whose VERIFY is `/usr/bin/sleep 30` plus two quick ones, waits for `running`, sends SIGKILL to that serve only, starts it again on the same ledger, then stops it with SIGTERM and starts it a third time. Paths, each a line in the feature's evidence:
+
+- `kill9_mid_attempt`: the task read `running` before the kill; the serve exited by signal 9.
+- `recovery_complete`: `health` after the restart reads `ok=true recovery_complete=true`.
+- `acked_present`: every acked task id answers `task.get` after the restart (k/N).
+- `named_rule`: the restarted serve's stderr holds exactly one `recovery task=<id> rule=<R> reason=<why> workspace=<w> running -> <after>` line for the killed task, with `<R>` in {`R08WorkerAbsent`, `R12VerificationBoundary`} and `<after>` terminal, `blocked` or `effect_unknown`, and `task.get` reads `<after>`. Measured 2026-10-05: `rule=R08WorkerAbsent reason=AcknowledgedWorkerLost workspace=NotLeasedWritable running -> effect_unknown` (the R08 row of the table below; the R10 automatic quarantine is the PROPOSED DC-nn and is not served).
+- `second_pass_pure`: after the SIGTERM stop and a third start, every recovery line naming the task leaves it where it was (measured 2026-10-05: `rule=R10EffectAmbiguity reason=none workspace=none effect_unknown -> effect_unknown`) and `task.get` reads the same phase.
+
+On the live unit's socket every path is UNMEASURED `reason=disposable serve`: the live kill is `tools/drill`, which the captain runs.
+
 ## Gotchas
 
 - `effect_unknown` is the honest end of a kill: "a clock anomaly or elapsed wait cannot turn an unknown external effect into `none`" (CD RC03 §6). A drill that expects every killed task to come back `admitted` or `failed` is wrong; one may come back `effect_unknown` and need `task.resolve`.
