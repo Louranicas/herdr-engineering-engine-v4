@@ -30,7 +30,7 @@ verify:
       elif [ -f .git/packed-refs ] && grep -q " $ref\$" .git/packed-refs; then head=$(awk -v r="$ref" '$2==r{print substr($1,1,12)}' .git/packed-refs)
       else head="unborn:${ref#refs/heads/}"; fi
     fi
-    names=(cite_pins funnel funnel_control hee4db_check db_control jev_entry_control trace render)
+    names=(cite_pins funnel funnel_control hee4db_check db_control jev_entry_control trace render fm_db_control roster_selfcheck)
     cmds=(
       "python3 ops/checks/cite_pins.py status"
       "python3 ops/checks/module_funnel.py"
@@ -40,6 +40,8 @@ verify:
       "python3 ops/db/tests/jev_entry_control.py"
       "python3 ops/checks/funnel_trace.py"
       "node ops/checks/render/render.cjs"
+      "python3 ops/firstmate/tests/control.py"
+      "python3 ops/roster/selfcheck.py"
     )
     ok=0; total=${#names[@]}; summary=""; failed=""
     for i in "${!names[@]}"; do
@@ -126,9 +128,9 @@ jev-entry SINCE="":
 highway MODULE:
     hee4db highway "$1" < /dev/null
 
-# One roster agent's selfcheck (spends about $0.25 of API per run)
-roster-selfcheck AGENT:
-    bash ops/roster/run-agent.sh "$1" selfcheck < /dev/null
+# Roster self-check; no argument: the $0 structural self-check (ops/roster/selfcheck.py); with AGENT: the paid runner (about $0.25 per run)
+roster-selfcheck AGENT="":
+    @[ -z "$1" ] && exec python3 ops/roster/selfcheck.py || exec bash ops/roster/run-agent.sh "$1" selfcheck < /dev/null
 
 # Host corpus backup rehearsal + restore drill, then remove ONLY the drill's own left-over scratch dir; `just drill dry` stops after the rehearsal
 drill MODE="":
