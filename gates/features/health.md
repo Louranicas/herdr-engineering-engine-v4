@@ -45,9 +45,12 @@ hee4 health     # ready=true recovery=complete database=ready socket=owned head=
 printf '%s\n' '{"request_id":"r1","action":"health","action_version":1,"idempotency_key":null,"body":{}}' | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/hee4/control.sock
 ```
 
-- Success: `kind=result`, `replayed=false`, body `{ok:true, head_sha, recovery_complete:true, uptime_s}`.
+- Success: `kind=result`, `replayed=false`, body `{ok:true, head_sha, recovery_complete:true, uptime_s, schema_version, serve_cgroup}`; the first four unchanged, the two new ones additive (`tools/drive` `d_health` asserts only the first four).
+- `schema_version` (integer): `Store::schema_version()`, the ledger's `PRAGMA user_version` as `open` left it = the running binary's migration count (`crates/hee4-core/FLOW.md` Migrations; 4 at this revision). D4 reading (`tools/check-deployed`): equals the installed binary's migration count, else the unit runs another binary than the ledger expects.
+- `serve_cgroup` (string): `Store::serve_cgroup()`, the `/proc/self/cgroup` `0::` path K1 read once at `open` and stamps on every admitted task; never re-read in hee4-app. D4 reading: under the unit it ends `/hee4.service`; any other suffix means the answering process is not the unit's.
 - Malformed frame (`{not json`): `invalid_argument` at `/`; unknown action: `unknown_action` at `/action`; `action_version` 2: `unsupported_action_version` at `/action_version`; each retry `never`.
 - Perms: `stat -c '%a'` of the socket dir `700` and of `control.sock` `600`.
+- Proposal (main.rs's owner): the CLI line gains `schema=<n>` from the same body; the JSON body is the D4 read-back until then.
 
 ## Gotchas
 

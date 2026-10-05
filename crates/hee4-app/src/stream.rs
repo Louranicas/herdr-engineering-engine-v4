@@ -1,5 +1,7 @@
-//! `events.subscribe {since_seq}` (I5): one JSON line per ledger event, `seq` ascending, replayed
-//! from `since_seq` and then followed live, until the client closes.
+//! `events.subscribe {since_seq, epoch}` (I5): one JSON line per ledger event, `seq` ascending,
+//! replayed from `since_seq` and then followed live, until the client closes. The cursor check
+//! (R13, `Store::cursor_check`) and the ack `{since_seq, epoch, high_water, stream}` are the
+//! handler's (`actions/task.rs`); this module starts after the ack is written.
 //!
 //! Three threads per subscriber: the connection thread writes frames; a reader thread polls
 //! the ledger through its own read-only SQLite connection and offers frames to a bounded queue;
