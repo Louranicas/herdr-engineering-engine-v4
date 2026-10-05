@@ -126,6 +126,11 @@ class World:
         hooks.mkdir(parents=True, exist_ok=True)
         for name, text in HOOKS_FIXTURE.items():
             (hooks / name).write_text(text)
+        # the skill the v4 rule must EXCLUDE (its killer case reads it as absent from `recipe skills`); not installed on
+        # this host, so the world carries a fixture copy, never the real skill
+        v3_skill = self.root / "claude/skills/hee-v3-corpus/SKILL.md"
+        v3_skill.parent.mkdir(parents=True, exist_ok=True)
+        v3_skill.write_text("---\nname: hee-v3-corpus\ndescription: planted control fixture, the frozen corpus skill the v4 rule excludes\n---\nPlanted. Never loaded.\n")
         handoffs = self.root / "handoffs"
         handoffs.mkdir()
         (handoffs / "HEE4_HANDOVER_planted.md").write_text("# HEE4 handover (planted control fixture)\n\nverdict=PASS planted\n")
