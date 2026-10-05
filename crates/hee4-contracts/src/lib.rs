@@ -15,6 +15,7 @@
 
 pub mod bounds;
 mod brief;
+mod budgets;
 mod hex;
 mod ids;
 mod observation;
@@ -22,8 +23,13 @@ mod receipt;
 mod refusal;
 mod state;
 mod verdict;
+mod verify;
 
 pub use brief::{Brief, BriefField};
+pub use budgets::{
+    AttemptBudget, BudgetParseError, BudgetRefusal, Budgets, DispatcherBudget, DoorBudget,
+    LedgerBudget, ModelBudget, RecoveryBudget, SocketBudget, StreamBudget,
+};
 pub use hex::{GitSha, Sha256Hex};
 pub use ids::{EvidenceLabel, ObservationId, ReceiptId, SourceId, TaskId, ToolName, ToolVersion};
 pub use observation::{Evidence, Observation, Outcome, RefusalText, ToolId};
@@ -34,3 +40,4 @@ pub use state::{
     transition,
 };
 pub use verdict::{Reason, Verdict};
+pub use verify::{VerifyFault, VerifyLine};

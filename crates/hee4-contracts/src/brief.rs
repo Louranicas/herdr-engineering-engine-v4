@@ -1,6 +1,7 @@
 //! The I1 brief: eleven fields, parsed once at admission.
 
 use crate::refusal::Refusal;
+use crate::verify::{VerifyFault, VerifyLine};
 
 /// The eleven brief fields (STACK-MAP §2 I1: pstack's nine plus RECON and RESTATEMENT).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -126,5 +127,37 @@ impl Brief {
         } else {
             Ok(text)
         }
+    }
+
+    /// The admission check of V4-94: VERIFY looks at something. Reads the text only, never the
+    /// host, the sandbox or a file; what it deliberately does not catch is listed in `FLOW.md`.
+    ///
+    /// # Errors
+    /// [`Refusal::VacuousVerify`] with [`VerifyFault::Empty`] when no line survives
+    /// normalisation; [`VerifyFault::NothingRuns`] when no line is `sh:` or an absolute path;
+    /// [`VerifyFault::OnlyNoOps`] when every runnable line is a no-op. One real runnable line
+    /// anywhere admits.
+    pub fn check_verify(&self) -> Result<&str, Refusal> {
+        let text = self.get(BriefField::Verify);
+        let lines = VerifyLine::parse_all(text);
+        if lines.is_empty() {
+            return Err(Refusal::VacuousVerify {
+                cause: VerifyFault::Empty,
+            });
+        }
+        let runnable: Vec<&VerifyLine> = lines.iter().filter(|l| l.runs()).collect();
+        if runnable.is_empty() {
+            return Err(Refusal::VacuousVerify {
+                cause: VerifyFault::NothingRuns { lines: lines.len() },
+            });
+        }
+        if runnable.iter().all(|l| l.is_no_op()) {
+            return Err(Refusal::VacuousVerify {
+                cause: VerifyFault::OnlyNoOps {
+                    lines: runnable.len(),
+                },
+            });
+        }
+        Ok(text)
     }
 }

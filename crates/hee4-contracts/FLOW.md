@@ -17,10 +17,12 @@ STACK-MAP §2 (I1, I3, I4), `gates/features/crash-restart.md` (R01–R14).
 | `TaskId ReceiptId ObservationId SourceId ToolName ToolVersion EvidenceLabel` | 1..=128 bytes, no whitespace or control | `FromStr` only |
 | `Outcome` | `#[non_exhaustive]`: `Pass`, `Fail`, `Error`, `Refused{reason: RefusalText}`; `RefusalText` is 1..=512 bytes, no control characters | serde, `FromStr` |
 | `Observation` (I3) | every field is one of the parsed types above; `deny_unknown_fields` | serde at the boundary |
-| `Brief` (I1) | all eleven fields present | `Brief::parse` (refuses a missing field by name, a duplicate); `check_restatement` refuses an empty RESTATEMENT |
+| `Brief` (I1) | all eleven fields present | `Brief::parse` (refuses a missing field by name, a duplicate); `check_restatement` refuses an empty RESTATEMENT; `check_verify` refuses a VERIFY that looks at nothing (`VacuousVerify{cause}`: empty, nothing runnable, only no-ops) |
 | `Verdict`, `Reason`, `Decision` | plain data | K4 (policy is K4's) |
 | `Receipt` (I4) | `seal(prev, ReceiptBody)` hashes decision + observed + `hash_prev` together over canonical JSON (keys sorted, no whitespace); read-only fields | `Receipt::seal`; `verify_chain` returns the first `ChainBreak{index, cause}` |
 | `Refusal` | `#[non_exhaustive]`, named variants with typed fields, never strings | this crate |
+| `VerifyLine` | one VERIFY line after normalisation: Shell / Exec / Unsupported (`model:` is Unsupported{model}); the only home of the VERIFY line grammar (K6 playbook maps it) | `VerifyLine::parse_all` |
+| `Budgets` | validated only through `Budgets::parse` (and `Deserialize`, the same path): the top value and every section an object (a positional array is refused, never read as the default), unknown key refused, every field non-zero, under its ceiling in budgets.rs, ordered. Fields are `pub` for reading; a literal, a field write after `parse`, or a section parsed alone (`DoorBudget`) is not checked: rung 2, for a later slice with private fields | `Budgets::DEFAULT`, `Budgets::parse` |
 
 ## Whitelist (`transition`)
 
@@ -74,4 +76,22 @@ Counted by `tests/transition.rs` over 14 sources × 32 events: `legal=65/65 ille
 |---|---|---|
 | K1 `hee4-core` (store, task) | call `transition`; persist `Phase::as_str`; rehydrate by `TaskState::replay` | build a `TaskState` any other way; write a state `transition` did not return |
 | K4 `decide` | build `Verdict`, `Decision`, `ReceiptBody`; call `Receipt::seal` | mutate a sealed `Receipt`; attach `observed` after the seal |
-| K6 host (admission, wire) | `Brief::parse` + `check_restatement`; parse `Observation`, ids and digests from the wire | pass a raw `String` where a newtype is required; admit a brief that failed either check |
+| K6 host (admission, wire) | `Brief::parse` + `check_restatement` + `check_verify`; parse `Observation`, ids and digests from the wire; load `Budgets` by `parse` at serve start only; host and worker receive the validated value | pass a raw `String` where a newtype is required; admit a brief that failed any check; build a `Budgets` from a literal or write one of its fields after `parse` |
+
+## What `check_verify` does not catch
+
+`check_verify` is a rung-2 door: admission reads the text, not the effect; a real command that
+proves nothing is the verdict's business and is deliberately a Pass. Pinned as `Ok` by
+`tests/verify.rs::deliberately_not_caught`:
+
+| VERIFY line | Why it admits |
+|---|---|
+| `sh: true && true`, `sh: true; :` | an operator makes it a compound command, not a listed no-op |
+| `sh: true # comment` | not an exact match of the no-op table |
+| `/bin/sh -c true` | an exec of `/bin/sh`, which is not in the exec no-op table |
+| `sh: printf ok`, `sh: cat /dev/null` | real commands with a trivial effect |
+| `sh: exit 1` | fails, which is not vacuous |
+| `/usr/bin/test -d /usr` | the fixture command of the later waves: real, silent, in `RO_BINDS` |
+
+Vacuity stays at rung 2 because the brief's VERIFY is free text the worker wrote; a type cannot
+refuse it before it is parsed, and parsing it is this check.
