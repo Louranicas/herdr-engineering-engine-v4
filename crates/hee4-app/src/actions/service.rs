@@ -389,6 +389,11 @@ fn action(engine: &Engine, req: &Request, runner: Option<&dyn ServiceRunner>) ->
         .act(&fact.unit_id, act, &input, &ProbeBudget::DEFAULT)
         .map_err(|e| match &e {
             ActFault::Probe(p) => probe_fault(p),
+            ActFault::UnitAbsent(_) => Fault::new(Code::NotFound, "/body/unit_id", e.to_string()),
+            ActFault::ManagerRefused(_) => {
+                Fault::new(Code::Unavailable, "/body/unit_id", e.to_string())
+                    .with_because("manager refused")
+            }
             ActFault::EffectUnknown { settling_read, .. } => {
                 Fault::new(Code::EffectUnknown, "/", e.to_string()).with_readback(settling_read)
             }
@@ -899,6 +904,47 @@ mod tests {
             (f["code"].as_str(), f["because"].as_str()),
             (Some("unavailable"), Some("busctl digest"))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn service_action_manager_refusal_is_typed_and_writes_no_operation() -> R {
+        let e = ready("svc-refused")?;
+        for (i, (fault, code, because)) in [
+            (
+                ActFault::UnitAbsent("Unit hee4-drive.service not loaded.".into()),
+                "not_found",
+                None,
+            ),
+            (
+                ActFault::ManagerRefused("Unit hee4-drive.service is masked.".into()),
+                "unavailable",
+                Some("manager refused"),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let s = stub(Ok(obs("active")?), Err(fault));
+            let r = req(
+                "service.action",
+                Some(&format!("m{i}")),
+                action_body(json!({})),
+                Some(pre(1)),
+            )?;
+            let f = err(action(&e, &r, Some(&s)));
+            assert_eq!(
+                (
+                    f["code"].as_str(),
+                    f["field"].as_str(),
+                    f["because"].as_str()
+                ),
+                (Some(code), Some("/body/unit_id"), because),
+                "{f}"
+            );
+            assert_eq!(e.store().operation_by_key(&op_key(&e, &r))?, None);
+        }
+        assert_eq!(inspect_drive(&e, &Value::Null)?["generation"], 1);
         Ok(())
     }
 

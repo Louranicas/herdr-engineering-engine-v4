@@ -195,6 +195,14 @@ pub enum ActFault {
     /// The digest, head, bus, bound or door refusal a probe would raise.
     #[error(transparent)]
     Probe(#[from] ProbeFault),
+    /// The manager answered the call with an error naming the unit as absent (`Unit X not
+    /// found.` / `not loaded.`): nothing happened (`not_found` at `/body/unit_id`).
+    #[error("manager refused: {0}")]
+    UnitAbsent(String),
+    /// The manager answered the call with another unit error (`Unit X is masked.`, an invalid
+    /// name): nothing happened (`unavailable`, because "manager refused").
+    #[error("manager refused: {0}")]
+    ManagerRefused(String),
     /// The call was sent but its effect was not read back as settled: `effect_unknown`, retry
     /// after the read `settling_read` names. Nothing is committed.
     #[error("effect unknown ({detail}); settle by {settling_read}")]
@@ -274,6 +282,26 @@ fn property_value(stdout: &[u8]) -> Option<String> {
             .map(str::to_owned),
         _ => Some(rest.to_owned()),
     }
+}
+
+/// A definite refusal in a failed `busctl call`'s stderr: the manager's error reply about the
+/// unit (MEASURED on systemd 261: `Call failed: Unit X not loaded.`, `... not found.`, `Call
+/// failed: Unit name X is not valid.`). Anything else (a timeout, a dropped connection, an
+/// unparsed line) is `None`: the call may have taken effect.
+fn call_refusal(stderr: &[u8]) -> Option<ActFault> {
+    let line = std::str::from_utf8(stderr).ok()?.lines().next()?.trim();
+    let reply = line.strip_prefix("Call failed: ")?;
+    if !reply.starts_with("Unit ") {
+        return None;
+    }
+    let detail = reply.to_owned();
+    Some(
+        if reply.ends_with(" not found.") || reply.ends_with(" not loaded.") {
+            ActFault::UnitAbsent(detail)
+        } else {
+            ActFault::ManagerRefused(detail)
+        },
+    )
 }
 
 /// The object path of a `busctl call` reply `o "/org/freedesktop/systemd1/job/N"`.
@@ -572,6 +600,9 @@ impl ServiceRunner for BusctlRunner {
         let out = run_busctl(&self.work, Some(bus), &args, budget.timeout)?
             .map_err(|e| unknown(format!("{} call: {e}", action.method())))?;
         if out.exit != Some(0) {
+            if let Some(refused) = call_refusal(&out.stderr) {
+                return Err(refused);
+            }
             return Err(unknown(format!(
                 "{} exit {:?}: {}",
                 action.method(),
@@ -588,7 +619,10 @@ impl ServiceRunner for BusctlRunner {
         })?;
         let deadline = started + budget.timeout;
         loop {
-            let (health, value) = self.observe(unit, ProbeId::ActiveState, input, budget)?;
+            // The call reached the manager: any read-back fault leaves the effect unknown.
+            let (health, value) = self
+                .observe(unit, ProbeId::ActiveState, input, budget)
+                .map_err(|e| unknown(format!("{unit} read-back: {e}")))?;
             if value.as_deref() == Some(action.settled_state()) {
                 return Ok(ActionOutcome {
                     owner_job_id,
@@ -643,6 +677,30 @@ mod tests {
         assert_eq!(ProbeId::parse("MainPID"), None);
         assert_eq!(UnitAction::parse("restart"), Some(UnitAction::Restart));
         assert_eq!(UnitAction::parse("reload"), None);
+    }
+
+    #[test]
+    fn service_call_refusals_parse_only_manager_unit_errors() {
+        assert_eq!(
+            call_refusal(b"Call failed: Unit hee4-nonexistent-xyz.service not loaded.\n"),
+            Some(ActFault::UnitAbsent(
+                "Unit hee4-nonexistent-xyz.service not loaded.".into()
+            ))
+        );
+        assert!(matches!(
+            call_refusal(b"Call failed: Unit hee4-nonexistent-xyz.service not found.\n"),
+            Some(ActFault::UnitAbsent(_))
+        ));
+        assert!(matches!(
+            call_refusal(b"Call failed: Unit name bad name is not valid.\n"),
+            Some(ActFault::ManagerRefused(_))
+        ));
+        assert_eq!(call_refusal(b"Call failed: Connection timed out\n"), None);
+        assert_eq!(
+            call_refusal(b"Failed to connect to bus: No such file\n"),
+            None
+        );
+        assert_eq!(call_refusal(b""), None);
     }
 
     /// Against the real busctl through the real door, reading `hee4.service`'s `ActiveState`
