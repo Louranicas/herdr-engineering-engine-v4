@@ -291,6 +291,7 @@ version = "4.0.0-skeleton"
 dependencies = [
  "hee4-contracts",
  "hee4-host",
+ "rustix",
  "serde_json",
  "thiserror",
 ]

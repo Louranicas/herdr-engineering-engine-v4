@@ -3,6 +3,7 @@
 
 use std::fmt;
 use std::io::{Read as _, Write as _};
+use std::os::unix::process::CommandExt as _;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -53,7 +54,8 @@ pub enum AdapterError {
         /// Digest the tool reported.
         sealed: Sha256Hex,
     },
-    /// The deadline passed; the child was killed and reaped. Map it with [`timeout_observation`].
+    /// The deadline passed; the child's whole process group was killed and the child reaped.
+    /// Map it with [`timeout_observation`].
     #[error("{BIN} ran past its {budget:?} budget and was killed")]
     Timeout {
         /// The budget the caller passed.
@@ -122,8 +124,8 @@ pub enum TaskObservation {
 ///   spawns;
 /// - a binary that is not on `PATH` → `Skipped(ToolAbsent)`; a present file that fails to exec
 ///   is `Err(Spawn)`;
-/// - a run past `budget` → `Observed` with [`timeout_observation`] (`Refused(timeout)` in
-///   `decide`);
+/// - a run past `budget` → `Observed` with [`timeout_observation`], advisory (a hung tool
+///   does not gate the task);
 /// - exit 7 → `Observed` with [`Outcome::Refused`], `advisory: true` (the tool declined to
 ///   rank; it does not gate the task); a pass → `Observed`, tier-0, bound to
 ///   `subject.input_sha256`.
@@ -196,9 +198,13 @@ pub fn observe(
     observe_with(Path::new(BIN), diff, subject, clock, budget)
 }
 
-/// The tier-0 observation for a run that hit its deadline: outcome `error`, `elapsed_ms` one
-/// past `budget_ms`, one evidence item (the digest of the diff that was sent). `decide` reads
-/// the elapsed-over-budget row first, so this yields `Refused(timeout)` and never a pass.
+/// The advisory observation for a run that hit its deadline: outcome `error`, `elapsed_ms` one
+/// past `budget_ms`, one evidence item (the digest of the diff that was sent).
+///
+/// Advisory, as exit 7 is: deep-diff-forge adds evidence and is never a second verdict
+/// authority (V4-81), so a hung tool must not gate the task. `decide` ignores an advisory row:
+/// beside a tier-0 Pass the task passes, alone it is the floor (`Refused(invalid)`), never a
+/// pass. The timeout is still sealed in `observed`.
 ///
 /// # Errors
 /// [`AdapterError::Malformed`] if a fixed token fails to parse (a bug, not an input).
@@ -222,7 +228,7 @@ pub fn timeout_observation(
             label: "deadline".parse().map_err(bad)?,
             sha256: Sha256Hex::digest(diff),
         }],
-        advisory: false,
+        advisory: true,
         elapsed_ms: budget_ms.saturating_add(1),
         budget_ms,
     })
@@ -287,11 +293,14 @@ pub fn observe_with(
     budget: Duration,
 ) -> Result<Observation, AdapterError> {
     let started = clock.now();
+    // Its own process group (pgid = the child's pid), so the deadline kills every process the
+    // tool forked, not only the direct child.
     let mut child = Command::new(bin)
         .args(ARGS)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .process_group(0)
         .spawn()?;
     // Owned, detached threads: a grandchild that keeps a pipe open must not hold us past the
     // deadline. Draining while we poll keeps a chatty child from blocking on a full pipe.
@@ -315,7 +324,7 @@ pub fn observe_with(
             break status;
         }
         if Instant::now() >= deadline {
-            child.kill()?;
+            kill_group(&mut child)?;
             child.wait()?;
             return Err(AdapterError::Timeout { budget });
         }
@@ -375,6 +384,24 @@ pub fn observe_with(
         return Err(AdapterError::LookedAtNothing);
     }
     pass_observation(tool, &output.stdout, sealed, subject, elapsed_ms, budget)
+}
+
+/// `SIGKILL` the child's process group (spawned with `process_group(0)`, so its pgid is its
+/// pid). The child is not yet reaped, so the group still exists; should the kernel refuse
+/// the group anyway, the direct child is still killed.
+///
+/// # Errors
+/// [`AdapterError::Spawn`] when neither the group nor the child could be signalled.
+fn kill_group(child: &mut std::process::Child) -> Result<(), AdapterError> {
+    let group = i32::try_from(child.id())
+        .ok()
+        .and_then(rustix::process::Pid::from_raw);
+    let killed =
+        group.map(|pgid| rustix::process::kill_process_group(pgid, rustix::process::Signal::KILL));
+    match killed {
+        Some(Ok(())) => Ok(()),
+        _ => Ok(child.kill()?),
+    }
 }
 
 /// The tier-0 Pass observation for a sealed, non-empty ranking. It is bound to the subject's
