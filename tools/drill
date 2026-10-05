@@ -90,19 +90,29 @@ class Run:
         for s in self.steps[self.steps.index(after) + 1:]:
             emit(s, "UNMEASURED", self.a.restart_budget, time.monotonic(), f"not reached: {why}")
 
+    def save(self, ap):
+        """Write the record: this run's steps and ack count, task_ids merged with the record already there."""
+        p = os.path.join(self.a.drill_root, self.head, "rehearsal.json")
+        try:
+            prior = json.load(open(p)).get("task_ids") or []
+        except (OSError, ValueError):
+            prior = []
+        ids = list(dict.fromkeys([*prior, *self.ids]))  # append-only: no earlier run's id is ever dropped
+        rec = {"tree": self.head, "unit": self.a.unit, "submitted": self.a.submit, "acked_present": ap,
+               "task_ids": ids, "steps": rows, "ts": time.time()}
+        try:
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p + ".tmp", "w") as f:
+                json.dump(rec, f)
+            os.replace(p + ".tmp", p)
+        except OSError as e:
+            print(f"drill rehearsal=UNWRITTEN({p}: {e})")
+
     def finish(self):
         k, n = sum(1 for r in rows if r["status"] == "MEASURED"), len(self.steps)
         v = "FAIL" if any(r["status"] == "FAIL" for r in rows) else "PASS" if k == n else "UNMEASURED"
         ap = f"{self.acked}/{self.a.submit}"
-        rec = {"tree": self.head, "unit": self.a.unit, "submitted": self.a.submit, "acked_present": ap,
-               "task_ids": self.ids, "steps": rows, "ts": time.time()}
-        p = os.path.join(self.a.drill_root, self.head, "rehearsal.json")
-        try:
-            os.makedirs(os.path.dirname(p), exist_ok=True)
-            with open(p, "w") as f:
-                json.dump(rec, f)
-        except OSError as e:
-            print(f"drill rehearsal=UNWRITTEN({p}: {e})")
+        self.save(ap)
         tail = f" submitted={self.a.submit} acked_present={ap}" if self.a.submit > 0 else ""
         print(f"drill verdict={v} steps={k}/{n} unit={self.a.unit} head={self.head}{tail}")
         sys.exit({"PASS": 0, "FAIL": 1, "UNMEASURED": 3}[v])
@@ -161,6 +171,7 @@ def main():
         if not ok:
             run.not_reached("submit", "submit failed")
             run.finish()
+        run.save(f"0/{a.submit}")  # the ids are on disk before the kill: a drill killed mid-way loses none
 
     t0 = time.monotonic()
     try:

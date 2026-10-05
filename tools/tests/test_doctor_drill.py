@@ -184,6 +184,16 @@ class DrillTests(unittest.TestCase):
         rec = json.load(open(os.path.join(root, head_of(TOOLS), "rehearsal.json")))
         self.assertEqual(rec["acked_present"], "2/3"); self.assertEqual(len(rec["task_ids"]), 3)
 
+    def test_quiet_second_submit_run_keeps_every_id(self):
+        w = World(); self.addCleanup(w.close)
+        root = tempfile.mkdtemp(prefix="dr-")
+        for _ in range(2):  # the record is append-only across runs at one tree: no drill id ever counts as use
+            restarter(self, w)
+            rc, out, _ = run(DRILL, "--socket", w.sockpath, "--restart-budget", "10", "--repo", TOOLS, "--submit", "3", "--drill-root", root, env=w.env)
+            self.assertEqual(rc, 0, out)
+        rec = json.load(open(os.path.join(root, head_of(TOOLS), "rehearsal.json")))
+        self.assertEqual(sorted(rec["task_ids"]), sorted(w.submitted)); self.assertEqual(rec["acked_present"], "3/3")
+
     def test_fire_mainpid_zero_is_refused_and_nothing_is_killed(self):
         import subprocess
         w = World(); self.addCleanup(w.close)
