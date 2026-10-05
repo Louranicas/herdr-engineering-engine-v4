@@ -13,11 +13,13 @@ Every claim here is labelled. MEASURED means a command ran on this machine and i
 | Live unit | `hee4.service` active, `Restart=on-failure` | `systemctl --user is-active hee4.service` |
 | Binary | `hee4 4.0.0-skeleton <sha12>`, the sha baked at build | `hee4 --version` |
 | Health | `recovery_complete=true` after reconcile | `hee4 health` |
-| Crash drill | SIGKILL → systemd restart → recovery complete, socket perms intact | `tools/drill --unit hee4.service --socket $XDG_RUNTIME_DIR/hee4/control.sock --repo .` |
-| Feature drive | health, task.submit, task.get, task.list, task.cancel against the live unit, restart included | `tools/drive --doctor-first --allow-restart` |
-| Gate | cut tier **7/7** at `6bd7579e20b7` (fmt, clippy, 129 tests, sealed diff, kill -9 drill, feature drive, doctor) with the live model on | `just gate commit`, `just gate cut` |
+| Crash drill | SIGKILL → systemd restart → recovery complete, socket perms intact; `--submit 3` acks survive the kill and the drill settles its own rehearsal tasks (step `rehearsal_settled`) | `tools/drill --submit 3` |
+| Feature drive | 21 served features driven against the live unit (mutating paths only on a disposable serve), restart included; the drive settles the tasks it submitted; 4 features UNMEASURED by scope (`thread.*`, `analysis.*`) | `tools/drive --doctor-first --allow-restart` |
+| Gate | cut tier 10/11 at `7193129` (features, lints, deps, fmt, clippy, 333 tests, sealed diff, drill, drive, doctor, advisories): every step green but `drive`, UNMEASURED only for the unserved actions; tools suite 228/228 | `just gate commit`, `just gate cut` |
 | Model | user-space ollama 0.35.1 on `127.0.0.1:11434`, `qwen2.5:0.5b`, GPU via Vulkan; the engine reaches it only through the door | `systemctl --user is-active ollama.service`, `hee4 doctor --repo .` |
 | First live Pass | one task through the deployed unit: `admitted -> accepted` in 0.2 s, receipt `71a15c2b…`, `command` and `model-door` observations, one `model_request` row | `plan/DECISIONS.md` V4-94 |
+| Version cut | `just cut-check` at `7193129`: `deployed=9/9` (ATLAS D1–D9), cold-clone 6/6, push-scan hits=0 over 278 commits, watchers 5/6; refused only because thread.get/list and analysis.get/request are unserved (a design decision, plus the GitHub credential for the push). No `v4.0.0` tag is claimed. | `just cut-check` |
+| Backups | ledger: online at serve start and every 8 dispatches to `/mnt/storage-10tb/hee4-backups`, restore drill PASS; habitat: `hee4-backup.timer` daily, codebase bundle + evidence + handoffs to the home disk | `hee4 restore`, `systemctl --user list-timers` |
 | Tags | `skeleton-deployed-2026-10-05`, `hardened-deployed-2026-10-05`, `live-model-deployed-2026-10-05` | `git tag -n` |
 
 The engine has run a real model attempt: a `sh:` VERIFY step inside the sandbox curled the model door, the door forwarded one request to ollama on loopback, and `decide` sealed `Pass` over two observations bound to the brief's VERIFY digest. Before the model existed, the same path ended in a refusal, not a Pass; that refusal is the design, and the Pass is the same code with a model behind the door. This is still not the ATLAS D10 version cut: that tag has its own field list (`tools/check-deployed` over D1–D9, a cold clone, `push-scan`, `apparatus_ratio=`), composed by `just cut-check` only from the lines those tools print in one run, and laid by `just tag NAME confirm`; no such tag exists yet.
@@ -153,12 +155,10 @@ Recorded because each is now an instance a future door must fail on:
 
 ## Not yet
 
-- The D10 version cut as the ATLAS defines it: `tools/check-deployed` (with `--control`), `tools/cold-clone`, `tools/push-scan`, `tools/layers`, `tools/watch`, `tools/prune`, `just cut-check` and `just tag` exist. A `v4.0.0` tag is laid only by `just tag v4.0.0 confirm` after a `cut-check` PASS at a deployed sha; none has been laid and none is claimed. Pushing it is Luke's word (`github_push=UNMEASURED`: no credential).
-- Shipped: a VERIFY that looks at nothing (empty, nothing runnable, or only `true`/`:`/`exit 0`/`echo` lines) is refused at admission by name (`invalid_argument` at `/body/brief`, `Refusal::VacuousVerify`); a real command that proves nothing is still a Pass, as named in the app FLOW (crates/hee4-app/FLOW.md).
-- Firstmate live crew in herdr: decided (V4-93) as captain-supervised on this harness; zero-touch work runs through the Agent-tool roster recorded in `firstmate.db`. Revisit when herdr gains a key-send or Firstmate delivers briefs to raw launches.
-- Nineteen release actions beyond the skeleton (`thread.*`, `tools.*`, `roster.*`, `analysis.*`, `judge.inspect`): the drive reports each `UNMEASURED` by name.
-- An attempts table so recovery rules R03, R09 and R13 can fire; socket and door limits as K1 budgets rather than literals.
-- The Jev advisory port: the boundary door is installed and refuses every v4 name; no sender is installed.
+- **The version cut.** `just cut-check` refuses it for one named reason: `thread.get`, `thread.list`, `analysis.get` and `analysis.request` are catalogued but unserved, so the drive reports them UNMEASURED by scope. Serving them is a design decision (what a thread is; the grants file format, PT-06, that gates `analysis.request`) that the plan does not settle. The tag is then pushed on the owner's word; GitHub needs a credential on this host.
+- **Named gaps carried in the unit evidence** (`hee4-evidence/roster/U-stack-04/`): `SpawnPlan` fields are public (a plan literal can bypass the permit door); `service.action`'s effect lock is per process; Quarantine leaves an attempt row open; the brief door does not yet refuse a VERIFY line that cannot fail (the workflow curator counts 95 of 378).
+- **Firstmate live crew in herdr:** captain-supervised on this harness (V4-93); zero-touch work runs through the Agent-tool roster recorded in `firstmate.db`.
+- **The Jev advisory port:** no sender is installed. After incident H-10a (V4-102) the two user-level senders are off; any return is the owner's decision, with a per-session opt-in.
 
 ## Layout
 
