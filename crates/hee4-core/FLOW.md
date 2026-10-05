@@ -7,12 +7,21 @@ before any dispatch. Sources: `modules/hee4-core/{store,recovery,task}/MODULE.md
 ## The rule
 
 **No SQL outside `src/store/`.** `tests/one_door.rs` walks `src/**` recursively and runs a
-regex-free token census outside `src/store/`: `execute`, `execute_batch`, `prepare`, `query_row`,
-`query_map`, `pragma_update`, `pragma`, each not preceded by an identifier character and followed
-by optional spaces and `(`. It fails on a hit, requires at least one file under `src/store/` to
-hold a call (the door exists), and proves the walk catches planted calls: a copy of `src` with
-one `conn.execute(` in `recovery.rs` and one in `backup.rs` names both as offenders. Inside the
-door, `apply_in` is the only code that writes `events` or `tasks`; `Store::apply` and
+regex-free token census outside `src/store/`, two families: the identifier `rusqlite` as a whole
+token anywhere (a `use`, a path, a type, a comment: a module cannot call a `Connection` method
+without naming the crate, so this closes `prepare_cached`, `query`, `query_one`, `raw_execute`
+and the rest without chasing names), and the call tokens `execute`, `execute_batch`, `prepare`,
+`query_row`, `query_map`, `pragma_update`, `pragma` and `operate` (the one door that hands a
+`Transaction` to a closure, which needs no `rusqlite` token), each not preceded by an identifier
+character and followed by optional spaces and `(`. It fails on a hit, requires at least one file
+under `src/store/` to hold a call (the door exists), and proves the walk catches planted calls: a
+copy of `src` with one `conn.execute(` in `recovery.rs` and one `conn.prepare_cached(..)` +
+`st.query(..)` (no listed verb) in `backup.rs` names both as offenders, the latter by the crate
+name alone. The shell form of the same door:
+`grep -rn -E '(^|[^A-Za-z0-9_])rusqlite([^A-Za-z0-9_]|$)' crates/hee4-core/src --include=*.rs |
+grep -v src/store/` prints nothing.
+
+Inside the door, `apply_in` is the only code that writes `events` or `tasks`; `Store::apply` and
 `Store::admit` (through `operate`) are its two callers. `src/backup.rs` is the non-SQL half of
 the backup door: it imports no rusqlite item and calls `Store` doors only.
 
@@ -84,9 +93,12 @@ manifest is incomplete by construction and `restore` refuses it (`Incomplete`). 
 (serve's default) refuses a `dest_root` on the ledger's device (`SameDevice`).
 `restore(backup_dir, into)` refuses `TargetOccupied` when `<into>/ledger.sqlite3` exists,
 verifies every sha256 before copying anything (`DigestMismatch{file}`, `ObjectsMissing{n,
-total}`), copies the ledger and `work/briefs/*.brief`, opens the ledger, records
-`restored_from` (the manifest's epoch), mints a fresh epoch and runs `reconcile` with
-unobserved custody inside the verb.
+total}`), then stages the ledger and `work/briefs/*.brief` under `<into>/.restore-<id>.tmp/`,
+opens the staged ledger, records `restored_from` (the manifest's epoch), mints a fresh epoch and
+runs `reconcile` with unobserved custody there, and only then renames the briefs and, LAST, the
+ledger into place. A failure after the copy (`BackupError::Store`: a snapshot newer than the
+binary answers `UnknownMigration`) removes the staging dir, so `<into>` holds no ledger and the
+retry is not `TargetOccupied`; a `<into>/ledger.sqlite3` therefore means a completed restore.
 
 Rules: backups stay in `serve`; there is no backup thread, timer or daemon (V4-6). The four
 DC-22 triggers (freshness ≤ 15 min before any dispatch; after a task once freshness expired; at
