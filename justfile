@@ -247,3 +247,168 @@ install-timers:
 # Push main (and tags) to the local mirror that treehouse and Firstmate cut worktrees from. Never GitHub.
 mirror:
     git push -q origin main --tags && echo "mirror verdict=PASS origin/main=$(git rev-parse --short=12 origin/main)"
+
+# The D10 cut record at a DEPLOYED HEAD: refuses unless `hee4 --version`'s head = HEAD (`just deploy` first), then mirror, gate cut, check-deployed --control then check-deployed, cold-clone, push-scan, layers, watch; writes $HEE4_CUT_ROOT/<sha12>/cut-check.json
+cut-check:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    root="${HEE4_CUT_ROOT:-$HOME/.cache/hee4-cut}"
+    sha=$(git rev-parse --verify -q 'HEAD^{commit}') || { echo "cut-check verdict=REFUSED reason=no_head"; exit 2; }
+    s12=${sha:0:12}
+    # the third field of `hee4 <VERSION> <head12> ...` (crates/hee4-app/src/main.rs), compared whole, never a substring
+    bin=$(hee4 --version 2>/dev/null < /dev/null | awk '{print $3}')
+    [[ "$bin" =~ ^[0-9a-f]{12}$ ]] || bin="UNMEASURED(hee4_--version)"
+    if [ "$bin" != "$s12" ]; then
+      echo "cut-check verdict=REFUSED reason=binary_head_mismatch binary=$bin head=$s12 hint='just deploy first'"; exit 2
+    fi
+    stamp=$(date -u +%Y%m%dT%H%M%SZ); logs="$root/$stamp-$s12"; mkdir -p "$logs" "$root/$s12"
+    # the control runs before the aggregate's first real use (ATLAS §1, P7)
+    names=(mirror gate_cut check_deployed_control check_deployed cold_clone push_scan layers watch)
+    cmds=(
+      "just --justfile '{{justfile()}}' --working-directory '$PWD' mirror"
+      "tools/gate cut"
+      "tools/check-deployed --control"
+      "tools/check-deployed"
+      "tools/cold-clone --sha $sha"
+      "tools/push-scan"
+      "tools/layers"
+      "tools/watch"
+    )
+    total=${#names[@]}; ok=0; steps=""
+    for i in "${!names[@]}"; do
+      n=${names[$i]}; log="$logs/$n.log"
+      bash -c "${cmds[$i]}" > "$log" 2>&1 < /dev/null; rc=$?
+      echo "── step $((i+1))/$total $n rc=$rc :: ${cmds[$i]}"
+      grep -E 'verdict=|^D8 ' "$log" | tail -n 2 | sed 's/^/   /'
+      if [ "$rc" -eq 0 ]; then ok=$((ok+1)); else echo "   log=$log"; fi
+      steps="$steps $n=$rc"
+    done
+    # Compose the D10 fields ONLY from the lines these doors just printed (ATLAS D10, the one home).
+    python3 - "$logs" "$root/$s12/cut-check.json" "$sha" "$ok" "$total" $steps <<'PY'
+    import json, sys, time
+    logs, out, sha, ok, total, steps = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), int(sys.argv[5]), sys.argv[6:]
+    steps = [{"name": s.split("=")[0], "rc": int(s.split("=")[1])} for s in steps]
+    def lines(n):
+        try:
+            return open(f"{logs}/{n}.log").read().splitlines()
+        except OSError:
+            return []
+    def last(n, prefix):
+        hit = [l for l in lines(n) if l.startswith(prefix)]
+        return dict(t.split("=", 1) for t in hit[-1].split() if "=" in t) if hit else {}
+    d8, dep = last("check_deployed", "D8 "), last("check_deployed", "deployed=")
+    cold, push = last("cold_clone", "cold-clone "), last("push_scan", "push-scan range=")
+    lay, watch = last("layers", "apparatus_ratio="), last("watch", "watch verdict=")
+    f, missing, bad = {}, [], []
+    if all(k in d8 for k in ("flows", "l2", "reasoned", "unexplained")):
+        f["scoreboard"] = "scoreboard " + " ".join(f"{k}={d8[k]}" for k in ("flows", "l2", "reasoned", "unexplained"))
+    else:
+        missing.append("scoreboard")
+    if "deployed" in dep:
+        f["deployed"] = f"deployed={dep['deployed']}"
+        n, _, m = dep["deployed"].partition("/")
+        if not (n.isdigit() and n == m): bad.append("deployed")
+    else:
+        missing.append("deployed")
+    if "steps" in cold and "matched" in cold:
+        f["cold_clone"] = f"cold-clone steps={cold['steps']} matched={cold['matched']}"
+        if cold["steps"] != cold["matched"]: bad.append("cold_clone")
+    else:
+        missing.append("cold_clone")
+    if "hits" in push:
+        f["push_scan"] = f"push-scan hits={push['hits']}"
+        if push["hits"] != "0": bad.append("push_scan")
+    else:
+        missing.append("push_scan")
+    if "apparatus_ratio" in lay:
+        f["apparatus_ratio"] = f"apparatus_ratio={lay['apparatus_ratio']}"
+    else:
+        missing.append("apparatus_ratio")
+    # tree= is the sha12 check-deployed printed; the record carries the full sha only when that prefix matches HEAD
+    if dep.get("tree") and sha.startswith(dep["tree"]) and len(dep["tree"]) >= 12:
+        f["tree"] = sha
+    else:
+        missing.append("tree")
+    if "dirty" in dep:
+        f["dirty"] = dep["dirty"]
+        if dep["dirty"] != "0": bad.append("dirty")
+    else:
+        missing.append("dirty")
+    if "watchers" not in watch: missing.append("watch")
+    v = "PASS" if ok == total and not missing and not bad else "FAIL"
+    rec = {"sha": sha, "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "verdict": v, "steps": steps, "fields": f}
+    with open(out, "w") as fh:
+        json.dump(rec, fh, indent=1)
+    failed = [s["name"] for s in steps if s["rc"] != 0]
+    g = lambda k, pre: f[k][len(pre):] if k in f else "UNMEASURED(missing)"
+    print(f"cut-check verdict={v}" + (f" missing_field={','.join(missing)}" if missing else "")
+          + (f" bad_field={','.join(bad)}" if bad else "") + (f" failed={','.join(failed)}" if failed else "")
+          + f" sha={sha[:12]} deployed={g('deployed', 'deployed=')} cold={g('cold_clone', 'cold-clone ')}"
+          + f" push={g('push_scan', 'push-scan ')} apparatus_ratio={g('apparatus_ratio', 'apparatus_ratio=')}"
+          + f" watch={watch.get('watchers', 'UNMEASURED(missing)')} tree={dep.get('tree', 'UNMEASURED(missing)')}"
+          + f" dirty={f.get('dirty', 'UNMEASURED(missing)')} record={out} github_push=UNMEASURED(no credential: gh not logged in)")
+    sys.exit(0 if v == "PASS" else 1)
+    PY
+
+# Lay the annotated D10 tag NAME at HEAD from HEAD's PASS cut-check record, LOCALLY (never pushed); refuses unless the positional argument is `confirm`
+tag NAME CONFIRM="":
+    #!/usr/bin/env bash
+    set -uo pipefail
+    root="${HEE4_CUT_ROOT:-$HOME/.cache/hee4-cut}"
+    sha=$(git rev-parse --verify -q 'HEAD^{commit}') || { echo "tag verdict=REFUSED reason=no_head name=$1"; exit 3; }
+    s12=${sha:0:12}; rec="$root/$s12/cut-check.json"; msg=$(mktemp); trap 'rm -f "$msg"' EXIT
+    refuse() { echo "tag verdict=REFUSED reason=$1 name=$NAME sha=$s12${2:+ $2}"; exit 3; }
+    NAME="$1"
+    [ -f "$rec" ] || refuse no_cut_check_at_sha "record=$rec"
+    # the six message lines, in the D10 order, from THIS sha's record only
+    why=$(python3 - "$rec" "$sha" "$msg" <<'PY'
+    import json, sys
+    rec, sha, msg = sys.argv[1:4]
+    try:
+        r = json.load(open(rec))
+        f = r["fields"]
+    except (OSError, ValueError, KeyError, TypeError):
+        print("cut_check_failed"); sys.exit(1)
+    if r.get("sha") != sha:
+        print("no_cut_check_at_sha"); sys.exit(1)
+    if r.get("verdict") != "PASS":
+        print("cut_check_failed"); sys.exit(1)
+    try:
+        body = [f["scoreboard"], f["deployed"], f["cold_clone"], f["push_scan"], f["apparatus_ratio"], f"tree={f['tree']} dirty={f['dirty']}"]
+    except KeyError:
+        print("cut_check_failed"); sys.exit(1)
+    open(msg, "w").write("\n".join(body) + "\n")
+    PY
+    ) || refuse "$why" "record=$rec"
+    dirty=$(git status --porcelain | wc -l)
+    [ "$dirty" -eq 0 ] || refuse dirty "dirty=$dirty"
+    git rev-parse -q --verify "refs/tags/$NAME" > /dev/null && refuse tag_exists
+    want=$(wc -l < "$msg")
+    if [ "${2:-}" != confirm ]; then
+      echo "   the annotated tag $NAME at $s12 would carry:"; sed 's/^/     /' "$msg"
+      echo "   to lay it (locally; never pushed): just tag $NAME confirm"
+      echo "tag verdict=REFUSED reason=no_confirm name=$NAME sha=$s12 fields=$want"; exit 2
+    fi
+    git tag -a "$NAME" -F "$msg" || { echo "tag verdict=FAIL step=git_tag name=$NAME sha=$s12"; exit 1; }
+    # read back: the tag object's message (after the header's blank line) and its target
+    got=$(git cat-file -p "$NAME" | sed '1,/^$/d')
+    same=$(diff <(printf '%s\n' "$got") "$msg" > /dev/null && echo "$want" || echo 0)
+    target=$(git rev-parse "$NAME^{commit}")
+    v=PASS; [ "$same" = "$want" ] && [ "$target" = "$sha" ] || v=FAIL
+    printf '%s\n' "$got" | sed 's/^/   /'
+    echo "tag verdict=$v name=$NAME sha=$s12 fields=$same/$want pushed=no"
+    [ "$v" = PASS ]
+
+# The six roster watchers' deterministic detectors (tools/watch); zero spend, no fix, writes nothing
+watch:
+    @tools/watch
+
+# Build-cache prune (tools/prune): dry run by default; `just prune apply` removes the listed candidates
+prune MODE="":
+    #!/usr/bin/env bash
+    set -uo pipefail
+    case "$1" in
+      "") exec tools/prune ;;
+      apply) exec tools/prune --apply ;;
+      *) echo "usage: just prune [apply]  (got: $1)" >&2; exit 2 ;;
+    esac
