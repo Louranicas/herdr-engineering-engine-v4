@@ -456,6 +456,294 @@ mod tests {
         assert_eq!(rows, code);
     }
 
+    /// One refusal the source emits: the code's wire name, its field and its `because` when
+    /// each is a literal at the `Fault::new` site or at a caller of the one helper around it.
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+    struct Emission {
+        code: String,
+        field: Option<String>,
+        because: Option<String>,
+    }
+
+    /// Every `.rs` file under `src/`, cut at its `#[cfg(test)]`, doc and line comments dropped.
+    fn crate_sources() -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let mut dirs = vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")];
+        while let Some(dir) = dirs.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for path in entries.filter_map(Result::ok).map(|e| e.path()) {
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path.extension().is_some_and(|x| x == "rs")
+                    && let Ok(text) = std::fs::read_to_string(&path)
+                {
+                    let live = text.split("#[cfg(test)]").next().unwrap_or("");
+                    let code: Vec<&str> = live
+                        .lines()
+                        .filter(|l| !l.trim_start().starts_with("//"))
+                        .collect();
+                    out.push((path.display().to_string(), code.join("\n")));
+                }
+            }
+        }
+        out
+    }
+
+    /// The index of the `)` that closes the `(` at `open`, skipping string literals.
+    fn close_of(s: &str, open: usize) -> Option<usize> {
+        let (mut depth, mut in_str, mut escaped) = (0_i32, false, false);
+        for (i, c) in s.char_indices().skip_while(|(i, _)| *i < open) {
+            if in_str {
+                match (escaped, c) {
+                    (true, _) => escaped = false,
+                    (false, '\\') => escaped = true,
+                    (false, '"') => in_str = false,
+                    _ => {}
+                }
+                continue;
+            }
+            match c {
+                '"' => in_str = true,
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// `s` split at its top-level commas (string literals and brackets respected), trimmed.
+    fn args_of(s: &str) -> Vec<String> {
+        let (mut out, mut cur) = (Vec::new(), String::new());
+        let (mut depth, mut in_str, mut escaped) = (0_i32, false, false);
+        for c in s.chars() {
+            if in_str {
+                match (escaped, c) {
+                    (true, _) => escaped = false,
+                    (false, '\\') => escaped = true,
+                    (false, '"') => in_str = false,
+                    _ => {}
+                }
+            } else {
+                match c {
+                    '"' => in_str = true,
+                    '(' | '[' | '{' | '<' => depth += 1,
+                    ')' | ']' | '}' | '>' => depth -= 1,
+                    ',' if depth == 0 => {
+                        out.push(cur.trim().to_owned());
+                        cur.clear();
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            cur.push(c);
+        }
+        if !cur.trim().is_empty() {
+            out.push(cur.trim().to_owned());
+        }
+        out
+    }
+
+    /// The text of a plain string literal `"..."` (no escapes, no format), else `None`.
+    fn literal(arg: &str) -> Option<String> {
+        let inner = arg.strip_prefix('"')?.strip_suffix('"')?;
+        (!inner.contains(['"', '\\'])).then(|| inner.to_owned())
+    }
+
+    fn is_ident(s: &str) -> bool {
+        !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    }
+
+    /// The helper (`let NAME = |params|` or `fn NAME(params)`) defined last before `at`:
+    /// `(name, parameter names)`.
+    fn helper_before(src: &str, at: usize) -> Option<(String, Vec<String>)> {
+        let head = &src[..at];
+        let closure = head.rfind(" = |").and_then(|eq| {
+            let name = head[..eq].rsplit("let ").next()?.trim();
+            let params = head[eq + 4..].split('|').next()?;
+            Some((eq, name.to_owned(), params.to_owned()))
+        });
+        let func = head.rfind("fn ").and_then(|f| {
+            let rest = &head[f + 3..];
+            let paren = rest.find('(')?;
+            let close = close_of(rest, paren)?;
+            Some((
+                f,
+                rest[..paren].to_owned(),
+                rest[paren + 1..close].to_owned(),
+            ))
+        });
+        let (_, name, params) = match (closure, func) {
+            (Some(c), Some(f)) => {
+                if c.0 > f.0 {
+                    c
+                } else {
+                    f
+                }
+            }
+            (c, f) => c.or(f)?,
+        };
+        let names = args_of(&params)
+            .iter()
+            .map(|p| {
+                p.split(':')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .trim_start_matches("mut ")
+                    .to_owned()
+            })
+            .collect();
+        is_ident(name.trim()).then(|| (name.trim().to_owned(), names))
+    }
+
+    /// The argument lists of every call `name(..)` in `src` (not its definition).
+    fn calls_of(src: &str, name: &str) -> Vec<Vec<String>> {
+        let needle = format!("{name}(");
+        let mut out = Vec::new();
+        for (at, _) in src.match_indices(&needle) {
+            let before = src[..at].chars().next_back();
+            if before.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+                || src[..at].ends_with("fn ")
+            {
+                continue;
+            }
+            let open = at + name.len();
+            if let Some(close) = close_of(src, open) {
+                out.push(args_of(&src[open + 1..close]));
+            }
+        }
+        out
+    }
+
+    /// Every refusal the crate's live source emits through `Fault::new`, with its field and
+    /// `because` resolved to literals where the site or one helper level holds them.
+    fn emissions() -> std::collections::BTreeSet<Emission> {
+        let mut out = std::collections::BTreeSet::new();
+        for (_, src) in crate_sources() {
+            for (at, _) in src.match_indices("Fault::new(") {
+                let open = at + "Fault::new".len();
+                let Some(close) = close_of(&src, open) else {
+                    continue;
+                };
+                let args = args_of(&src[open + 1..close]);
+                let Some(code) = args
+                    .first()
+                    .and_then(|c| c.rsplit("Code::").next())
+                    .filter(|c| is_ident(c))
+                else {
+                    continue;
+                };
+                let Some(variant) = Code::ALL.iter().find(|v| format!("{v:?}") == code) else {
+                    continue;
+                };
+                let field = args.get(1).cloned().unwrap_or_default();
+                let mut because = None;
+                let mut rest = close + 1;
+                loop {
+                    let tail = src[rest..].trim_start();
+                    let skipped = src.len() - rest - tail.len();
+                    let Some(m) = tail.strip_prefix(".with_") else {
+                        break;
+                    };
+                    let Some(paren) = m.find('(') else { break };
+                    let start = rest + skipped + ".with_".len() + paren;
+                    let Some(end) = close_of(&src, start) else {
+                        break;
+                    };
+                    if m.starts_with("because(") {
+                        because = Some(src[start + 1..end].trim().to_owned());
+                    }
+                    rest = end + 1;
+                }
+                let lit = |a: &str| literal(a);
+                let field_lit = lit(&field);
+                let because_lit = because.as_deref().and_then(lit);
+                let needs =
+                    |a: Option<&str>, l: &Option<String>| l.is_none() && a.is_some_and(is_ident);
+                let helper = (needs(Some(&field), &field_lit)
+                    || needs(because.as_deref(), &because_lit))
+                .then(|| helper_before(&src, at))
+                .flatten();
+                let name = variant.name().to_owned();
+                let Some((helper, params)) = helper else {
+                    out.insert(Emission {
+                        code: name,
+                        field: field_lit,
+                        because: because_lit,
+                    });
+                    continue;
+                };
+                let pos = |a: Option<&str>| a.and_then(|a| params.iter().position(|p| p == a));
+                let (fi, bi) = (pos(Some(&field)), pos(because.as_deref()));
+                for call in calls_of(&src, &helper) {
+                    let from = |i: Option<usize>, own: &Option<String>| {
+                        i.and_then(|i| call.get(i))
+                            .and_then(|a| literal(a))
+                            .or_else(|| own.clone())
+                    };
+                    out.insert(Emission {
+                        code: name.clone(),
+                        field: from(fi, &field_lit),
+                        because: from(bi, &because_lit),
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// The FLOW.md "Refusal names" row of `code`, whole.
+    fn flow_row(code: &str) -> Option<String> {
+        let flow = include_str!("../FLOW.md");
+        flow.lines()
+            .find(|l| l.starts_with(&format!("| `{code}` |")))
+            .map(str::to_owned)
+    }
+
+    /// Triple parity: every `(code, field, because)` the source emits (literal at the site or
+    /// one helper level up) appears in that code's FLOW.md row: the field as `` `field` ``, the
+    /// `because` text verbatim. A field or `because` the scan cannot resolve to a literal is
+    /// not checked; the resync triple below proves the helper resolution runs.
+    #[test]
+    fn every_emitted_triple_appears_in_its_flow_row() {
+        let found = emissions();
+        assert!(
+            found.contains(&Emission {
+                code: "resync_required".into(),
+                field: Some("/body/since_seq".into()),
+                because: Some("future_sequence".into()),
+            }),
+            "the scan no longer resolves helper arguments: {found:?}"
+        );
+        let mut missing = Vec::new();
+        for e in &found {
+            let Some(row) = flow_row(&e.code) else {
+                missing.push(format!("{}: no row", e.code));
+                continue;
+            };
+            if let Some(f) = &e.field
+                && !row.contains(&format!("`{f}`"))
+            {
+                missing.push(format!("{}: field `{f}`", e.code));
+            }
+            if let Some(b) = &e.because
+                && !row.contains(b.as_str())
+            {
+                missing.push(format!("{}: because {b:?}", e.code));
+            }
+        }
+        assert!(missing.is_empty(), "FLOW.md rows miss: {missing:#?}");
+    }
+
     #[test]
     fn precondition_member_is_parsed_or_refused_by_shape() {
         let line = |p: serde_json::Value| {
