@@ -34,7 +34,9 @@ pub use budgets::{
 pub use hex::{GitSha, Sha256Hex};
 pub use ids::{EvidenceLabel, ObservationId, ReceiptId, SourceId, TaskId, ToolName, ToolVersion};
 pub use observation::{Evidence, Observation, Outcome, RefusalText, ToolId};
-pub use receipt::{BreakCause, ChainBreak, Decision, Receipt, ReceiptBody, canonical_json};
+pub use receipt::{
+    BreakCause, ChainBreak, Decision, Receipt, ReceiptBody, canonical_json, merkle_root,
+};
 pub use refusal::{HexFault, HexKind, Refusal, TokenFault, TokenKind};
 pub use state::{
     AbandonReason, Event, Phase, QuarantineReason, RecoveryRule, Resolution, Settlement, TaskState,

@@ -126,6 +126,15 @@ impl Receipt {
         Sha256Hex::digest(canonical_json(&Value::Object(body)).as_bytes())
     }
 
+    /// The RFC 6962 Merkle Tree Hash ([`merkle_root`]) over `hashes` as raw 32-byte leaves, in
+    /// the given order: the checkpoint root K1 stores over every `hash_self` of a ledger prefix.
+    /// Deterministic; a reordered, dropped or altered seal changes it.
+    #[must_use]
+    pub fn checkpoint(hashes: &[Sha256Hex]) -> Sha256Hex {
+        let leaves: Vec<&[u8]> = hashes.iter().map(|h| h.as_bytes().as_slice()).collect();
+        merkle_root(&leaves)
+    }
+
     /// The receipt id.
     #[must_use]
     pub fn id(&self) -> &ReceiptId {
@@ -172,6 +181,36 @@ fn decision_value(decision: Decision) -> Value {
     let mut m = Map::new();
     m.insert("verdict".into(), verdict);
     Value::Object(m)
+}
+
+/// RFC 6962 §2.1 Merkle Tree Hash over `leaves` in the given order, built from
+/// [`Sha256Hex::digest`] alone: the empty tree is `SHA-256("")`, one leaf is
+/// `SHA-256(0x00 || leaf)`, and `n > 1` leaves are
+/// `SHA-256(0x01 || MTH(D[0:k]) || MTH(D[k:n]))` with `k` the largest power of two strictly
+/// less than `n`. Every root is therefore the hash of a log prefix (the consistency shape).
+#[must_use]
+pub fn merkle_root(leaves: &[&[u8]]) -> Sha256Hex {
+    match leaves {
+        [] => Sha256Hex::digest(b""),
+        [leaf] => {
+            let mut bytes = Vec::with_capacity(leaf.len() + 1);
+            bytes.push(0x00);
+            bytes.extend_from_slice(leaf);
+            Sha256Hex::digest(&bytes)
+        }
+        _ => {
+            let mut k = 1;
+            while k * 2 < leaves.len() {
+                k *= 2;
+            }
+            let (left, right) = leaves.split_at(k);
+            let mut bytes = Vec::with_capacity(65);
+            bytes.push(0x01);
+            bytes.extend_from_slice(merkle_root(left).as_bytes());
+            bytes.extend_from_slice(merkle_root(right).as_bytes());
+            Sha256Hex::digest(&bytes)
+        }
+    }
 }
 
 /// Canonical JSON: object keys sorted bytewise at every depth, no whitespace. Sorting is done
