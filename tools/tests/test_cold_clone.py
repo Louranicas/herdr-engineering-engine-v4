@@ -64,6 +64,22 @@ class ColdCloneTests(unittest.TestCase):
         leftovers = [e for e in w.cache_entries() if e.startswith("hee4-cold-") and e != "hee4-cold-target"]
         self.assertEqual(leftovers, [])
 
+    def test_fire_second_cold_run_is_still_unmeasured(self):
+        # a cold run's summary lands under the same root the warm reference is read from; it must never count as warm
+        w = ColdWorld()
+        for _ in range(2):
+            rc, out, _ = w.cold()
+            self.assertEqual(rc, 3, out)
+            self.assertIn("matched=UNMEASURED(", out.strip().splitlines()[-1]); self.assertNotIn("matched=0", out)
+        rc, out, _ = w.warm()
+        self.assertEqual(rc, 0, out)
+        warm_summary = [l for l in out.splitlines() if l.startswith("summary=")][0][len("summary="):]
+        for _ in range(2):  # with a warm run present, every cold run matches against it, not the previous cold run
+            rc, out, _ = w.cold()
+            self.assertEqual(rc, 0, out)
+            self.assertIn(f"warm={warm_summary}\n", out)
+            self.assertNotIn(f"cold={warm_summary}\n", out)
+
     def test_fire_unknown_sha_refused(self):
         w = ColdWorld()
         unknown = "0123456789abcdef0123456789abcdef01234567"
