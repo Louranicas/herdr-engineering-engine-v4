@@ -24,13 +24,6 @@ pub const LIVE_ENV: &str = "HEE4_LIVE_MODEL";
 /// What one playbook step asks for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StepKind {
-    /// A model prompt named by the playbook. The driver no longer calls the model itself, so it
-    /// records this step as skipped; a `Run` step's own command talks to the model through the
-    /// door.
-    Generate {
-        /// The exact prompt.
-        prompt: String,
-    },
     /// Run `program` inside the namespace.
     Run {
         /// Absolute program path.
@@ -38,7 +31,9 @@ pub enum StepKind {
         /// Arguments.
         args: Vec<String>,
     },
-    /// A kind this driver does not run (named, so the skip is explained).
+    /// A kind this driver does not run (named, so the skip is explained). A `model:` line is one
+    /// of these (`kind: "model"`): the driver makes no model call; a `Run` step's own `sh:`
+    /// command talks to the model through the door.
     Unsupported {
         /// The kind's name.
         kind: String,
@@ -205,13 +200,10 @@ impl Attempt {
                 skip("an earlier step failed")
             } else {
                 match &step.kind {
-                    StepKind::Unsupported { kind } => {
-                        skip(&format!("driver has no handler for step kind {kind}"))
-                    }
-                    StepKind::Generate { .. } => skip(
-                        "the driver makes no model call; use a `sh:` step, whose command \
-                         reaches the model through HEE4_MODEL_SOCKET",
-                    ),
+                    StepKind::Unsupported { kind } => skip(&format!(
+                        "driver has no handler for step kind {kind}; use a `sh:` step, whose \
+                         command reaches the model through HEE4_MODEL_SOCKET"
+                    )),
                     StepKind::Run { program, args } => {
                         let t0 = Instant::now();
                         let before = (out.stdout.len(), out.exit);
@@ -461,10 +453,13 @@ mod tests {
         }
     }
 
-    fn gen_step(p: &str) -> Step {
+    /// A `model:` line as the playbook parses it: the kind is the literal "model".
+    fn model_step() -> Step {
         Step {
             name: "ask".into(),
-            kind: StepKind::Generate { prompt: p.into() },
+            kind: StepKind::Unsupported {
+                kind: "model".into(),
+            },
         }
     }
 
@@ -609,7 +604,7 @@ mod tests {
     fn skipped_steps_are_recorded_never_dropped() -> R {
         let (permit, plan, brief, a) = fixture("skip", false, &[])?;
         let playbook = vec![
-            gen_step("p"),
+            model_step(),
             Step {
                 name: "review".into(),
                 kind: StepKind::Unsupported {
@@ -622,9 +617,13 @@ mod tests {
             o.steps.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
             vec!["ask", "review"]
         );
-        assert!(
-            matches!(&o.steps[0].status, StepStatus::Skipped { reason } if reason.contains("HEE4_MODEL_SOCKET"))
-        );
+        assert!(matches!(
+            &o.steps[0].status,
+            StepStatus::Skipped { reason }
+                if reason.contains("step kind model")
+                    && reason.contains("sh:")
+                    && reason.contains("HEE4_MODEL_SOCKET")
+        ));
         assert!(
             matches!(&o.steps[1].status, StepStatus::Skipped { reason } if reason.contains("human-review"))
         );
@@ -670,7 +669,7 @@ mod tests {
             return Ok(());
         }
         let (permit, plan, brief, a) = fixture("live", true, &[])?;
-        let o = a.run_live(&permit, &plan, closed()?, &brief, &[gen_step("p")])?;
+        let o = a.run_live(&permit, &plan, closed()?, &brief, &[model_step()])?;
         assert!(
             matches!(&o.steps[0].status, StepStatus::Skipped { reason } if reason.contains(LIVE_ENV))
         );

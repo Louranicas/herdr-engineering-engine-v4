@@ -64,8 +64,8 @@ pub enum DispatchError {
 
 /// The playbook named by the brief's VERIFY field: one step per non-empty line. An absolute
 /// path runs in the namespace as a bare argv; `sh: <line>` runs `/bin/sh -c <line>` there, so the
-/// line can use `$HEE4_MODEL_SOCKET`; `model: <prompt>` is a recorded skip (the driver makes no
-/// model call; use `sh:`); anything else is a named skip.
+/// line can use `$HEE4_MODEL_SOCKET`; `model: <prompt>` is a named skip, `Unsupported{kind:
+/// "model"}` (the driver makes no model call; use `sh:`); anything else is a named skip.
 #[must_use]
 pub fn playbook(verify: &str) -> Vec<Step> {
     verify
@@ -74,9 +74,9 @@ pub fn playbook(verify: &str) -> Vec<Step> {
         .filter(|l| !l.is_empty())
         .enumerate()
         .map(|(i, line)| {
-            let kind = if let Some(prompt) = line.strip_prefix("model:") {
-                StepKind::Generate {
-                    prompt: prompt.trim().to_owned(),
+            let kind = if line.strip_prefix("model:").is_some() {
+                StepKind::Unsupported {
+                    kind: "model".to_owned(),
                 }
             } else if let Some(cmd) = line.strip_prefix("sh:") {
                 StepKind::Run {
@@ -101,6 +101,17 @@ pub fn playbook(verify: &str) -> Vec<Step> {
             }
         })
         .collect()
+}
+
+/// Whether any step wants the model door: a `sh:` step, whose command may reach the model
+/// through `$HEE4_MODEL_SOCKET`. The one home for this predicate; `step` and `task.preview`
+/// both read it, so preview probes availability exactly as dispatch does.
+#[must_use]
+pub(crate) fn wants_model(steps: &[Step]) -> bool {
+    steps.iter().any(|s| match &s.kind {
+        StepKind::Run { program, .. } => program == Path::new("/bin/sh"),
+        StepKind::Unsupported { .. } => false,
+    })
 }
 
 /// TIMEBOX as `<n>s` or `<n> min`; otherwise 120 s.
@@ -221,13 +232,11 @@ pub fn step(engine: &Engine, cfg: &Config) -> Result<Option<(TaskId, Phase)>, Di
         )));
     };
     let steps = playbook(brief.get(BriefField::Verify));
-    let wants_model = steps.iter().any(|s| match &s.kind {
-        StepKind::Generate { .. } => true,
-        StepKind::Run { program, .. } => program == Path::new("/bin/sh"),
-        StepKind::Unsupported { .. } => false,
-    });
+    let wants_model = wants_model(&steps);
     if wants_model && !cfg.live {
-        eprintln!("UNMEASURED: live model not called ({LIVE_ENV}!=1); model steps skip");
+        eprintln!(
+            "UNMEASURED: live model not called ({LIVE_ENV}!=1); `sh:` steps run without the door"
+        );
     }
     let needs_model = wants_model && cfg.live;
     let client = OllamaClient::new(MODEL_URL);
@@ -278,7 +287,7 @@ pub fn step(engine: &Engine, cfg: &Config) -> Result<Option<(TaskId, Phase)>, Di
         .iter()
         .filter_map(|s| match &s.kind {
             StepKind::Run { program, .. } => Some(program.clone()),
-            _ => None,
+            StepKind::Unsupported { .. } => None,
         })
         .collect();
     let permit = Permit::mint(
@@ -414,7 +423,12 @@ mod tests {
                 args: vec!["-c".into(), "echo \"$HEE4_MODEL_SOCKET\" | wc -c".into()]
             }
         );
-        assert!(matches!(steps[1].kind, StepKind::Generate { .. }));
+        assert_eq!(
+            steps[1].kind,
+            StepKind::Unsupported {
+                kind: "model".into()
+            }
+        );
     }
 
     #[test]
@@ -430,8 +444,8 @@ mod tests {
         );
         assert_eq!(
             steps[1].kind,
-            StepKind::Generate {
-                prompt: "say hi".into()
+            StepKind::Unsupported {
+                kind: "model".into()
             }
         );
         assert_eq!(

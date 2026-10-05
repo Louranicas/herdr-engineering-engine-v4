@@ -15,7 +15,6 @@ use hee4_contracts::{
 };
 use hee4_core::{OperationKey, Store, StoreError};
 use hee4_host::model::OllamaClient;
-use hee4_worker::native::StepKind;
 use serde_json::{Value, json};
 
 use super::registry::Family;
@@ -230,9 +229,7 @@ fn preview(engine: &Engine, body: &Value) -> Reply {
     if let Err(e) = brief.check_restatement() {
         return not_eligible(Code::InvalidArgument, e.to_string());
     }
-    let wants_model = dispatcher::playbook(brief.get(BriefField::Verify))
-        .iter()
-        .any(|s| matches!(s.kind, StepKind::Generate { .. }));
+    let wants_model = dispatcher::wants_model(&dispatcher::playbook(brief.get(BriefField::Verify)));
     let client = OllamaClient::new(dispatcher::MODEL_URL);
     match dispatcher::route(&engine.cfg, &client, wants_model && engine.cfg.live) {
         Ok(sel) => Ok((false, json!({"eligible": true, "model": sel.model}))),
