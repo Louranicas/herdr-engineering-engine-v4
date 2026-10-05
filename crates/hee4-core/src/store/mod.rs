@@ -1,4 +1,4 @@
-//! The ledger. The one file in this crate that writes SQL (`FLOW.md`, enforced by
+//! The ledger. The one directory in this crate that writes SQL (`FLOW.md`, enforced by
 //! `tests/one_door.rs`).
 //!
 //! `events` is the source of truth; `tasks` is a cache of `TaskState::replay(events)` written in
@@ -7,8 +7,17 @@
 //! `journal_mode=WAL` + `synchronous=FULL`, so the WAL is fsynced before `apply`, `admit`,
 //! `record_observation` or `append_receipt` returns (the ack point, task.submit "fsync before
 //! ack").
+//!
+//! The schema is a list of named migrations ([`migrations::MIGRATIONS`]); `open` applies the
+//! ones a file lacks and refuses one it does not know. [`Store::operate`] is the one idempotent
+//! operation primitive; [`Store::admit`] is its task-family caller.
 
-use std::path::Path;
+mod backup;
+pub(crate) mod migrations;
+
+use std::collections::BTreeSet;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use hee4_contracts::{
@@ -20,78 +29,7 @@ use serde_json::Value;
 
 use crate::codec;
 
-/// The schema version [`Store::open`] migrates to.
-pub const SCHEMA_VERSION: i64 = 2;
-
-const SCHEMA_V1: &str = "
-CREATE TABLE tasks(
-  id TEXT PRIMARY KEY NOT NULL,
-  phase TEXT NOT NULL CHECK (phase IN ('admitted','running','verifying','repair_pending',
-    'cancellation_requested','blocked','effect_unknown','accepted','failed','cancelled',
-    'abandoned')),
-  cancel INTEGER NOT NULL CHECK (cancel IN (0, 1)),
-  generation INTEGER NOT NULL CHECK (generation >= 0),
-  updated_ts INTEGER NOT NULL
-) STRICT;
-CREATE TABLE events(
-  seq INTEGER PRIMARY KEY AUTOINCREMENT,
-  task_id TEXT NOT NULL REFERENCES tasks(id),
-  event_json TEXT NOT NULL,
-  ts INTEGER NOT NULL
-) STRICT;
-CREATE INDEX events_by_task ON events(task_id, seq);
-CREATE TRIGGER events_no_update BEFORE UPDATE ON events
-  BEGIN SELECT RAISE(ABORT, 'events are append-only'); END;
-CREATE TRIGGER events_no_delete BEFORE DELETE ON events
-  BEGIN SELECT RAISE(ABORT, 'events are append-only'); END;
-CREATE TABLE operations(
-  principal TEXT NOT NULL,
-  action TEXT NOT NULL,
-  version INTEGER NOT NULL,
-  idem_key TEXT NOT NULL,
-  request_sha256 TEXT NOT NULL CHECK (length(request_sha256) = 64),
-  task_id TEXT NOT NULL REFERENCES tasks(id),
-  result_json TEXT NOT NULL,
-  ts INTEGER NOT NULL,
-  UNIQUE (principal, action, version, idem_key)
-) STRICT;
-CREATE TABLE observations(
-  id TEXT PRIMARY KEY NOT NULL,
-  task_id TEXT NOT NULL REFERENCES tasks(id),
-  json TEXT NOT NULL,
-  ts INTEGER NOT NULL
-) STRICT;
-CREATE TABLE receipts(
-  seq INTEGER PRIMARY KEY AUTOINCREMENT,
-  id TEXT NOT NULL UNIQUE,
-  task_id TEXT NOT NULL REFERENCES tasks(id),
-  json TEXT NOT NULL,
-  hash_prev TEXT NOT NULL CHECK (length(hash_prev) = 64),
-  hash_self TEXT NOT NULL UNIQUE CHECK (length(hash_self) = 64),
-  ts INTEGER NOT NULL,
-  UNIQUE (task_id, hash_prev)
-) STRICT;
-CREATE INDEX receipts_by_task ON receipts(task_id, seq);
-CREATE TRIGGER receipts_no_update BEFORE UPDATE ON receipts
-  BEGIN SELECT RAISE(ABORT, 'receipts are append-only'); END;
-CREATE TRIGGER receipts_no_delete BEFORE DELETE ON receipts
-  BEGIN SELECT RAISE(ABORT, 'receipts are append-only'); END;
-CREATE TABLE meta(
-  key TEXT PRIMARY KEY NOT NULL,
-  value TEXT NOT NULL
-) STRICT;
-";
-
-/// v2: `apply_in` records every time it overwrote a `tasks.phase` that disagreed with replay.
-const SCHEMA_V2: &str = "
-CREATE TABLE cache_heals(
-  seq INTEGER PRIMARY KEY AUTOINCREMENT,
-  task_id TEXT NOT NULL REFERENCES tasks(id),
-  cached_phase TEXT NOT NULL,
-  replayed_phase TEXT NOT NULL,
-  ts INTEGER NOT NULL
-) STRICT;
-";
+const CGROUP_FILE: &str = "/proc/self/cgroup";
 
 /// Why a store call wrote nothing.
 #[derive(Debug, thiserror::Error)]
@@ -103,6 +41,15 @@ pub enum StoreError {
     /// JSON (de)serialisation failed.
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+    /// The file system refused (mode convergence, the cgroup read, a snapshot path).
+    #[error("io at {path}: {source}")]
+    Io {
+        /// The path the call touched.
+        path: String,
+        /// The OS's answer.
+        #[source]
+        source: std::io::Error,
+    },
     /// `transition` refused the event; nothing was written.
     #[error("transition refused: {0}")]
     Refused(Refusal),
@@ -129,9 +76,10 @@ pub enum StoreError {
     /// `Dispatch` before this process's `recovery::reconcile` completed.
     #[error("dispatch refused: recovery_complete is false")]
     RecoveryIncomplete,
-    /// The file's schema is newer than this binary.
-    #[error("schema version {0} is not known to this binary (max {SCHEMA_VERSION})")]
-    UnknownSchema(i64),
+    /// The file holds a migration (or a legacy `user_version`) this binary does not know: the
+    /// file is newer than the binary.
+    #[error("migration {0} is not known to this binary")]
+    UnknownMigration(String),
 }
 
 /// The idempotency key of a mutating operation: `(principal, action, version, idem_key)`.
@@ -158,6 +106,55 @@ pub struct Admission {
     pub result: Value,
 }
 
+/// What [`Store::operate`] answered: the stored operation, new or replayed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Operation {
+    /// `op-` + the first 24 hex digits of sha256 of the key's four fields joined by `\n`.
+    pub operation_id: String,
+    /// The task the operation created or acted on, if any.
+    pub task_id: Option<TaskId>,
+    /// The subject the operation is about (a task id, a roster name, ...), if any.
+    pub subject: Option<String>,
+    /// `true` when the key was already recorded with the same request bytes.
+    pub replayed: bool,
+    /// The stored result.
+    pub result: Value,
+}
+
+/// One `operations` row as read back by [`Store::operation_by_key`] and
+/// [`Store::last_operation_for`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationRow {
+    /// The derived id (see [`Operation::operation_id`]).
+    pub operation_id: String,
+    /// The action, e.g. `task.submit`.
+    pub action: String,
+    /// The caller's idempotency key.
+    pub idem_key: String,
+    /// The task, if any.
+    pub task_id: Option<TaskId>,
+    /// The subject, if any.
+    pub subject: Option<String>,
+    /// The stored result.
+    pub result: Value,
+    /// When the row was written (ms since the Unix epoch).
+    pub ts: i64,
+}
+
+/// What [`Store::cursor_check`] says about a subscriber cursor (R13; never a replay
+/// authorization).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorVerdict {
+    /// The cursor's epoch is the one this ledger was restored from.
+    PriorEpochOfRestore,
+    /// The cursor's epoch is not this ledger's epoch.
+    EpochChanged,
+    /// The cursor's sequence is past `event_high_water`.
+    FutureSequence,
+    /// The cursor is consistent with this ledger: a snapshot answer, no replay.
+    SnapshotOnly,
+}
+
 /// The `tasks` cache row, as stored (for recovery's cache check).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CachedRow {
@@ -180,23 +177,91 @@ pub struct CacheHeal {
     pub replayed_phase: String,
 }
 
+/// An `operations` row as SQLite hands it over, before its ids and JSON are parsed.
+struct RawOperation {
+    operation_id: String,
+    action: String,
+    idem_key: String,
+    task_id: Option<String>,
+    subject: Option<String>,
+    result_json: String,
+    ts: i64,
+    request_sha256: String,
+}
+
+impl RawOperation {
+    fn from_row(r: &rusqlite::Row<'_>) -> Result<Self, rusqlite::Error> {
+        Ok(Self {
+            operation_id: r.get(0)?,
+            action: r.get(1)?,
+            idem_key: r.get(2)?,
+            task_id: r.get(3)?,
+            subject: r.get(4)?,
+            result_json: r.get(5)?,
+            ts: r.get(6)?,
+            request_sha256: r.get(7)?,
+        })
+    }
+
+    fn parse(self) -> Result<OperationRow, StoreError> {
+        let task_id = self
+            .task_id
+            .map(|t| {
+                t.parse::<TaskId>().map_err(|e| StoreError::Corrupt {
+                    task: t.clone(),
+                    detail: format!("operations.task_id: {e}"),
+                })
+            })
+            .transpose()?;
+        Ok(OperationRow {
+            operation_id: self.operation_id,
+            action: self.action,
+            idem_key: self.idem_key,
+            task_id,
+            subject: self.subject,
+            result: serde_json::from_str(&self.result_json)?,
+            ts: self.ts,
+        })
+    }
+}
+
 /// The ledger.
 #[derive(Debug)]
 pub struct Store {
     conn: Connection,
+    path: PathBuf,
+    serve_cgroup: String,
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
-fn corrupt(task: &TaskId, detail: impl Into<String>) -> StoreError {
+pub(crate) fn corrupt(task: &TaskId, detail: impl Into<String>) -> StoreError {
     StoreError::Corrupt {
         task: task.to_string(),
         detail: detail.into(),
     }
+}
+
+fn io_at(path: &Path, source: std::io::Error) -> StoreError {
+    StoreError::Io {
+        path: path.display().to_string(),
+        source,
+    }
+}
+
+/// `op-` + the first 24 hex digits of `sha256("principal\naction\nversion\nidem_key")`:
+/// deterministic, so a migration and a fresh insert derive the same id.
+pub(crate) fn operation_id(op: &OperationKey) -> String {
+    let text = format!(
+        "{}\n{}\n{}\n{}",
+        op.principal, op.action, op.version, op.idem_key
+    );
+    let digest = Sha256Hex::digest(text.as_bytes()).to_string();
+    format!("op-{}", &digest[..24])
 }
 
 fn load_events(conn: &Connection, task: &TaskId) -> Result<Vec<Event>, StoreError> {
@@ -224,12 +289,12 @@ fn replay(task: &TaskId, events: &[Event]) -> Result<Option<TaskState>, StoreErr
         .map_err(|r| corrupt(task, format!("replay refused: {r}")))
 }
 
-fn meta_get(conn: &Connection, key: &str) -> Result<Option<String>, rusqlite::Error> {
+pub(crate) fn meta_get(conn: &Connection, key: &str) -> Result<Option<String>, rusqlite::Error> {
     conn.query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
         .optional()
 }
 
-fn meta_set(conn: &Connection, key: &str, value: &str) -> Result<(), rusqlite::Error> {
+pub(crate) fn meta_set(conn: &Connection, key: &str, value: &str) -> Result<(), rusqlite::Error> {
     conn.execute(
         "INSERT INTO meta(key, value) VALUES (?1, ?2)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -238,9 +303,24 @@ fn meta_set(conn: &Connection, key: &str, value: &str) -> Result<(), rusqlite::E
     Ok(())
 }
 
+fn table_exists(conn: &Connection, name: &str) -> Result<bool, rusqlite::Error> {
+    let n: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [name],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
 /// The one state writer: replay, `transition`, append the event, update the cache. Runs inside
-/// the caller's transaction; the caller commits.
-fn apply_in(tx: &Transaction<'_>, task: &TaskId, event: Event) -> Result<Phase, StoreError> {
+/// the caller's transaction; the caller commits. `serve_cgroup` is written only when the
+/// `tasks` row is created (the `Admit` row); a later event never overwrites it.
+fn apply_in(
+    tx: &Transaction<'_>,
+    serve_cgroup: &str,
+    task: &TaskId,
+    event: Event,
+) -> Result<Phase, StoreError> {
     if event == Event::Dispatch && meta_get(tx, "recovery_complete")?.as_deref() != Some("1") {
         return Err(StoreError::RecoveryIncomplete);
     }
@@ -272,7 +352,8 @@ fn apply_in(tx: &Transaction<'_>, task: &TaskId, event: Event) -> Result<Phase, 
         .count();
     let generation = i64::try_from(generation).map_err(|_| corrupt(task, "generation overflow"))?;
     tx.execute(
-        "INSERT INTO tasks(id, phase, cancel, generation, updated_ts) VALUES (?1, ?2, ?3, ?4, ?5)
+        "INSERT INTO tasks(id, phase, cancel, generation, updated_ts, serve_cgroup)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
          ON CONFLICT(id) DO UPDATE SET phase = excluded.phase, cancel = excluded.cancel,
            generation = excluded.generation, updated_ts = excluded.updated_ts",
         params![
@@ -280,7 +361,8 @@ fn apply_in(tx: &Transaction<'_>, task: &TaskId, event: Event) -> Result<Phase, 
             phase.as_str(),
             phase.cancel_requested(),
             generation,
-            ts
+            ts,
+            serve_cgroup
         ],
     )?;
     tx.execute(
@@ -290,13 +372,92 @@ fn apply_in(tx: &Transaction<'_>, task: &TaskId, event: Event) -> Result<Phase, 
     Ok(phase)
 }
 
+/// Apply every migration the file lacks, inside `tx`; seed a legacy file's rows from its
+/// `user_version`; refuse a row this binary does not know. Returns the count of applied rows.
+fn migrate(tx: &Transaction<'_>) -> Result<usize, StoreError> {
+    let user_version: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    let mut applied: BTreeSet<String> = BTreeSet::new();
+    if table_exists(tx, "meta")? {
+        let mut stmt = tx.prepare("SELECT key FROM meta WHERE key LIKE 'migration:%'")?;
+        for key in stmt.query_map([], |r| r.get::<_, String>(0))? {
+            let key = key?;
+            applied.insert(key.trim_start_matches("migration:").to_owned());
+        }
+    }
+    if applied.is_empty() {
+        let seeded = migrations::seeded_by_user_version(user_version)
+            .ok_or_else(|| StoreError::UnknownMigration(format!("user_version={user_version}")))?;
+        applied.extend(seeded.iter().map(|s| (*s).to_owned()));
+    }
+    let known: BTreeSet<&str> = migrations::MIGRATIONS.iter().map(|m| m.name).collect();
+    if let Some(unknown) = applied.iter().find(|name| !known.contains(name.as_str())) {
+        return Err(StoreError::UnknownMigration(unknown.clone()));
+    }
+    let stamp = format!("{:x}", now_ms());
+    for m in migrations::MIGRATIONS {
+        if !applied.contains(m.name) {
+            (m.apply)(tx)?;
+            applied.insert(m.name.to_owned());
+        }
+        // A seeded legacy row and a freshly applied one are written the same way; a present
+        // row is left as it is.
+        if meta_get(tx, &format!("migration:{}", m.name))?.is_none() {
+            meta_set(tx, &format!("migration:{}", m.name), &stamp)?;
+        }
+    }
+    let count = applied.len();
+    tx.pragma_update(
+        None,
+        "user_version",
+        i64::try_from(count).unwrap_or(i64::MAX),
+    )?;
+    Ok(count)
+}
+
+/// The `0::<path>` line of `/proc/self/cgroup`, the cgroup v2 path of this process.
+fn read_serve_cgroup() -> Result<String, StoreError> {
+    let text = std::fs::read_to_string(CGROUP_FILE).map_err(|e| io_at(Path::new(CGROUP_FILE), e))?;
+    text.lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .map(|p| p.trim_end().to_owned())
+        .ok_or_else(|| {
+            io_at(
+                Path::new(CGROUP_FILE),
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "no `0::` line"),
+            )
+        })
+}
+
+/// Ledger 0600 (with `-wal` and `-shm` when present), its directory 0700. Idempotent.
+fn converge_modes(path: &Path) -> Result<(), StoreError> {
+    let base = path.as_os_str().to_owned();
+    for suffix in ["", "-wal", "-shm"] {
+        let mut name = base.clone();
+        name.push(suffix);
+        let file = PathBuf::from(name);
+        if file.exists() {
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| io_at(&file, e))?;
+        }
+    }
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| io_at(dir, e))?;
+    }
+    Ok(())
+}
+
 impl Store {
     /// Open (creating or migrating) the ledger at `path`: WAL, `synchronous=FULL`, foreign keys
-    /// on. Resets `recovery_complete` to false: every process reconciles before it dispatches.
+    /// on. Applies every named migration the file lacks, increments `meta.boot`, records this
+    /// process's cgroup as `meta.serve_cgroup`, resets `recovery_complete` to false (every
+    /// process reconciles before it dispatches), then converges the file modes to 0600 and the
+    /// directory to 0700.
     ///
     /// # Errors
-    /// SQLite errors, or [`StoreError::UnknownSchema`] for a newer file.
+    /// SQLite or IO errors, or [`StoreError::UnknownMigration`] for a newer file.
     pub fn open(path: &Path) -> Result<Self, StoreError> {
+        let serve_cgroup = read_serve_cgroup()?;
         let mut conn = Connection::open(path)?;
         let mode: String = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
         if !mode.eq_ignore_ascii_case("wal") {
@@ -309,28 +470,34 @@ impl Store {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Exclusive)?;
-        let version: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        match version {
-            0 => {
-                tx.execute_batch(SCHEMA_V1)?;
-                tx.execute_batch(SCHEMA_V2)?;
-                tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-                meta_set(&tx, "epoch", &format!("{:x}", now_ms()))?;
-            }
-            1 => {
-                tx.execute_batch(SCHEMA_V2)?;
-                tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-            }
-            SCHEMA_VERSION => {}
-            other => return Err(StoreError::UnknownSchema(other)),
+        migrate(&tx)?;
+        if meta_get(&tx, "epoch")?.is_none() {
+            meta_set(&tx, "epoch", &format!("{:x}", now_ms()))?;
         }
+        let boot = meta_get(&tx, "boot")?
+            .and_then(|b| b.parse::<u64>().ok())
+            .unwrap_or(0)
+            .saturating_add(1);
+        meta_set(&tx, "boot", &boot.to_string())?;
+        meta_set(&tx, "serve_cgroup", &serve_cgroup)?;
         meta_set(&tx, "recovery_complete", "0")?;
         tx.commit()?;
-        Ok(Self { conn })
+        converge_modes(path)?;
+        Ok(Self {
+            conn,
+            path: path.to_path_buf(),
+            serve_cgroup,
+        })
     }
 
     fn begin(&self) -> Result<Transaction<'_>, rusqlite::Error> {
         Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
+    }
+
+    /// The path `open` was given.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Apply `event` to `task`: replay its events, call `transition`, append the event and update
@@ -342,14 +509,88 @@ impl Store {
     /// `Dispatch` before reconcile; [`StoreError::Corrupt`] for an unreadable history.
     pub fn apply(&self, task: &TaskId, event: Event) -> Result<Phase, StoreError> {
         let tx = self.begin()?;
-        let phase = apply_in(&tx, task, event)?;
+        let phase = apply_in(&tx, &self.serve_cgroup, task, event)?;
         tx.commit()?;
         Ok(phase)
     }
 
-    /// The idempotency door. Same key and same request digest: the stored result, `replayed`.
-    /// Same key, other digest: [`StoreError::Conflict`]. New key: `Admit` `task`, compute the
-    /// result with `f`, record the operation, all in one transaction, then commit (fsync).
+    /// The one idempotent-operation primitive. Same key and same request digest: the stored
+    /// operation, `replayed`. Same key, other digest: [`StoreError::Conflict`]. New key: run `f`
+    /// inside one Immediate transaction, record the operation with its derived id, commit
+    /// (fsync). An `Err` from `f` rolls everything back and records nothing.
+    ///
+    /// Crate-private: a family file under `src/store/` wraps it in a `pub fn <family>_*` verb,
+    /// so no crate outside `hee4-core` ever holds a `Transaction`.
+    ///
+    /// # Errors
+    /// [`StoreError::Conflict`]; whatever `f` returns.
+    pub(crate) fn operate<F>(
+        &self,
+        op: &OperationKey,
+        request: &[u8],
+        f: F,
+    ) -> Result<Operation, StoreError>
+    where
+        F: FnOnce(&Transaction<'_>) -> Result<(Option<TaskId>, Option<String>, Value), StoreError>,
+    {
+        let sha = Sha256Hex::digest(request).to_string();
+        let tx = self.begin()?;
+        let stored = tx
+            .query_row(
+                "SELECT operation_id, action, idem_key, task_id, subject, result_json, ts,
+                        request_sha256
+                 FROM operations
+                 WHERE principal = ?1 AND action = ?2 AND version = ?3 AND idem_key = ?4",
+                params![op.principal, op.action, op.version, op.idem_key],
+                RawOperation::from_row,
+            )
+            .optional()?;
+        if let Some(raw) = stored {
+            if raw.request_sha256 != sha {
+                return Err(StoreError::Conflict(op.clone()));
+            }
+            let row = raw.parse()?;
+            return Ok(Operation {
+                operation_id: row.operation_id,
+                task_id: row.task_id,
+                subject: row.subject,
+                replayed: true,
+                result: row.result,
+            });
+        }
+        let (task_id, subject, result) = f(&tx)?;
+        let operation_id = operation_id(op);
+        tx.execute(
+            "INSERT INTO operations(operation_id, principal, action, version, idem_key,
+               request_sha256, task_id, subject, result_json, ts)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                operation_id,
+                op.principal,
+                op.action,
+                op.version,
+                op.idem_key,
+                sha,
+                task_id.as_ref().map(TaskId::as_str),
+                subject,
+                serde_json::to_string(&result)?,
+                now_ms()
+            ],
+        )?;
+        tx.commit()?;
+        Ok(Operation {
+            operation_id,
+            task_id,
+            subject,
+            replayed: false,
+            result,
+        })
+    }
+
+    /// The idempotency door for task admission, a caller of [`Store::operate`]. Same key and
+    /// same request digest: the stored result, `replayed`. Same key, other digest:
+    /// [`StoreError::Conflict`]. New key: `Admit` `task`, compute the result with `f`, record
+    /// the operation (subject = the task id), all in one transaction, then commit (fsync).
     ///
     /// # Errors
     /// [`StoreError::Conflict`]; [`StoreError::Refused`] if `task` already exists.
@@ -363,51 +604,58 @@ impl Store {
     where
         F: FnOnce(&TaskId, Phase) -> Value,
     {
-        let sha = Sha256Hex::digest(request).to_string();
-        let tx = self.begin()?;
-        let stored: Option<(String, String, String)> = tx
-            .query_row(
-                "SELECT request_sha256, task_id, result_json FROM operations
-                 WHERE principal = ?1 AND action = ?2 AND version = ?3 AND idem_key = ?4",
-                params![op.principal, op.action, op.version, op.idem_key],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .optional()?;
-        if let Some((stored_sha, stored_task, result)) = stored {
-            if stored_sha != sha {
-                return Err(StoreError::Conflict(op.clone()));
-            }
-            let task_id = stored_task
-                .parse()
-                .map_err(|e| corrupt(task, format!("operations.task_id: {e}")))?;
-            return Ok(Admission {
-                task_id,
-                replayed: true,
-                result: serde_json::from_str(&result)?,
-            });
-        }
-        let phase = apply_in(&tx, task, Event::Admit)?;
-        let result = f(task, phase);
-        tx.execute(
-            "INSERT INTO operations(principal, action, version, idem_key, request_sha256, task_id,
-               result_json, ts) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                op.principal,
-                op.action,
-                op.version,
-                op.idem_key,
-                sha,
-                task.as_str(),
-                serde_json::to_string(&result)?,
-                now_ms()
-            ],
-        )?;
-        tx.commit()?;
+        let operation = self.operate(op, request, |tx| {
+            let phase = apply_in(tx, &self.serve_cgroup, task, Event::Admit)?;
+            let result = f(task, phase);
+            Ok((Some(task.clone()), Some(task.to_string()), result))
+        })?;
+        let task_id = operation
+            .task_id
+            .ok_or_else(|| corrupt(task, "operations.task_id is null for an admission"))?;
         Ok(Admission {
-            task_id: task.clone(),
-            replayed: false,
-            result,
+            task_id,
+            replayed: operation.replayed,
+            result: operation.result,
         })
+    }
+
+    /// The `operations` row for `op`, if recorded.
+    ///
+    /// # Errors
+    /// SQLite errors; [`StoreError::Corrupt`] for an unparsable task id or result.
+    pub fn operation_by_key(&self, op: &OperationKey) -> Result<Option<OperationRow>, StoreError> {
+        self.operation_row(
+            "SELECT operation_id, action, idem_key, task_id, subject, result_json, ts,
+                    request_sha256
+             FROM operations
+             WHERE principal = ?1 AND action = ?2 AND version = ?3 AND idem_key = ?4",
+            params![op.principal, op.action, op.version, op.idem_key],
+        )
+    }
+
+    /// The newest `operations` row whose `subject` is `subject` (by `ts`, ties by rowid).
+    ///
+    /// # Errors
+    /// SQLite errors; [`StoreError::Corrupt`] for an unparsable task id or result.
+    pub fn last_operation_for(&self, subject: &str) -> Result<Option<OperationRow>, StoreError> {
+        self.operation_row(
+            "SELECT operation_id, action, idem_key, task_id, subject, result_json, ts,
+                    request_sha256
+             FROM operations WHERE subject = ?1 ORDER BY ts DESC, rowid DESC LIMIT 1",
+            params![subject],
+        )
+    }
+
+    fn operation_row(
+        &self,
+        sql: &str,
+        args: impl rusqlite::Params,
+    ) -> Result<Option<OperationRow>, StoreError> {
+        self.conn
+            .query_row(sql, args, RawOperation::from_row)
+            .optional()?
+            .map(RawOperation::parse)
+            .transpose()
     }
 
     /// Ledger an observation for `task` (before any verdict cites it). Re-recording the same id
@@ -609,12 +857,94 @@ impl Store {
         Ok(u64::try_from(n).unwrap_or(0))
     }
 
-    /// The ledger epoch, set when the file was created.
+    /// The highest `events.seq`, or 0 for an empty ledger (R13's high water).
+    ///
+    /// # Errors
+    /// SQLite errors.
+    pub fn event_high_water(&self) -> Result<u64, StoreError> {
+        let n: Option<i64> = self
+            .conn
+            .query_row("SELECT max(seq) FROM events", [], |r| r.get(0))?;
+        Ok(n.and_then(|n| u64::try_from(n).ok()).unwrap_or(0))
+    }
+
+    /// The ledger epoch, set when the file was created (or renewed by a restore).
     ///
     /// # Errors
     /// SQLite errors.
     pub fn epoch(&self) -> Result<String, StoreError> {
         Ok(meta_get(&self.conn, "epoch")?.unwrap_or_default())
+    }
+
+    /// Give the ledger a fresh `meta.epoch` (a restore's new generation) and return it. Every
+    /// cursor minted under the old epoch then answers `EpochChanged` or `PriorEpochOfRestore`.
+    pub(crate) fn renew_epoch(&self) -> Result<String, StoreError> {
+        let epoch = format!("{:x}", now_ms());
+        let tx = self.begin()?;
+        meta_set(&tx, "epoch", &epoch)?;
+        tx.commit()?;
+        Ok(epoch)
+    }
+
+    /// How many times this file has been opened (`meta.boot`, incremented by every `open`).
+    ///
+    /// # Errors
+    /// SQLite errors; [`StoreError::Corrupt`] for an unparsable value.
+    pub fn boot(&self) -> Result<u64, StoreError> {
+        let text = meta_get(&self.conn, "boot")?.unwrap_or_default();
+        text.parse().map_err(|e| StoreError::Corrupt {
+            task: String::new(),
+            detail: format!("meta.boot {text:?}: {e}"),
+        })
+    }
+
+    /// Record the epoch this ledger was restored from (`meta.restored_from`); the one writer of
+    /// that key, called by `backup::restore`.
+    ///
+    /// # Errors
+    /// SQLite errors.
+    pub fn mark_restored_from(&self, epoch: &str) -> Result<(), StoreError> {
+        let tx = self.begin()?;
+        meta_set(&tx, "restored_from", epoch)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// R13 over a subscriber cursor, pure over `meta` and `max(events.seq)`, in this order:
+    /// `epoch == restored_from` → `PriorEpochOfRestore`; `epoch != meta.epoch` → `EpochChanged`;
+    /// `seq > event_high_water` → `FutureSequence`; else `SnapshotOnly`. Never a replay
+    /// authorization.
+    ///
+    /// # Errors
+    /// SQLite errors.
+    pub fn cursor_check(&self, epoch: &str, seq: u64) -> Result<CursorVerdict, StoreError> {
+        if meta_get(&self.conn, "restored_from")?.as_deref() == Some(epoch) {
+            return Ok(CursorVerdict::PriorEpochOfRestore);
+        }
+        if self.epoch()? != epoch {
+            return Ok(CursorVerdict::EpochChanged);
+        }
+        if seq > self.event_high_water()? {
+            return Ok(CursorVerdict::FutureSequence);
+        }
+        Ok(CursorVerdict::SnapshotOnly)
+    }
+
+    /// `PRAGMA user_version`: the count of applied migrations, as `open` left it.
+    ///
+    /// # Errors
+    /// SQLite errors.
+    pub fn schema_version(&self) -> Result<i64, StoreError> {
+        Ok(self
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))?)
+    }
+
+    /// The cgroup path of the process that opened this store, as recorded in
+    /// `meta.serve_cgroup` and stamped on every task it admits.
+    #[must_use]
+    pub fn serve_cgroup(&self) -> &str {
+        &self.serve_cgroup
     }
 
     /// Whether this process's reconcile completed. K6 reads it before binding or dispatching;
