@@ -3,8 +3,8 @@
 //! The types here are built through their checked constructors: a [`TaskState`] came out of
 //! [`transition`], a [`Sha256Hex`] parsed as 64 lowercase hex digits, a [`Brief`] has all eleven
 //! fields, a [`Receipt`] was sealed over its decision and observations together. A [`Budgets`]
-//! is legal when it came from [`Budgets::parse`] (or its `Deserialize`, the same path) or is
-//! [`Budgets::DEFAULT`], its only legal constructors; its section fields stay writable (`pub`)
+//! is legal when it came from [`Budgets::parse`] or is [`Budgets::DEFAULT`], its only legal
+//! constructors; its section fields stay writable (`pub`)
 //! pending a DC row, so a literal or a later write is not checked. See `FLOW.md`.
 //!
 //! A `TaskState` cannot be built from a `Phase` outside [`transition`]:
@@ -18,6 +18,11 @@
 //! nor a budgets section read on its own, past [`Budgets::parse`]'s checks:
 //! ```compile_fail,E0277
 //! let _: hee4_contracts::DoorBudget = serde_json::from_str(r#"{"pool":0}"#).unwrap();
+//! ```
+//! nor a whole `Budgets` read through serde, which over a `serde_json::Value` would take a key
+//! named twice last-wins:
+//! ```compile_fail,E0277
+//! let _: hee4_contracts::Budgets = serde_json::from_value(serde_json::json!({})).unwrap();
 //! ```
 
 pub mod bounds;

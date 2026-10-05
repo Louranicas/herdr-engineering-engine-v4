@@ -9,11 +9,13 @@
 //! and `render` both walk it, so a field cannot be checked under one name and printed under
 //! another.
 //!
-//! What the type keeps and what it does not. [`Budgets::parse`] and `Deserialize` share one
-//! path, a single streaming read of the text: the top value and every section must be JSON
+//! What the type keeps and what it does not. [`Budgets::parse`] is the only door in from text:
+//! one streaming read of the `&str` itself, never of a parsed `serde_json::Value` (which has
+//! already collapsed a repeated key last-wins). The top value and every section must be JSON
 //! objects (a positional array never names a key, so it is refused, not read as the default),
 //! an unknown key is refused, a key named twice is refused (never last-wins), then `validate`
-//! runs. A section has no `Deserialize` of its own, so it cannot be read unchecked. The fields
+//! runs. Neither `Budgets` nor a section implements `Deserialize`, so no other deserializer can
+//! build one unchecked or past the duplicate-key check. The fields
 //! are `pub` for reading, so a struct literal or a field write after `parse` is not checked: a
 //! rung-2 door, named in `FLOW.md`, for a later slice to close with private fields (a DC row).
 
@@ -22,7 +24,7 @@ use std::time::Duration;
 use std::fmt;
 
 use serde::de::{self, DeserializeSeed, Error as _, MapAccess, Visitor};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserializer, Serialize};
 
 /// Ceiling for `socket.max_connections`.
 pub const MAX_CONNECTIONS_CEILING: u64 = 65_535;
@@ -384,8 +386,7 @@ impl Default for LedgerBudget {
     }
 }
 
-/// Every budget the runtime reads. A value that came out of [`Budgets::parse`] or `Deserialize`
-/// passed [`Budgets::validate`]; [`Budgets::DEFAULT`] does too. A partial file overrides only
+/// Every budget the runtime reads. A value that came out of [`Budgets::parse`] passed [`Budgets::validate`]; [`Budgets::DEFAULT`] does too. A partial file overrides only
 /// the keys it names; an unknown key, a key named twice, or an array where an object is
 /// required, is a parse failure, never a silent default. The fields are `pub` for reading: a
 /// literal or a write after `parse` is not checked (see the module doc).
@@ -485,16 +486,6 @@ impl<'de> Visitor<'de> for SectionSeed<'_> {
             (field.set)(self.budgets, map.next_value::<u64>()?);
         }
         Ok(())
-    }
-}
-
-/// The same path as [`Budgets::parse`]: the streaming read (objects only, unknown and repeated
-/// keys refused), then [`Budgets::validate`], whose refusal becomes serde's custom error.
-impl<'de> Deserialize<'de> for Budgets {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let budgets = deserializer.deserialize_map(FileVisitor)?;
-        budgets.validate().map_err(de::Error::custom)?;
-        Ok(budgets)
     }
 }
 
@@ -809,8 +800,9 @@ impl Budgets {
     };
 
     /// Parse the budgets file's text (JSON; `{}` is [`Budgets::DEFAULT`]; a partial object
-    /// overrides only the keys it names) and validate the result. Same path as `Deserialize`:
-    /// one streaming read of the text, so a key named twice is seen and refused.
+    /// overrides only the keys it names) and validate the result. The only door in from text
+    /// (`Budgets` has no `Deserialize`): one streaming read of the text, so a key named twice is
+    /// seen and refused.
     ///
     /// # Errors
     /// [`BudgetParseError::Json`] when the text is not the shape: malformed, an array or scalar
