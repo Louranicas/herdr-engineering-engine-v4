@@ -92,6 +92,20 @@ def parse_environment(value):
     return dict(kv.split("=", 1) for kv in value.split() if "=" in kv)
 
 
+def parse_version(out):
+    """`hee4 <version> <sha> [catalogue=<12hex>]` -> {version, head (sha12), catalogue}, or None when the
+    line is not that shape. The sha is the token after the version, never the last token: since the
+    catalogue landed the last token is `catalogue=<12hex>` (old lines end at the sha)."""
+    toks = out.split()
+    if len(toks) < 3 or toks[0] != "hee4":
+        return None
+    head = toks[2]
+    if len(head) < 12 or any(c not in "0123456789abcdef" for c in head):
+        return None
+    kv = dict(t.split("=", 1) for t in toks[3:] if "=" in t)
+    return {"version": toks[1], "head": head[:12], "catalogue": kv.get("catalogue")}
+
+
 def sha256_file(path):
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -241,18 +255,23 @@ def d1(a, ctx):
         r.unm("binary", "no ExecStart argv[0]")
     else:  # the unit's own binary answers, never the `hee4` first on PATH
         rc, out, err = sh(binp, "--version")
-        if rc != 0 or not out.split():
-            r.unm("binary", f"{binp} --version rc={rc} {err}")
+        bv = parse_version(out) if rc == 0 else None
+        if bv is None:
+            r.unm("binary", f"{binp} --version rc={rc} line={out!r} {err}")
         else:
-            bh = out.split()[-1][:12]
+            bh = bv["head"]
             r.check("binary", bh, bh == ctx["tree"])
+            r.val("catalogue", bv["catalogue"] or "absent")
     if pid and exe_sha:  # the running copy's own head: must agree with argv[0]'s
         rc, out, err = sh(os.path.join(a.proc, str(pid), "exe"), "--version")
-        if rc != 0 or not out.split():
-            r.unm("exe_head", f"exe --version rc={rc} {err}")
+        ev = parse_version(out) if rc == 0 else None
+        if ev is None:
+            r.unm("exe_head", f"exe --version rc={rc} line={out!r} {err}")
         else:
-            eh = out.split()[-1][:12]
+            eh = ev["head"]
             r.check("exe_head", eh, bh is not None and eh == bh)
+            if bh is not None and eh != bh:
+                r.check("version_head", f"mismatch(binary={bh},exe={eh})", False)
     if binp and bin_sha:
         try:
             data = open(binp, "rb").read()
@@ -700,7 +719,7 @@ def control(a):
         write(serve_bin, f"""#!/usr/bin/env bash
 # the control unit's own binary: ExecStart argv[0]
 case "$1" in
-  --version) echo "hee4 4.0.0-control-unit {bin_head}" ;;
+  --version) echo "hee4 4.0.0-control-unit {bin_head} catalogue=c0ffeec0ffee" ;;
   health) echo "ready=true recovery=complete database=ready socket=owned head={bin_head} uptime_s=1"; echo {shlex.quote(bin_health)} ;;
   serve) shift; exec {shlex.quote(interp)} {shlex.quote(server_py)} "$@" ;;
   *) echo "hee4: unknown verb $1" >&2; exit 2 ;;
