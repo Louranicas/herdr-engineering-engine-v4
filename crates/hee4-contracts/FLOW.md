@@ -21,6 +21,7 @@ STACK-MAP §2 (I1, I3, I4), `gates/features/crash-restart.md` (R01–R14).
 | `Verdict`, `Reason`, `Decision` | plain data | K4 (policy is K4's) |
 | `Receipt` (I4) | `seal(prev, ReceiptBody)` hashes decision + observed + `hash_prev` together over canonical JSON (keys sorted, no whitespace); read-only fields | `Receipt::seal`; `verify_chain` returns the first `ChainBreak{index, cause}` |
 | `Refusal` | `#[non_exhaustive]`, named variants with typed fields, never strings | this crate |
+| `catalogue::{Action, Owner, Effect, Scope, CATALOGUE, find, revision}` | the 22 action ids as data: owner, effect (`mutates()`), scope (`because()`), readback, precondition rule; `revision()` is the content digest; `Judge`/`Deploy` owners are held | this crate (`CATALOGUE` const; tests compare it to `gates/features`) |
 
 ## Whitelist (`transition`)
 
