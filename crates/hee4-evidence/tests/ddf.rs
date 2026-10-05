@@ -171,6 +171,22 @@ fn a_present_tool_with_a_missing_interpreter_is_spawn_not_a_skip() {
     assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "{e}");
 }
 
+/// `execve` of a directory fails `EACCES`: `PermissionDenied` is never a skip.
+#[test]
+fn a_present_but_unexecutable_tool_is_spawn_not_a_skip() {
+    let got = ddf::for_task_with(
+        Path::new("/"),
+        Diff::Bytes(FIXTURE),
+        &subject(),
+        &TestClock::new(0),
+        BUDGET,
+    );
+    let Err(AdapterError::Spawn(e)) = got else {
+        panic!("expected Err(Spawn), got {got:?}");
+    };
+    assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}");
+}
+
 /// A VERIFY-digest subject: the diff digest and the subject's input differ, as in the
 /// dispatcher (`Subject.input_sha256 = digest(brief VERIFY)`, V4-94).
 fn verify_subject() -> Subject {
