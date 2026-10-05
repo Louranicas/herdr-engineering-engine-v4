@@ -8,7 +8,7 @@
 #      v3_refs>0 (measured_v3_refs=N), `funnel: verdict=FAIL` (measured_funnel_fail), or any line of measure.sh's output
 #      containing UNMEASURED (measured_unmeasured_lines=N). Code measures, the agent curates: a red floor outranks its PASS.
 #   20 FAIL — a typed FAIL
-#   30 REFUSED (UNMEASURED) — no report, or its last non-empty line is not `<agent-without-hee4-> verdict=PASS|PASS_WITH_GAPS|FAIL`
+#   30 REFUSED (UNMEASURED) — no report, or its last non-empty line is not `<agent-without-hee4-> verdict=PASS|PASS_WITH_GAPS|FAIL|BLOCKED|STOP`
 #      followed by a space or end of line; also any run claude ended with subtype error_max_budget_usd (cut off mid-run)
 #   40 SKIPPED — another run of this agent holds the lock (written to skipped.log and to this run's log)
 #   2 usage · 3 setup

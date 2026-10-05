@@ -16,7 +16,7 @@ Firstmate is **L1, the outer loop**, and the collaboration layer of the roster. 
 - **What it never holds:** engine task state (HEE K1 `store` + `transition` is the single home — README "must never share a file, a schema or a writer"); `backlog.md` (tasks-axi owns it); `.wake-queue` (the watcher's, lock-bound).
 - **Writer rules (from `ops/db/README.md` "Writer safety"):** one writer, `ops/firstmate/fm-db`, Python sqlite3 under a flock with `BEGIN IMMEDIATE`; `tursodb` only ever `--readonly` one-shot for read-back (`fm-db q`, `fm-db status`). Crew append claims through `fm-db record claim`, never raw SQL. Schema in `ops/firstmate/schema/*.sql`, applied by `fm-db init`, which refuses a changed applied file.
 - **Allocation:** one DB per `FM_HOME`. A secondmate home gets its own by running `fm-db init` with `FM_HOME` set to that home. `hee4.env` exports `FM_HOME` (default `~/firstmate`) and `FM_DB`.
-- **Doors this gives the meta goal (rung 2):** unlabelled claim → refused by CHECK; self-verification → refused by trigger; spawn beyond `planned_agents` → refused; spawn under an open andon → refused; STOP without `measured=1` → refused by CHECK.
+- **Doors this gives the meta goal (rung 2):** unlabelled claim → refused by CHECK; self-verification → refused by trigger; spawn beyond `planned_agents` → refused; spawn under an open andon → refused; STOP without `measured=1` → refused by CHECK; spawn without a recorded brief → refused (`no brief recorded for unit`); a brief missing a `LABEL:` field or with summarised standing orders → refused (`brief_field_missing=`, `standing_not_verbatim`; the shas are computed, never caller-typed); `fm-db close-unit` refuses an open andon or a spawn without an exit (`spawn_without_exit`).
 
 ## 4 · Reconciliations with Firstmate's conventions
 | Topic | Firstmate | Roster/PROTOCOL | Resolution |
@@ -24,7 +24,7 @@ Firstmate is **L1, the outer loop**, and the collaboration layer of the roster. 
 | Fresh vs resume | secondmates persist and relaunch into the same home; `fm-control relaunch` reuses the worktree | every spawn fresh | crew/scouts fresh; a secondmate relaunch is a new `spawns` row with `fresh=0` against the same brief |
 | Concurrency | no cap ("dispatch isolated work immediately") | `planned_agents=` first, flat, stop at 70% | enforced in `fm-db record spawn`, plus `spend_max_concurrent_workers` in the away contract |
 | Worker permissions | Claude workers default to `--dangerously-skip-permissions` | `hee4-watch-fence` flags bypass | `config/claude-permission-mode = auto` set in this home (gitignored) |
-| Exit vocabulary | `done/failed/blocked/needs-decision/paused` | `PASS/PASS_WITH_GAPS/FAIL/BLOCKED/STOP` | mapped in `fm-db record exit`; the roster runner regex still rejects BLOCKED/STOP (exit 30) — a `ops/roster/README.md` fix for Luke |
+| Exit vocabulary | `done/failed/blocked/needs-decision/paused` | `PASS/PASS_WITH_GAPS/FAIL/BLOCKED/STOP` | mapped in `fm-db record exit`; the runner regex accepts BLOCKED/STOP since V4-84 |
 | Halt | `fm-captain-hold.sh hold`, `fm-control interrupt`; no fleet-wide verb | STOP halts the unit | `andon` row blocks spawns; the first mate interrupts the unit's live panes |
 | Authority of a chat sentence | intake treats it as authority if "current, explicit, concrete" | "no agent acts on a chat sentence; the brief is the only start" | both already require a brief before spawn; `HANDOFF-TO-FIRSTMATE.md` (2026-10-04) handed work via a pane, not a brief — it needs one |
 | Watchers | scouts (knowledge, never a PR) | read-only, never fix, may STOP | roster watchers run as scouts; STOP is recorded in `andon`, surfaced to the captain as `needs-decision` |
@@ -32,5 +32,5 @@ Firstmate is **L1, the outer loop**, and the collaboration layer of the roster. 
 ## 5 · Still Luke's
 - Confirm `FM_HOME=~/firstmate` as the primary home and whether HEE v4 gets a dedicated secondmate home (each with its own `firstmate.db`).
 - Decide whether `treehouse.toml` (lost with the old home) is re-created, and with which pool size.
-- The roster runner's verdict regex (BLOCKED/STOP) and the retirement of the cron curators (V4-80).
+- The retirement of the cron curators (V4-80).
 - Proposed register rows: **V4-82** Firstmate is the orchestrator; **V4-83** one orchestration DB per Firstmate home, `fm-db` the single writer, engine task state never inside it.

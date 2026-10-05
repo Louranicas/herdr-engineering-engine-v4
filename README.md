@@ -119,7 +119,7 @@ The unit runs with `ProtectSystem=strict`, `NoNewPrivileges=yes`, `PrivateTmp=ye
 
 ## Orchestration
 
-Firstmate is the orchestrator (`~/firstmate`, backend herdr). Each Firstmate home holds one orchestration database, `data/firstmate.db`, written only by `ops/firstmate/fm-db` (units, briefs, spawns, claims, verifications, receipts, exits, andon) and read back with `tursodb --readonly`. Its doors refuse an unlabelled claim, a claim verified by its own author, a spawn past `planned_agents`, and a spawn under an open andon.
+Firstmate is the orchestrator (`~/firstmate`, backend herdr). Each Firstmate home holds one orchestration database, `data/firstmate.db`, written only by `ops/firstmate/fm-db` (units, briefs, spawns, claims, verifications, receipts, exits, andon) and read back with `tursodb --readonly`. Its doors refuse an unlabelled claim, a claim verified by its own author, a spawn past `planned_agents`, a spawn under an open andon, and a spawn without a recorded brief; `fm-db close-unit` closes a unit only when every spawn has an exit.
 
 The roster (`.claude/agents/ROSTER.md`, bound by `PROTOCOL.md`) is twelve facet specialists, six read-only watchers and three collaboration roles. Builders work in git worktrees under `/mnt/storage-10tb/hee4-wt/`, one branch each, merged only after the first mate re-runs their gates. `treehouse` cuts crew worktrees from the local mirror `origin` (`/mnt/storage-10tb/hee4-origin.git`); GitHub is the remote `github`, pushed on the owner's word.
 
