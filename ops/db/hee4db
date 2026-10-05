@@ -2044,6 +2044,8 @@ def scan_timers() -> tuple[str, list[tuple[Path, bytes, Path, bytes | None]], st
         for t in timers:
             tb = reg_read(t, CRONTAB_CAP)
             unit = next((v for _, k, v in parse_unit(reg_text(t, tb)).get("Timer", []) if k == "Unit" and v), f"{t.stem}.service")
+            if Path(unit).name != unit or not unit.endswith(".service"):   # the paired service is a sibling, never a path
+                raise Refusal("ingest_malformed", f"source={t} Unit={unit} is not a .service name in the timer directory")
             s = d / unit
             sb = reg_read(s, CRONTAB_CAP) if s.is_file() else None
             h.update(tb)

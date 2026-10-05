@@ -534,6 +534,9 @@ def main() -> int:
         case("timers-malformed", "fault",
              lambda w: plant_timer(w, "hee4-broken", "/usr/bin/true", "[Unit]\nDescription=no timer section\n\n[Install]\nWantedBy=timers.target\n"),
              ["ingest"], 20, ["ingest_malformed", "hee4-broken.timer no [Timer] section"])
+        case("timers-unit-escape", "fault",   # Unit= names a sibling .service, never a path out of the declared source
+             lambda w: plant_timer(w, "hee4-escape", "/usr/bin/true", timer_unit("*-*-* 04:00:00", "../x.service")),
+             ["ingest"], 20, ["ingest_malformed", "hee4-escape.timer Unit=../x.service is not a .service name in the timer directory"])
         case("crontab-absent-timers-ok", "quiet", unlink("crontab.txt"), ["ingest"], 0,
              ["registry_crontab_absent", "registry_unreadable=0"], absent_from(["ingest"], "registry_crontab_unmeasured"))
         case("timers-stale", "fault",
@@ -701,6 +704,7 @@ NEUTERS += [  # rev 2026-10-01 registry (V4-70): one per refusal site and per ru
     ("timers-stale-changed", '        elif tstatus == "ok" and tsha != row[0]:\n', "        elif False:\n"),
     # a listing that swallows PermissionError (Path.glob's behaviour) reads an unlistable dir as ok entries=0
     ("timers-dir-unreadable", "        names = sorted(os.listdir(d))\n", "        names = sorted(os.listdir(d)) if os.access(d, os.R_OK) else []\n"),
+    ("timers-unit-escape", '            if Path(unit).name != unit or not unit.endswith(".service"):', "            if False:"),
     ("crontab-absent-word", '        return "absent", None, f"HEE4DB_CRONTAB_FILE={p} absent"\n', '        return "unreadable", None, f"HEE4DB_CRONTAB_FILE={p} absent"\n'),
     ("world-measured-empty", "            if ok_kinds:\n", "            if True:\n"),
     ("registry-stale-changed", '        elif sha256_bytes(reg_read(fp)) != sha:\n', "        elif False:\n"),
