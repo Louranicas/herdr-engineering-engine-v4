@@ -43,6 +43,10 @@ Q_CAP = 200  # rows per read-back; a larger answer is a report, not a query
 # The eleven I1 fields; a field is a line that starts at column 0 with `LABEL:` (crates/hee4-contracts/src/brief.rs:63-64,
 # BriefField::opens). fm-db mirrors that one rule for its file door; it owns no second grammar.
 BRIEF_FIELDS = ("GOAL", "SCOPE", "CONTEXT", "ACCEPTANCE", "VERIFY", "TIMEBOX", "FORBIDDEN", "REPORT", "STANDING", "RECON", "RESTATEMENT")
+# A section opener as agents read one: a field name at column 0, an optional `(...)` qualifier, then `:`. It is the
+# workflow curator's section reader (bin/workflow-curator brief_sections), so `VERIFY (from the worktree root):` opens a
+# VERIFY section that the door judges like the `VERIFY:` field itself.
+SECTION_LABEL = re.compile(r"^(" + "|".join(BRIEF_FIELDS) + r")(\s*\([^)]*\))?:")
 BRIEF_KEYS = ["unit_id", "path", "head_sha", "ts"]   # the caller's keys for `record brief`; every sha is computed here
 
 
@@ -158,15 +162,22 @@ def collapsed(text: str) -> list[str]:
 
 
 # A VERIFY line whose exit status is not its check's: the shape names why. fm-db owns this detector: it is the door, the
-# highest rung. The workflow curator's `cannot_fail` (bin/workflow-curator) is an older, looser copy; control.py's
-# `brief-verify-curator-parity` case requires every line the curator flags across the roster briefs to be refused here.
+# highest rung. The workflow curator keeps no copy; it loads `verify_cannot_fail` from here. control.py's
+# `brief-verify-section-parity` case requires every roster VERIFY line the curator's section reader finds, and this
+# detector flags, to be among this door's `verify_findings`.
 VERIFY_SINKS = {"tail": "pipe_into_tail_head", "head": "pipe_into_tail_head", "wc": "pipe_into_sink", "cat": "pipe_into_sink",
                 "sort": "pipe_into_sink", "uniq": "pipe_into_sink", "tee": "pipe_into_sink"}
 VERIFY_SWALLOWERS = ("echo", "printf", "true", ":")              # each exits 0 whatever ran before it
-# A whole-line `( ... )` is a description, not a subshell, only when it opens with one of these prose words. `at`, `as`,
-# `expect` and `see` are left out because each is also a command name.
+# A whole-line `( ... )` is a description, not a subshell, only when it opens with one of these prose words and holds no
+# shell operator (SHELL_OPERATOR, outside quotes). `at`, `as`, `expect` and `see` are left out because each is also a
+# command name.
 VERIFY_DESCRIPTION = re.compile(r"^\(\s*(from|run from|the|each|every|all|in|on|with|expected|note|where|after|before|per|"
                                 r"using|judged|this|these|only)\b", re.IGNORECASE)
+SHELL_OPERATOR = re.compile(r"[|;]|&&")
+# `bash -c '...'`, `sh -lc "..."`, `env [-i] [VAR=v ...] bash -c '...'`, matched on the masked text: group 1 is the one
+# quoted argument (masked to `Q`s), whose raw text is judged as a VERIFY line of its own.
+SHELL_C = re.compile(r"^\s*(?:(?:\S*/)?env(?:\s+(?:-\S+|[A-Za-z_][A-Za-z0-9_]*=\S*))*\s+)?(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*"
+                     r"(?:\S*/)?(?:bash|sh)(?:\s+-[A-Za-z]+)*?\s+-[A-Za-z]*c[A-Za-z]*\s+(Q{2,})\s*$")
 PIPEFAIL_ON = re.compile(r"(?:^|\s)-[A-Za-z]*o\s+pipefail\b")
 PIPEFAIL_OFF = re.compile(r"(?:^|\s)\+[A-Za-z]*o\s+pipefail\b")
 PIPESTATUS_READ = re.compile(r"^(exit|test|\[\[?)\s+.*\$\{PIPESTATUS\[[^\]]*\]\}")
@@ -204,6 +215,19 @@ def _split(bare: str, raw: str, sep: str) -> list[tuple[str, str, str]]:
     return out
 
 
+def _description(bare: str, raw: str) -> bool:
+    """A whole `( ... )` that opens with a prose word and holds no unquoted shell operator: prose, not a subshell."""
+    return raw.startswith("(") and raw.endswith(")") and bool(VERIFY_DESCRIPTION.match(raw)) and not SHELL_OPERATOR.search(bare)
+
+
+def _shell_c(bare: str, raw: str) -> set[str]:
+    """The shapes of the quoted argument when this command is `bash -c '...'` / `sh -c` / `env ... bash -c`; else none."""
+    m = SHELL_C.match(bare)
+    if not m:
+        return set()
+    return set(verify_cannot_fail(raw[m.start(1) + 1:m.end(1) - 1]))
+
+
 def _pipefail(bare: str, on: bool) -> bool:
     """The pipefail setting after one command: only `set -o pipefail` (or `-eo`, `-euo` ...) sets it, `set +o` clears it."""
     if _first_word(bare) != "set":
@@ -228,17 +252,20 @@ def _judge(bare: str, raw: str) -> set[str]:
     if len(parts) > 1 and parts[-1][0] == "||" and (_first_word(parts[-1][1]) in VERIFY_SWALLOWERS
                                                     or re.match(r"^exit\s+0$", parts[-1][1])):
         shapes.add("or_true")
-    for i, (_, b, _r) in enumerate(parts):
+    for i, (_, b, r) in enumerate(parts):
         on = _pipefail(b, on)
-        segs = [x.strip() for x in re.split(r"\|&?", b) if x.strip()]   # `|&` pipes stderr too; its sink is the next word
-        if not segs:
+        stages = [(sb, sr) for _, sb, sr in _split(b, r, r"\|&?") if sb.strip()]   # `|&` pipes stderr too; its sink is the next word
+        if not stages:
             continue
+        segs = [sb.strip() for sb, _ in stages]
         sink = _first_word(segs[-1])
         read = i + 1 < len(parts) and parts[i + 1][0] == "&&" and bool(PIPESTATUS_READ.match(parts[i + 1][2]))
         if len(segs) > 1 and not on and not read and sink in VERIFY_SINKS:
             shapes.add(VERIFY_SINKS[sink])
         if sink in ("grep", "egrep", "rg") and any(re.match(r"^-[A-Za-z]*v", o) for o in segs[-1].split()[1:]):
             shapes.add("inverted_grep")
+        for sb, sr in (stages if on else stages[-1:]):                   # the stages whose status is this part's
+            shapes |= _shell_c(sb, sr)
     return shapes
 
 
@@ -247,8 +274,9 @@ def verify_cannot_fail(line: str) -> list[str]:
 
     What is judged: a markdown bullet (`- `, `* `, `1. `) and a backtick wrapper are stripped; quoted text and `$(..)` are
     masked; an unquoted `#` at the start or after whitespace starts a comment, which is dropped; a whole line `( ... )`
-    that opens with a prose word (VERIFY_DESCRIPTION: `(from the worktree root; ...)`) is a description and is not judged,
-    and any other parenthesised text is a subshell, judged as a command. A trailing annotation after two or more spaces,
+    that opens with a prose word (VERIFY_DESCRIPTION: `(from the worktree root)`) and holds no unquoted `|`, `;`, `&&` or
+    `||` is a description and is not judged, and any other parenthesised text is a subshell, judged as a command. The one
+    quoted argument of `bash -c`, `sh -c` or `env ... bash -c` is judged as a line of its own, recursively. A trailing annotation after two or more spaces,
     `x  (rc=0; ...)`, is cut off, and the line before it and the annotation (unless a description) are judged apart.
 
     How: `a; b` exits with b, so only the last `;` command counts; in it every `&&`/`||` part must carry its status to
@@ -266,26 +294,27 @@ def verify_cannot_fail(line: str) -> list[str]:
         s, bare = s[:comment.start()].rstrip(), bare[:comment.start()].rstrip()
     if not s:
         return []
-    if s.startswith("(") and s.endswith(")") and VERIFY_DESCRIPTION.match(s):
+    if _description(bare, s):
         return []
     note = re.search(r"\s{2,}\(", bare)
     if not note:
         return sorted(_judge(bare, s))
     cut = note.end() - 1
     shapes = _judge(bare[:cut], s[:cut])
-    if not (s.endswith(")") and VERIFY_DESCRIPTION.match(s[cut:])):
+    if not _description(bare[cut:], s[cut:]):
         shapes |= _judge(bare[cut:], s[cut:])
     return sorted(shapes)
 
 
 def verify_findings(text: str) -> list[tuple[int, list[str], str]]:
-    """(file line number, shapes, line) for every VERIFY line of a brief that cannot fail."""
+    """(file line number, shapes, line) for every VERIFY line of a brief that cannot fail. Every VERIFY section is read:
+    the `VERIFY:` field and any `VERIFY (...):` section after it (SECTION_LABEL), each running to the next section label."""
     out, in_verify = [], False
     for n, ln in enumerate(text.splitlines(), start=1):
-        label = next((f for f in BRIEF_FIELDS if ln.startswith(f + ":")), None)   # column 0, `LABEL:` — brief.rs:63-64
+        label = SECTION_LABEL.match(ln)
         if label is not None:
-            in_verify = label == "VERIFY"
-            ln = ln[len(label) + 1:]
+            in_verify = label.group(1) == "VERIFY"
+            ln = ln[label.end():]
         if in_verify:
             shapes = verify_cannot_fail(ln)
             if shapes:

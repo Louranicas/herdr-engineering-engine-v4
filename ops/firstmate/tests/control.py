@@ -23,6 +23,7 @@ import json
 import os
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -41,7 +42,7 @@ DRIVE_LINES = ["GOAL: drive", "SCOPE: s", "CONTEXT: c", "ACCEPTANCE: a", "VERIFY
 HEAD = "0123456789abcdef0123456789abcdef01234567"
 # fm-db's control seam for the init-atomicity case: SIGKILL after the named migration's DDL, before its row.
 KILL_SEAM = "FM_DB_CONTROL_KILL_BEFORE_ROW"
-# The parity case's two worlds, outside this repo: the curator's detector and the roster briefs it was measured on.
+# The parity case's two worlds, outside this repo: the curator's section reader and the roster briefs it was measured on.
 CURATOR_BIN = Path(os.environ.get("WFC_BIN") or "/mnt/storage-10tb/workflow-curator/bin/workflow-curator")
 ROSTER = Path(os.environ.get("FM_ROSTER") or "/mnt/storage-10tb/hee4-evidence/roster")
 MIGRATIONS = sorted(p.name for p in (HERE.parent / "schema").glob("*.sql"))
@@ -83,25 +84,57 @@ def load_script(name: str, path: Path) -> ModuleType:
     return mod
 
 
-def curator_parity() -> tuple[bool, str]:
-    """fm-db owns the cannot-fail detector; the curator's `cannot_fail` is an older copy in another repo. Over every VERIFY
-    line of the roster briefs (the curator's own section reader picks them), a line the curator flags and the door admits
-    fails the case. Absent curator or roster, or zero lines looked at, fails it too: a parity that read nothing is not one."""
-    if not CURATOR_BIN.is_file() or not ROSTER.is_dir():
-        return False, f"unmeasured: curator={CURATOR_BIN.is_file()} roster={ROSTER.is_dir()}"
-    fm, wfc = load_script("fm_db", FM_DB_BIN), load_script("workflow_curator", CURATOR_BIN)
-    briefs = sorted(ROSTER.glob("*/*.md"))
-    curator = door = 0
+def section_parity(fm_bin: Path = FM_DB_BIN) -> tuple[bool, str]:
+    """The curator loads fm-db's detector, so a detector parity compares fm-db with itself. What can still differ is which
+    lines each one reads as VERIFY. For every U-stack-04 roster brief, each line of the curator's VERIFY sections
+    (`brief_sections`, which opens a section on `VERIFY (...):` too) that fm-db's detector flags must be among the
+    door's own `verify_findings` for that brief. Absent curator or roster, or zero flagged lines, fails the case: a
+    parity that read nothing is not one."""
+    briefs = sorted((ROSTER / "U-stack-04").glob("*.md"))
+    if not CURATOR_BIN.is_file() or not briefs:
+        return False, f"unmeasured: curator={CURATOR_BIN.is_file()} briefs={len(briefs)}"
+    fm, wfc = load_script("fm_db_parity", fm_bin), load_script("workflow_curator", CURATOR_BIN)
+    reader = door = 0
     only: list[str] = []
     for p in briefs:
-        for ln in wfc.brief_sections(p.read_text(errors="replace")).get("VERIFY", []):
-            c = [s for s in wfc.cannot_fail(ln) if s != "informational"]
-            d = fm.verify_cannot_fail(ln)
-            curator, door = curator + bool(c), door + bool(d)
-            if c and not d:
-                only.append(f"{p.name}: {ln.strip()[:80]}")
-    ok = curator > 0 and not only
-    return ok, f"briefs={len(briefs)} curator={curator} door={door} curator_only={len(only)} {'; '.join(only[:3])}".strip()
+        text = p.read_text(errors="replace")
+        found = {ln for _, _, ln in fm.verify_findings(text)}
+        door += len(found)
+        for ln in wfc.brief_sections(text).get("VERIFY", []):
+            if fm.verify_cannot_fail(ln):
+                reader += 1
+                if ln.strip() not in found:
+                    only.append(f"{p.name}: {ln.strip()[:80]}")
+    ok = reader > 0 and not only
+    return ok, f"briefs={len(briefs)} reader={reader} door={door} reader_only={len(only)} {'; '.join(only[:3])}".strip()
+
+
+def migration_001_only(db: Path) -> None:
+    """A populated pre-002 database: 001_init.sql and its schema_migrations row, one open unit, one spawn (no brief_sha)."""
+    first = HERE.parent / "schema" / FIRST_MIGRATION
+    db.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(db)
+    try:
+        con.executescript(first.read_text())
+        con.execute("INSERT INTO schema_migrations VALUES (?,?,?)", (FIRST_MIGRATION, sha(first), "2026-10-04T13:21:02Z"))
+        con.execute("INSERT INTO units VALUES ('U0','hee4','ship','test',0,'x',4,'2026-10-04T13:21:02Z',NULL)")
+        con.execute("INSERT INTO spawns (task_id, unit_id, agent, harness, ts) VALUES ('s0','U0','hee4-gate','agent','2026-10-04T13:21:03Z')")
+        con.commit()
+    finally:
+        con.close()
+
+
+def raw_refusal(db: Path, sql: str, args: tuple = ()) -> str:
+    """Run one raw write against a temp DB (foreign_keys off, sqlite3's default); the SQLite error text, or 'admitted'."""
+    con = sqlite3.connect(db)
+    try:
+        con.execute(sql, args)
+        con.commit()
+        return "admitted"
+    except sqlite3.DatabaseError as e:
+        return str(e)
+    finally:
+        con.close()
 
 
 class World:
@@ -249,7 +282,11 @@ def main() -> int:
                                      ("pipe-amp", "cargo test --offline |& tail -1", "shape=pipe_into_tail_head"),
                                      ("exit-0", "cargo test --offline; exit 0", "shape=trailing_true"),
                                      ("or-echo", "cargo test --offline || echo FAILED", "shape=or_true"),
-                                     ("subshell", "(cargo test --offline | tail -1)", "shape=pipe_into_tail_head")):
+                                     ("subshell", "(cargo test --offline | tail -1)", "shape=pipe_into_tail_head"),
+                                     ("described-pipeline", "(from the worktree root; cargo test --offline | tail -1)",
+                                      "shape=pipe_into_tail_head"),
+                                     ("bash-c", "bash -c 'cargo test --offline | tail -1'", "shape=pipe_into_tail_head"),
+                                     ("env-bash-c", "env RUST_LOG=off bash -c 'cargo test --offline || true'", "shape=or_true")):
                 text = brief_text(verify=["python3 ops/firstmate/tests/control.py", bad])
                 n = text.splitlines().index(bad) + 1
                 p = w.brief_file(text)
@@ -264,12 +301,28 @@ def main() -> int:
                                ("pipestatus-read", "cargo test --offline | tail -1 && exit ${PIPESTATUS[0]}"),
                                ("plain", "cargo fmt --all --check"),
                                ("subshell-can-fail", "(cd tools/tests && python3 -m unittest discover -s . -p 'test_*.py')"),
-                               ("described", "(from the worktree root; each line judged by its own exit code, never | tail)")):
+                               ("described", "(from the worktree root, each line judged by its own exit code)"),
+                               ("bash-c-can-fail", "bash -c 'cargo test --offline | grep -q \"test result: ok\"'")):
                 p = w.brief_file(brief_text(verify=[good]))
                 rc, j = w.fm("record", "brief", "--unit", "U1", "--path", str(p), "--head-sha", HEAD)
                 case(f"brief-verify-{name}", "quiet", rc, j, 0, None)
-            parity_ok, parity = curator_parity()
-            case("brief-verify-curator-parity", "fault", 0, {}, 0, None, parity_ok, parity)
+            # A second VERIFY section under a qualified label is judged like the `VERIFY:` field (the probe is audit 3's).
+            text = brief_text() + "VERIFY (from the worktree root):\ncargo test --workspace 2>&1 | tail -1\n"
+            n = text.splitlines().index("cargo test --workspace 2>&1 | tail -1") + 1
+            p = w.brief_file(text)
+            rc, j = w.fm("record", "brief", "--unit", "U1", "--path", str(p), "--head-sha", HEAD)
+            case("verify-paren-section", "fault", rc, j, 20, f"verify_line_cannot_fail line={n} shape=pipe_into_tail_head")
+            # The detector itself, called as the curator calls it: a quoted `bash -c` pipeline and a prose-opener
+            # parenthesis holding a pipeline are flagged; a pure description, a real subshell and a plain command are not.
+            fm = load_script("fm_db", FM_DB_BIN)
+            got = (fm.verify_cannot_fail("bash -c 'cargo test --workspace | tail -1'"),
+                   fm.verify_cannot_fail("(from the worktree root; cargo test --workspace | tail -1)"))
+            case("detector-quoted-and-prose", "fault", 0, {}, 0, None, got[0] == ["pipe_into_tail_head"] and bool(got[1]), f"got={got}")
+            got = tuple(fm.verify_cannot_fail(x) for x in ("(from the worktree root)", "(cd crates && cargo test --workspace)",
+                                                           "cargo test --workspace"))
+            case("detector-negatives", "quiet", 0, {}, 0, None, got == ([], [], []), f"got={got}")
+            parity_ok, parity = section_parity()
+            case("brief-verify-section-parity", "fault", 0, {}, 0, None, parity_ok, parity)
 
             p = w.brief_file(brief_text())
             rc, j = w.fm("record", "brief", "--unit", "U1", "--path", str(p))     # no git under the temp HEE4_ROOT
