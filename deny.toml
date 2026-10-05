@@ -1,5 +1,5 @@
 # cargo-deny policy (the `deps` step of the commit tier). Offline and deterministic: bans, licenses
-# and sources only; advisories need a live database and are not a commit-tier fact.
+# and sources only. Advisories need a live database: the cut tier runs them (`tools/advisories`).
 # Assimilated from ECC's pointer to cargo-deny (2026-10-05); the allow-list is the measured graph.
 
 [graph]

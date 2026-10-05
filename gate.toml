@@ -19,7 +19,7 @@ steps = ["ddf"]
 
 [tier.cut]
 includes = "stack"
-steps = ["drill", "drive", "doctor"]
+steps = ["drill", "drive", "doctor", "advisories"]
 
 [step.features]
 cmd = "tools/features-check --served"
@@ -73,4 +73,11 @@ expect = "tool_rc"
 [step.drive]
 cmd = "tools/drive --doctor-first --allow-restart"
 budget_s = 120
+expect = "tool_rc"
+
+[step.advisories]
+# RustSec advisories at the cut (V4-101 follow-up): fetches the database, names its revision and age;
+# a stale (> 7 days) or unfetched database is UNMEASURED (rc 3), which is red. Not a commit-tier fact.
+cmd = "tools/advisories"
+budget_s = 300
 expect = "tool_rc"

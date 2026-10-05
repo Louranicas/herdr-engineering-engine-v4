@@ -13,8 +13,8 @@ Rules (one finding line each, `finding rule=<R> path=<p> detail=<d>`):
                lint, or of `warnings`, outside crates/*/tests/** (test files may unwrap)
   R4 unreasoned  `#[allow(...)]` outside tests counted against [allows] src_unreasoned_max
   R5 flags     no .cargo/config(.toml) passing `--cap-lints` or `-A`
-  R6 gate      gate.toml's commit tier keeps every step in the floor's [gate] commit_steps, each
-               step is defined, and the clippy step keeps `-D warnings`
+  R6 gate      each gate.toml tier keeps every step in the floor's [gate] <tier>_steps, each step
+               is defined, and the clippy step keeps `-D warnings`
 Last line: `lint-ratchet verdict=PASS|FAIL lints=k/n crates_inherit=a/b deny_off=d src_unreasoned=u/max findings=f`
 Exit 0 PASS, 1 FAIL, 2 refused (no Cargo.toml, no crates, unreadable floor, unknown level).
 --control: plants one weakening per rule into an in-memory copy of the live tree; each must be
@@ -127,16 +127,19 @@ def check(world, floor):
     for name in (".cargo/config.toml", ".cargo/config"):
         if name in world and re.search(r"--cap-lints|[\"']-A", world[name]):
             findings.append(("R5", name, "rustflags weaken lints"))
-    want = list((floor.get("gate") or {}).get("commit_steps") or [])
-    if want:
-        gate = tomllib.loads(world.get("gate.toml", ""))
-        have = ((gate.get("tier") or {}).get("commit") or {}).get("steps") or []
-        steps = gate.get("step") or {}
+    gfloor = floor.get("gate") or {}
+    gate = tomllib.loads(world.get("gate.toml", "")) if gfloor else {}
+    steps = gate.get("step") or {}
+    for tier in ("commit", "stack", "cut"):
+        want = list(gfloor.get(f"{tier}_steps") or [])
+        have = ((gate.get("tier") or {}).get(tier) or {}).get("steps") or []
         for name in want:
             if name not in have:
-                findings.append(("R6", "gate.toml", f"commit tier lacks step={name}"))
+                findings.append(("R6", "gate.toml", f"{tier} tier lacks step={name}"))
             elif name not in steps:
                 findings.append(("R6", "gate.toml", f"step={name} undefined"))
+    if gfloor:
+        want = list(gfloor.get("commit_steps") or [])
         if "clippy" in want and "-D warnings" not in (steps.get("clippy") or {}).get("cmd", ""):
             findings.append(("R6", "gate.toml", "clippy step without -D warnings"))
     summary = dict(lints=f"{met}/{total}", crates_inherit=f"{inherit}/{len(manifests)}",
@@ -183,6 +186,9 @@ def plants(world):
         w = dict(world)
         w["gate.toml"] = w["gate.toml"].replace(" -- -D warnings", "", 1)
         out.append(("clippy step loses -D warnings", "R6", w))
+        w = dict(world)
+        w["gate.toml"] = re.sub(r',\s*"advisories"', "", w["gate.toml"], count=1)
+        out.append(("cut tier drops the advisories step", "R6", w))
     return out
 
 

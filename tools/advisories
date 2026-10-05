@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""advisories [--repo DIR] [--max-age-days N] [--db-root DIR]
+
+The `advisories` step of the cut tier: no known RustSec advisory against the dependency graph at
+the moment of the cut. It runs `cargo-deny --format json check advisories` (which fetches the
+advisory database) and names what it looked at, because a stale or unfetched database checks
+nothing (AP-29):
+  advisory id=<RUSTSEC-…> crate=<name> severity=<s> code=<c>      one line per error diagnostic
+  advisories verdict=PASS|FAIL|UNMEASURED db=<sha12> db_date=<iso> db_age_days=<n> errors=<e> [reason=…]
+Exit 0 PASS; 1 FAIL (an error-level advisory); 3 UNMEASURED (the run produced no summary, e.g. the
+fetch failed, or the database is older than --max-age-days, default 7, or absent); 2 refused
+(cargo-deny not on PATH). Not in the commit tier: the database changes daily, so the same commit
+can pass today and fail tomorrow; the cut is where "known at release" is the question.
+Database root: --db-root, else $CARGO_HOME/advisory-dbs (default ~/.cargo/advisory-dbs).
+"""
+import argparse, datetime, glob, json, os, shutil, subprocess, sys
+
+
+def say(verdict, db, date, age, errors, reason=None):
+    tail = f" reason={reason}" if reason else ""
+    print(f"advisories verdict={verdict} db={db} db_date={date} db_age_days={age} errors={errors}{tail}")
+    return {"PASS": 0, "FAIL": 1, "UNMEASURED": 3}[verdict]
+
+
+def database(root):
+    """(sha12, iso date, commit datetime) of the newest advisory db checkout under root, else None."""
+    best = None
+    for d in glob.glob(os.path.join(root, "*", "")):
+        r = subprocess.run(["git", "-C", d, "log", "-1", "--format=%H %cI"], capture_output=True, text=True)
+        if r.returncode != 0 or not r.stdout.strip():
+            continue
+        sha, iso = r.stdout.split()
+        when = datetime.datetime.fromisoformat(iso)
+        if best is None or when > best[2]:
+            best = (sha[:12], iso, when)
+    return best
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--repo", default=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    ap.add_argument("--max-age-days", type=int, default=7)
+    ap.add_argument("--db-root", default=os.path.join(os.environ.get("CARGO_HOME") or os.path.expanduser("~/.cargo"), "advisory-dbs"))
+    a = ap.parse_args()
+    if shutil.which("cargo-deny") is None:
+        print("advisories: cargo-deny not on PATH (mise: cargo-deny 0.20.2)", file=sys.stderr)
+        return 2
+    try:
+        r = subprocess.run(["cargo-deny", "--format", "json", "check", "advisories"], cwd=a.repo,
+                           capture_output=True, text=True, timeout=240)
+    except subprocess.TimeoutExpired:
+        return say("UNMEASURED", "none", "none", "none", "none", "cargo_deny_timeout")
+    summary, findings = None, []
+    for line in (r.stdout + "\n" + r.stderr).splitlines():
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(msg, dict):
+            continue
+        f = msg.get("fields") or {}
+        if msg.get("type") == "summary":
+            summary = (f.get("advisories") or {})
+        elif msg.get("type") == "diagnostic" and f.get("severity") == "error":
+            adv = f.get("advisory") or {}
+            findings.append((adv.get("id") or "none", adv.get("package") or "none", f.get("code") or "none"))
+    db = database(a.db_root)
+    sha, iso, age = (db[0], db[1], (datetime.datetime.now(datetime.timezone.utc) - db[2]).days) if db else ("none", "none", "none")
+    if summary is None:
+        return say("UNMEASURED", sha, iso, age, "none", f"no_summary_rc={r.returncode}")
+    if db is None:
+        return say("UNMEASURED", sha, iso, age, summary.get("errors", 0), "advisory_db_absent")
+    if age > a.max_age_days:
+        return say("UNMEASURED", sha, iso, age, summary.get("errors", 0), f"advisory_db_older_than_{a.max_age_days}d")
+    for aid, pkg, code in findings:
+        print(f"advisory id={aid} crate={pkg} severity=error code={code}")
+    errors = int(summary.get("errors") or 0)
+    return say("FAIL" if errors or r.returncode else "PASS", sha, iso, age, errors)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

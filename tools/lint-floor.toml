@@ -18,9 +18,10 @@ unreachable = "deny"
 dbg_macro = "deny"
 
 [gate]
-# The commit tier of gate.toml keeps every one of these steps (lint-ratchet R6), and the clippy
+# Each tier of gate.toml keeps every one of its steps listed here (lint-ratchet R6), and the clippy
 # step keeps `-D warnings`. Removing a step from the gate means removing it here first.
 commit_steps = ["features", "lints", "deps", "fmt", "clippy", "test"]
+cut_steps = ["advisories"]
 
 [allows]
 # Unreasoned `#[allow(...)]` attributes outside test files (crates/*/tests/**). `#[expect(.., reason = ..)]`

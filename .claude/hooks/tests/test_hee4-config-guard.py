@@ -23,7 +23,7 @@ def edit(path: Path, tool: str = "Edit") -> dict:
 def main() -> int:
     c = Cases(HOOK)
     fire = ["tools/lint-floor.toml", "Cargo.toml", "crates/hee4-core/Cargo.toml", "deny.toml", "gate.toml", "layers.toml",
-            ".cargo/config.toml", "tools/gate", "tools/lint-ratchet", "tools/tests/test_gate.py",
+            ".cargo/config.toml", "tools/gate", "tools/lint-ratchet", "tools/advisories", "tools/tests/test_gate.py",
             "ops/checks/module_funnel.py", ".claude/settings.json", ".claude/hooks/lib/v3_guard.py"]
     for rel in fire:
         rc, out, _, dt = run_hook(HOOK, edit(REPO / rel))

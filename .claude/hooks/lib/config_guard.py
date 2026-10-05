@@ -29,6 +29,7 @@ DOORS: tuple[tuple[str, str], ...] = (
     ("rust-toolchain*", "the toolchain pin every gate step builds with"),
     ("tools/gate", "the gate runner"),
     ("tools/lint-ratchet", "the lint ratchet (commit tier `lints`)"),
+    ("tools/advisories", "the RustSec check (cut tier `advisories`)"),
     ("tools/tests/**", "the tests that prove the gate tools; a weaker test is a weaker gate"),
     ("ops/checks/**", "a check run by `just verify` / `just regen`"),
     (".claude/settings.json", "the project permissions (v3 deny rules) and the hook registry"),
