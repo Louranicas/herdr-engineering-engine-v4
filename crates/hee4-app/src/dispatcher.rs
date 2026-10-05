@@ -15,6 +15,7 @@ use hee4_contracts::{
     Settlement, Sha256Hex, SourceId, TaskId, Verdict, VerifyLine,
 };
 use hee4_core::backup::{BackupError, SameDisk, backup_to};
+use hee4_core::recovery::Facts;
 use hee4_core::roster::RosterDefinition;
 use hee4_core::{AttemptId, AttemptStart, StoreError};
 use hee4_evidence::ddf::{self, AdapterError, Diff, TaskObservation};
@@ -460,12 +461,32 @@ fn brief_timebox(brief: &Brief, budgets: &hee4_contracts::Budgets) -> Duration {
     )
 }
 
-/// The first `admitted` task, oldest id first.
-fn next_admitted(engine: &Engine) -> Result<Option<TaskId>, StoreError> {
+/// What the pick found for one step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Pick {
+    /// An `admitted` task: route, then `Dispatch`.
+    Dispatch(TaskId),
+    /// A `cancellation_requested` task with no open attempt (cancelled before its `Dispatch`,
+    /// or between the pick and `Dispatch`): `Stop` settles it `cancelled`. A task whose attempt
+    /// is open is not picked; its attempt settles first.
+    Stop(TaskId),
+}
+
+/// The first `admitted` task, or `cancellation_requested` task with no open attempt, oldest
+/// id first. The attempt is open by `recovery::Facts`, the one derivation reconcile also reads.
+fn next_task(engine: &Engine) -> Result<Option<Pick>, StoreError> {
     let store = engine.store();
     for task in store.task_ids()? {
-        if store.phase(&task)? == Some(Phase::Admitted) {
-            return Ok(Some(task));
+        match store.phase(&task)? {
+            Some(Phase::Admitted) => return Ok(Some(Pick::Dispatch(task))),
+            Some(phase @ Phase::CancellationRequested) => {
+                let history = store.history_with_seq(&task)?;
+                let facts = Facts::from_history(phase, &history, store.receipt_count(&task)?);
+                if !facts.attempt_open {
+                    return Ok(Some(Pick::Stop(task)));
+                }
+            }
+            _ => {}
         }
     }
     Ok(None)
@@ -635,7 +656,9 @@ fn route_with(
     select(&input, &roster)
 }
 
-/// Dispatch one `admitted` task to a terminal or parked phase. `Ok(None)`: nothing to do.
+/// Dispatch one `admitted` task to a terminal or parked phase, or settle one
+/// `cancellation_requested` task that holds no open attempt with `Stop` (→ `cancelled`).
+/// `Ok(None)`: nothing to do.
 /// With `backups`, the DC-22 backup [`backup_due`] names is taken immediately before
 /// `apply(Dispatch)`.
 ///
@@ -648,16 +671,30 @@ pub fn step(
     cfg: &Config,
     backups: Option<&mut Backups>,
 ) -> Result<Option<(TaskId, Phase)>, DispatchError> {
-    let Some(task) = next_admitted(engine)? else {
-        return Ok(None);
-    };
-    let Some(brief) = fs::read_to_string(engine.brief_path(&task))
+    match next_task(engine)? {
+        None => Ok(None),
+        Some(Pick::Stop(task)) => {
+            let phase = apply(engine, &task, Event::Stop)?;
+            Ok(Some((task, phase)))
+        }
+        Some(Pick::Dispatch(task)) => run(engine, cfg, backups, &task),
+    }
+}
+
+/// Route, build, `Dispatch`, attempt, seal and settle one picked `admitted` task.
+fn run(
+    engine: &Engine,
+    cfg: &Config,
+    backups: Option<&mut Backups>,
+    task: &TaskId,
+) -> Result<Option<(TaskId, Phase)>, DispatchError> {
+    let Some(brief) = fs::read_to_string(engine.brief_path(task))
         .ok()
         .and_then(|t| Brief::parse(&t).ok())
     else {
         return Ok(Some((
             task.clone(),
-            abandon(engine, &task, AbandonReason::BriefUnreadable)?,
+            abandon(engine, task, AbandonReason::BriefUnreadable)?,
         )));
     };
     let steps = playbook(brief.get(BriefField::Verify));
@@ -682,12 +719,12 @@ pub fn step(
         Err(r) => {
             return Ok(Some((
                 task.clone(),
-                abandon(engine, &task, route_reason(&r))?,
+                abandon(engine, task, route_reason(&r))?,
             )));
         }
     };
     let budget = brief_timebox(&brief, &budgets);
-    let (ns, generation) = match workspace(engine, &task, needs_model, budget)? {
+    let (ns, generation) = match workspace(engine, task, needs_model, budget)? {
         Ok(built) => built,
         Err(abandoned) => return Ok(Some((task.clone(), abandoned))),
     };
@@ -695,7 +732,7 @@ pub fn step(
     let Ok(head) = crate::HEAD.parse::<GitSha>() else {
         return Ok(Some((
             task.clone(),
-            abandon(engine, &task, AbandonReason::HeadUnknown)?,
+            abandon(engine, task, AbandonReason::HeadUnknown)?,
         )));
     };
     let nanos = SystemTime::now()
@@ -710,12 +747,12 @@ pub fn step(
             eprintln!("dispatch task={task} cause={e}");
             return Ok(Some((
                 task.clone(),
-                abandon(engine, &task, AbandonReason::NoPermit)?,
+                abandon(engine, task, AbandonReason::NoPermit)?,
             )));
         }
     };
 
-    dispatch(engine, &task, backups)?;
+    dispatch(engine, task, backups)?;
     let start = AttemptStart {
         receipt_id: receipt_id.clone(),
         permit_id: permit.id().0,
@@ -726,7 +763,7 @@ pub fn step(
         // here grants reuse of a workspace. `attempt.deadline_ms` is therefore not recorded.
         lease: None,
     };
-    let id = match acknowledge(engine, &task, generation, &start)? {
+    let id = match acknowledge(engine, task, generation, &start)? {
         Ok(id) => id,
         Err(stopped) => return Ok(Some((task.clone(), stopped))),
     };
@@ -739,14 +776,14 @@ pub fn step(
         Ok(o) => o,
         Err(e) => {
             eprintln!("dispatch task={task} attempt_error={e}");
-            apply(engine, &task, Event::Settle(Settlement::NotReady))?;
-            return Ok(Some((task.clone(), apply(engine, &task, Event::Stop)?)));
+            apply(engine, task, Event::Settle(Settlement::NotReady))?;
+            return Ok(Some((task.clone(), apply(engine, task, Event::Stop)?)));
         }
     };
     let sealing = Sealing {
         receipt_id,
         permit: &permit,
-        subject: &subject_of(&task, head, &brief),
+        subject: &subject_of(task, head, &brief),
         work_dir: ns.work_dir(),
         before: &before,
         budget,
@@ -1706,5 +1743,74 @@ mod tests {
         );
         let one_ms = Duration::from_millis(1);
         assert_eq!(timebox("2s", default, one_ms), one_ms);
+    }
+
+    fn offline() -> Config {
+        Config {
+            model: "m:1".into(),
+            live: false,
+        }
+    }
+
+    /// `task`'s events in seq order.
+    fn events(engine: &Engine, task: &TaskId) -> R<Vec<Event>> {
+        Ok(engine
+            .store()
+            .history_with_seq(task)?
+            .into_iter()
+            .map(|(_, e)| e)
+            .collect())
+    }
+
+    /// A task cancelled before its `Dispatch` is settled `cancelled` by one step's `Stop`; the
+    /// next step finds nothing and applies nothing.
+    #[test]
+    fn a_cancel_before_dispatch_is_stopped_once() -> R<()> {
+        let engine = crate::actions::testing::engine("dispatch-cancel-before")?;
+        let task: TaskId = "t-cancel-before".parse()?;
+        {
+            let store = engine.store();
+            store.apply(&task, Event::Admit)?;
+            store.apply(&task, Event::Cancel)?;
+        }
+        assert_eq!(
+            step(&engine, &offline(), None)?,
+            Some((task.clone(), Phase::Cancelled))
+        );
+        assert_eq!(
+            events(&engine, &task)?,
+            [Event::Admit, Event::Cancel, Event::Stop]
+        );
+        assert_eq!(step(&engine, &offline(), None)?, None);
+        assert_eq!(
+            events(&engine, &task)?,
+            [Event::Admit, Event::Cancel, Event::Stop]
+        );
+        Ok(())
+    }
+
+    /// A cancel that lands on an open attempt is not stopped by the pick: the attempt settles
+    /// first (its `Settle` moves the task on).
+    #[test]
+    fn a_cancel_with_an_open_attempt_is_not_stopped() -> R<()> {
+        let engine = crate::actions::testing::engine("dispatch-cancel-open")?;
+        let task: TaskId = "t-cancel-open".parse()?;
+        {
+            let store = engine.store();
+            assert!(hee4_core::reconcile(&store, &hee4_core::Observations::default())?.complete);
+            store.apply(&task, Event::Admit)?;
+            store.apply(&task, Event::Dispatch)?;
+            store.apply(&task, Event::Cancel)?;
+        }
+        assert_eq!(step(&engine, &offline(), None)?, None);
+        assert_eq!(
+            engine.store().phase(&task)?,
+            Some(Phase::CancellationRequested)
+        );
+        assert_eq!(
+            events(&engine, &task)?,
+            [Event::Admit, Event::Dispatch, Event::Cancel]
+        );
+        Ok(())
     }
 }

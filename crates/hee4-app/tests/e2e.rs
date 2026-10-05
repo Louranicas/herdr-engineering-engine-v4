@@ -669,6 +669,78 @@ fn a_step_that_outlives_attempt_deadline_ms_is_killed_at_the_deadline() -> R<()>
     Ok(())
 }
 
+/// `task`'s events in seq order (SELECT only).
+fn events_of(ledger: &Path, task: &str) -> R<Vec<Event>> {
+    let conn =
+        rusqlite::Connection::open_with_flags(ledger, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut stmt = conn.prepare("SELECT event_json FROM events WHERE task_id = ?1 ORDER BY seq")?;
+    let rows = stmt.query_map([task], |r| r.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for json in rows {
+        out.push(serde_json::from_str(&json?)?);
+    }
+    Ok(out)
+}
+
+/// A task cancelled before its dispatch reaches `cancelled` with events admit, cancel, stop and
+/// no attempt. The dispatcher is held on a blocker task (`sleep 3`) while the second task is
+/// submitted and cancelled, so the cancel lands before any pick of it.
+#[test]
+fn a_cancel_before_dispatch_reaches_cancelled() -> R<()> {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("e2e-cbd");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir)?;
+    let mut server = start(&dir, "serve.log")?;
+    let blocker = call(
+        &server.sock,
+        "task.submit",
+        Some("key-blocker"),
+        json!({ "brief": brief("/usr/bin/sleep 3") }),
+    )?;
+    assert_eq!(blocker["kind"], "result", "{blocker}");
+    let blocker_id = blocker["body"]["task_id"].clone();
+    poll(
+        &server.sock,
+        &blocker_id,
+        |p| p == "running",
+        &mut Vec::new(),
+    )?;
+    let t = call(
+        &server.sock,
+        "task.submit",
+        Some("key-cancelled"),
+        json!({ "brief": brief(FIXTURE) }),
+    )?;
+    assert_eq!(t["kind"], "result", "{t}");
+    let id = t["body"]["task_id"].clone();
+    let task = id.as_str().ok_or("id")?.to_owned();
+    let c = call(
+        &server.sock,
+        "task.cancel",
+        Some("key-cancel"),
+        json!({ "task_id": id }),
+    )?;
+    assert_eq!(c["body"]["phase"], "cancellation_requested", "{c}");
+    let mut trace = vec!["admitted".to_owned()];
+    let done = poll(&server.sock, &id, |p| TERMINAL.contains(&p), &mut trace)?;
+    let log = fs::read_to_string(dir.join("serve.log"))?;
+    println!(
+        "MEASURED cancel-before-dispatch task {task} trace {}",
+        trace.join(" -> ")
+    );
+    assert_eq!(done["body"]["phase"], "cancelled", "{done}\n{log}");
+    let ledger = dir.join("ledger.sqlite3");
+    assert_eq!(
+        events_of(&ledger, &task)?,
+        [Event::Admit, Event::Cancel, Event::Stop],
+        "{log}"
+    );
+    assert!(attempt_ids(&ledger, &task)?.is_empty(), "{log}");
+    server.child.kill()?;
+    server.child.wait()?;
+    Ok(())
+}
+
 /// `true` when the contracts' attempt budget carries `max_generations` (the repair leg's bound).
 fn max_generations_present() -> R<bool> {
     let attempt = serde_json::to_value(Budgets::DEFAULT)?["attempt"].clone();
