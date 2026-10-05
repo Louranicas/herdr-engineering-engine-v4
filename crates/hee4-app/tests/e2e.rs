@@ -1664,3 +1664,80 @@ fn a_candidate_git_config_runs_nothing_on_the_host() -> R<()> {
     }
     Ok(())
 }
+
+/// Acceptance 3 at the binary: a claim left behind in the ledger (its holder committed, then
+/// died before the release) is reported by name in `serve.log` when `hee4 serve` starts. The
+/// claim is seeded through the store's own verbs (no SQL here): claim `drive` at generation 1,
+/// commit the act, never release. The `expired` reason needs a claim older than
+/// `CLAIM_STALE_MS`, which only SQL could backdate; the store test covers it.
+#[test]
+fn a_stale_claim_is_reported_by_name_at_serve_start() -> R<()> {
+    use hee4_contracts::{Evidence, Observation, Outcome, ToolId};
+    use hee4_core::OperationKey;
+    use hee4_core::service::{Expected, Seed};
+
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("e2e-stale-claim");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir)?;
+    let held = {
+        let store = hee4_core::Store::open(&dir.join("ledger.sqlite3"))?;
+        store.service_seed(&[Seed {
+            service_id: "drive",
+            owner_id: "deploy",
+            unit_id: "hee4-drive.service",
+            actable: true,
+        }])?;
+        let op = OperationKey {
+            principal: "uid:dead".into(),
+            action: "service.action".into(),
+            version: 1,
+            idem_key: "died-before-release".into(),
+        };
+        store.service_claim("drive", 1, &op)?;
+        let held = store
+            .service_claim_get("drive")?
+            .ok_or("the claim was not taken")?;
+        let health = Observation {
+            source: "service.probe".parse()?,
+            input_sha256: Sha256Hex::digest(b"{}"),
+            tool: ToolId {
+                name: "busctl".parse()?,
+                version: "systemd-261".parse()?,
+            },
+            head_sha: "a".repeat(40).parse()?,
+            outcome: Outcome::Pass,
+            evidence: vec![Evidence {
+                label: "active_state".parse()?,
+                sha256: Sha256Hex::digest(b"inactive"),
+            }],
+            advisory: false,
+            elapsed_ms: 3,
+            budget_ms: 5000,
+        };
+        let expected = Expected {
+            generation: 1,
+            owner_sha256: Sha256Hex::digest(b"deploy"),
+        };
+        store.service_action_commit(&op, b"{}", "drive", expected, &health, |_| json!(null))?;
+        held
+    };
+    let mut server = start(&dir, "serve.log")?;
+    let line = format!(
+        "service family start stale_claim service_id=drive operation_id={} generation=1",
+        held.operation_id
+    );
+    let found = wait_log(
+        &dir.join("serve.log"),
+        &[&line, "reason=generation_moved"],
+        Duration::from_secs(10),
+    );
+    server.child.kill()?;
+    server.child.wait()?;
+    let log = found?;
+    let named: Vec<&str> = log.lines().filter(|l| l.contains("stale_claim")).collect();
+    println!("MEASURED serve.log stale_claim lines: {named:?}");
+    assert_eq!(named.len(), 1, "{log}");
+    assert!(named[0].contains(&line), "{log}");
+    assert!(named[0].ends_with(" reason=generation_moved"), "{log}");
+    Ok(())
+}

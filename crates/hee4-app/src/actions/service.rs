@@ -4,11 +4,11 @@
 //! work (the `service_facts` seed and the busctl digest pin) is this family's `on_serve_start`
 //! hook, the single place it happens.
 
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::OnceLock;
 
 use hee4_contracts::Sha256Hex;
 use hee4_contracts::catalogue::Owner;
-use hee4_core::service::{Expected, Seed, ServiceError, ServiceFact};
+use hee4_core::service::{Expected, Seed, ServiceError, ServiceFact, StaleClaim};
 use hee4_core::{OperationKey, StoreError};
 use serde_json::{Value, json};
 
@@ -43,12 +43,6 @@ pub const SEEDS: &[Seed<'static>] = &[
         actable: true,
     },
 ];
-
-/// One lock per seed, in [`SEEDS`] order: `service.action` holds its service's lock across the
-/// replay check, the CAS check, `runner.act` and the commit, so two requests on one service
-/// never both reach the manager. The loser waits, then reads the moved generation (or its own
-/// committed key) and is refused (or replayed) without acting.
-static ACT_LOCKS: [Mutex<()>; SEEDS.len()] = [const { Mutex::new(()) }; SEEDS.len()];
 
 /// The `probe_version` this release serves.
 pub const PROBE_VERSION: u64 = 1;
@@ -124,6 +118,12 @@ fn start(engine: &Engine) -> Result<(), StartFault> {
         bus.as_deref()
             .map_or_else(|| "absent".to_owned(), |b| b.display().to_string()),
     );
+    match engine.store().service_stale_claims() {
+        Ok(stale) => stale
+            .iter()
+            .for_each(|c| report_stale("service family start", c)),
+        Err(e) => eprintln!("service family start: stale claims unread: {e}"),
+    }
     let _ = RUNNER.set(BusctlRunner::new(
         engine.work().to_path_buf(),
         bus,
@@ -131,6 +131,18 @@ fn start(engine: &Engine) -> Result<(), StartFault> {
         version,
     ));
     Ok(())
+}
+
+/// One line naming a stale act claim: at serve start (recovery) and when an action supersedes it.
+fn report_stale(prefix: &str, stale: &StaleClaim) {
+    eprintln!(
+        "{prefix} stale_claim service_id={} operation_id={} generation={} age_ms={} reason={}",
+        stale.claim.service_id,
+        stale.claim.operation_id,
+        stale.claim.generation,
+        stale.age_ms,
+        stale.reason.as_str()
+    );
 }
 
 fn bad(field: &'static str, message: impl Into<String>) -> Fault {
@@ -211,8 +223,18 @@ fn not_actable() -> Fault {
     .with_because("service not actable")
 }
 
+fn claim_held() -> Fault {
+    Fault::new(
+        Code::Conflict,
+        "/body/service_id",
+        "another act holds this service's claim",
+    )
+    .with_because("service claim held")
+}
+
 fn service_fault(e: ServiceError) -> Fault {
     match e {
+        ServiceError::ClaimHeld(_) => claim_held(),
         ServiceError::NotActable(_) => not_actable(),
         ServiceError::Store(e) => store_fault(e),
         ServiceError::UnknownService(_) => not_found(),
@@ -373,14 +395,15 @@ fn action_body(body: &Value) -> Result<(&str, &str, UnitAction, Sha256Hex), Faul
 
 /// `service.action`: a CAS-guarded act through the runner, committed only after its read-back
 /// settled. An unsettled read-back is `effect_unknown` and writes no operations row.
+///
+/// The act runs under the service's durable claim (`Store::service_claim`), taken after every
+/// request check and before `runner.act`, released after the commit whatever the outcome. The
+/// claim is in the ledger, so it holds across serves on one file and across a restart mid-act:
+/// a request that finds it held is refused `conflict` ("service claim held") before it acts;
+/// one that finds the generation moved is refused `stale_generation`. No in-process lock sits
+/// in front of it: one guard, and every test of it exercises the cross-process path.
 fn action(engine: &Engine, req: &Request, runner: Option<&dyn ServiceRunner>) -> Reply {
     let (service_id, unit_id, act, owner) = action_body(&req.body)?;
-    let lock = SEEDS
-        .iter()
-        .position(|seed| seed.service_id == service_id)
-        .and_then(|i| ACT_LOCKS.get(i))
-        .ok_or_else(not_found)?;
-    let _held = lock.lock().unwrap_or_else(PoisonError::into_inner);
     let op = op_key(engine, req);
     let bytes = body_bytes(&req.body)?;
     if let Some(stored) = engine
@@ -413,8 +436,37 @@ fn action(engine: &Engine, req: &Request, runner: Option<&dyn ServiceRunner>) ->
     if owner != fact.owner_sha256 {
         return Err(owner_conflict());
     }
-    let input = Sha256Hex::digest(&bytes);
-    let outcome = runner_of(runner)?
+    let runner = runner_of(runner)?;
+    if let Some(stale) = engine
+        .store()
+        .service_claim(service_id, pre.generation, &op)
+        .map_err(service_fault)?
+    {
+        report_stale("service.action superseded", &stale);
+    }
+    let expected = Expected {
+        generation: pre.generation,
+        owner_sha256: owner,
+    };
+    let reply = act_and_commit(engine, runner, (&op, &bytes), &fact, act, expected);
+    if let Err(e) = engine.store().service_release(service_id, &op) {
+        eprintln!("service.action claim release failed service_id={service_id}: {e}");
+    }
+    reply
+}
+
+/// The claimed half of `service.action`: `runner.act`, then the CAS commit.
+fn act_and_commit(
+    engine: &Engine,
+    runner: &dyn ServiceRunner,
+    (op, bytes): (&OperationKey, &[u8]),
+    fact: &ServiceFact,
+    act: UnitAction,
+    expected: Expected,
+) -> Reply {
+    let service_id = fact.service_id.as_str();
+    let input = Sha256Hex::digest(bytes);
+    let outcome = runner
         .act(&fact.unit_id, act, &input, &ProbeBudget::DEFAULT)
         .map_err(|e| match &e {
             ActFault::Probe(p) => probe_fault(p),
@@ -430,21 +482,11 @@ fn action(engine: &Engine, req: &Request, runner: Option<&dyn ServiceRunner>) ->
     let health = json_of(&outcome.health)?;
     let operation = engine
         .store()
-        .service_action_commit(
-            &op,
-            &bytes,
-            service_id,
-            Expected {
-                generation: pre.generation,
-                owner_sha256: owner,
-            },
-            &outcome.health,
-            |id| {
-                json!({"operation_id": id, "service_id": service_id,
+        .service_action_commit(op, bytes, service_id, expected, &outcome.health, |id| {
+            json!({"operation_id": id, "service_id": service_id,
                        "owner_job_id": outcome.owner_job_id,
                        "observed_state": outcome.observed_state, "useful_health": health})
-            },
-        )
+        })
         .map_err(service_fault)?;
     Ok((operation.replayed, operation.result))
 }
@@ -778,14 +820,46 @@ mod tests {
         Ok(())
     }
 
+    /// A second serve's engine over `e`'s ledger file: its own `Store` connection, as another
+    /// `hee4 serve` process on the same ledger has.
+    fn second_serve(e: &Engine) -> Result<Engine, Box<dyn std::error::Error>> {
+        let ledger = e.store().path().to_path_buf();
+        let dir = ledger.parent().ok_or("ledger has no directory")?;
+        Ok(Engine::new(
+            hee4_core::Store::open(&ledger)?,
+            ledger.clone(),
+            dir.join("work-2"),
+            dir.join("rt-2"),
+            crate::actions::Config {
+                model: "m:1".into(),
+                live: false,
+            },
+        )?)
+    }
+
+    /// Whether `reply` is the loser's refusal by name: the claim was held, or the generation
+    /// had moved by the time it looked.
+    fn refused_by_name(reply: &Value) -> bool {
+        (reply["code"] == "conflict" && reply["because"] == "service claim held")
+            || (reply["code"] == "stale_generation" && reply["current_generation"] == 2)
+    }
+
     /// Two concurrent requests on one service at one generation, run on two threads against
-    /// a slow stub: `keys` names each request's idempotency key. Returns the replies, as error
-    /// frames or `{"replayed": .., "body": ..}`, and how many times the stub acted.
+    /// a slow stub: `keys` names each request's idempotency key; with `two_serves` the second
+    /// request goes through a second engine over the same ledger file. Returns the replies, as
+    /// error frames or `{"replayed": .., "body": ..}`, and how many times the stub acted.
     fn race(
         name: &str,
         keys: [&str; 2],
+        two_serves: bool,
     ) -> Result<(Vec<Value>, usize), Box<dyn std::error::Error>> {
         let e = ready(name)?;
+        let other = if two_serves {
+            Some(second_serve(&e)?)
+        } else {
+            None
+        };
+        let serves = [&e, other.as_ref().unwrap_or(&e)];
         let mut s = ok_stub()?;
         s.act_ms = 150;
         let reqs = keys
@@ -802,8 +876,9 @@ mod tests {
         let replies = std::thread::scope(|scope| {
             let handles: Vec<_> = reqs
                 .iter()
-                .map(|r| {
-                    let (e, s) = (&e, &s);
+                .zip(serves)
+                .map(|(r, e)| {
+                    let s = &s;
                     scope.spawn(move || match action(e, r, Some(s)) {
                         Ok((replayed, body)) => json!({"replayed": replayed, "body": body}),
                         Err(f) => wire::error("r", &f),
@@ -815,35 +890,101 @@ mod tests {
                 .map(|h| h.join().unwrap_or_else(|_| json!({"panicked": true})))
                 .collect::<Vec<_>>()
         });
+        assert_eq!(
+            e.store().service_claim_get("drive")?,
+            None,
+            "every claim is released after the race: {replies:?}"
+        );
         Ok((replies, s.calls.load(Ordering::SeqCst)))
     }
 
     #[test]
-    fn service_action_concurrent_keys_act_once_and_the_loser_is_stale() -> R {
-        let (replies, calls) = race("svc-race-keys", ["c1", "c2"])?;
+    fn service_action_concurrent_keys_act_once_and_the_loser_is_refused_by_name() -> R {
+        let (replies, calls) = race("svc-race-keys", ["c1", "c2"], false)?;
         assert_eq!(
             calls, 1,
             "only one request reaches the manager: {replies:?}"
         );
         let won = replies.iter().filter(|r| r["replayed"] == false).count();
-        let stale = replies
-            .iter()
-            .filter(|r| r["code"] == "stale_generation" && r["current_generation"] == 2)
-            .count();
-        assert_eq!((won, stale), (1, 1), "{replies:?}");
+        let refused = replies.iter().filter(|r| refused_by_name(r)).count();
+        assert_eq!((won, refused), (1, 1), "{replies:?}");
         Ok(())
     }
 
     #[test]
-    fn service_action_concurrent_same_key_acts_once_and_replays() -> R {
-        let (replies, calls) = race("svc-race-same", ["c1", "c1"])?;
+    fn service_action_concurrent_same_key_acts_once() -> R {
+        let (replies, calls) = race("svc-race-same", ["c1", "c1"], false)?;
         assert_eq!(calls, 1, "a same-key race acts once: {replies:?}");
-        let flags: Vec<_> = replies.iter().map(|r| r["replayed"].clone()).collect();
-        assert!(
-            flags.contains(&json!(false)) && flags.contains(&json!(true)),
-            "{replies:?}"
+        let won = replies
+            .iter()
+            .find(|r| r["replayed"] == false)
+            .ok_or("no request acted")?;
+        let loser = replies
+            .iter()
+            .find(|r| r["replayed"] != false)
+            .ok_or("no loser")?;
+        let replayed = loser["replayed"] == true && loser["body"] == won["body"];
+        let held = loser["code"] == "conflict" && loser["because"] == "service claim held";
+        assert!(replayed || held, "{replies:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn two_serves_on_one_ledger_act_once_and_the_loser_is_refused_by_name() -> R {
+        let (replies, calls) = race("svc-race-serves", ["c1", "c2"], true)?;
+        assert_eq!(
+            calls, 1,
+            "two serves on one ledger reach the manager once: {replies:?}"
         );
-        assert_eq!(replies[0]["body"], replies[1]["body"]);
+        let won = replies.iter().filter(|r| r["replayed"] == false).count();
+        let refused = replies.iter().filter(|r| refused_by_name(r)).count();
+        assert_eq!((won, refused), (1, 1), "{replies:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_claim_left_by_a_serve_that_died_mid_act_refuses_before_acting() -> R {
+        let e = ready("svc-died")?;
+        let s = ok_stub()?;
+        let dead = OperationKey {
+            principal: e.principal.clone(),
+            action: "service.action".into(),
+            version: 1,
+            idem_key: "died".into(),
+        };
+        e.store().service_claim("drive", 1, &dead)?;
+        let restarted = second_serve(&e)?;
+        let r = req(
+            "service.action",
+            Some("after"),
+            action_body(json!({})),
+            Some(pre(1)),
+        )?;
+        let f = err(action(&restarted, &r, Some(&s)));
+        assert_eq!(
+            (
+                f["code"].as_str(),
+                f["field"].as_str(),
+                f["because"].as_str()
+            ),
+            (
+                Some("conflict"),
+                Some("/body/service_id"),
+                Some("service claim held")
+            ),
+            "{f}"
+        );
+        assert_eq!(s.calls.load(Ordering::SeqCst), 0, "the loser never acts");
+        assert_eq!(
+            restarted
+                .store()
+                .operation_by_key(&op_key(&restarted, &r))?,
+            None
+        );
+        assert!(
+            restarted.store().service_claim_get("drive")?.is_some(),
+            "a refused request leaves the holder's claim in place"
+        );
         Ok(())
     }
 
