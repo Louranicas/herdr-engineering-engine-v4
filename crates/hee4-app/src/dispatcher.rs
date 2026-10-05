@@ -103,18 +103,26 @@ pub(crate) fn wants_model(steps: &[Step]) -> bool {
 }
 
 /// TIMEBOX as `<n>s` or `<n> min`; otherwise `default` (the dispatcher passes
-/// `attempt.timebox_default_ms`).
+/// `attempt.timebox_default_ms`). The result never exceeds `ceiling` (the dispatcher passes
+/// `attempt.deadline_ms`, the hard deadline): a count too large for `u64`, or minutes whose
+/// seconds overflow, saturate and are clamped, never wrapped or panicked on.
 #[must_use]
-pub fn timebox(text: &str, default: Duration) -> Duration {
+pub fn timebox(text: &str, default: Duration, ceiling: Duration) -> Duration {
     let t = text.trim();
     let digits: String = t.chars().take_while(char::is_ascii_digit).collect();
-    let n: u64 = digits.parse().unwrap_or(0);
     let unit = t[digits.len()..].trim_start();
-    match (n, unit.chars().next()) {
+    // All ASCII digits, so the only parse failure is overflow: past any ceiling.
+    let n: u64 = if digits.is_empty() {
+        0
+    } else {
+        digits.parse().unwrap_or(u64::MAX)
+    };
+    let asked = match (n, unit.chars().next()) {
         (0, _) => default,
-        (n, Some('m')) => Duration::from_secs(n * 60),
+        (n, Some('m')) => Duration::from_secs(n.saturating_mul(60)),
         (n, _) => Duration::from_secs(n),
-    }
+    };
+    asked.min(ceiling)
 }
 
 /// The first `admitted` task, oldest id first.
@@ -343,6 +351,7 @@ pub fn step(engine: &Engine, cfg: &Config) -> Result<Option<(TaskId, Phase)>, Di
         timebox(
             brief.get(BriefField::Timebox),
             budgets.attempt.timebox_default(),
+            budgets.attempt.deadline(),
         ),
     )? {
         Ok(built) => built,
@@ -676,13 +685,45 @@ mod tests {
 
     #[test]
     fn timebox_parses_seconds_and_minutes() {
-        let default = hee4_contracts::Budgets::DEFAULT.attempt.timebox_default();
-        assert_eq!(timebox("10s", default), Duration::from_secs(10));
-        assert_eq!(timebox("60 min", default), Duration::from_secs(3600));
-        assert_eq!(timebox("soon", default), Duration::from_secs(120));
+        let attempt = hee4_contracts::Budgets::DEFAULT.attempt;
+        let (default, ceiling) = (attempt.timebox_default(), Duration::from_secs(86_400));
+        assert_eq!(timebox("10s", default, ceiling), Duration::from_secs(10));
         assert_eq!(
-            timebox("soon", Duration::from_secs(7)),
+            timebox("60 min", default, ceiling),
+            Duration::from_secs(3600)
+        );
+        assert_eq!(timebox("soon", default, ceiling), Duration::from_secs(120));
+        assert_eq!(
+            timebox("soon", Duration::from_secs(7), ceiling),
             Duration::from_secs(7)
         );
+    }
+
+    /// `attempt.deadline_ms` bounds every timebox: minutes whose seconds overflow `u64`, a
+    /// count wider than `u64`, a plain large count and a default above it all clamp to it.
+    #[test]
+    fn timebox_overflow_and_excess_clamp_to_the_attempt_deadline() {
+        let attempt = hee4_contracts::Budgets::DEFAULT.attempt;
+        let (default, ceiling) = (attempt.timebox_default(), attempt.deadline());
+        assert_eq!(ceiling, Duration::from_secs(1200));
+        let overflow = format!("{} min", u64::MAX / 60 + 1);
+        assert_eq!(timebox(&overflow, default, ceiling), ceiling);
+        assert_eq!(
+            timebox("99999999999999999999999 s", default, ceiling),
+            ceiling
+        );
+        assert_eq!(timebox("60 min", default, ceiling), ceiling);
+        assert_eq!(timebox("1201s", default, ceiling), ceiling);
+        assert_eq!(
+            timebox("1199s", default, ceiling),
+            Duration::from_secs(1199)
+        );
+        assert_eq!(
+            timebox("", Duration::from_secs(5000), ceiling),
+            ceiling,
+            "a default above the deadline is clamped too"
+        );
+        let one_ms = Duration::from_millis(1);
+        assert_eq!(timebox("2s", default, one_ms), one_ms);
     }
 }
