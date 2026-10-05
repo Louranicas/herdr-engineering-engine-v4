@@ -9,7 +9,7 @@
 //! ack").
 //!
 //! The schema is a list of named migrations ([`migrations::MIGRATIONS`]); `open` applies the
-//! ones a file lacks and refuses one it does not know. [`Store::operate`] is the one idempotent
+//! ones a file lacks and refuses one it does not know. `Store::operate` is the one idempotent
 //! operation primitive; [`Store::admit`] is its task-family caller.
 
 mod backup;
@@ -106,7 +106,7 @@ pub struct Admission {
     pub result: Value,
 }
 
-/// What [`Store::operate`] answered: the stored operation, new or replayed.
+/// What `Store::operate` answered: the stored operation, new or replayed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Operation {
     /// `op-` + the first 24 hex digits of sha256 of the key's four fields joined by `\n`.
@@ -416,7 +416,8 @@ fn migrate(tx: &Transaction<'_>) -> Result<usize, StoreError> {
 
 /// The `0::<path>` line of `/proc/self/cgroup`, the cgroup v2 path of this process.
 fn read_serve_cgroup() -> Result<String, StoreError> {
-    let text = std::fs::read_to_string(CGROUP_FILE).map_err(|e| io_at(Path::new(CGROUP_FILE), e))?;
+    let text =
+        std::fs::read_to_string(CGROUP_FILE).map_err(|e| io_at(Path::new(CGROUP_FILE), e))?;
     text.lines()
         .find_map(|line| line.strip_prefix("0::"))
         .map(|p| p.trim_end().to_owned())
@@ -587,7 +588,7 @@ impl Store {
         })
     }
 
-    /// The idempotency door for task admission, a caller of [`Store::operate`]. Same key and
+    /// The idempotency door for task admission, a caller of `Store::operate`. Same key and
     /// same request digest: the stored result, `replayed`. Same key, other digest:
     /// [`StoreError::Conflict`]. New key: `Admit` `task`, compute the result with `f`, record
     /// the operation (subject = the task id), all in one transaction, then commit (fsync).
@@ -988,5 +989,99 @@ impl Store {
             .conn
             .query_row("PRAGMA foreign_keys", [], |r| r.get(0))?;
         Ok((j, s, f))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! `operate` through its crate-private seam: the behaviour `admit` and the wave-2 family
+    //! verbs inherit.
+
+    use super::*;
+    use serde_json::json;
+
+    type R = Result<(), Box<dyn std::error::Error>>;
+
+    fn fresh(name: &str) -> Result<Store, Box<dyn std::error::Error>> {
+        let dir = std::env::temp_dir().join(format!("hee4-core-operate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("{name}.sqlite"));
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+        Ok(Store::open(&path)?)
+    }
+
+    fn key(idem: &str) -> OperationKey {
+        OperationKey {
+            principal: "luke".into(),
+            action: "roster.add".into(),
+            version: 1,
+            idem_key: idem.into(),
+        }
+    }
+
+    #[test]
+    fn operate_replays_same_bytes_conflicts_on_other_bytes_and_rolls_back_an_err() -> R {
+        let store = fresh("operate")?;
+        let first = store.operate(&key("k1"), b"body-A", |_| {
+            Ok((None, Some("roster:alpha".into()), json!({"n": 1})))
+        })?;
+        assert!(!first.replayed);
+        assert_eq!(first.operation_id, operation_id(&key("k1")));
+        assert_eq!(first.subject.as_deref(), Some("roster:alpha"));
+        let replay = store.operate(&key("k1"), b"body-A", |_| Ok((None, None, json!("never"))))?;
+        assert_eq!(
+            (replay.replayed, &replay.operation_id, &replay.result),
+            (true, &first.operation_id, &first.result)
+        );
+        let conflict = store.operate(&key("k1"), b"body-B", |_| Ok((None, None, json!("never"))));
+        assert!(matches!(conflict, Err(StoreError::Conflict(k)) if k == key("k1")));
+
+        let before = store.event_count()?;
+        let task: TaskId = "t-err".parse()?;
+        let err = store.operate(&key("k2"), b"body", |tx| {
+            apply_in(tx, "cg", &task, Event::Admit)?;
+            Err(StoreError::RecoveryIncomplete)
+        });
+        assert!(matches!(err, Err(StoreError::RecoveryIncomplete)));
+        assert_eq!(
+            store.operation_by_key(&key("k2"))?,
+            None,
+            "no row from a failed closure"
+        );
+        assert_eq!(
+            store.event_count()?,
+            before,
+            "the closure's event rolled back too"
+        );
+        assert_eq!(store.phase(&task)?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn last_operation_for_returns_the_newest_of_a_subject() -> R {
+        let store = fresh("newest")?;
+        for (idem, n) in [("k1", 1), ("k2", 2), ("k3", 3)] {
+            store.operate(&key(idem), b"x", |_| {
+                Ok((None, Some("roster:beta".into()), json!({"n": n})))
+            })?;
+        }
+        store.operate(&key("other"), b"x", |_| {
+            Ok((None, Some("roster:gamma".into()), json!({"n": 99})))
+        })?;
+        let newest = store.last_operation_for("roster:beta")?.ok_or("row")?;
+        assert_eq!(
+            (newest.idem_key.as_str(), &newest.result),
+            ("k3", &json!({"n": 3}))
+        );
+        assert_eq!(newest.task_id, None);
+        assert_eq!(
+            store
+                .last_operation_for("roster:gamma")?
+                .map(|r| r.idem_key),
+            Some("other".into())
+        );
+        Ok(())
     }
 }

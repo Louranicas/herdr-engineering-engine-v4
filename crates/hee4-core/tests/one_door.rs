@@ -97,11 +97,7 @@ fn census(src: &Path) -> Result<Census, Box<dyn Error>> {
 fn no_sql_outside_store_dir() -> Result<(), Box<dyn Error>> {
     let src = Path::new(&manifest_dir()?).join("src");
     let c = census(&src)?;
-    assert!(
-        c.files >= 4,
-        "the census looked at {} files",
-        c.files
-    );
+    assert!(c.files >= 4, "the census looked at {} files", c.files);
     assert!(
         !c.door_files.is_empty(),
         "at least one file under src/store/ holds a call: the door exists"

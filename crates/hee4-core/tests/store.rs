@@ -345,3 +345,66 @@ fn a_foreign_event_spelling_is_unreadable_history_never_repaired() -> R {
     );
     Ok(())
 }
+
+#[test]
+fn admit_records_no_operation_and_no_event_when_its_closure_refuses() -> R {
+    let store = ready("admit-refused")?;
+    let t = tid("t1")?;
+    store.apply(&t, Event::Admit)?;
+    let before = store.event_count()?;
+    // The second Admit of an existing task is refused inside operate's closure: nothing lands.
+    let err = store.admit(&t, &op("k-refused"), b"spec", |_, _| json!("never"));
+    assert!(matches!(err, Err(StoreError::Refused(_))), "{err:?}");
+    assert_eq!(store.operation_by_key(&op("k-refused"))?, None);
+    assert_eq!(store.event_count()?, before);
+    Ok(())
+}
+
+#[test]
+fn operation_readbacks_by_key_and_by_subject() -> R {
+    let store = ready("readbacks")?;
+    let t1 = tid("t1")?;
+    let first = store.admit(
+        &t1,
+        &op("k1"),
+        b"spec-A",
+        |id, p| json!({"id": id.as_str(), "state": p.as_str()}),
+    )?;
+    let expected_id = format!(
+        "op-{}",
+        &Sha256Hex::digest(b"luke\ntask.submit\n1\nk1").to_string()[..24]
+    );
+    let row = store.operation_by_key(&op("k1"))?.ok_or("row")?;
+    assert_eq!(row.operation_id, expected_id, "derived, never random");
+    assert_eq!(row.action, "task.submit");
+    assert_eq!(row.idem_key, "k1");
+    assert_eq!(row.task_id, Some(t1.clone()));
+    assert_eq!(row.subject.as_deref(), Some("t1"));
+    assert_eq!(row.result, first.result);
+    let replay = store.admit(&tid("t9")?, &op("k1"), b"spec-A", |_, _| json!("never"))?;
+    assert!(replay.replayed);
+    assert_eq!(
+        store.operation_by_key(&op("k1"))?.map(|r| r.operation_id),
+        Some(expected_id.clone()),
+        "a replay keeps the stored id"
+    );
+    assert_eq!(
+        store.last_operation_for("t1")?.map(|r| r.operation_id),
+        Some(expected_id)
+    );
+    let t2 = tid("t2")?;
+    store.admit(&t2, &op("k2"), b"spec-B", |_, _| json!("second"))?;
+    assert_eq!(
+        store
+            .last_operation_for("t2")?
+            .map(|r| (r.idem_key, r.result)),
+        Some(("k2".into(), json!("second")))
+    );
+    assert_eq!(
+        store.last_operation_for("t1")?.map(|r| r.idem_key),
+        Some("k1".into())
+    );
+    assert_eq!(store.last_operation_for("nobody")?, None);
+    assert_eq!(store.operation_by_key(&op("k-none"))?, None);
+    Ok(())
+}
