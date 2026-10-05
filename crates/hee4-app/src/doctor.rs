@@ -7,8 +7,9 @@ use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _}
 use std::path::Path;
 use std::process::Command;
 
+use hee4_contracts::Budgets;
 use hee4_host::model::OllamaClient;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::{dispatcher::MODEL_URL, socket, wire};
 
@@ -61,17 +62,23 @@ pub fn rows(unit: &str, sock: &Path, repo: &Path) -> Vec<Row> {
         None => row("socket", false, format!("{} absent", sock.display())),
     };
     let health = socket::request(sock, &wire::request("doctor", "health", None, json!({})));
-    let ledger_row = match health {
+    let ledger_row = match &health {
         Ok(v) if v["body"]["recovery_complete"] == true => {
             row("ledger", true, "health recovery_complete=true".into())
         }
         Ok(v) => row("ledger", false, format!("health {v}")),
         Err(e) => row("ledger", false, format!("health: {e}")),
     };
-    let model_row = match OllamaClient::new(MODEL_URL).tags() {
-        Ok(tags) => row("model", true, format!("{MODEL_URL} tags={}", tags.len())),
-        Err(e) => row("model", false, format!("{MODEL_URL}: {e}")),
+    let budgets_row = match &health {
+        Ok(v) => budgets_row(&v["body"]["budgets"]),
+        Err(e) => row("budgets", false, format!("health: {e}")),
     };
+    // The CLI reads no budgets file: the contracts' default tags timeout.
+    let model_row =
+        match OllamaClient::new(MODEL_URL).tags_within(Budgets::DEFAULT.model.tags_timeout()) {
+            Ok(tags) => row("model", true, format!("{MODEL_URL} tags={}", tags.len())),
+            Err(e) => row("model", false, format!("{MODEL_URL}: {e}")),
+        };
     let head = Command::new("git")
         .arg("-C")
         .arg(repo)
@@ -88,7 +95,26 @@ pub fn rows(unit: &str, sock: &Path, repo: &Path) -> Vec<Row> {
             head.get(..12).unwrap_or("unknown")
         ),
     );
-    vec![unit_row, sock_row, ledger_row, model_row, sha_row]
+    vec![
+        unit_row,
+        sock_row,
+        ledger_row,
+        budgets_row,
+        model_row,
+        sha_row,
+    ]
+}
+
+/// `budgets` is present iff `health`'s `body.budgets` re-parses through [`Budgets::parse`]
+/// (validation and rendering stay the contracts'); the detail is [`Budgets::render`].
+fn budgets_row(budgets: &Value) -> Row {
+    if budgets.is_null() {
+        return row("budgets", false, "health carries no budgets".into());
+    }
+    match Budgets::parse(&budgets.to_string()) {
+        Ok(b) => row("budgets", true, b.render()),
+        Err(e) => row("budgets", false, e.to_string()),
+    }
 }
 
 /// Print the rows and the verdict line; `true` when every row is present.
@@ -114,4 +140,20 @@ pub fn render(rows: &[Row]) -> (String, bool) {
         crate::head12()
     );
     (out, pass)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_budgets_row_re_parses_through_the_contracts() -> Result<(), serde_json::Error> {
+        let present = budgets_row(&serde_json::to_value(Budgets::DEFAULT)?);
+        assert_eq!(present, row("budgets", true, Budgets::DEFAULT.render()));
+        let zero = budgets_row(&json!({"door": {"max_body_bytes": 0}}));
+        assert!(!zero.present, "{zero:?}");
+        assert!(zero.detail.contains("door.max_body_bytes"), "{zero:?}");
+        assert!(!budgets_row(&Value::Null).present);
+        Ok(())
+    }
 }

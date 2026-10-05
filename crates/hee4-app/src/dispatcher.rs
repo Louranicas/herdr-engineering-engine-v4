@@ -10,10 +10,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use hee4_contracts::bounds::MAX_VIEW_ITEMS;
 use hee4_contracts::{
     AbandonReason, Brief, BriefField, Event, GitSha, Observation, Phase, ReceiptId, Resolution,
-    Settlement, Sha256Hex, SourceId, TaskId, Verdict,
+    Settlement, Sha256Hex, SourceId, TaskId, Verdict, VerifyLine,
 };
-use hee4_core::StoreError;
 use hee4_core::roster::RosterDefinition;
+use hee4_core::{AttemptId, AttemptStart, StoreError};
 use hee4_evidence::{Identities, Identity, Source, Subject, Why, decide_and_seal, observation_id};
 use hee4_host::model::OllamaClient;
 use hee4_host::model_door::Upstream;
@@ -64,43 +64,29 @@ pub enum DispatchError {
     Contract(#[from] hee4_contracts::Refusal),
 }
 
-/// The playbook named by the brief's VERIFY field: one step per non-empty line. An absolute
-/// path runs in the namespace as a bare argv; `sh: <line>` runs `/bin/sh -c <line>` there, so the
-/// line can use `$HEE4_MODEL_SOCKET`; `model: <prompt>` is a named skip, `Unsupported{kind:
-/// "model"}` (the driver makes no model call; use `sh:`); anything else is a named skip.
+/// The playbook named by the brief's VERIFY field: one step per line of
+/// [`hee4_contracts::VerifyLine::parse_all`], the grammar's only home. The mapping is
+/// exhaustive (no wildcard arm): `Shell` runs `/bin/sh -c <command>` in the namespace, so the
+/// line can use `$HEE4_MODEL_SOCKET`; `Exec` runs the bare argv there; `Unsupported` (a
+/// `model:` line is `Unsupported{kind: "model"}`) is a named skip.
 #[must_use]
 pub fn playbook(verify: &str) -> Vec<Step> {
-    verify
-        .lines()
-        .map(|l| l.trim().trim_start_matches("- ").trim_matches('`'))
-        .filter(|l| !l.is_empty())
+    VerifyLine::parse_all(verify)
+        .into_iter()
         .enumerate()
-        .map(|(i, line)| {
-            let kind = if line.strip_prefix("model:").is_some() {
-                StepKind::Unsupported {
-                    kind: "model".to_owned(),
-                }
-            } else if let Some(cmd) = line.strip_prefix("sh:") {
-                StepKind::Run {
+        .map(|(i, line)| Step {
+            name: format!("verify-{}", i + 1),
+            kind: match line {
+                VerifyLine::Shell { command } => StepKind::Run {
                     program: PathBuf::from("/bin/sh"),
-                    args: vec!["-c".to_owned(), cmd.trim().to_owned()],
-                }
-            } else if line.starts_with('/') {
-                let mut words = line.split_whitespace().map(str::to_owned);
-                let program = PathBuf::from(words.next().unwrap_or_default());
-                StepKind::Run {
-                    program,
-                    args: words.collect(),
-                }
-            } else {
-                StepKind::Unsupported {
-                    kind: line.split_whitespace().next().unwrap_or("").to_owned(),
-                }
-            };
-            Step {
-                name: format!("verify-{}", i + 1),
-                kind,
-            }
+                    args: vec!["-c".to_owned(), command],
+                },
+                VerifyLine::Exec { program, args } => StepKind::Run {
+                    program: PathBuf::from(program),
+                    args,
+                },
+                VerifyLine::Unsupported { kind } => StepKind::Unsupported { kind },
+            },
         })
         .collect()
 }
@@ -116,15 +102,16 @@ pub(crate) fn wants_model(steps: &[Step]) -> bool {
     })
 }
 
-/// TIMEBOX as `<n>s` or `<n> min`; otherwise 120 s.
+/// TIMEBOX as `<n>s` or `<n> min`; otherwise `default` (the dispatcher passes
+/// `attempt.timebox_default_ms`).
 #[must_use]
-pub fn timebox(text: &str) -> Duration {
+pub fn timebox(text: &str, default: Duration) -> Duration {
     let t = text.trim();
     let digits: String = t.chars().take_while(char::is_ascii_digit).collect();
     let n: u64 = digits.parse().unwrap_or(0);
     let unit = t[digits.len()..].trim_start();
     match (n, unit.chars().next()) {
-        (0, _) => Duration::from_secs(120),
+        (0, _) => default,
         (n, Some('m')) => Duration::from_secs(n * 60),
         (n, _) => Duration::from_secs(n),
     }
@@ -229,7 +216,7 @@ fn entry(name: &str, d: &RosterDefinition) -> ModelEntry {
 }
 
 /// Route by floor over `roster`, baseline = the declared model. When the model is needed, one
-/// `tags` call lists what the upstream holds and each row is `Up` exactly when its name is listed
+/// `tags` call (bounded by `tags_timeout`, the `model.tags_timeout_ms` budget) lists what the upstream holds and each row is `Up` exactly when its name is listed
 /// (a name without a tag also matches `<name>:latest`), `Down` otherwise or when the call fails;
 /// when it is not needed every row is `Unknown`, which routes to the declared baseline when it is
 /// in the roster.
@@ -238,11 +225,12 @@ pub(crate) fn route(
     client: &OllamaClient,
     needs_model: bool,
     roster: &Roster,
+    tags_timeout: Duration,
 ) -> Result<Selection, RouteRefusal> {
     if !needs_model {
         return route_with(cfg, roster, |_| Availability::Unknown);
     }
-    let listed = client.tags().unwrap_or_default();
+    let listed = client.tags_within(tags_timeout).unwrap_or_default();
     route_with(cfg, roster, |name| {
         let held = listed
             .iter()
@@ -330,9 +318,16 @@ pub fn step(engine: &Engine, cfg: &Config) -> Result<Option<(TaskId, Phase)>, Di
         );
     }
     let needs_model = wants_model && cfg.live;
+    let budgets = *engine.budgets();
     let client = OllamaClient::new(MODEL_URL);
     let (roster, _) = roster_from_store(engine, cfg)?;
-    let selection = match route(cfg, &client, needs_model, &roster) {
+    let selection = match route(
+        cfg,
+        &client,
+        needs_model,
+        &roster,
+        budgets.model.tags_timeout(),
+    ) {
         Ok(s) => s,
         Err(r) => {
             return Ok(Some((
@@ -341,30 +336,19 @@ pub fn step(engine: &Engine, cfg: &Config) -> Result<Option<(TaskId, Phase)>, Di
             )));
         }
     };
-    let ns = match NamespaceTask::with_door_root(
-        task.clone(),
-        engine.work(),
-        engine.doors(),
+    let (ns, generation) = match workspace(
+        engine,
+        &task,
         needs_model,
-        timebox(brief.get(BriefField::Timebox)),
-    ) {
-        Ok(ns) => ns,
-        Err(e) => {
-            eprintln!("dispatch task={task} cause={e}");
-            return Ok(Some((
-                task.clone(),
-                abandon(engine, &task, AbandonReason::NamespaceRefused)?,
-            )));
-        }
+        timebox(
+            brief.get(BriefField::Timebox),
+            budgets.attempt.timebox_default(),
+        ),
+    )? {
+        Ok(built) => built,
+        Err(abandoned) => return Ok(Some((task.clone(), abandoned))),
     };
     let plan = plan_for(&ns);
-    if let Err(e) = fs::create_dir_all(ns.work_dir()) {
-        eprintln!("dispatch task={task} cause={e}");
-        return Ok(Some((
-            task.clone(),
-            abandon(engine, &task, AbandonReason::WorkDirUnavailable)?,
-        )));
-    }
     let Ok(head) = crate::HEAD.parse::<GitSha>() else {
         return Ok(Some((
             task.clone(),
@@ -375,17 +359,7 @@ pub fn step(engine: &Engine, cfg: &Config) -> Result<Option<(TaskId, Phase)>, Di
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
     let receipt_id: ReceiptId = format!("r-{task}-{nanos:x}").parse()?;
-    let programs = steps
-        .iter()
-        .filter_map(|s| match &s.kind {
-            StepKind::Run { program, .. } => Some(program.clone()),
-            StepKind::Unsupported { .. } => None,
-        })
-        .collect();
-    let permit = Permit::mint(
-        spawn::ReceiptId(receipt_id.to_string()),
-        SpawnScope::of_programs(programs),
-    );
+    let permit = permit_for(&receipt_id, &steps);
 
     let upstream = match Upstream::parse(MODEL_URL) {
         Ok(u) => u,
@@ -399,8 +373,23 @@ pub fn step(engine: &Engine, cfg: &Config) -> Result<Option<(TaskId, Phase)>, Di
     };
 
     apply(engine, &task, Event::Dispatch)?;
-    let attempt =
-        Attempt::new(&selection.model, head.clone()).run(&permit, &plan, upstream, &brief, &steps);
+    let start = AttemptStart {
+        receipt_id: receipt_id.clone(),
+        permit_id: permit.id().0,
+        model: selection.model.clone(),
+        head_sha: head.clone(),
+        workspace: ns.work_dir().to_path_buf(),
+        // No lease is issued: a lease is what R09 compares before licensing reuse, and nothing
+        // here grants reuse of a workspace. `attempt.deadline_ms` is therefore not recorded.
+        lease: None,
+    };
+    let id = match acknowledge(engine, &task, generation, &start)? {
+        Ok(id) => id,
+        Err(stopped) => return Ok(Some((task.clone(), stopped))),
+    };
+    let on_start = |pid: u32, start_ticks: u64| record_pid(engine, &id, pid, start_ticks);
+    let attempt = Attempt::with_budget(&selection.model, head.clone(), budgets.door)
+        .run(&permit, &plan, upstream, &brief, &steps, &on_start);
     let outcome = match attempt {
         Ok(o) => o,
         Err(e) => {
@@ -410,6 +399,143 @@ pub fn step(engine: &Engine, cfg: &Config) -> Result<Option<(TaskId, Phase)>, Di
         }
     };
     settle_and_decide(engine, &task, receipt_id, &permit, &brief, head, &outcome)
+}
+
+/// The attempt's permit: receipt `receipt_id`, scope = the `Run` steps' programs.
+fn permit_for(receipt_id: &ReceiptId, steps: &[Step]) -> Permit {
+    let programs = steps
+        .iter()
+        .filter_map(|s| match &s.kind {
+            StepKind::Run { program, .. } => Some(program.clone()),
+            StepKind::Unsupported { .. } => None,
+        })
+        .collect();
+    Permit::mint(
+        spawn::ReceiptId(receipt_id.to_string()),
+        SpawnScope::of_programs(programs),
+    )
+}
+
+/// S2: a fresh work dir per generation, `<work>/<task>/<generation>` as the namespace's work
+/// root (the namespace appends `/<task>`). The generation the coming `Dispatch` opens is the
+/// latest attempt's plus one; the row it opens is read back after `Dispatch` and must agree.
+/// `Err(phase)` when the task was abandoned (`NamespaceRefused`, `WorkDirUnavailable`).
+fn workspace(
+    engine: &Engine,
+    task: &TaskId,
+    needs_model: bool,
+    timebox: Duration,
+) -> Result<Result<(NamespaceTask, u64), Phase>, StoreError> {
+    let generation = engine
+        .store()
+        .latest_attempt(task)?
+        .map_or(1, |row| row.generation + 1);
+    let work_root = engine
+        .work()
+        .join(task.as_str())
+        .join(generation.to_string());
+    let ns = match NamespaceTask::with_door_root(
+        task.clone(),
+        &work_root,
+        engine.doors(),
+        needs_model,
+        timebox,
+    ) {
+        Ok(ns) => ns,
+        Err(e) => {
+            eprintln!("dispatch task={task} cause={e}");
+            return abandon(engine, task, AbandonReason::NamespaceRefused).map(Err);
+        }
+    };
+    if let Err(e) = fs::create_dir_all(ns.work_dir()) {
+        eprintln!("dispatch task={task} cause={e}");
+        return abandon(engine, task, AbandonReason::WorkDirUnavailable).map(Err);
+    }
+    Ok(Ok((ns, generation)))
+}
+
+/// Read back the row `Dispatch` opened (generation `generation`) and record its start facts
+/// (`Store::attempt_started`) before anything runs. `Err(phase)` when the task was moved instead: a leased workspace is abandoned
+/// `WorkDirUnavailable` with the store's text printed; any other refusal is `Settle(NotReady)`
+/// then `Stop`, never a silent run.
+fn acknowledge(
+    engine: &Engine,
+    task: &TaskId,
+    generation: u64,
+    start: &AttemptStart,
+) -> Result<Result<AttemptId, Phase>, StoreError> {
+    let stop = |cause: &dyn std::fmt::Display| {
+        eprintln!("dispatch task={task} attempt_started error={cause}");
+        apply(engine, task, Event::Settle(Settlement::NotReady))?;
+        apply(engine, task, Event::Stop).map(Err)
+    };
+    let id = match opened_attempt(engine, task, generation) {
+        Ok(id) => id,
+        Err(e) => return stop(&e),
+    };
+    let started = engine.store().attempt_started(&id, start);
+    match started {
+        Ok(()) => {
+            eprintln!(
+                "dispatch task={task} attempt={id} started workspace={}",
+                start.workspace.display()
+            );
+            Ok(Ok(id))
+        }
+        Err(e @ StoreError::WorkspaceLeased { .. }) => {
+            eprintln!("dispatch task={task} attempt_started error={e}");
+            abandon(engine, task, AbandonReason::WorkDirUnavailable).map(Err)
+        }
+        Err(e) => stop(&e),
+    }
+}
+
+/// The attempt's `on_start`: record the worker's `(pid, start_ticks)` on its row. A store
+/// error is printed, not raised: the child is already running.
+fn record_pid(engine: &Engine, id: &AttemptId, pid: u32, start_ticks: u64) {
+    let task = id.task_id();
+    eprintln!("dispatch task={task} attempt={id} pid={pid} start_ticks={start_ticks}");
+    if let Err(e) = engine.store().attempt_pid(id, pid, start_ticks) {
+        eprintln!("dispatch task={task} attempt={id} attempt_pid error={e}");
+    }
+}
+
+/// Why the row `Dispatch` opened could not be read back as this generation's.
+#[derive(Debug, thiserror::Error)]
+enum OpenedFault {
+    /// The ledger failed.
+    #[error("ledger: {0}")]
+    Store(#[from] StoreError),
+    /// No running row for the task after `Dispatch`.
+    #[error("no open attempt after dispatch")]
+    Missing,
+    /// The open row's generation is not the one the work dir was built for.
+    #[error("open attempt {found} is not generation {expected}")]
+    Generation {
+        /// The row read back.
+        found: AttemptId,
+        /// The generation the work dir names.
+        expected: u64,
+    },
+}
+
+/// The id of the attempt `Dispatch` just opened for `task`, read from the ledger (never
+/// formatted here), checked against the generation the work dir was built for.
+fn opened_attempt(engine: &Engine, task: &TaskId, expected: u64) -> Result<AttemptId, OpenedFault> {
+    let row = engine
+        .store()
+        .open_attempts()?
+        .into_iter()
+        .find(|row| row.task_id == *task)
+        .ok_or(OpenedFault::Missing)?;
+    if row.generation == expected {
+        Ok(row.id)
+    } else {
+        Err(OpenedFault::Generation {
+            found: row.id,
+            expected,
+        })
+    }
 }
 
 /// After the attempt: settle, ledger each observation, `decide_and_seal`, append, decide.
@@ -550,8 +676,13 @@ mod tests {
 
     #[test]
     fn timebox_parses_seconds_and_minutes() {
-        assert_eq!(timebox("10s"), Duration::from_secs(10));
-        assert_eq!(timebox("60 min"), Duration::from_secs(3600));
-        assert_eq!(timebox("soon"), Duration::from_secs(120));
+        let default = hee4_contracts::Budgets::DEFAULT.attempt.timebox_default();
+        assert_eq!(timebox("10s", default), Duration::from_secs(10));
+        assert_eq!(timebox("60 min", default), Duration::from_secs(3600));
+        assert_eq!(timebox("soon", default), Duration::from_secs(120));
+        assert_eq!(
+            timebox("soon", Duration::from_secs(7)),
+            Duration::from_secs(7)
+        );
     }
 }

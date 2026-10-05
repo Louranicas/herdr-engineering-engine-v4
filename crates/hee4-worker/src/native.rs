@@ -133,7 +133,7 @@ impl Attempt {
     }
 
     /// The live entry: runs only when `HEE4_LIVE_MODEL=1`; otherwise prints UNMEASURED and
-    /// returns an outcome with every step `Skipped`.
+    /// returns an outcome with every step `Skipped`. `on_start` as in [`Attempt::run`].
     ///
     /// # Errors
     /// As [`Attempt::run`].
@@ -144,9 +144,10 @@ impl Attempt {
         upstream: Upstream,
         brief: &Brief,
         playbook: &[Step],
+        on_start: &dyn Fn(u32, u64),
     ) -> Result<AttemptOutcome, WorkerError> {
         if std::env::var(LIVE_ENV).as_deref() == Ok("1") {
-            return self.run(permit, plan, upstream, brief, playbook);
+            return self.run(permit, plan, upstream, brief, playbook, on_start);
         }
         eprintln!("UNMEASURED: live attempt not run ({LIVE_ENV}!=1)");
         brief.check_restatement()?;
@@ -172,7 +173,9 @@ impl Attempt {
 
     /// Drive `playbook` in order. After a failed step every later step is `Skipped`. When the
     /// plan carries a model door, the door forwards to `upstream` for the whole attempt and is
-    /// closed (socket removed) before this returns.
+    /// closed (socket removed) before this returns. `on_start(pid, start_ticks)` is called once
+    /// per `Run` step, after the child is spawned and before it is waited on: the caller records
+    /// the identity (the worker touches no ledger).
     ///
     /// # Errors
     /// [`WorkerError::Contract`] for a brief with an empty RESTATEMENT or an unparseable token,
@@ -186,6 +189,7 @@ impl Attempt {
         upstream: Upstream,
         brief: &Brief,
         playbook: &[Step],
+        on_start: &dyn Fn(u32, u64),
     ) -> Result<AttemptOutcome, WorkerError> {
         brief.check_restatement()?;
         let start = Instant::now();
@@ -217,7 +221,7 @@ impl Attempt {
                         let t0 = Instant::now();
                         let before = (out.stdout.len(), out.exit);
                         out.exit = None;
-                        let status = run_step(permit, plan, program, args, &mut out)?;
+                        let status = run_step(permit, plan, program, args, &mut out, on_start)?;
                         let stdout = out.stdout.get(before.0..).unwrap_or_default().to_vec();
                         let ob = self.command_observation(
                             input,
@@ -355,6 +359,7 @@ fn run_step(
     program: &std::path::Path,
     args: &[String],
     out: &mut AttemptOutcome,
+    on_start: &dyn Fn(u32, u64),
 ) -> Result<StepStatus, WorkerError> {
     let sp = spawn::plan(
         permit,
@@ -364,7 +369,9 @@ fn run_step(
         },
         plan.clone(),
     )?;
-    match spawn::run(sp) {
+    let started = spawn::start(sp)?;
+    on_start(started.pid, started.start_ticks);
+    match started.wait() {
         Ok(o) => {
             out.stdout.extend_from_slice(&o.stdout);
             out.stderr.extend_from_slice(&o.stderr);
@@ -501,7 +508,14 @@ mod tests {
         );
         let direct = format!("http://127.0.0.1:{port}/api/tags");
         let direct_step = run_step("direct-mock", "/usr/bin/curl", &["-sS", "-m", "3", &direct]);
-        let o = a.run(&permit, &plan, up, &brief, &[through, direct_step])?;
+        let o = a.run(
+            &permit,
+            &plan,
+            up,
+            &brief,
+            &[through, direct_step],
+            &|_, _| {},
+        )?;
         let stdout = String::from_utf8_lossy(&o.stdout);
         let stderr = String::from_utf8_lossy(&o.stderr);
         println!(
@@ -549,7 +563,7 @@ mod tests {
             "/usr/bin/curl",
             &["-sS", "-m", "3", "http://127.0.0.1:11434/"],
         );
-        let o = a.run(&permit, &plan, up, &brief, &[ollama])?;
+        let o = a.run(&permit, &plan, up, &brief, &[ollama], &|_, _| {})?;
         println!(
             "SANDBOX negative: curl http://127.0.0.1:11434/ -> {:?} stderr={}",
             o.steps[0].status,
@@ -599,7 +613,7 @@ mod tests {
                 r#"/usr/bin/curl -sS -m 5 --unix-socket "$HEE4_MODEL_SOCKET" http://model/api/tags; /usr/bin/curl -sS -m 5 --unix-socket "$HEE4_MODEL_SOCKET" http://model/api/tags"#,
             ],
         );
-        let o = a.run(&permit, &plan, up, &brief, &[twice])?;
+        let o = a.run(&permit, &plan, up, &brief, &[twice], &|_, _| {})?;
         println!(
             "SANDBOX 429: two curls through the door under max_requests=1 -> {:?} stdout={}",
             o.steps[0].status,
@@ -678,7 +692,7 @@ mod tests {
                 },
             },
         ];
-        let o = a.run(&permit, &plan, closed()?, &brief, &playbook)?;
+        let o = a.run(&permit, &plan, closed()?, &brief, &playbook, &|_, _| {})?;
         assert_eq!(
             o.steps.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
             vec!["ask", "review"]
@@ -705,8 +719,14 @@ mod tests {
         }
         let (permit, plan, brief, a) = fixture("echo", false, &["/usr/bin/echo"])?;
         let step = run_step("echo", "/usr/bin/echo", &["hi"]);
-        match a.run(&permit, &plan, closed()?, &brief, &[step]) {
+        let seen = std::cell::RefCell::new(Vec::new());
+        let on_start = |pid: u32, ticks: u64| seen.borrow_mut().push((pid, ticks));
+        match a.run(&permit, &plan, closed()?, &brief, &[step], &on_start) {
             Ok(o) => {
+                // on_start fired once, with the spawned child's identity, before the wait.
+                let seen = seen.borrow();
+                assert_eq!(seen.len(), 1, "{seen:?}");
+                assert!(seen[0].0 > 0 && seen[0].1 > 0, "{seen:?}");
                 assert_eq!(o.stdout, b"hi\n");
                 assert_eq!(o.exit, Some(0));
                 assert!(o.elapsed > Duration::ZERO);
@@ -723,7 +743,7 @@ mod tests {
     fn run_step_out_of_scope_is_a_host_refusal() -> R {
         let (permit, plan, brief, a) = fixture("scope", false, &[])?;
         let step = run_step("x", "/usr/bin/echo", &[]);
-        let res = a.run(&permit, &plan, closed()?, &brief, &[step]);
+        let res = a.run(&permit, &plan, closed()?, &brief, &[step], &|_, _| {});
         assert!(matches!(res, Err(WorkerError::Host(_))));
         Ok(())
     }
@@ -735,7 +755,14 @@ mod tests {
             return Ok(());
         }
         let (permit, plan, brief, a) = fixture("live", true, &[])?;
-        let o = a.run_live(&permit, &plan, closed()?, &brief, &[model_step()])?;
+        let o = a.run_live(
+            &permit,
+            &plan,
+            closed()?,
+            &brief,
+            &[model_step()],
+            &|_, _| {},
+        )?;
         assert!(
             matches!(&o.steps[0].status, StepStatus::Skipped { reason } if reason.contains(LIVE_ENV))
         );

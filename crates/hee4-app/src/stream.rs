@@ -18,20 +18,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
 use std::time::Duration;
 
-use hee4_contracts::{Event, TaskId, TaskState};
+use hee4_contracts::{Event, StreamBudget, TaskId, TaskState};
 use rusqlite::{Connection, OpenFlags, params};
 use serde_json::{Value, json};
 
 use crate::actions::Engine;
 use crate::wire::{self, Code};
-
-/// Frames a subscriber may fall behind before it is dropped (API Map A-10 queue bound).
-pub const QUEUE_FRAMES: usize = 256;
-
-/// Rows read from the ledger per poll.
-const BATCH: i64 = 256;
-
-const POLL: Duration = Duration::from_millis(100);
 
 /// Why the reader stopped offering frames.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,13 +58,14 @@ struct Row {
     nth: usize,
 }
 
-fn rows_after(conn: &Connection, after: i64) -> rusqlite::Result<Vec<Row>> {
+/// Up to `batch` (`stream.batch_rows`) rows after `after`, in `seq` order.
+fn rows_after(conn: &Connection, after: i64, batch: i64) -> rusqlite::Result<Vec<Row>> {
     let mut stmt = conn.prepare_cached(
         "SELECT e.seq, e.task_id, e.ts,
                 (SELECT count(*) FROM events x WHERE x.task_id = e.task_id AND x.seq <= e.seq)
          FROM events e WHERE e.seq > ?1 ORDER BY e.seq LIMIT ?2",
     )?;
-    stmt.query_map(params![after, BATCH], |r| {
+    stmt.query_map(params![after, batch], |r| {
         Ok(Row {
             seq: r.get(0)?,
             task: r.get(1)?,
@@ -131,10 +124,12 @@ fn read_ledger(
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(|e| e.to_string())?;
+    let budget = engine.budgets().stream;
+    let batch = i64::try_from(budget.batch_rows).unwrap_or(i64::MAX);
     while !closed.load(Ordering::Acquire) {
-        let rows = rows_after(&conn, cursor).map_err(|e| e.to_string())?;
+        let rows = rows_after(&conn, cursor, batch).map_err(|e| e.to_string())?;
         let Some(last) = rows.last().map(|r| r.seq) else {
-            std::thread::sleep(POLL);
+            std::thread::sleep(budget.poll());
             continue;
         };
         if let Err(stop) = offer(tx, frames(engine, &rows)?) {
@@ -145,16 +140,13 @@ fn read_ledger(
     Ok(Stop::Gone)
 }
 
-/// Deadline for the `slow_consumer` close frame: the peer's buffer is probably full, so the
-/// write must not wait on it.
-const CLOSE_DEADLINE: Duration = Duration::from_millis(200);
-
-/// Send the `slow_consumer` close frame, best effort: when the write misses its deadline the
-/// peer sees EOF and the server logs it.
-fn write_close(writer: &mut UnixStream) -> std::io::Result<()> {
+/// Send the `slow_consumer` close frame, best effort, under `deadline`
+/// (`stream.close_deadline_ms`: the peer's buffer is probably full, so the write must not wait
+/// on it): when the write misses it the peer sees EOF and the server logs it.
+fn write_close(writer: &mut UnixStream, deadline: Duration) -> std::io::Result<()> {
     let close = wire::close(Code::SlowConsumer, "queue full; resubscribe with since_seq");
     let sent = writer
-        .set_write_timeout(Some(CLOSE_DEADLINE))
+        .set_write_timeout(Some(deadline))
         .and_then(|()| writer.write_all(format!("{close}\n").as_bytes()));
     if let Err(e) = &sent {
         eprintln!("slow_consumer close frame not delivered ({e})");
@@ -163,18 +155,19 @@ fn write_close(writer: &mut UnixStream) -> std::io::Result<()> {
 }
 
 /// Write frames from `rx` until the client closes or the reader stops; a slow consumer gets
-/// a `slow_consumer` close frame first.
+/// a `slow_consumer` close frame first. `budget` is the engine's stream budget.
 fn write_frames(
     writer: &mut UnixStream,
     rx: &Receiver<Value>,
     slow: &AtomicBool,
     closed: &AtomicBool,
+    budget: StreamBudget,
 ) -> std::io::Result<()> {
     loop {
         if slow.load(Ordering::Acquire) {
-            return write_close(writer);
+            return write_close(writer, budget.close_deadline());
         }
-        match rx.recv_timeout(POLL) {
+        match rx.recv_timeout(budget.poll()) {
             Ok(frame) => writer.write_all(format!("{frame}\n").as_bytes())?,
             Err(RecvTimeoutError::Timeout) if closed.load(Ordering::Acquire) => return Ok(()),
             Err(RecvTimeoutError::Timeout) => {}
@@ -199,7 +192,10 @@ pub fn run(mut writer: UnixStream, engine: Arc<Engine>, since_seq: i64) -> std::
         while matches!(watch.read(&mut sink), Ok(n) if n > 0) {}
         watch_closed.store(true, Ordering::Release);
     });
-    let (tx, rx) = sync_channel(QUEUE_FRAMES);
+    let budget = engine.budgets().stream;
+    // `stream.queue_frames`: frames a subscriber may fall behind before it is dropped (API Map
+    // A-10 queue bound).
+    let (tx, rx) = sync_channel(usize::try_from(budget.queue_frames).unwrap_or(usize::MAX));
     let reader_closed = Arc::clone(&closed);
     let reader_slow = Arc::clone(&slow);
     std::thread::spawn(
@@ -212,7 +208,7 @@ pub fn run(mut writer: UnixStream, engine: Arc<Engine>, since_seq: i64) -> std::
             Err(e) => eprintln!("events.subscribe reader stopped: {e}"),
         },
     );
-    let result = write_frames(&mut writer, &rx, &slow, &closed);
+    let result = write_frames(&mut writer, &rx, &slow, &closed, budget);
     if result.is_err() && slow.load(Ordering::Acquire) {
         // The writer itself was stuck on a full peer buffer, so the close frame was never tried.
         eprintln!("slow_consumer close frame not delivered (writer blocked)");
@@ -231,7 +227,7 @@ mod tests {
     -> std::io::Result<()> {
         use std::io::{BufRead as _, BufReader};
         let (mut server, client) = UnixStream::pair()?;
-        assert!(write_close(&mut server).is_ok());
+        assert!(write_close(&mut server, StreamBudget::DEFAULT.close_deadline()).is_ok());
         let mut line = String::new();
         BufReader::new(&client).read_line(&mut line)?;
         assert!(line.contains("slow_consumer"), "{line}");
@@ -243,7 +239,7 @@ mod tests {
         while server.write(&[b'x'; 4096]).is_ok() {}
         server.set_nonblocking(false)?;
         let t0 = std::time::Instant::now();
-        assert!(write_close(&mut server).is_err());
+        assert!(write_close(&mut server, StreamBudget::DEFAULT.close_deadline()).is_err());
         assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
         Ok(())
     }

@@ -13,7 +13,7 @@ use hee4_core::Store;
 use hee4_core::receipts::VerifyError;
 use serde_json::{Value, json};
 
-const USAGE: &str = "usage: hee4 --version | serve --socket P --ledger P --work D | doctor [--unit U] [--socket P] [--repo D] | verify-ledger --ledger P
+const USAGE: &str = "usage: hee4 --version | serve --socket P --ledger P --work D [--budgets F] | doctor [--unit U] [--socket P] [--repo D] | verify-ledger --ledger P
        | health | task.list | task.get ID | task.cancel ID --key K | task.submit --brief-file F --key K   [--socket P]
        | <action> [--key K] [--body JSON | --body-file F] [--precondition JSON] [--socket P]   (any catalogued action)";
 
@@ -65,6 +65,10 @@ fn main() -> ExitCode {
                 socket: sock,
                 ledger: ledger.into(),
                 work: work.into(),
+                // The one place a budgets path is named: the flag, else the unit's env.
+                budgets: flag(&args, "--budgets")
+                    .map(PathBuf::from)
+                    .or_else(|| std::env::var_os("HEE4_BUDGETS").map(PathBuf::from)),
             };
             match hee4_app::serve(&serve, &dispatcher::Config::from_env()) {
                 Ok(()) => ExitCode::SUCCESS,

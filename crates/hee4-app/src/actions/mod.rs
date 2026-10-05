@@ -18,8 +18,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use hee4_contracts::TaskId;
 use hee4_contracts::catalogue::{self, PreconditionRule};
+use hee4_contracts::{Budgets, TaskId};
 use hee4_core::{Store, StoreError};
 use serde_json::Value;
 
@@ -65,6 +65,7 @@ pub struct Engine {
     principal: String,
     registry: Registry,
     boot: u64,
+    budgets: Budgets,
 }
 
 impl Engine {
@@ -93,6 +94,7 @@ impl Engine {
                 .map_or_else(|| "uid:unknown".into(), |u| format!("uid:{u}")),
             registry: composed()?,
             boot: unix_nanos(),
+            budgets: Budgets::DEFAULT,
         })
     }
 
@@ -138,6 +140,20 @@ impl Engine {
     #[must_use]
     pub fn boot(&self) -> u64 {
         self.boot
+    }
+
+    /// The same engine under `budgets`: the one value `serve` loaded and validated at startup
+    /// (`Engine::new` starts from [`Budgets::DEFAULT`]). Every app limit reads [`Engine::budgets`].
+    #[must_use]
+    pub fn with_budgets(mut self, budgets: Budgets) -> Self {
+        self.budgets = budgets;
+        self
+    }
+
+    /// The budgets every app limit reads (socket, stream, attempt, dispatcher, recovery, model).
+    #[must_use]
+    pub fn budgets(&self) -> &Budgets {
+        &self.budgets
     }
 }
 

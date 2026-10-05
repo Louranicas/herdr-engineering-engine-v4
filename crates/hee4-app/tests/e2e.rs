@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use hee4_app::{socket, wire};
-use hee4_contracts::{Receipt, Verdict};
+use hee4_app::{doctor, socket, wire};
+use hee4_contracts::{Budgets, Receipt, Verdict};
 use serde_json::{Value, json};
 
 type R<T> = Result<T, Box<dyn Error>>;
@@ -36,16 +36,21 @@ struct Server {
 }
 
 fn start(dir: &Path, log: &str) -> R<Server> {
-    start_with(dir, log, false)
+    start_with(dir, log, false, &[])
 }
 
-fn start_with(dir: &Path, log: &str, live: bool) -> R<Server> {
+/// `hee4 serve` over `dir` with `env` set (and `HEE4_BUDGETS` removed unless `env` names it).
+fn start_with(dir: &Path, log: &str, live: bool, env: &[(&str, &Path)]) -> R<Server> {
     let sock = dir.join("rt/control.sock");
     let mut cmd = Command::new(BIN);
     if live {
         cmd.env("HEE4_LIVE_MODEL", "1");
     } else {
         cmd.env_remove("HEE4_LIVE_MODEL");
+    }
+    cmd.env_remove("HEE4_BUDGETS");
+    for (k, v) in env {
+        cmd.env(k, v);
     }
     let child = cmd
         .args(["serve", "--socket"])
@@ -98,6 +103,68 @@ fn poll(
     Err(format!("timed out; trace {trace:?}").into())
 }
 
+/// One `attempts` row, read through a read-only connection (SELECT only), as
+/// `(receipt_id, workspace, pid, state, closed_seq, outcome)`.
+type AttemptCols = (
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    String,
+    Option<i64>,
+    Option<String>,
+);
+
+fn attempt_row(ledger: &Path, id: &str) -> R<Option<AttemptCols>> {
+    let conn =
+        rusqlite::Connection::open_with_flags(ledger, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut stmt = conn.prepare(
+        "SELECT receipt_id, workspace, pid, state, closed_seq, outcome FROM attempts WHERE id = ?1",
+    )?;
+    let mut rows = stmt.query_map([id], |r| {
+        Ok((
+            r.get(0)?,
+            r.get(1)?,
+            r.get(2)?,
+            r.get(3)?,
+            r.get(4)?,
+            r.get(5)?,
+        ))
+    })?;
+    Ok(rows.next().transpose()?)
+}
+
+/// The ids of `task`'s attempts, generation order (SELECT only).
+fn attempt_ids(ledger: &Path, task: &str) -> R<Vec<String>> {
+    let conn =
+        rusqlite::Connection::open_with_flags(ledger, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut stmt =
+        conn.prepare("SELECT id FROM attempts WHERE task_id = ?1 ORDER BY generation")?;
+    let ids = stmt
+        .query_map([task], |r| r.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ids)
+}
+
+/// Poll the attempt row until the worker's pid is recorded (`on_start` → `attempt_pid`).
+fn wait_for_pid(ledger: &Path, id: &str) -> R<i64> {
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(30) {
+        if let Some((_, _, Some(pid), _, _, _)) = attempt_row(ledger, id)? {
+            return Ok(pid);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Err(format!("{id}: no pid recorded").into())
+}
+
+/// The serve log line `recovery task=<task> ...`.
+fn recovery_line(log: &str, task: &str) -> Option<String> {
+    let prefix = format!("recovery task={task} ");
+    log.lines()
+        .find(|l| l.starts_with(&prefix))
+        .map(str::to_owned)
+}
+
 fn receipts(ledger: &Path, task: &str) -> R<Vec<Receipt>> {
     let conn =
         rusqlite::Connection::open_with_flags(ledger, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
@@ -127,10 +194,94 @@ fn assert_health_fields(sock: &Path) -> R<()> {
         body["serve_cgroup"].as_str().is_some_and(|s| !s.is_empty()),
         "{health}"
     );
+    let budgets = Budgets::parse(&serde_json::to_string(&body["budgets"])?)?;
+    println!("MEASURED health budgets {}", budgets.render());
     println!(
         "MEASURED health schema_version={} serve_cgroup={}",
         body["schema_version"], body["serve_cgroup"]
     );
+    Ok(())
+}
+
+/// The orphaned bwrap child (FLOW Gaps: it can outlive `kill -9`) is the test's to clean up,
+/// by the pid the ledger recorded: R06 is observe-only, so a live one would park the task.
+fn kill_orphan(pid: i64) {
+    let proc_dir = PathBuf::from(format!("/proc/{pid}"));
+    let alive = proc_dir.exists();
+    let _ = Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .status();
+    println!("MEASURED task B worker pid={pid} alive_after_sigkill={alive}");
+    let t0 = Instant::now();
+    while proc_dir.exists() && t0.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Task B's generation-1 row after the restart: acknowledged, its workspace
+/// `<work>/<b>/1/<b>`, the recorded pid, closed `unknown` by recovery.
+fn assert_b_row_closed_unknown(dir: &Path, b_task: &str, pid: i64) -> R<()> {
+    let workspace = dir.join("work").join(b_task).join("1").join(b_task);
+    let (receipt_id, ws, pid_col, state, closed_seq, _) =
+        attempt_row(&dir.join("ledger.sqlite3"), &format!("a-{b_task}-1"))?
+            .ok_or("no attempt row for B")?;
+    println!(
+        "MEASURED attempt a-{b_task}-1 receipt_id={receipt_id:?} workspace={ws:?} pid={pid_col:?} state={state} closed_seq={closed_seq:?}"
+    );
+    assert!(receipt_id.is_some());
+    assert_eq!(ws.as_deref(), workspace.to_str());
+    assert_eq!(pid_col, Some(pid));
+    assert_eq!(state, "unknown");
+    assert!(closed_seq.is_some());
+    Ok(())
+}
+
+/// `hee4 doctor`'s rows against this serve: `budgets` is present with the default render
+/// (the other rows may be MISSING here: no unit, maybe no model).
+fn assert_doctor_budgets_row(sock: &Path) -> R<()> {
+    let rows = doctor::rows("hee4-e2e-absent.service", sock, Path::new("."));
+    let budgets_row = rows
+        .iter()
+        .find(|r| r.name == "budgets")
+        .ok_or("no budgets row")?;
+    assert!(budgets_row.present, "{budgets_row:?}");
+    assert_eq!(budgets_row.detail, Budgets::DEFAULT.render());
+    print!("{}", doctor::render(&rows).0);
+    Ok(())
+}
+
+/// ACCEPTANCE 14: copy the stopped kill-9 ledger to `<dir>/planted` and plant away `attempt`'s
+/// acknowledgement facts and pid (the one write this test makes; the server is stopped).
+fn plant_unacknowledged(dir: &Path, attempt: &str) -> R<PathBuf> {
+    let planted = dir.join("planted");
+    fs::create_dir_all(&planted)?;
+    for suffix in ["", "-wal", "-shm"] {
+        let from = dir.join(format!("ledger.sqlite3{suffix}"));
+        if from.exists() {
+            fs::copy(&from, planted.join(format!("ledger.sqlite3{suffix}")))?;
+        }
+    }
+    let conn = rusqlite::Connection::open(planted.join("ledger.sqlite3"))?;
+    let n = conn.execute(
+        "UPDATE attempts SET receipt_id = NULL, permit_id = NULL, model = NULL, head_sha = NULL,
+             workspace = NULL, deadline_ms = NULL, clock_epoch = NULL, pid = NULL,
+             pid_start_ticks = NULL
+         WHERE id = ?1",
+        [attempt],
+    )?;
+    assert_eq!(n, 1);
+    Ok(planted)
+}
+
+/// Serve the planted copy: no acknowledgement and no pid is the `DispatchUnacknowledged` class.
+fn assert_unacknowledged_class(planted: &Path, task: &str) -> R<()> {
+    let mut server = start(planted, "serve-planted.log")?;
+    let log = fs::read_to_string(planted.join("serve-planted.log"))?;
+    let line = recovery_line(&log, task).ok_or_else(|| format!("no line: {log}"))?;
+    println!("serve-planted.log: {line}");
+    assert!(line.contains("reason=DispatchUnacknowledged"), "{line}");
+    server.child.kill()?;
+    server.child.wait()?;
     Ok(())
 }
 
@@ -154,6 +305,9 @@ fn one_task_end_to_end_then_kill9_mid_dispatch() -> R<()> {
     assert_eq!((dir_mode, sock_mode), (0o700, 0o600));
 
     assert_health_fields(&sock)?;
+    let log1 = fs::read_to_string(dir.join("serve-1.log"))?;
+    assert!(log1.contains(" budgets=default"), "{log1}");
+    assert_doctor_budgets_row(&sock)?;
 
     // Task A: the silent fixture VERIFY, no live model.
     let a = call(
@@ -193,7 +347,7 @@ fn one_task_end_to_end_then_kill9_mid_dispatch() -> R<()> {
     )?;
     assert_eq!(replay["replayed"], true);
 
-    // Task B: a long step, killed mid-dispatch.
+    // Task B: a long step, killed mid-dispatch once the worker's identity is recorded.
     let b = call(
         &sock,
         "task.submit",
@@ -201,21 +355,24 @@ fn one_task_end_to_end_then_kill9_mid_dispatch() -> R<()> {
         json!({ "brief": brief("/usr/bin/sleep 30") }),
     )?;
     let b_id = b["body"]["task_id"].clone();
+    let b_task = b_id.as_str().ok_or("id")?.to_owned();
+    let b_attempt = format!("a-{b_task}-1");
+    let ledger = dir.join("ledger.sqlite3");
     let mut trace_b = vec!["admitted".to_owned()];
     poll(&sock, &b_id, |p| p == "running", &mut trace_b)?;
+    let pid = wait_for_pid(&ledger, &b_attempt)?;
     server.child.kill()?; // SIGKILL
     server.child.wait()?;
     trace_b.push("<SIGKILL>".into());
+    kill_orphan(pid);
+    let planted = plant_unacknowledged(&dir, &b_attempt)?;
 
     let mut server = start(&dir, "serve-2.log")?;
     let health = call(&server.sock, "health", None, json!({}))?;
     assert_eq!(health["body"]["recovery_complete"], true);
     let after = poll(&server.sock, &b_id, |_| true, &mut trace_b)?;
     let phase = after["body"]["phase"].as_str().unwrap_or("?");
-    assert!(
-        TERMINAL.contains(&phase) || ["effect_unknown", "blocked"].contains(&phase),
-        "{phase}"
-    );
+    assert_eq!(phase, "effect_unknown", "{after}");
     println!("task B {b_id} trace {}", trace_b.join(" -> "));
     println!("health after restart {}", health["body"]);
     for log in ["serve-1.log", "serve-2.log"] {
@@ -224,15 +381,19 @@ fn one_task_end_to_end_then_kill9_mid_dispatch() -> R<()> {
         }
     }
     let log2 = fs::read_to_string(dir.join("serve-2.log"))?;
+    let probe = format!("recovery probe attempt={b_attempt} custody=");
+    assert_eq!(log2.matches(&probe).count(), 1, "{log2}");
+    let line = recovery_line(&log2, &b_task).ok_or_else(|| format!("no line: {log2}"))?;
     assert!(
-        log2.contains("R07ProcessNotOurs") || log2.contains("R08WorkerAbsent"),
-        "{log2}"
+        line.contains("rule=R08WorkerAbsent reason=AcknowledgedWorkerLost")
+            && line.contains("workspace=NotLeasedWritable"),
+        "{line}"
     );
+    assert_b_row_closed_unknown(&dir, &b_task, pid)?;
     server.child.kill()?;
     server.child.wait()?;
-    // The orphaned bwrap child of task B (if still alive) is the test's to clean up.
-    let work = dir.join("work").to_string_lossy().into_owned();
-    let _ = Command::new("pkill").args(["-KILL", "-f", &work]).status();
+
+    assert_unacknowledged_class(&planted, &b_task)?;
     Ok(())
 }
 
@@ -351,7 +512,7 @@ fn an_oversize_line_is_refused_by_name_then_closed() -> R<()> {
     let mut server = start(&dir, "serve.log")?;
     let mut s = UnixStream::connect(&server.sock)?;
     s.set_read_timeout(Some(Duration::from_secs(10)))?;
-    let junk = vec![b'a'; wire::MAX_FRAME_BYTES + 2];
+    let junk = vec![b'a'; usize::try_from(Budgets::DEFAULT.socket.frame_bytes)? + 2];
     s.write_all(&junk)?;
     let mut r = BufReader::new(s);
     let mut line = String::new();
@@ -379,9 +540,16 @@ fn the_connection_after_the_cap_is_refused_by_name_and_health_still_answers() ->
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("e2e-cap");
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir)?;
-    let mut server = start(&dir, "serve.log")?;
+    let file = dir.join("budgets.json");
+    fs::write(&file, r#"{"socket":{"max_connections":2}}"#)?;
+    let mut server = start_with(&dir, "serve.log", false, &[("HEE4_BUDGETS", &file)])?;
+    let log = fs::read_to_string(dir.join("serve.log"))?;
+    assert!(
+        log.contains(&format!(" budgets=file:{}", file.display())),
+        "{log}"
+    );
     let mut held = Vec::new();
-    for _ in 0..socket::MAX_CONNECTIONS {
+    for _ in 0..2 {
         held.push(UnixStream::connect(&server.sock)?);
     }
     let extra = UnixStream::connect(&server.sock)?;
@@ -390,7 +558,13 @@ fn the_connection_after_the_cap_is_refused_by_name_and_health_still_answers() ->
     BufReader::new(&extra).read_line(&mut line)?;
     let v: Value = serde_json::from_str(&line)?;
     assert_eq!(v["code"], "too_many_connections", "{v}");
-    println!("MEASURED connection {} -> {v}", socket::MAX_CONNECTIONS + 1);
+    assert!(
+        v["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("2 connections are open")),
+        "{v}"
+    );
+    println!("MEASURED connection 3 -> {v}");
     // An admitted connection is unharmed: health answers on it.
     let mut first = held.remove(0);
     first.set_read_timeout(Some(Duration::from_secs(10)))?;
@@ -399,7 +573,9 @@ fn the_connection_after_the_cap_is_refused_by_name_and_health_still_answers() ->
     BufReader::new(&first).read_line(&mut line)?;
     let h: Value = serde_json::from_str(&line)?;
     assert_eq!(h["body"]["ok"], true, "{h}");
-    // Closing one frees a slot.
+    assert_eq!(h["body"]["budgets"]["socket"]["max_connections"], 2, "{h}");
+    // Closing them frees the slots.
+    drop(first);
     drop(held);
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(
@@ -408,6 +584,106 @@ fn the_connection_after_the_cap_is_refused_by_name_and_health_still_answers() ->
     );
     server.child.kill()?;
     server.child.wait()?;
+    Ok(())
+}
+
+/// A budgets file with a zero field: `hee4 serve` exits non-zero naming the field, by the
+/// env and by the flag, before the ledger is opened or the socket bound.
+#[test]
+fn a_budgets_refusal_names_the_field_and_serve_does_not_listen() -> R<()> {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("e2e-budgets-refused");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir)?;
+    let file = dir.join("b.json");
+    fs::write(&file, r#"{"door":{"max_body_bytes":0}}"#)?;
+    for by_flag in [false, true] {
+        let mut cmd = Command::new(BIN);
+        cmd.env_remove("HEE4_BUDGETS")
+            .args(["serve", "--socket"])
+            .arg(dir.join("rt/control.sock"))
+            .arg("--ledger")
+            .arg(dir.join("ledger.sqlite3"))
+            .arg("--work")
+            .arg(dir.join("work"));
+        if by_flag {
+            cmd.arg("--budgets").arg(&file);
+        } else {
+            cmd.env("HEE4_BUDGETS", &file);
+        }
+        let out = cmd.output()?;
+        let stderr = String::from_utf8(out.stderr)?;
+        println!(
+            "MEASURED by_flag={by_flag} status={} stderr={stderr}",
+            out.status
+        );
+        assert!(!out.status.success(), "{stderr}");
+        assert!(stderr.contains("hee4 serve refused: budgets:"), "{stderr}");
+        assert!(stderr.contains("max_body_bytes"), "{stderr}");
+        assert!(!dir.join("rt/control.sock").exists());
+        assert!(!dir.join("ledger.sqlite3").exists());
+    }
+    Ok(())
+}
+
+/// `true` when the contracts' attempt budget carries `max_generations` (the repair leg's bound).
+fn max_generations_present() -> R<bool> {
+    let attempt = serde_json::to_value(Budgets::DEFAULT)?["attempt"].clone();
+    Ok(attempt.get("max_generations").is_some())
+}
+
+/// D6 repair leg. `attempt.max_generations` is absent from K0's `AttemptBudget`, so no repair
+/// is dispatched: this test measures today's parking (generation 1 in `<work>/<t>/1/<t>`,
+/// settled `not_ready`, `failed`, no receipt) and prints the named gap. It fails once the field
+/// lands, so the redispatch assertions are written then.
+#[test]
+fn a_failed_step_is_redispatched_in_a_fresh_generation_dir() -> R<()> {
+    if max_generations_present()? {
+        return Err("attempt.max_generations landed: write the redispatch assertions".into());
+    }
+    println!("UNMEASURED: attempt.max_generations absent");
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("e2e-repair");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir)?;
+    let mut server = start(&dir, "serve.log")?;
+    let verify = r#"sh: /usr/bin/test "$(/usr/bin/basename "$(/usr/bin/dirname "$(/usr/bin/pwd -P)")")" = 2"#;
+    let t = call(
+        &server.sock,
+        "task.submit",
+        Some("key-repair"),
+        json!({ "brief": brief(verify) }),
+    )?;
+    assert_eq!(t["kind"], "result", "{t}");
+    let id = t["body"]["task_id"].clone();
+    let task = id.as_str().ok_or("id")?.to_owned();
+    let mut trace = vec!["admitted".to_owned()];
+    let done = poll(&server.sock, &id, |p| TERMINAL.contains(&p), &mut trace)?;
+    println!("repair task {task} trace {}", trace.join(" -> "));
+    assert_eq!(done["body"]["phase"], "failed", "{done}");
+    let ledger = dir.join("ledger.sqlite3");
+    assert_eq!(attempt_ids(&ledger, &task)?, vec![format!("a-{task}-1")]);
+    let (_, ws, _, state, _, outcome) =
+        attempt_row(&ledger, &format!("a-{task}-1"))?.ok_or("no row")?;
+    let gen1 = dir.join("work").join(&task).join("1").join(&task);
+    assert_eq!(ws.as_deref(), gen1.to_str());
+    assert!(gen1.is_dir());
+    assert_eq!(
+        (state.as_str(), outcome.as_deref()),
+        ("settled", Some("not_ready"))
+    );
+    assert_eq!(receipts(&ledger, &task)?.len(), 0);
+    server.child.kill()?;
+    server.child.wait()?;
+    Ok(())
+}
+
+/// D6 bound: a repair that never passes ends `failed` after `attempt.max_generations`
+/// dispatches. Gated on the same absent field.
+#[test]
+fn a_repair_that_never_passes_stops_after_max_generations() -> R<()> {
+    if max_generations_present()? {
+        return Err("attempt.max_generations landed: write the exhaustion assertions".into());
+    }
+    println!("UNMEASURED: attempt.max_generations absent");
     Ok(())
 }
 
@@ -720,7 +996,7 @@ fn live_model_attempt_through_the_door() -> R<()> {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("e2e-live");
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir)?;
-    let mut server = start_with(&dir, "serve-live.log", true)?;
+    let mut server = start_with(&dir, "serve-live.log", true, &[])?;
     let verify = r#"sh: /usr/bin/curl -sS -m 60 --unix-socket "$HEE4_MODEL_SOCKET" http://model/api/generate -d '{"model":"qwen2.5:0.5b","prompt":"Say exactly: hee4 ok","stream":false}'"#;
     let sub = call(
         &server.sock,

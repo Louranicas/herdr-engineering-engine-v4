@@ -1,7 +1,8 @@
 //! `hee4-app` (K6): the `hee4` binary's parts. Startup order, the control socket, the actions
 //! (catalogue + owner registry), the synchronous dispatcher and `doctor`. See `FLOW.md`.
 //!
-//! Startup: `Store::open` → `recovery::reconcile` → `Engine::new` (composes the registry) →
+//! Startup: the budgets file (`--budgets`/`HEE4_BUDGETS`, else the default) →
+//! `Store::open` → `probe::observe(open_attempts)` → `recovery::reconcile` → `Engine::new` (composes the registry) →
 //! the families' `on_serve_start` → dispatcher thread → bind → serve. A
 //! mutating action is refused `not_ready` while the ledger's `recovery_complete` is false.
 
@@ -14,11 +15,11 @@ pub mod stream;
 pub mod wire;
 
 use std::os::unix::fs::MetadataExt as _;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
-use hee4_core::{Observations, ProcessCustody, Store, reconcile};
+use hee4_contracts::{BudgetParseError, Budgets};
+use hee4_core::{Store, probe, reconcile};
 
 /// The build commit (`git rev-parse HEAD` at build time, or `unknown`).
 pub const HEAD: &str = env!("HEE4_HEAD");
@@ -48,37 +49,6 @@ pub fn process_uid() -> Option<u32> {
     std::fs::metadata("/proc/self").ok().map(|m| m.uid())
 }
 
-/// The startup worker probe of the work dir. A task whose `<work>/<task_id>` appears in a live
-/// process's argv is `PidReused` (alive, and not this process's to re-attach: R07); every other
-/// task's worker is `Absent` (R08). MEASURED: a bwrap child outlives `kill -9` of `hee4` (it is
-/// re-parented to the user manager), so absence is probed, not assumed.
-///
-/// # Errors
-/// The ledger's task list.
-pub fn probe_workers(store: &Store, work: &Path) -> Result<Observations, hee4_core::StoreError> {
-    let mut argvs: Vec<(String, Vec<String>)> = Vec::new();
-    for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
-        let pid = entry.file_name().to_string_lossy().into_owned();
-        if pid.bytes().all(|b| b.is_ascii_digit())
-            && let Ok(raw) = std::fs::read(entry.path().join("cmdline"))
-        {
-            let argv = raw
-                .split(|b| *b == 0)
-                .map(|a| String::from_utf8_lossy(a).into_owned());
-            argvs.push((pid, argv.collect()));
-        }
-    }
-    let mut observed = Observations::worker_absent();
-    for task in store.task_ids()? {
-        let dir = work.join(task.as_str()).to_string_lossy().into_owned();
-        if let Some((pid, _)) = argvs.iter().find(|(_, argv)| argv.contains(&dir)) {
-            eprintln!("recovery probe task={task} live_worker_pid={pid} custody=PidReused");
-            observed.process.insert(task, ProcessCustody::PidReused);
-        }
-    }
-    Ok(observed)
-}
-
 /// `hee4 serve` arguments.
 #[derive(Debug, Clone)]
 pub struct ServeArgs {
@@ -88,11 +58,25 @@ pub struct ServeArgs {
     pub ledger: PathBuf,
     /// Work root.
     pub work: PathBuf,
+    /// The budgets file (`--budgets P`, else `HEE4_BUDGETS`); `None` is [`Budgets::DEFAULT`].
+    pub budgets: Option<PathBuf>,
 }
 
 /// Why `serve` stopped.
 #[derive(Debug, thiserror::Error)]
 pub enum ServeError {
+    /// The budgets file could not be read; the engine does not open the ledger.
+    #[error("budgets: {path}: {source}")]
+    BudgetsFile {
+        /// The file named by `--budgets` or `HEE4_BUDGETS`.
+        path: PathBuf,
+        /// The read error.
+        source: std::io::Error,
+    },
+    /// The budgets file did not parse or a field failed validation (the text names the
+    /// field, e.g. `budgets: door.max_body_bytes is zero`); the engine does not open the ledger.
+    #[error("{0}")]
+    Budgets(#[from] BudgetParseError),
     /// The ledger failed.
     #[error("ledger: {0}")]
     Store(#[from] hee4_core::StoreError),
@@ -118,17 +102,49 @@ pub enum ServeError {
 /// # Errors
 /// [`ServeError`].
 pub fn serve(args: &ServeArgs, cfg: &dispatcher::Config) -> Result<(), ServeError> {
+    let budgets = match &args.budgets {
+        None => Budgets::DEFAULT,
+        Some(path) => Budgets::parse(&std::fs::read_to_string(path).map_err(|source| {
+            ServeError::BudgetsFile {
+                path: path.clone(),
+                source,
+            }
+        })?)?,
+    };
+    let budgets_from = args
+        .budgets
+        .as_ref()
+        .map_or_else(|| "default".to_owned(), |p| format!("file:{}", p.display()));
     if let Some(dir) = args.ledger.parent() {
         std::fs::create_dir_all(dir)?;
     }
     std::fs::create_dir_all(&args.work)?;
     let store = Store::open(&args.ledger)?;
-    let report = reconcile(&store, &probe_workers(&store, &args.work)?)?;
+    let open = store.open_attempts()?;
+    let observed = probe::observe(&open, budgets.recovery.workspace_readback_bytes);
+    for row in &open {
+        eprintln!(
+            "recovery probe attempt={} custody={:?} workspace={:?}",
+            row.id,
+            observed
+                .process
+                .get(&row.task_id)
+                .copied()
+                .unwrap_or_default(),
+            observed.workspace.get(&row.id).copied().unwrap_or_default()
+        );
+    }
+    let report = reconcile(&store, &observed)?;
     for row in &report.rows {
         eprintln!(
-            "recovery task={} rule={:?} {} -> {}",
+            "recovery task={} rule={} reason={} workspace={} {} -> {}",
             row.task_id,
-            row.rule,
+            row.rule
+                .map_or_else(|| "none".to_owned(), |r| format!("{r:?}")),
+            row.reason
+                .map_or_else(|| "none".to_owned(), |r| format!("{r:?}")),
+            row.workspace
+                .map_or_else(|| "none".to_owned(), |w| format!("{w:?}")),
             row.before.as_str(),
             row.after.as_str()
         );
@@ -136,16 +152,19 @@ pub fn serve(args: &ServeArgs, cfg: &dispatcher::Config) -> Result<(), ServeErro
     if !report.complete {
         return Err(ServeError::Recovery(report.findings.len()));
     }
-    let engine = Arc::new(actions::Engine::new(
-        store,
-        args.ledger.clone(),
-        args.work.clone(),
-        // The door root is the control socket's dir: the runtime dir in production, short.
-        args.socket
-            .parent()
-            .map_or_else(|| PathBuf::from("/"), std::path::Path::to_path_buf),
-        cfg.clone(),
-    )?);
+    let engine = Arc::new(
+        actions::Engine::new(
+            store,
+            args.ledger.clone(),
+            args.work.clone(),
+            // The door root is the control socket's dir: the runtime dir in production, short.
+            args.socket
+                .parent()
+                .map_or_else(|| PathBuf::from("/"), std::path::Path::to_path_buf),
+            cfg.clone(),
+        )?
+        .with_budgets(budgets),
+    );
     engine.registry().on_serve_start(&engine)?;
     let worker = Arc::clone(&engine);
     let cfg = cfg.clone();
@@ -153,17 +172,17 @@ pub fn serve(args: &ServeArgs, cfg: &dispatcher::Config) -> Result<(), ServeErro
         loop {
             match dispatcher::step(&worker, &cfg) {
                 Ok(Some(_)) => {}
-                Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+                Ok(None) => std::thread::sleep(budgets.dispatcher.idle()),
                 Err(e) => {
                     eprintln!("dispatch error: {e}");
-                    std::thread::sleep(Duration::from_secs(1));
+                    std::thread::sleep(budgets.dispatcher.error_backoff());
                 }
             }
         }
     });
     let listener = socket::bind(&args.socket)?;
     eprintln!(
-        "hee4 {VERSION} {} serving socket={} peer_check={:?} recovery_applied={} catalogue={}",
+        "hee4 {VERSION} {} serving socket={} peer_check={:?} recovery_applied={} catalogue={} budgets={budgets_from}",
         head12(),
         args.socket.display(),
         socket::PEER_CHECK,
