@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+"""habitat-backup [--dest DIR] [--codebase GIT] [--evidence DIR] [--handoffs DIR] [--keep K] [--log FILE]
+               [--service] [--control]
+
+The habitat backup (ATLAS D5(c)): the codebase (`git bundle create --all` of the bare mirror), the
+evidence home and the handoffs, copied into <dest>/h-<UTC stamp>/ on a DIFFERENT physical disk from
+every source. Not the ledger backup: `hee4 serve` takes that one itself (D5(a)); this is no ledger daemon.
+Order of a run:
+  1. every source must exist (`refused reason=missing_source source=<name> path=<p>`), and the dest
+     (or its nearest existing parent) must sit on another st_dev than each source
+     (`refused reason=same_device source=<name> dest=<p> dev=<n>`); a refusal writes nothing.
+  2. under an exclusive flock on <dest>/.lock: copy into h-<stamp>.partial/, write manifest.json LAST
+     (tmp + rename; {"objects": n, "files": {rel: sha256}, ...}), then rename the dir to h-<stamp>.
+  3. prune: keep the newest --keep complete backups (names h-<stamp> holding a manifest); older ones
+     and leftover *.partial dirs go. Nothing else under <dest> is touched.
+Last line:
+  habitat-backup verdict=PASS|FAIL objects=<n> bytes=<b> backup=<id> dest=<p> keep=<k> pruned=<n> [reason=...]
+Exit 0 PASS, 20 FAIL (the roster contract: PASS 0, PASS_WITH_GAPS 10, FAIL 20, no verdict line 30).
+--service: what hee4-backup.service runs. Runs this tool as a child, prints and appends its output to
+  --log (default ~/.local/state/hee4/habitat-backup.log), and exits with the code DERIVED from the
+  child's last `verdict=` line, never the child's own rc: a crash with no verdict line exits 30.
+--control: in a disposable dir under ~/.cache/hee4-host, plants a same-device dest and a missing source;
+  each must be refused by name with nothing written. When a dir on another device exists (the temp dir),
+  a third case runs a real backup there and checks the manifest. Last line
+  `habitat-backup control cases=k/n verdict=PASS|FAIL`.
+"""
+import argparse, fcntl, hashlib, json, os, re, shutil, subprocess, sys, tempfile, time
+
+HOME = os.path.expanduser("~")
+DEFAULTS = {
+    "dest": os.path.join(HOME, ".local", "share", "hee4-habitat-backups"),
+    "codebase": "/mnt/storage-10tb/hee4-origin.git",
+    "evidence": os.environ.get("HEE4_EVIDENCE", "/mnt/storage-10tb/hee4-evidence"),
+    "handoffs": os.environ.get("HEE4_HANDOFFS", "/mnt/storage-10tb/handoffs"),
+    "log": os.path.join(HOME, ".local", "state", "hee4", "habitat-backup.log"),
+}
+EXIT = {"PASS": 0, "PASS_WITH_GAPS": 10, "FAIL": 20}
+NO_VERDICT = 30
+COMPLETE = re.compile(r"^h-\d{8}T\d{6}-\d{6}Z$")
+PARTIAL = re.compile(r"^h-\d{8}T\d{6}-\d{6}Z\.partial$")
+VERDICT = re.compile(r"\bverdict=(PASS_WITH_GAPS|PASS|FAIL)\b")
+
+
+def exit_for(text):
+    """The exit code from the LAST `verdict=` line of `text`; 30 when there is none."""
+    for line in reversed(text.splitlines()):
+        m = VERDICT.search(line)
+        if m:
+            return EXIT[m.group(1)]
+    return NO_VERDICT
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def existing_parent(path):
+    p = os.path.abspath(path)
+    while not os.path.exists(p):
+        p = os.path.dirname(p)
+    return p
+
+
+def admit(sources, dest):
+    """Refusal lines (empty when admitted): every source exists, and none shares the dest's device."""
+    out = []
+    for name, path in sources:
+        if not os.path.exists(path):
+            out.append(f"refused reason=missing_source source={name} path={path}")
+    dev = os.stat(existing_parent(dest)).st_dev
+    for name, path in sources:
+        if os.path.exists(path) and os.stat(path).st_dev == dev:
+            out.append(f"refused reason=same_device source={name} dest={dest} dev={dev}")
+    return out
+
+
+def copy_sources(sources, into):
+    for name, path in sources:
+        if name == "codebase":
+            r = subprocess.run(["git", "-C", path, "bundle", "create", os.path.join(into, "codebase.bundle"), "--all"],
+                               capture_output=True, text=True, timeout=1200, stdin=subprocess.DEVNULL)
+            if r.returncode != 0:
+                raise OSError(f"git bundle rc={r.returncode}: {(r.stderr.strip().splitlines() or ['?'])[-1]}")
+        else:  # shutil.copy, not copy2: copies take the run's mtime, so the manifest is provably the newest file
+            shutil.copytree(path, os.path.join(into, name), symlinks=True, copy_function=shutil.copy)
+
+
+def manifest_files(root):
+    files = {}
+    for d, dirs, names in os.walk(root):
+        dirs.sort()
+        for n in sorted(names):
+            p = os.path.join(d, n)
+            rel = os.path.relpath(p, root)
+            files[rel] = f"symlink:{os.readlink(p)}" if os.path.islink(p) else sha256_file(p)
+    return files
+
+
+def prune(dest, keep):
+    names = sorted(os.listdir(dest))
+    complete = [n for n in names if COMPLETE.match(n) and os.path.isfile(os.path.join(dest, n, "manifest.json"))]
+    gone = complete[:-keep] if keep > 0 else complete
+    gone += [n for n in names if PARTIAL.match(n)]
+    for n in gone:
+        shutil.rmtree(os.path.join(dest, n))
+    return len(gone)
+
+
+def backup(a):
+    sources = [("codebase", a.codebase), ("evidence", a.evidence), ("handoffs", a.handoffs)]
+    tail = f"dest={a.dest} keep={a.keep}"
+    refusals = admit(sources, a.dest)
+    if refusals:
+        for line in refusals:
+            print(f"habitat-backup {line}")
+        print(f"habitat-backup verdict=FAIL objects=0 bytes=0 backup=none {tail} pruned=0 {refusals[0].split()[1]}")
+        return EXIT["FAIL"]
+    os.makedirs(a.dest, mode=0o700, exist_ok=True)
+    with open(os.path.join(a.dest, ".lock"), "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        now = time.time()
+        bid = time.strftime("h-%Y%m%dT%H%M%S", time.gmtime(now)) + f"-{int(now % 1 * 1e6):06d}Z"
+        part = os.path.join(a.dest, bid + ".partial")
+        try:
+            os.mkdir(part, 0o700)
+            copy_sources(sources, part)
+            files = manifest_files(part)
+            size = sum(os.lstat(os.path.join(part, f)).st_size for f in files)
+            man = {"id": bid, "ts": int(now), "objects": len(files), "bytes": size, "files": files,
+                   "sources": {n: {"path": p, "dev": os.stat(p).st_dev} for n, p in sources}}
+            tmp = os.path.join(part, "manifest.json.tmp")
+            with open(tmp, "w") as f:
+                json.dump(man, f, indent=1, sort_keys=True)
+                f.flush(); os.fsync(f.fileno())
+            os.rename(tmp, os.path.join(part, "manifest.json"))
+            os.rename(part, os.path.join(a.dest, bid))
+            pruned = prune(a.dest, a.keep)
+        except (OSError, subprocess.SubprocessError, shutil.Error) as e:
+            print(f"habitat-backup verdict=FAIL objects=0 bytes=0 backup={bid} {tail} pruned=0 reason=copy_failed "
+                  f"detail={str(e).replace(' ', '_')[:200]}")
+            return EXIT["FAIL"]
+    print(f"habitat-backup verdict=PASS objects={len(files)} bytes={size} backup={bid} {tail} pruned={pruned}")
+    return EXIT["PASS"]
+
+
+def service(a, argv):
+    child = [sys.executable, os.path.abspath(__file__)] + [x for x in argv if x != "--service"]
+    try:
+        r = subprocess.run(child, capture_output=True, text=True, timeout=3600, stdin=subprocess.DEVNULL)
+        out = r.stdout + (r.stderr and f"habitat-backup child_stderr={r.stderr.strip().splitlines()[-1]!r}\n")
+        rc_child = r.returncode
+    except (OSError, subprocess.TimeoutExpired) as e:
+        out, rc_child = f"habitat-backup child_error={e!r}\n", None
+    code = exit_for(out)
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    text = f"habitat-backup run ts={stamp} child_rc={rc_child} exit={code}\n{out}"
+    sys.stdout.write(text)
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(a.log)), mode=0o700, exist_ok=True)
+        with open(a.log, "a") as f:
+            f.write(text if text.endswith("\n") else text + "\n")
+    except OSError as e:
+        print(f"habitat-backup log_unwritable={e!r}")
+    return code
+
+
+def control():
+    root = os.path.join(HOME, ".cache", "hee4-host")
+    os.makedirs(root, exist_ok=True)
+    ctl = tempfile.mkdtemp(prefix="hb-control-", dir=root)
+    met, n = 0, 0
+    try:
+        src = os.path.join(ctl, "src")
+        bare = os.path.join(src, "origin.git")
+        work = os.path.join(ctl, "work")
+        g = lambda *x: subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *x], check=True, capture_output=True)
+        g("init", "-q", work)
+        with open(os.path.join(work, "a.txt"), "w") as f:
+            f.write("a\n")
+        g("-C", work, "add", "-A"); g("-C", work, "commit", "-qm", "one")
+        g("clone", "-q", "--bare", work, bare)
+        for d in ("evidence/reviews", "handoffs"):
+            os.makedirs(os.path.join(src, d))
+        for rel in ("evidence/reviews/r.md", "evidence/e.txt", "handoffs/h.md"):
+            with open(os.path.join(src, rel), "w") as f:
+                f.write(rel + "\n")
+        me = os.path.abspath(__file__)
+
+        def run(dest, evidence):
+            r = subprocess.run([sys.executable, me, "--dest", dest, "--codebase", bare, "--evidence", evidence,
+                                "--handoffs", os.path.join(src, "handoffs")], capture_output=True, text=True, timeout=600)
+            return r.returncode, r.stdout
+
+        cases = [("same_device", os.path.join(ctl, "dest-same"), os.path.join(src, "evidence"),
+                  "refused reason=same_device source=codebase"),
+                 ("missing_source", os.path.join(ctl, "dest-missing"), os.path.join(src, "evidence-absent"),
+                  "refused reason=missing_source source=evidence")]
+        for name, dest, ev, want in cases:
+            n += 1
+            rc, out = run(dest, ev)
+            last = (out.splitlines() or [""])[-1]
+            hit = rc == EXIT["FAIL"] and want in out and "verdict=FAIL" in last and not os.path.exists(dest)
+            met += hit
+            print(f"control case={name} rc={rc} refused_by_name={'yes' if want in out else 'no'} "
+                  f"dest_written={'yes' if os.path.exists(dest) else 'no'} detected={'yes' if hit else 'no'} line={last}")
+        other = tempfile.gettempdir()
+        if os.stat(other).st_dev != os.stat(src).st_dev:
+            n += 1
+            dest = tempfile.mkdtemp(prefix="hb-control-dest-", dir=other)
+            try:
+                rc, out = run(dest, os.path.join(src, "evidence"))
+                last = (out.splitlines() or [""])[-1]
+                done = [d for d in os.listdir(dest) if COMPLETE.match(d)]
+                ok = rc == 0 and "verdict=PASS objects=4 " in last and len(done) == 1
+                if ok:
+                    man = json.load(open(os.path.join(dest, done[0], "manifest.json")))
+                    ok = man["objects"] == 4 and sorted(man["files"]) == [
+                        "codebase.bundle", "evidence/e.txt", "evidence/reviews/r.md", "handoffs/h.md"]
+                met += ok
+                print(f"control case=other_device_backup rc={rc} detected={'yes' if ok else 'no'} line={last}")
+            finally:
+                shutil.rmtree(dest, ignore_errors=True)
+        else:
+            print(f"control case=other_device_backup skipped reason=no_other_device temp={other}")
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError) as e:
+        print(f"control error={e!r}")
+    finally:
+        shutil.rmtree(ctl, ignore_errors=True)
+    v = "PASS" if n >= 2 and met == n else "FAIL"
+    print(f"habitat-backup control cases={met}/{n} verdict={v}")
+    return 0 if v == "PASS" else 1
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    ap = argparse.ArgumentParser(prog="habitat-backup", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    for k in ("dest", "codebase", "evidence", "handoffs", "log"):
+        ap.add_argument(f"--{k}", default=DEFAULTS[k])
+    ap.add_argument("--keep", type=int, default=14)
+    ap.add_argument("--service", action="store_true")
+    ap.add_argument("--control", action="store_true")
+    a = ap.parse_args(argv)
+    if a.keep < 1:
+        print(f"habitat-backup verdict=FAIL objects=0 bytes=0 backup=none dest={a.dest} keep={a.keep} pruned=0 reason=keep_below_1")
+        return EXIT["FAIL"]
+    if a.control:
+        return control()
+    if a.service:
+        return service(a, argv)
+    return backup(a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
