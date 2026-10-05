@@ -5,14 +5,15 @@
 //! Parses the wire, calls K1, defines no contract type. Every operation key's action is the
 //! request's own `action`, so no roster id is spelled into the ledger here either.
 //!
-//! Active attempts of a disabled record (INTERP until K1-attempts-ledger lands): the tasks in
-//! `running`, `verifying` or `cancellation_requested` when the record is the model `route` would
-//! select now. The `forbidden` (operator capability) path has no reachable site: no grants exist
-//! (owner: the grants slice).
+//! Active attempts of a disabled record are read from K1's attempts ledger
+//! (`Store::open_attempts`): the tasks whose open attempt row was acknowledged on that model
+//! (`started.model` equals the id's model name). An unacknowledged row (`started` is `None`)
+//! never matches: the `Dispatch` event that opened it names no model. The `forbidden` (operator
+//! capability) path has no reachable site: no grants exist (owner: the grants slice).
 
 use hee4_contracts::bounds::MAX_VIEW_ITEMS;
 use hee4_contracts::catalogue::Owner;
-use hee4_contracts::{Event, Phase, TaskId};
+use hee4_contracts::{Event, TaskId};
 use hee4_core::roster::{
     DisablePolicy, Locality, RosterCaps, RosterDefinition, RosterError, RosterFilter, RosterId,
     RosterKind,
@@ -23,7 +24,6 @@ use serde_json::{Value, json};
 use super::page::{Cursor, PageIn, PageOut};
 use super::registry::{Family, StartFault};
 use super::{Answer, Engine, Reply, internal};
-use crate::dispatcher;
 use crate::wire::{Code, Fault, Precondition, Request};
 
 /// The four `roster.*` handlers and the deploy-record hook: owner `Roster`.
@@ -328,29 +328,20 @@ fn update(engine: &Engine, req: &Request) -> Reply {
     Ok((operation.replayed, reply))
 }
 
-/// The tasks mid-attempt on `id` now (module doc INTERP): empty unless `id` is the model the
-/// dispatcher selects over the stored roster, evaluated as the dispatcher does when live
-/// (`route_as_dispatched`: no upstream call from a roster path).
+/// The tasks with an open attempt on `id` now, in task id order: every running attempts row
+/// whose acknowledged model is `id`'s model name. A record that is not a `model:` id, and an
+/// unacknowledged row, list nothing.
 fn active_attempts(engine: &Engine, id: &RosterId) -> Result<Vec<TaskId>, Fault> {
-    let (roster, _) =
-        dispatcher::roster_from_store(engine, &engine.cfg).map_err(|e| internal(&e))?;
-    let selected = dispatcher::route_as_dispatched(&engine.cfg, &roster)
-        .ok()
-        .map(|s| s.model);
-    if selected.as_deref() != id.model_name() {
+    let Some(model) = id.model_name() else {
         return Ok(Vec::new());
-    }
-    let store = engine.store();
-    let mut active = Vec::new();
-    for task in store.task_ids().map_err(|e| internal(&e))? {
-        let mid_attempt = matches!(
-            store.phase(&task).map_err(|e| internal(&e))?,
-            Some(Phase::Running | Phase::Verifying | Phase::CancellationRequested)
-        );
-        if mid_attempt {
-            active.push(task);
-        }
-    }
+    };
+    let rows = engine.store().open_attempts().map_err(|e| internal(&e))?;
+    let mut active: Vec<TaskId> = rows
+        .into_iter()
+        .filter(|row| row.started.as_ref().is_some_and(|s| s.model == model))
+        .map(|row| row.task_id)
+        .collect();
+    active.dedup();
     Ok(active)
 }
 
@@ -444,7 +435,10 @@ mod tests {
     use super::*;
     use crate::actions::handle;
     use crate::actions::testing::{BRIEF, engine};
+    use crate::dispatcher;
     use crate::wire;
+    use hee4_contracts::Phase;
+    use hee4_core::{AttemptId, AttemptStart};
     use hee4_core::{Observations, reconcile};
 
     type R = Result<(), Box<dyn std::error::Error>>;
@@ -488,6 +482,119 @@ mod tests {
 
     fn precondition(id: &str, generation: u64) -> Value {
         json!({"resource": "roster", "id": id, "generation": generation})
+    }
+
+    /// Submit a task (`brief` admitted under `key`) and dispatch it: running, with its open
+    /// attempts row `a-<task>-1` unacknowledged.
+    fn dispatched(
+        e: &Engine,
+        key: &str,
+        brief: &str,
+    ) -> Result<TaskId, Box<dyn std::error::Error>> {
+        let submit = call(e, "task.submit", Some(key), json!({ "brief": brief }));
+        let task: TaskId = submit["body"]["task_id"]
+            .as_str()
+            .ok_or_else(|| format!("submit {key}: {submit}"))?
+            .parse()?;
+        e.store().apply(&task, Event::Dispatch)?;
+        assert_eq!(e.store().phase(&task)?, Some(Phase::Running));
+        Ok(task)
+    }
+
+    /// Acknowledge `task`'s first attempt on `model`, as the dispatcher does before it runs.
+    fn acknowledged(e: &Engine, task: &TaskId, model: &str) -> R {
+        e.store().attempt_started(
+            &AttemptId::new(task, 1),
+            &AttemptStart {
+                receipt_id: format!("r-{task}-test").parse()?,
+                permit_id: 1,
+                model: model.into(),
+                head_sha: "a".repeat(40).parse()?,
+                workspace: std::env::temp_dir()
+                    .join("hee4-roster-attempts")
+                    .join(task.as_str()),
+                lease: None,
+            },
+        )?;
+        Ok(())
+    }
+
+    fn create_model(e: &Engine, name: &str) {
+        let created = call(
+            e,
+            "roster.update",
+            Some(&format!("add-{name}")),
+            json!({"record_id": format!("model:{name}"), "definition": default_definition().to_json(), "audit_reason": "add"}),
+        );
+        assert_eq!(created["body"]["change"], "created", "{created}");
+    }
+
+    #[test]
+    fn disable_lists_only_attempts_on_that_model() -> R {
+        let e = ready("roster-disable-two-models")?;
+        create_model(&e, "a");
+        create_model(&e, "b");
+        let (roster, _) = dispatcher::roster_from_store(&e, &e.cfg)?;
+        let eligible: Vec<&str> = roster.models.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(eligible, ["a", "b"], "two eligible models");
+        let t1 = dispatched(&e, "s1", BRIEF)?;
+        let t2 = dispatched(&e, "s2", &BRIEF.replace("run test", "run test twice"))?;
+        assert_ne!(t1, t2);
+        acknowledged(&e, &t1, "a")?;
+        acknowledged(&e, &t2, "b")?;
+        let done = call_with(
+            &e,
+            "roster.disable",
+            Some("d1"),
+            json!({"record_id": "model:a", "active_attempt_policy": "request_cancel", "audit_reason": "retire"}),
+            precondition("model:a", 1),
+        );
+        assert_eq!(done["kind"], "result", "{done}");
+        assert_eq!(done["body"]["active_attempts"], json!([t1.as_str()]));
+        assert_eq!(
+            done["body"]["cancellation_obligations"],
+            json!([{"task_id": t1.as_str(), "phase_after": "cancellation_requested"}])
+        );
+        assert_eq!(e.store().phase(&t1)?, Some(Phase::CancellationRequested));
+        assert_eq!(
+            e.store().phase(&t2)?,
+            Some(Phase::Running),
+            "t2 runs on model:b"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn disable_of_the_routed_model_with_no_open_rows_lists_none() -> R {
+        let e = ready("roster-disable-routed-none")?;
+        let hook = FAMILY.on_serve_start.ok_or("hook")?;
+        hook(&e)?;
+        create_model(&e, "b");
+        let preview = call(&e, "task.preview", None, json!({ "brief": BRIEF }));
+        assert_eq!(
+            preview["body"]["model"], "m:1",
+            "m:1 is the routed model: {preview}"
+        );
+        let on_b = dispatched(&e, "s1", BRIEF)?;
+        acknowledged(&e, &on_b, "b")?;
+        let unacknowledged = dispatched(&e, "s2", &BRIEF.replace("run test", "run test twice"))?;
+        let done = call_with(
+            &e,
+            "roster.disable",
+            Some("d1"),
+            json!({"record_id": "model:m:1", "active_attempt_policy": "request_cancel", "audit_reason": "retire"}),
+            precondition("model:m:1", 1),
+        );
+        assert_eq!(done["kind"], "result", "{done}");
+        assert_eq!(done["body"]["active_attempts"], json!([]));
+        assert_eq!(done["body"]["cancellation_obligations"], json!([]));
+        assert_eq!(e.store().phase(&on_b)?, Some(Phase::Running));
+        assert_eq!(
+            e.store().phase(&unacknowledged)?,
+            Some(Phase::Running),
+            "a row that names no model matches no record"
+        );
+        Ok(())
     }
 
     #[test]
@@ -804,6 +911,7 @@ mod tests {
             .parse()?;
         e.store().apply(&task, Event::Dispatch)?;
         assert_eq!(e.store().phase(&task)?, Some(Phase::Running));
+        acknowledged(&e, &task, "m:1")?;
         let idle = call(
             &e,
             "task.submit",
