@@ -131,6 +131,14 @@ fn cannot_fail_lines_are_refused() {
         // No pipefail: the dispatcher runs `/bin/sh -c <command>` (hee4-app dispatcher.rs).
         "sh: cargo test | tail -1",
         "sh: cargo test 2>&1 | head -n 5",
+        // `|&` is a pipe (bash pipes stderr too), not `|` then `&`.
+        "sh: cargo test |& tail -1",
+        // A no-op whose only redirections cannot fail is still a no-op.
+        "sh: cargo test || true 2>/dev/null",
+        "sh: cargo test || : >/dev/null 2>&1",
+        "sh: cargo test || echo failed >&2",
+        "sh: cargo test || true &>/dev/null",
+        "sh: true </dev/null",
     ];
     for text in cannot_fail {
         assert_eq!(
@@ -171,6 +179,11 @@ fn deliberately_not_caught() {
         // A `#` inside a word is not a comment; a quoted operator is not an operator.
         "sh: echo a#b > f",
         "sh: grep -q 'a || true' f",
+        // A redirection that can fail makes the no-op one that can fail: a file that may not
+        // open, an fd that may be closed.
+        "sh: cargo test || true > out",
+        "sh: cargo test || true <&3",
+        "sh: cargo test || true 2>",
     ];
     for text in not_caught {
         assert_eq!(check(text).as_deref(), Ok(text), "{text:?}");

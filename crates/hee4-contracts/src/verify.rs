@@ -208,8 +208,43 @@ struct Word {
 #[derive(Debug)]
 enum Token {
     Word(Word),
-    Redirect,
+    /// A redirection operator; `dup` when it ends in `&` (`>&`, `<&`, `2>&`), so its target is
+    /// a file descriptor, not a file.
+    Redirect {
+        dup: bool,
+    },
     Op(Op),
+}
+
+/// The redirections on one command, as far as they decide whether it can fail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Redir {
+    /// None.
+    None,
+    /// Only redirections that cannot fail: to or from `/dev/null`, or a dup onto 0, 1 or 2 (or
+    /// a close, `-`).
+    Null,
+    /// Any other: a file that may not open, an fd that may be closed, or no target.
+    Other,
+}
+
+impl Redir {
+    /// Add one redirection whose target is `target` (`None`: the line ended or an operator came
+    /// first).
+    fn add(self, dup: bool, target: Option<&Word>) -> Self {
+        let harmless = target.is_some_and(|w| {
+            !w.dynamic
+                && if dup {
+                    matches!(w.text.as_str(), "0" | "1" | "2" | "-")
+                } else {
+                    w.text == "/dev/null"
+                }
+        });
+        match (self, harmless) {
+            (Self::Other, _) | (_, false) => Self::Other,
+            _ => Self::Null,
+        }
+    }
 }
 
 /// One `;`- or `&`-terminated list: its and-or chain of pipelines (each with the operator that
@@ -243,6 +278,32 @@ fn flush(word: &mut Option<Word>, tokens: &mut Vec<Token>) {
     if let Some(w) = word.take() {
         tokens.push(Token::Word(w));
     }
+}
+
+/// Read one redirection operator starting at `c` (`<` or `>`) into `tokens`. `None` for a
+/// here-document, which this reader does not follow.
+fn lex_redirect(
+    c: char,
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    word: &mut Option<Word>,
+    tokens: &mut Vec<Token>,
+) -> Option<()> {
+    // A word of digits right before the operator is its fd (`2>`), not an argument.
+    if word.as_ref().is_some_and(|w| {
+        !w.dynamic && !w.text.is_empty() && w.text.bytes().all(|b| b.is_ascii_digit())
+    }) {
+        *word = None;
+    }
+    flush(word, tokens);
+    if c == '<' && chars.peek() == Some(&'<') {
+        return None;
+    }
+    let mut last = c;
+    while let Some(n) = chars.next_if(|n| matches!(n, '<' | '>' | '&' | '|')) {
+        last = n;
+    }
+    tokens.push(Token::Redirect { dup: last == '&' });
+    Some(())
 }
 
 /// Split a shell script into words, redirections and control operators. `None` when the text
@@ -311,9 +372,17 @@ fn lex(script: &str) -> Option<Vec<Token>> {
                 let op = if chars.next_if_eq(&'|').is_some() {
                     Op::Or
                 } else {
+                    // `|&` pipes stderr too (bash): still a pipe.
+                    chars.next_if_eq(&'&');
                     Op::Pipe
                 };
                 tokens.push(Token::Op(op));
+            }
+            '&' if chars.peek() == Some(&'>') => {
+                // `&>` and `&>>` (bash): stdout and stderr to a file.
+                flush(&mut word, &mut tokens);
+                while chars.next_if_eq(&'>').is_some() {}
+                tokens.push(Token::Redirect { dup: false });
             }
             '&' => {
                 flush(&mut word, &mut tokens);
@@ -331,17 +400,7 @@ fn lex(script: &str) -> Option<Vec<Token>> {
                 }
                 tokens.push(Token::Op(Op::Seq));
             }
-            '<' | '>' => {
-                flush(&mut word, &mut tokens);
-                if c == '<' && chars.peek() == Some(&'<') {
-                    return None;
-                }
-                while chars
-                    .next_if(|n| matches!(n, '<' | '>' | '&' | '|'))
-                    .is_some()
-                {}
-                tokens.push(Token::Redirect);
-            }
+            '<' | '>' => lex_redirect(c, &mut chars, &mut word, &mut tokens)?,
             ch => word.get_or_insert_with(Word::default).text.push(ch),
         }
     }
@@ -357,19 +416,31 @@ fn lists(tokens: Vec<Token>, depth: u8) -> Option<Vec<List>> {
     let mut chain: Vec<(Op, Vec<Kind>)> = Vec::new();
     let mut pipeline: Vec<Kind> = Vec::new();
     let mut words: Vec<Word> = Vec::new();
-    let mut redirects = false;
+    let mut redirects = Redir::None;
+    // A redirection waiting for its target word.
+    let mut pending: Option<bool> = None;
     let mut join = Op::Seq;
     for token in tokens {
         match token {
-            Token::Word(w) => words.push(w),
-            Token::Redirect => redirects = true,
+            Token::Word(w) => match pending.take() {
+                Some(dup) => redirects = redirects.add(dup, Some(&w)),
+                None => words.push(w),
+            },
+            Token::Redirect { dup } => {
+                if let Some(dup) = pending.replace(dup) {
+                    redirects = redirects.add(dup, None);
+                }
+            }
             Token::Op(op) => {
-                if words.is_empty() && !redirects {
+                if let Some(dup) = pending.take() {
+                    redirects = redirects.add(dup, None);
+                }
+                if words.is_empty() && redirects == Redir::None {
                     return None;
                 }
                 pipeline.push(kind(&words, redirects, false, depth));
                 words.clear();
-                redirects = false;
+                redirects = Redir::None;
                 if op == Op::Pipe {
                     continue;
                 }
@@ -386,7 +457,10 @@ fn lists(tokens: Vec<Token>, depth: u8) -> Option<Vec<List>> {
             }
         }
     }
-    if words.is_empty() && !redirects {
+    if let Some(dup) = pending.take() {
+        redirects = redirects.add(dup, None);
+    }
+    if words.is_empty() && redirects == Redir::None {
         return (pipeline.is_empty() && chain.is_empty()).then_some(out);
     }
     pipeline.push(kind(&words, redirects, false, depth));
@@ -399,7 +473,10 @@ fn lists(tokens: Vec<Token>, depth: u8) -> Option<Vec<List>> {
 }
 
 /// Judge one command. `argv` is true for an exec (no shell: no built-ins, no keywords).
-fn kind(words: &[Word], redirects: bool, argv: bool, depth: u8) -> Kind {
+///
+/// A no-op whose only redirections cannot fail (`true 2>/dev/null`, `echo x >&2`) is still a
+/// no-op; any other redirection makes the command one that can fail.
+fn kind(words: &[Word], redirects: Redir, argv: bool, depth: u8) -> Kind {
     let Some((first, rest)) = words.split_first() else {
         return Kind::Other;
     };
@@ -412,30 +489,30 @@ fn kind(words: &[Word], redirects: bool, argv: bool, depth: u8) -> Kind {
         if RESERVED.contains(&p) {
             return Kind::Opaque;
         }
-        if p == "exit" && !redirects {
+        if p == "exit" && redirects == Redir::None {
             return match rest {
                 [] => Kind::ExitBare,
                 [w] if !w.dynamic && w.text == "0" => Kind::ExitZero,
                 _ => Kind::Escape,
             };
         }
-        if p == ":" && !redirects {
+        if p == ":" && redirects != Redir::Other {
             return Kind::NoOp;
         }
         if ESCAPES.contains(&p) {
             return Kind::Escape;
         }
     }
-    if redirects {
-        return Kind::Other;
-    }
-    if TRUE_WORDS.contains(&p) || ECHO_WORDS.contains(&p) {
+    if (TRUE_WORDS.contains(&p) || ECHO_WORDS.contains(&p)) && redirects != Redir::Other {
         return Kind::NoOp;
+    }
+    if redirects != Redir::None {
+        return Kind::Other;
     }
     if ENV_WORDS.contains(&p) {
         return match rest.first() {
             Some(w) if !w.dynamic && !w.text.starts_with('-') && !w.text.contains('=') => {
-                kind(rest, false, true, depth)
+                kind(rest, Redir::None, true, depth)
             }
             _ => Kind::Other,
         };
@@ -548,7 +625,7 @@ fn exec_class(program: &str, args: &[String]) -> Class {
             dynamic: false,
         })
         .collect();
-    match kind(&words, false, true, 0) {
+    match kind(&words, Redir::None, true, 0) {
         Kind::NoOp => Class::NoOp,
         Kind::CannotFail => Class::CannotFail,
         _ => Class::CanFail,
