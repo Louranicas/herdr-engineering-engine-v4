@@ -115,7 +115,7 @@ The brief text is written to `<W>/briefs/<task>.brief` under the same ledger loc
 | `forbidden` | never | `SO_PEERCRED` uid ≠ the process uid (or unreadable); sent before any request is read, then close; `service.probe` `network_scope` ≠ `none`; `service.action` on a service seeded not actable (`because` "service not actable") | `/`, `/body/network_scope`, `/body/service_id` |
 | `internal` | same_exact_request | the ledger failed under the request | `/` |
 | `no_route` | after_condition | `task.preview`: `route::select` refused the brief (result body `refusal`, not an error frame) | — |
-| `slow_consumer` | after_condition | `events.subscribe`: the subscriber is `stream.queue_frames` frames behind; `{"kind":"close",…}` frame, then close. Best effort: written with a `stream.close_deadline_ms` write deadline; if the peer's socket buffer is full the frame is not delivered, the server logs `slow_consumer close frame not delivered`, and the client sees EOF | — |
+| `slow_consumer` | after_condition | `events.subscribe`: the subscriber's `stream.queue_frames`-frame queue accepted no frame for `stream.stall_ms` (behind but draining is never dropped); `{"kind":"close",…}` frame, then close. Best effort: written with a `stream.close_deadline_ms` write deadline; if the peer's socket buffer is full the frame is not delivered, the server logs `slow_consumer close frame not delivered`, and the client sees EOF | — |
 | `frame_too_large` | never | a request line over `socket.frame_bytes` bytes (the message prints the active bound); error frame, then close | `/` |
 | `too_many_connections` | after_condition | `socket.max_connections` connections already open (the message prints the count and the field); error frame written from the accept loop before any thread is spawned, then close | `/` |
 | `unavailable` | after_condition | the registry miss in `dispatch`: the action is catalogued but its owner is not registered in this release; `because` is the scope's text (v4.0 "owner not composed", v4.1 the roster family, v4.2 the cohort/numerical families, held "H-8"); `service.probe`/`service.action` before the call: `because` "busctl digest", "head unknown", "user bus absent", "service runner not started", or "manager refused" (a manager error reply, at `/body/unit_id`) | `/action`, `/`, `/body/unit_id` |
@@ -189,7 +189,7 @@ After the ack, one line per ledger `events` row with `seq > since_seq`, in `seq`
 `{"kind":"event","seq","task_id","event","phase_after","ts"}`. `event` is the contracts'
 `Serialize` spelling; `phase_after` is `TaskState::replay` over the task's history up to that row.
 A reader thread polls the ledger every `stream.poll_ms` (`stream.batch_rows` rows a read) through
-its own read-only connection and `try_send`s into a `stream.queue_frames`-frame queue; a full queue sets `slow_consumer`, the writer sends the close
+its own read-only connection and offers into a `stream.queue_frames`-frame queue, waiting for space up to `stream.stall_ms` per frame (each accepted frame restarts the window; no ledger read is open while it waits); a queue that accepts nothing for the window sets `slow_consumer`, the writer sends the close
 frame and shuts the socket. A watcher thread reads the socket to EOF so a closed client ends all
 three threads. Resume with `since_seq` = the last `seq` received: exactly-once by `seq`.
 

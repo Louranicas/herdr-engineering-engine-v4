@@ -56,7 +56,9 @@ fn a_partial_file_keeps_every_other_default() {
 #[test]
 fn every_field_at_zero_is_refused_by_name() {
     let keys = flat_default();
-    assert_eq!(keys.len(), 28, "field count");
+    // No pinned count: every serialized key below must be refused by its own name, which already
+    // requires a validation entry per field (the count pin broke on every new field).
+    assert!(!keys.is_empty(), "the census looked at no field");
     for key in keys.keys() {
         let got = refused(&with_field(key, json!(0)));
         assert_eq!(got, BudgetRefusal::Zero { field: leak(key) }, "{key}");
@@ -208,7 +210,7 @@ fn render_names_every_field_once() {
 fn every_ms_field_has_a_duration_accessor() {
     let b = Budgets::DEFAULT;
     assert_eq!(b.door.header_deadline(), Duration::from_millis(2_000));
-    let accessors: [(&str, Duration); 15] = [
+    let accessors = [
         ("socket.read_deadline_ms", b.socket.read_deadline()),
         ("socket.write_deadline_ms", b.socket.write_deadline()),
         ("socket.refusal_write_ms", b.socket.refusal_write()),
@@ -224,6 +226,7 @@ fn every_ms_field_has_a_duration_accessor() {
         ("dispatcher.error_backoff_ms", b.dispatcher.error_backoff()),
         ("model.tags_timeout_ms", b.model.tags_timeout()),
         ("ledger.busy_timeout_ms", b.ledger.busy_timeout()),
+        ("stream.stall_ms", b.stream.stall()),
     ];
     let keys = flat_default();
     let ms_keys: Vec<&String> = keys.keys().filter(|k| k.ends_with("_ms")).collect();
@@ -248,4 +251,40 @@ fn every_ms_field_has_a_duration_accessor() {
 /// leaked copy (test-only).
 fn leak(s: &str) -> &'static str {
     Box::leak(s.to_owned().into_boxed_str())
+}
+
+/// `stream.stall_ms` (2026-10-06): zero is refused by name, and a stall window shorter than one
+/// poll is refused by the order rule (equal is allowed), so a subscriber always gets at least one
+/// poll's chance to drain before it is judged slow.
+#[test]
+fn stall_ms_is_validated_and_lasts_at_least_a_poll() {
+    let zero = refused(&with_field("stream.stall_ms", json!(0)));
+    assert!(format!("{zero:?}").contains("stream.stall_ms"), "{zero:?}");
+    let poll = Budgets::DEFAULT.stream.poll_ms;
+    let short = refused(&with_field("stream.stall_ms", json!(poll - 1)));
+    assert!(
+        matches!(short, BudgetRefusal::Order { lesser, greater } if lesser == "stream.poll_ms" && greater == "stream.stall_ms"),
+        "{short:?}"
+    );
+    assert!(Budgets::parse(&with_field("stream.stall_ms", json!(poll))).is_ok());
+    assert_eq!(
+        Budgets::DEFAULT.stream.stall(),
+        Duration::from_millis(Budgets::DEFAULT.stream.stall_ms)
+    );
+}
+
+/// The stall window must end within the socket's write deadline, so `slow_consumer` is decided
+/// before a blocked write can end the stream with a bare EOF (the refuter's equal-timer race).
+#[test]
+fn stall_ms_ends_within_the_write_deadline() {
+    let write = Budgets::DEFAULT.socket.write_deadline_ms;
+    assert!(
+        Budgets::DEFAULT.stream.stall_ms < write,
+        "the defaults must not race"
+    );
+    let long = refused(&with_field("stream.stall_ms", json!(write + 1)));
+    assert!(
+        matches!(long, BudgetRefusal::Order { lesser, greater } if lesser == "stream.stall_ms" && greater == "socket.write_deadline_ms"),
+        "{long:?}"
+    );
 }

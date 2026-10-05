@@ -880,14 +880,89 @@ fn is_close_frame(line: &str) -> bool {
     line.contains("\"kind\":\"close\"") && line.contains("slow_consumer")
 }
 
-/// A subscriber that reads one line per 64 submits is a slow consumer against a real
-/// `hee4 serve`: the submit loop stops at the first signal (the server's log line, a close frame
-/// or EOF on the subscriber) or at 3000 submits, and the wait after it is bounded by the same
-/// signals, so the test finishes in seconds without weakening `delivered || logged`.
+/// The cut tier's defect, end to end through `read_ledger` on a real `hee4 serve`: with a
+/// 16-frame queue, a subscriber that reads every frame but more slowly than the server writes
+/// them replays the whole ledger from `since_seq` 0 to `high_water`, in `seq` order, with no
+/// `slow_consumer`. The ledger is seeded past 3000 events because the server's writer first drains
+/// the queue into the kernel socket buffer (hundreds of KB): only once that buffer is full does
+/// the queue stay full, which is where the drive was cut off (172-525 of ~800 frames, 2026-10-06).
+/// Under the old instant-drop rule this test fails.
+#[test]
+fn a_slow_reader_replays_more_than_three_queues_through_a_real_serve() -> R<()> {
+    let (_run, dir) = fsync_cheap_dir("e2e-slow-replay")?;
+    let budgets = dir.join("budgets.json");
+    fs::write(
+        &budgets,
+        r#"{"stream":{"queue_frames":16,"batch_rows":16}}"#,
+    )?;
+    let mut server = start_with(&dir, "serve.log", false, &[("HEE4_BUDGETS", &budgets)])?;
+    let mut c = UnixStream::connect(&server.sock)?;
+    c.set_read_timeout(Some(Duration::from_secs(30)))?;
+    let mut cr = BufReader::new(c.try_clone()?);
+    let mut hw = 0;
+    let mut submits = 0;
+    // Enough events to fill the kernel socket buffer and then the 16-frame queue many times over.
+    while hw <= 3000 && submits < 6000 {
+        let f = wire::request(
+            "replay",
+            "task.submit",
+            Some(&format!("replay-{submits}")),
+            json!({ "brief": brief(FIXTURE) }),
+        );
+        c.write_all(format!("{f}\n").as_bytes())?;
+        let mut l = String::new();
+        cr.read_line(&mut l)?;
+        submits += 1;
+        if submits % 500 == 0 {
+            let (ack, _) = subscribe_frame(&server.sock, 0, None)?;
+            hw = ack["body"]["high_water"].as_i64().unwrap_or(0);
+        }
+    }
+    assert!(hw > 3000, "only {hw} events after {submits} submits");
+    let (ack, mut sub) = subscribe_frame(&server.sock, 0, None)?;
+    let high_water = ack["body"]["high_water"].as_i64().ok_or("no high_water")?;
+    let mut seqs = Vec::new();
+    while seqs.last().copied().unwrap_or(0) < high_water {
+        let mut l = String::new();
+        if sub.read_line(&mut l)? == 0 {
+            break;
+        }
+        assert!(
+            !is_close_frame(&l),
+            "dropped as slow_consumer after {} frames: {l}",
+            seqs.len()
+        );
+        let v: Value = serde_json::from_str(&l)?;
+        seqs.push(v["seq"].as_i64().ok_or("frame without seq")?);
+        std::thread::sleep(Duration::from_micros(200)); // slower than the server writes
+    }
+    println!(
+        "MEASURED replay frames={} high_water={high_water} submits={submits}",
+        seqs.len()
+    );
+    assert_eq!(
+        seqs.last().copied(),
+        Some(high_water),
+        "the replay stopped early"
+    );
+    assert!(seqs.windows(2).all(|w| w[0] < w[1]), "seq not ascending");
+    server.child.kill()?;
+    server.child.wait()?;
+    Ok(())
+}
+
+/// A subscriber that never reads is a slow consumer against a real `hee4 serve`: its queue
+/// accepts no frame for `stream.stall_ms` (set to 500 ms here through `HEE4_BUDGETS`, so the test
+/// stays fast). The submit loop never touches the subscriber; it stops at the server's log line
+/// or at 3000 submits, and the bounded drain after it then finds the close frame or EOF. (Before
+/// 2026-10-06 this test read one line per 64 submits, which the instant-drop rule also dropped;
+/// under the stall rule a draining reader is never dropped, so the test now truly never reads.)
 #[test]
 fn a_subscriber_that_never_reads_gets_the_close_frame_or_the_log_line() -> R<()> {
     let (_run, dir) = fsync_cheap_dir("e2e-slow")?;
-    let mut server = start(&dir, "serve.log")?;
+    let budgets = dir.join("budgets.json");
+    fs::write(&budgets, r#"{"stream":{"stall_ms":500}}"#)?;
+    let mut server = start_with(&dir, "serve.log", false, &[("HEE4_BUDGETS", &budgets)])?;
     let log = dir.join("serve.log");
     let mut sub = subscribe(&server.sock, 0, None)?;
     sub.get_ref()
@@ -915,15 +990,6 @@ fn a_subscriber_that_never_reads_gets_the_close_frame_or_the_log_line() -> R<()>
         }
         if log_says(&log, "slow_consumer") {
             signal = Some("log");
-        }
-        let mut l = String::new();
-        match sub.read_line(&mut l) {
-            Ok(0) => signal = Some("eof"),
-            Ok(_) if is_close_frame(&l) => {
-                delivered = true;
-                signal = Some("close_frame");
-            }
-            Ok(_) | Err(_) => {}
         }
     }
     // Bounded wait: drain the subscriber to the close frame or EOF, re-reading the log.
