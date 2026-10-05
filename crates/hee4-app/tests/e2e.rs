@@ -1808,3 +1808,38 @@ fn a_stale_claim_is_reported_by_name_at_serve_start() -> R<()> {
     assert!(named[0].ends_with(" reason=generation_moved"), "{log}");
     Ok(())
 }
+
+/// `ledger.checkpoint_every` is read: with it at 2, two accepted tasks (two receipts) write at
+/// least one `checkpoints` row (read-only SELECT), the dispatcher logs it, and `hee4
+/// verify-ledger` re-derives every root and passes.
+#[test]
+fn checkpoints_are_written_every_n_receipts() -> R<()> {
+    let (_run, dir) = fsync_cheap_dir("e2e-checkpoint")?;
+    let budgets = dir.join("budgets.json");
+    fs::write(&budgets, r#"{"ledger":{"checkpoint_every":2}}"#)?;
+    let mut server = start_with(&dir, "serve.log", false, &[("HEE4_BUDGETS", &budgets)])?;
+    for key in ["key-cp-1", "key-cp-2"] {
+        let (_, done) = run_task(&server.sock, key, FIXTURE)?;
+        assert_eq!(done["body"]["phase"], "accepted", "{done}");
+    }
+    server.child.kill()?;
+    server.child.wait()?;
+    let log = fs::read_to_string(dir.join("serve.log"))?;
+    let ledger = dir.join("ledger.sqlite3");
+    let conn =
+        rusqlite::Connection::open_with_flags(&ledger, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let rows: i64 = conn.query_row("SELECT count(*) FROM checkpoints", [], |r| r.get(0))?;
+    println!("MEASURED checkpoints={rows}");
+    assert!(rows >= 1, "no checkpoint row; {log}");
+    assert!(log.contains("dispatch checkpoint seq="), "{log}");
+    let out = Command::new(BIN)
+        .args(["verify-ledger", "--ledger"])
+        .arg(&ledger)
+        .output()?;
+    let stdout = String::from_utf8(out.stdout)?;
+    println!("{stdout}");
+    assert!(out.status.success(), "{stdout}");
+    assert!(stdout.trim_end().ends_with("verdict=PASS"), "{stdout}");
+    assert!(!stdout.contains(" checkpoints=0 "), "{stdout}");
+    Ok(())
+}

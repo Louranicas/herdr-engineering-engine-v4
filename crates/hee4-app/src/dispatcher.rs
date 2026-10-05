@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write as _;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -1011,7 +1012,24 @@ fn settle_and_decide(
     if verdict == Verdict::Pass {
         phase = apply(engine, task, Event::Accept)?;
     }
+    checkpoint(engine)?;
     Ok(Some((task.clone(), phase)))
+}
+
+/// After a receipt: K1's `checkpoint_if_due` under `ledger.checkpoint_every`, one
+/// `dispatch checkpoint seq= count= root=` line when a checkpoint is written. The field's floor
+/// is 1 (`Budgets::parse`), so a zero never reaches here; it would write none.
+fn checkpoint(engine: &Engine) -> Result<(), StoreError> {
+    let Some(every) = NonZeroU64::new(engine.budgets().ledger.checkpoint_every) else {
+        return Ok(());
+    };
+    if let Some(c) = engine.store().checkpoint_if_due(every)? {
+        eprintln!(
+            "dispatch checkpoint seq={} count={} root={}",
+            c.seq, c.count, c.root
+        );
+    }
+    Ok(())
 }
 
 /// The bytes one workspace walk may read (file contents plus a per-entry charge for its
