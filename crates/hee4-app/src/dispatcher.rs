@@ -3,10 +3,10 @@
 //!
 //! Every state change is `Store::apply`; the only verdict is `hee4_evidence::decide_and_seal`'s.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hee4_contracts::bounds::MAX_VIEW_ITEMS;
@@ -730,6 +730,8 @@ pub fn step(
         Ok(id) => id,
         Err(stopped) => return Ok(Some((task.clone(), stopped))),
     };
+    // The diff's base, taken before the candidate runs, so nothing it writes shapes it.
+    let before = Snapshot::of(ns.work_dir(), DDF_DIFF_BYTES);
     let on_start = |pid: u32, start_ticks: u64| record_pid(engine, &id, pid, start_ticks);
     let attempt = Attempt::with_budget(&selection.model, head.clone(), budgets.door)
         .run(&permit, &plan, upstream, &brief, &steps, &on_start);
@@ -746,6 +748,7 @@ pub fn step(
         permit: &permit,
         subject: &subject_of(&task, head, &brief),
         work_dir: ns.work_dir(),
+        before: &before,
         budget,
     };
     settle_and_decide(engine, &sealing, &outcome)
@@ -922,6 +925,8 @@ struct Sealing<'a> {
     subject: &'a Subject,
     /// The per-generation workspace (`ns.work_dir()`), diffed for deep-diff-forge.
     work_dir: &'a Path,
+    /// The workspace as it stood before the attempt ran, the diff's base.
+    before: &'a Result<Snapshot, DiffFault>,
     /// The attempt's timebox, deep-diff-forge's budget too.
     budget: Duration,
 }
@@ -966,48 +971,303 @@ fn settle_and_decide(
     Ok(Some((task.clone(), phase)))
 }
 
-/// Why the workspace could not be diffed.
+/// The bytes one workspace walk may read (file contents plus a per-entry charge for its
+/// path), for the pre-attempt [`Snapshot`] and again for [`workspace_diff`]. UNMEASURED
+/// stand-in pending a K0 `Budgets` field (proposed: `attempt.diff_bytes`); never a literal at
+/// a call site.
+pub const DDF_DIFF_BYTES: u64 = 16 * 1024 * 1024;
+
+/// What one walked entry costs beyond its bytes, so a flood of empty files hits the cap too.
+const ENTRY_CHARGE: u64 = 64;
+
+/// Why the workspace could not be diffed. Every variant is a skip line, never a refusal.
 #[derive(Debug, thiserror::Error)]
 pub enum DiffFault {
-    /// `git` could not be run.
-    #[error("git: {0}")]
-    Spawn(#[from] std::io::Error),
-    /// `git diff` exited non-zero.
-    #[error("git diff exited {code:?}")]
-    Exit {
-        /// The exit code, if any.
-        code: Option<i32>,
+    /// The walk could not read the workspace.
+    #[error("workspace: {0}")]
+    Io(#[from] std::io::Error),
+    /// The walk read more than its cap.
+    #[error("workspace over {cap} bytes")]
+    TooLarge {
+        /// The cap that was hit.
+        cap: u64,
     },
+    /// `<ws>/.git` is a file or a symlink (a `gitdir:` pointer can name any repository on the
+    /// host): refused by name, never followed, never read.
+    #[error("<ws>/.git is not a directory")]
+    GitDirNotDir,
 }
 
-/// The workspace's diff: `None` when `<ws>/.git` is absent (no worktree); else
-/// `git diff --cached` (a fresh `git init` has no HEAD, so staged files show only here)
-/// followed by `git diff`. Empty bytes mean a clean worktree.
+impl DiffFault {
+    /// The skip-line word.
+    const fn name(&self) -> &'static str {
+        match self {
+            Self::Io(_) => "io",
+            Self::TooLarge { .. } => "too_large",
+            Self::GitDirNotDir => "git_dir_not_dir",
+        }
+    }
+}
+
+/// One snapshotted entry. Symlinks are recorded by their target text, never followed;
+/// FIFOs, sockets and devices are not entries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Entry {
+    /// A regular file, with its executable bit.
+    File {
+        /// Whether any execute bit is set.
+        exec: bool,
+        /// The contents.
+        bytes: Vec<u8>,
+    },
+    /// A symlink's target.
+    Link(Vec<u8>),
+}
+
+impl Entry {
+    const fn mode(&self) -> &'static str {
+        match self {
+            Self::File { exec: false, .. } => "100644",
+            Self::File { exec: true, .. } => "100755",
+            Self::Link(_) => "120000",
+        }
+    }
+
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::File { bytes, .. } | Self::Link(bytes) => bytes,
+        }
+    }
+}
+
+/// The workspace's entries keyed by relative path, read in-process: no git, so nothing the
+/// candidate wrote (a `.git/config`, a `.gitattributes`, a `gitdir:` file) is ever executed
+/// or followed on the host. Every entry named `.git` (at any depth) is left out, as git does.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Snapshot(BTreeMap<Vec<u8>, Entry>);
+
+impl Snapshot {
+    /// Walk `ws` without following any symlink, reading at most `cap` bytes.
+    ///
+    /// # Errors
+    /// [`DiffFault::Io`] when the walk cannot read; [`DiffFault::TooLarge`] past `cap`.
+    pub fn of(ws: &Path, cap: u64) -> Result<Self, DiffFault> {
+        use std::io::Read as _;
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let mut entries = BTreeMap::new();
+        let mut left = cap;
+        let charge = |left: &mut u64, n: u64| -> Result<(), DiffFault> {
+            *left = left.checked_sub(n).ok_or(DiffFault::TooLarge { cap })?;
+            Ok(())
+        };
+        let mut dirs = vec![ws.to_path_buf()];
+        while let Some(dir) = dirs.pop() {
+            for item in fs::read_dir(&dir)? {
+                let item = item?;
+                if item.file_name() == ".git" {
+                    continue;
+                }
+                let path = item.path();
+                let rel = path
+                    .strip_prefix(ws)
+                    .map_err(|_| std::io::Error::other("entry outside the workspace"))?
+                    .as_os_str()
+                    .as_bytes()
+                    .to_vec();
+                charge(&mut left, ENTRY_CHARGE + rel.len() as u64)?;
+                let meta = fs::symlink_metadata(&path)?;
+                let ft = meta.file_type();
+                if ft.is_dir() {
+                    dirs.push(path);
+                } else if ft.is_symlink() {
+                    let target = fs::read_link(&path)?.as_os_str().as_bytes().to_vec();
+                    charge(&mut left, target.len() as u64)?;
+                    entries.insert(rel, Entry::Link(target));
+                } else if ft.is_file() {
+                    // Read only after the walk's `symlink_metadata` said "regular file", and
+                    // only once the attempt is over: `bwrap --unshare-all --die-with-parent`
+                    // leaves no candidate process to swap it for a FIFO or a symlink.
+                    let file = fs::File::open(&path)?;
+                    let fmeta = file.metadata()?;
+                    if !fmeta.is_file() {
+                        continue;
+                    }
+                    let mut bytes = Vec::new();
+                    file.take(left.saturating_add(1)).read_to_end(&mut bytes)?;
+                    charge(&mut left, bytes.len() as u64)?;
+                    let exec = fmeta.permissions().mode() & 0o111 != 0;
+                    entries.insert(rel, Entry::File { exec, bytes });
+                }
+            }
+        }
+        Ok(Self(entries))
+    }
+}
+
+/// The workspace's change since `before`, as a git-style unified patch computed here: `None`
+/// when `<ws>/.git` is absent (no worktree); empty bytes when nothing changed. `<ws>/.git` is
+/// only stat'ed (`symlink_metadata`), never read and never handed to git.
 ///
 /// # Errors
-/// [`DiffFault`] when git cannot run or exits non-zero.
-pub fn workspace_diff(ws: &Path) -> Result<Option<Vec<u8>>, DiffFault> {
-    if !ws.join(".git").exists() {
-        return Ok(None);
+/// [`DiffFault`]: a `.git` that is not a real directory, an unreadable or oversized workspace.
+pub fn workspace_diff(
+    ws: &Path,
+    before: &Snapshot,
+    cap: u64,
+) -> Result<Option<Vec<u8>>, DiffFault> {
+    match fs::symlink_metadata(ws.join(".git")) {
+        Ok(m) if m.is_dir() => {}
+        Ok(_) => return Err(DiffFault::GitDirNotDir),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
     }
-    let mut bytes = Vec::new();
-    for cached in [true, false] {
-        let mut cmd = Command::new("git");
-        cmd.arg("-C")
-            .arg(ws)
-            .args(["diff", "--no-color", "--no-ext-diff"]);
-        if cached {
-            cmd.arg("--cached");
+    let after = Snapshot::of(ws, cap)?;
+    Ok(Some(patch(before, &after)))
+}
+
+/// `before` → `after` as a unified patch `git apply` accepts: whole-file hunks, git's path
+/// quoting, `Binary files ... differ` for contents holding NUL.
+fn patch(before: &Snapshot, after: &Snapshot) -> Vec<u8> {
+    let mut out = Vec::new();
+    let paths: std::collections::BTreeSet<&Vec<u8>> =
+        before.0.keys().chain(after.0.keys()).collect();
+    for p in paths {
+        match (before.0.get(p), after.0.get(p)) {
+            (None, Some(new)) => file_patch(&mut out, p, None, Some(new)),
+            (Some(old), None) => file_patch(&mut out, p, Some(old), None),
+            (Some(old), Some(new)) if old == new => {}
+            (Some(old), Some(new)) if old.mode() == "120000" || new.mode() == "120000" => {
+                if old.mode() == new.mode() {
+                    file_patch(&mut out, p, Some(old), Some(new));
+                } else {
+                    file_patch(&mut out, p, Some(old), None);
+                    file_patch(&mut out, p, None, Some(new));
+                }
+            }
+            (old, new) => file_patch(&mut out, p, old, new),
         }
-        let out = cmd.output()?;
-        if !out.status.success() {
-            return Err(DiffFault::Exit {
-                code: out.status.code(),
-            });
-        }
-        bytes.extend_from_slice(&out.stdout);
     }
-    Ok(Some(bytes))
+    out
+}
+
+/// One file's section of the patch.
+fn file_patch(out: &mut Vec<u8>, path: &[u8], old: Option<&Entry>, new: Option<&Entry>) {
+    let a = quoted("a/", path);
+    let b = quoted("b/", path);
+    out.extend_from_slice(b"diff --git ");
+    out.extend_from_slice(&a);
+    out.push(b' ');
+    out.extend_from_slice(&b);
+    out.push(b'\n');
+    match (old, new) {
+        (None, Some(n)) => {
+            out.extend_from_slice(format!("new file mode {}\n", n.mode()).as_bytes());
+        }
+        (Some(o), None) => {
+            out.extend_from_slice(format!("deleted file mode {}\n", o.mode()).as_bytes());
+        }
+        (Some(o), Some(n)) if o.mode() != n.mode() => out.extend_from_slice(
+            format!("old mode {}\nnew mode {}\n", o.mode(), n.mode()).as_bytes(),
+        ),
+        _ => {}
+    }
+    let old_bytes = old.map_or(&[][..], Entry::bytes);
+    let new_bytes = new.map_or(&[][..], Entry::bytes);
+    if old_bytes == new_bytes {
+        return;
+    }
+    let from = if old.is_some() {
+        a
+    } else {
+        b"/dev/null".to_vec()
+    };
+    let to = if new.is_some() {
+        b
+    } else {
+        b"/dev/null".to_vec()
+    };
+    if old_bytes.contains(&0) || new_bytes.contains(&0) {
+        out.extend_from_slice(b"Binary files ");
+        out.extend_from_slice(&from);
+        out.extend_from_slice(b" and ");
+        out.extend_from_slice(&to);
+        out.extend_from_slice(b" differ\n");
+        return;
+    }
+    out.extend_from_slice(b"--- ");
+    out.extend_from_slice(&from);
+    out.extend_from_slice(b"\n+++ ");
+    out.extend_from_slice(&to);
+    out.push(b'\n');
+    let old_lines = lines(old_bytes);
+    let new_lines = lines(new_bytes);
+    out.extend_from_slice(
+        format!(
+            "@@ -{} +{} @@\n",
+            range(old_lines.len()),
+            range(new_lines.len())
+        )
+        .as_bytes(),
+    );
+    for (sign, bytes, ls) in [(b'-', old_bytes, old_lines), (b'+', new_bytes, new_lines)] {
+        for l in ls {
+            out.push(sign);
+            out.extend_from_slice(l);
+            out.push(b'\n');
+        }
+        if !bytes.is_empty() && !bytes.ends_with(b"\n") {
+            out.extend_from_slice(b"\\ No newline at end of file\n");
+        }
+    }
+}
+
+/// The lines of `bytes`, without their `\n`.
+fn lines(bytes: &[u8]) -> Vec<&[u8]> {
+    if bytes.is_empty() {
+        return Vec::new();
+    }
+    bytes
+        .strip_suffix(b"\n")
+        .unwrap_or(bytes)
+        .split(|&c| c == b'\n')
+        .collect()
+}
+
+/// A hunk range as git writes it: `0,0`, `1`, or `1,n`.
+fn range(n: usize) -> String {
+    match n {
+        0 => "0,0".into(),
+        1 => "1".into(),
+        n => format!("1,{n}"),
+    }
+}
+
+/// `prefix` + `path`, C-quoted as git quotes it when the path holds a control byte, `"`, `\`
+/// or a non-ASCII byte, so no file name can forge a patch header line.
+fn quoted(prefix: &str, path: &[u8]) -> Vec<u8> {
+    let plain = |c: u8| (0x20..0x7f).contains(&c) && c != b'"' && c != b'\\';
+    let mut out = Vec::new();
+    if path.iter().all(|&c| plain(c)) {
+        out.extend_from_slice(prefix.as_bytes());
+        out.extend_from_slice(path);
+        return out;
+    }
+    out.push(b'"');
+    out.extend_from_slice(prefix.as_bytes());
+    for &c in path {
+        match c {
+            b'"' => out.extend_from_slice(b"\\\""),
+            b'\\' => out.extend_from_slice(b"\\\\"),
+            b'\n' => out.extend_from_slice(b"\\n"),
+            b'\t' => out.extend_from_slice(b"\\t"),
+            c if plain(c) => out.push(c),
+            c => out.extend_from_slice(format!("\\{c:03o}").as_bytes()),
+        }
+    }
+    out.push(b'"');
+    out
 }
 
 /// The `AdapterError` variant name for the skip line.
@@ -1031,16 +1291,19 @@ fn ddf_observation(sealing: &Sealing<'_>) -> Option<Observation> {
         eprintln!("dispatch task={task} ddf=skipped reason={reason}");
         None
     };
-    let bytes = match workspace_diff(sealing.work_dir) {
+    let diff = sealing
+        .before
+        .as_ref()
+        .map_err(DiffFault::name)
+        .and_then(|before| {
+            workspace_diff(sealing.work_dir, before, DDF_DIFF_BYTES).map_err(|e| {
+                eprintln!("dispatch task={task} ddf diff_error={e}");
+                e.name()
+            })
+        });
+    let bytes = match diff {
         Ok(bytes) => bytes,
-        Err(e) => {
-            eprintln!("dispatch task={task} ddf git_error={e}");
-            let kind = match e {
-                DiffFault::Spawn(_) => "spawn",
-                DiffFault::Exit { .. } => "exit",
-            };
-            return skipped(&format!("git_error:{kind}"));
-        }
+        Err(kind) => return skipped(&format!("diff_error:{kind}")),
     };
     let diff = bytes.as_deref().map_or(Diff::NoWorktree, Diff::Bytes);
     match ddf::for_task(diff, sealing.subject, &SystemClock, sealing.budget) {
@@ -1202,11 +1465,14 @@ mod tests {
         })
     }
 
+    const CAP: u64 = DDF_DIFF_BYTES;
+
     #[test]
     fn workspace_diff_without_git_dir_is_no_worktree() -> R<()> {
         let ws = scratch("no-worktree")?;
+        let before = Snapshot::of(&ws, CAP)?;
         fs::write(ws.join("f"), "x")?;
-        assert_eq!(workspace_diff(&ws)?, None);
+        assert_eq!(workspace_diff(&ws, &before, CAP)?, None);
         let skip = ddf::for_task(
             Diff::NoWorktree,
             &subject()?,
@@ -1221,13 +1487,11 @@ mod tests {
     #[test]
     fn workspace_diff_of_a_clean_worktree_is_no_diff() -> R<()> {
         let ws = scratch("clean")?;
-        let init = Command::new("git")
-            .arg("-C")
-            .arg(&ws)
-            .args(["init", "-q", "."])
-            .status()?;
-        assert!(init.success());
-        let bytes = workspace_diff(&ws)?.ok_or("no worktree")?;
+        fs::create_dir(ws.join(".git"))?;
+        let before = Snapshot::of(&ws, CAP)?;
+        // What happens under `.git` is not the workspace's change.
+        fs::write(ws.join(".git").join("index"), "staged")?;
+        let bytes = workspace_diff(&ws, &before, CAP)?.ok_or("no worktree")?;
         assert!(bytes.is_empty(), "{}", String::from_utf8_lossy(&bytes));
         let skip = ddf::for_task(
             Diff::Bytes(&bytes),
@@ -1236,17 +1500,124 @@ mod tests {
             Duration::from_secs(5),
         )?;
         assert_eq!(skip, TaskObservation::Skipped(ddf::Skip::NoDiff));
-        // A staged file in the same HEAD-less worktree is in the diff.
         fs::write(ws.join("f"), "x\n")?;
-        let add = Command::new("git")
-            .arg("-C")
-            .arg(&ws)
-            .args(["add", "f"])
-            .status()?;
-        assert!(add.success());
-        let staged = workspace_diff(&ws)?.ok_or("no worktree")?;
-        assert!(String::from_utf8_lossy(&staged).contains("+x"));
+        let added = workspace_diff(&ws, &before, CAP)?.ok_or("no worktree")?;
+        assert_eq!(
+            String::from_utf8(added)?,
+            "diff --git a/f b/f\nnew file mode 100644\n--- /dev/null\n+++ b/f\n@@ -0,0 +1 @@\n+x\n"
+        );
         let _ = fs::remove_dir_all(&ws);
+        Ok(())
+    }
+
+    /// The refuter's `gitdir:` pointer: a `.git` file naming another repository is refused by
+    /// name and nothing behind it is read.
+    #[test]
+    fn workspace_diff_refuses_a_git_file_or_symlink_by_name() -> R<()> {
+        let victim = scratch("victim")?;
+        fs::create_dir(victim.join(".git"))?;
+        fs::write(victim.join("secret"), "SECRET_TOKEN=abc\n")?;
+        let ws = scratch("gitfile")?;
+        let before = Snapshot::of(&ws, CAP)?;
+        fs::write(
+            ws.join(".git"),
+            format!("gitdir: {}\n", victim.join(".git").display()),
+        )?;
+        assert!(matches!(
+            workspace_diff(&ws, &before, CAP),
+            Err(DiffFault::GitDirNotDir)
+        ));
+        fs::remove_file(ws.join(".git"))?;
+        std::os::unix::fs::symlink(victim.join(".git"), ws.join(".git"))?;
+        assert!(matches!(
+            workspace_diff(&ws, &before, CAP),
+            Err(DiffFault::GitDirNotDir)
+        ));
+        // A symlink into the victim inside a real worktree is its target text, not its content.
+        fs::remove_file(ws.join(".git"))?;
+        fs::create_dir(ws.join(".git"))?;
+        std::os::unix::fs::symlink(victim.join("secret"), ws.join("s"))?;
+        let bytes = workspace_diff(&ws, &before, CAP)?.ok_or("no worktree")?;
+        let text = String::from_utf8(bytes)?;
+        assert!(text.contains("new file mode 120000"), "{text}");
+        assert!(!text.contains("SECRET_TOKEN"), "{text}");
+        let _ = fs::remove_dir_all(&ws);
+        let _ = fs::remove_dir_all(&victim);
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_diff_past_its_cap_is_too_large() -> R<()> {
+        let ws = scratch("cap")?;
+        fs::create_dir(ws.join(".git"))?;
+        let before = Snapshot::of(&ws, CAP)?;
+        fs::write(ws.join("big"), vec![b'x'; 4096])?;
+        assert!(matches!(
+            workspace_diff(&ws, &before, 1024),
+            Err(DiffFault::TooLarge { cap: 1024 })
+        ));
+        for i in 0..64 {
+            fs::write(ws.join(format!("empty-{i}")), "")?;
+        }
+        fs::remove_file(ws.join("big"))?;
+        assert!(matches!(
+            workspace_diff(&ws, &before, 1024),
+            Err(DiffFault::TooLarge { cap: 1024 })
+        ));
+        let _ = fs::remove_dir_all(&ws);
+        Ok(())
+    }
+
+    /// The computed patch is one `git apply` turns `before` into `after` with: added, deleted,
+    /// modified, no final newline, an executable bit, a quoted name, a symlink, a binary file.
+    #[test]
+    fn workspace_diff_is_a_patch_git_apply_accepts() -> R<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::process::Command;
+        let ws = scratch("apply")?;
+        fs::create_dir(ws.join(".git"))?;
+        fs::create_dir(ws.join("d"))?;
+        fs::write(ws.join("d/mod"), "one\ntwo\n")?;
+        fs::write(ws.join("gone"), "bye\n")?;
+        fs::write(ws.join("run"), "#!/bin/sh\n")?;
+        let base = scratch("apply-base")?;
+        fs::create_dir(base.join("d"))?;
+        fs::write(base.join("d/mod"), "one\ntwo\n")?;
+        fs::write(base.join("gone"), "bye\n")?;
+        fs::write(base.join("run"), "#!/bin/sh\n")?;
+        let before = Snapshot::of(&ws, CAP)?;
+        fs::write(ws.join("d/mod"), "one\nthree")?;
+        fs::remove_file(ws.join("gone"))?;
+        fs::set_permissions(ws.join("run"), fs::Permissions::from_mode(0o755))?;
+        fs::write(ws.join("we\"ird\nname"), "q\n")?;
+        std::os::unix::fs::symlink("d/mod", ws.join("ln"))?;
+        let bytes = workspace_diff(&ws, &before, CAP)?.ok_or("no worktree")?;
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        assert!(text.contains("diff --git \"a/we\\\"ird\\nname\" \"b/we\\\"ird\\nname\"\n"));
+        let patch_file = scratch("apply-patch")?.join("p.diff");
+        fs::write(&patch_file, &bytes)?;
+        let applied = Command::new("git")
+            .arg("-C")
+            .arg(&base)
+            .args(["apply", "--no-index"])
+            .arg(&patch_file)
+            .output()?;
+        assert!(
+            applied.status.success(),
+            "{}\n{text}",
+            String::from_utf8_lossy(&applied.stderr)
+        );
+        assert_eq!(Snapshot::of(&base, CAP)?, Snapshot::of(&ws, CAP)?);
+        // A binary change is named, not inlined.
+        let before = Snapshot::of(&ws, CAP)?;
+        fs::write(ws.join("bin"), b"a\0b")?;
+        let bin = String::from_utf8(workspace_diff(&ws, &before, CAP)?.ok_or("no worktree")?)?;
+        assert!(
+            bin.contains("Binary files /dev/null and b/bin differ\n"),
+            "{bin}"
+        );
+        let _ = fs::remove_dir_all(&ws);
+        let _ = fs::remove_dir_all(&base);
         Ok(())
     }
 

@@ -1445,40 +1445,19 @@ fn ddf_present() -> bool {
         .is_some_and(|p| std::env::split_paths(&p).any(|d| d.join("deep-diff-forge").is_file()))
 }
 
-/// `git -C ws args..` on the host, which must succeed.
-fn git(ws: &Path, args: &[&str]) -> R<()> {
-    let status = Command::new("git").arg("-C").arg(ws).args(args).status()?;
-    if !status.success() {
-        return Err(format!("git {args:?} in {}: {status}", ws.display()).into());
-    }
-    Ok(())
-}
-
 /// The brief's VERIFY `sh: git init -q . && echo x > f && git add f` cannot run in the landed
 /// sandbox: `bwrap` mounts no `/dev`, and git exits 128 `could not open '/dev/null'` (MEASURED,
-/// hee4-host `spawn::plan` argv). So the test seeds generation 1's workspace on the host
-/// (`<work>/<task>/1/<task>`, the task id derived as `task.submit` derives it) with a HEAD-less
-/// repo holding one staged file, and the VERIFY checks that file from inside the sandbox.
+/// hee4-host `spawn::plan` argv; the `--dev /dev` fix is hee4-host/hee4-worker's). So the
+/// candidate makes its worktree the way git would, inside the sandbox: a `.git` directory and
+/// one new file. Nothing is seeded on the host; the engine diffs the workspace in-process
+/// against its pre-attempt snapshot.
 #[test]
 fn sealed_diff_observation_reaches_the_receipt() -> R<()> {
-    const VERIFY: &str = "/usr/bin/test -s f";
+    const VERIFY: &str = "sh: /usr/bin/mkdir .git && echo x > f";
     const KEY: &str = "key-ddf";
     let (_run, dir) = fsync_cheap_dir("e2e-ddf")?;
-    let uid = hee4_app::process_uid().ok_or("uid")?;
-    let digest = Sha256Hex::digest(format!("uid:{uid}\n{KEY}").as_bytes()).to_string();
-    let expected_task = format!("t-{}", &digest[..24]);
-    let ws = dir
-        .join("work")
-        .join(&expected_task)
-        .join("1")
-        .join(&expected_task);
-    fs::create_dir_all(&ws)?;
-    git(&ws, &["init", "-q", "."])?;
-    fs::write(ws.join("f"), "x\n")?;
-    git(&ws, &["add", "f"])?;
     let mut server = start(&dir, "serve.log")?;
     let (task, done) = run_task(&server.sock, KEY, VERIFY)?;
-    assert_eq!(task, expected_task, "the seeded workspace is the task's");
     server.child.kill()?;
     server.child.wait()?;
     let log = fs::read_to_string(dir.join("serve.log"))?;
@@ -1531,5 +1510,57 @@ fn sealed_diff_observation_reaches_the_receipt() -> R<()> {
         "{receipt:?}"
     );
     assert_eq!(receipt.decision().verdict, Verdict::Pass, "{receipt:?}");
+    Ok(())
+}
+
+/// The refuter's escape (rung: test): a candidate that plants a valid `.git` whose config names
+/// an fsmonitor hook, a clean filter and a textconv driver that write `<dir>/PWNED_*` — a path
+/// outside the sandbox's binds, so only a host-side git could create it. The engine runs no git
+/// over the workspace, so none of them exists afterwards and the task is still observed.
+#[test]
+fn a_candidate_git_config_runs_nothing_on_the_host() -> R<()> {
+    let (_run, dir) = fsync_cheap_dir("e2e-ddf-pwn")?;
+    let pwn = |what: &str| dir.join(format!("PWNED_{what}"));
+    let verify = format!(
+        r#"sh: /usr/bin/mkdir -p .git/objects .git/refs/heads && echo 'ref: refs/heads/main' > .git/HEAD && printf '[core]\n\trepositoryformatversion = 0\n\tfsmonitor = /usr/bin/touch {fsm}\n[filter "p"]\n\tclean = /usr/bin/touch {clean}\n[diff "p"]\n\ttextconv = /usr/bin/touch {conv}\n' > .git/config && echo '* filter=p diff=p' > .gitattributes && echo x > f"#,
+        fsm = pwn("FSMONITOR").display(),
+        clean = pwn("CLEAN").display(),
+        conv = pwn("TEXTCONV").display(),
+    );
+    let mut server = start(&dir, "serve.log")?;
+    let (task, done) = run_task(&server.sock, "key-pwn", &verify)?;
+    server.child.kill()?;
+    server.child.wait()?;
+    let log = fs::read_to_string(dir.join("serve.log"))?;
+    for l in log.lines().filter(|l| l.contains("ddf")) {
+        println!("serve.log: {l}");
+    }
+    assert_eq!(done["body"]["phase"], "accepted", "{done} {log}");
+    let config = dir
+        .join("work")
+        .join(&task)
+        .join("1")
+        .join(&task)
+        .join(".git")
+        .join("config");
+    let planted = fs::read_to_string(&config)?;
+    println!("planted .git/config:\n{planted}");
+    assert!(planted.contains("fsmonitor = /usr/bin/touch "), "{planted}");
+    for what in ["FSMONITOR", "CLEAN", "TEXTCONV"] {
+        assert!(
+            !pwn(what).exists(),
+            "host ran the candidate's {what} command"
+        );
+    }
+    if ddf_present() {
+        assert!(
+            log.contains(&format!(
+                "dispatch task={task} ddf=observed tool=deep-diff-forge "
+            )),
+            "{log}"
+        );
+    } else {
+        println!("UNMEASURED: deep-diff-forge not on PATH");
+    }
     Ok(())
 }

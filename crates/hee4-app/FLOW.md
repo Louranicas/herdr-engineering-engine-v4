@@ -148,7 +148,7 @@ DC proposal below.
 | attempt_pid | `on_start(pid, start_ticks)` from `spawn::start` before the wait, per Run step: `Store::attempt_pid(id, pid, start_ticks)`, prints `dispatch task= attempt= pid= start_ticks=`; the worker calls no store | a store error is printed `attempt_pid error=` (the child is already running) |
 | repair | D6: `Settle(NotReady)` or `Decide(Fail)` → `repair_pending` → redispatch under `attempt.max_generations`, else `Stop`. `attempt.max_generations` is absent from K0's `AttemptBudget`, so today's parking stands (`Settle(NotReady)` → `Stop` → failed) and `next_admitted` ignores `repair_pending`; the two repair e2e tests print `UNMEASURED: attempt.max_generations absent` and fail once the field lands | — |
 | settle | `Settle(Ready)` → verifying | — |
-| ddf | `workspace_diff(ns.work_dir())`: no `<ws>/.git` → `Diff::NoWorktree`; else `git -C <ws> diff --cached` then `git -C <ws> diff` (`--no-color --no-ext-diff`) on the host; then K4 `ddf::for_task(diff, &subject, &SystemClock, timebox)` (the attempt's TIMEBOX). `Observed(o)` of any outcome (Pass, exit-7 advisory `Refused`, timeout `Error`) joins the observations; prints `dispatch task= ddf=observed tool=<name> <version>` | a log line and nothing else: `dispatch task= ddf=skipped reason=no_worktree\|no_diff\|tool_absent\|adapter_error:<variant>\|git_error:<spawn\|exit>`; never a refusal, never an abandon, never `Settle(NotReady)`; the dispatcher never reads the outcome, the lattice does |
+| ddf | before the attempt, `Snapshot::of(ns.work_dir(), DDF_DIFF_BYTES)`; after it, `workspace_diff(ws, &before, DDF_DIFF_BYTES)`: no `<ws>/.git` → `Diff::NoWorktree`; a `.git` that is a file or symlink (`symlink_metadata`, never followed) → `git_dir_not_dir`; else the workspace walked in-process (no symlink followed, FIFOs/devices skipped, every `.git` entry left out) and diffed against the snapshot as a unified patch. **No git runs on the host over a candidate-written workspace**: a planted `core.fsmonitor`, `filter.*.clean`, `diff.*.textconv` or `gitdir:` pointer is never read (e2e `a_candidate_git_config_runs_nothing_on_the_host`). Then K4 `ddf::for_task(diff, &subject, &SystemClock, timebox)` (the attempt's TIMEBOX). `Observed(o)` of any outcome (Pass, exit-7 advisory `Refused`, timeout `Error`) joins the observations; prints `dispatch task= ddf=observed tool=<name> <version>` | a log line and nothing else: `dispatch task= ddf=skipped reason=no_worktree\|no_diff\|tool_absent\|adapter_error:<variant>\|diff_error:<io\|too_large\|git_dir_not_dir>`; never a refusal, never an abandon, never `Settle(NotReady)`; the dispatcher never reads the outcome, the lattice does |
 | observe | per observation (the attempt's, then the ddf one): `observation_id`, `Store::record_observation`, `apply(Observe)` | — |
 | decide + seal | `decide_and_seal(chain_head, receipt_id, ids, obs, subject)`; ids: collector = digest(ledger epoch), locks = digest(permit), standards = digest(`gate.toml` baked at build); the one subject (built once in `step`, `subject_of`) has input = digest(VERIFY text), the same subject ddf bound its observation to | — |
 | receipt | `Store::append_receipt` (K1 re-runs `verify_chain`) | — |
@@ -201,7 +201,11 @@ three threads. Resume with `since_seq` = the last `seq` received: exactly-once b
 - ddf has no per-attempt budget field: it runs under the attempt's TIMEBOX (`dispatcher::timebox`).
   Its timeout observation is tier-0, so a hung deep-diff-forge gates the task (K4 DC, evidence FLOW).
 - The sandbox mounts no `/dev`, so `git` cannot run inside a VERIFY (exit 128, `/dev/null`;
-  MEASURED); a candidate's `.git` must come from elsewhere. The e2e seeds it on the host.
+  MEASURED); the e2e's candidate makes its `.git` with `mkdir`. The `--dev /dev` mount is a
+  hee4-host/hee4-worker follow-up.
+- `DDF_DIFF_BYTES` (16 MiB, each walk) is a const in `dispatcher.rs`, an UNMEASURED stand-in
+  until K0 adds an `attempt.diff_bytes` `Budgets` field. The patch is whole-file hunks, not a
+  minimal diff.
 - deep-diff-forge is found on `PATH`; the unit's `PATH` is the user manager's, which may not hold
   `~/.local/bin` (then `ddf=skipped reason=tool_absent`; UNMEASURED under the unit).
 
