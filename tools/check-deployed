@@ -16,10 +16,11 @@ print in D1..D9 order. No value comes from a receipt, a plan row, a source file 
 --control: a disposable HOME under ~/.cache/hee4-host (never /tmp) with stub systemctl/loginctl/
 hee4 on PATH, a real AF_UNIX listener held by a fake MainPID, a fake /api/ps, a synthetic ledger,
 a stub drive and a rehearsal record; one fault planted per row, each asserted by its row's own
-diagnostic text. Prints `check-deployed control cases=k/9 verdict=PASS|FAIL`.
+diagnostic text. Prints `check-deployed control cases=k/9 verdict=PASS|FAIL`. The control's
+children die with it (PR_SET_PDEATHSIG) and a control start sweeps cd-control-* dirs whose pid is dead.
 --control-skip D<n> (test only) removes that one plant: the control must then print cases=8/9.
 """
-import argparse, hashlib, http.server, json, os, shlex, shutil, socket, sqlite3, stat, subprocess, sys, tempfile, threading, time, uuid
+import argparse, ctypes, hashlib, http.server, json, os, shlex, shutil, signal, socket, sqlite3, stat, subprocess, sys, tempfile, threading, time, uuid
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
@@ -578,6 +579,36 @@ PLANTS = {  # row -> (what is planted, the diagnostic text its row must carry)
     "D9": ("the one accepted task id is in the rehearsal record", "use=0"),
 }
 
+def die_with_parent():
+    """preexec_fn: the child is SIGKILLed when its parent dies (PR_SET_PDEATHSIG), so a killed control leaves no listener."""
+    me = os.getppid()
+    try:
+        ctypes.CDLL(None, use_errno=True).prctl(1, signal.SIGKILL, 0, 0, 0)  # PR_SET_PDEATHSIG = 1
+    except (OSError, AttributeError):
+        pass
+    if os.getppid() != me:  # the parent died between fork and prctl
+        os._exit(1)
+
+
+def sweep_dead_controls(root):
+    """Remove cd-control-* dirs whose pid file names a process that is gone (a control killed mid-way)."""
+    swept = 0
+    for d in os.listdir(root) if os.path.isdir(root) else []:
+        full = os.path.join(root, d)
+        if not d.startswith("cd-control-") or not os.path.isdir(full):
+            continue
+        try:
+            pid = int(open(os.path.join(full, "pid")).read().strip())
+            os.kill(pid, 0)
+            alive = True
+        except (OSError, ValueError):
+            alive = False
+        if not alive:
+            shutil.rmtree(full, ignore_errors=True)
+            swept += 1
+    return swept
+
+
 SERVER_PY = r'''
 import json, os, socket, sys
 path, sv, head = sys.argv[1], int(sys.argv[2]), sys.argv[3]
@@ -626,7 +657,9 @@ def control(a):
     planted = lambda n: n not in skip
     root = os.path.expanduser("~/.cache/hee4-host")
     os.makedirs(root, exist_ok=True)
+    swept = sweep_dead_controls(root)
     ctl = tempfile.mkdtemp(prefix="cd-control-", dir=root)
+    write(os.path.join(ctl, "pid"), f"{os.getpid()}\n")
     procs = []
     try:
         head40 = "c0ffee" + uuid.uuid4().hex + "0" * 2
@@ -642,12 +675,12 @@ def control(a):
         server_py = os.path.join(lib, "server.py")
         write(server_py, SERVER_PY)
         sv_ledger, sv_health = 2, (3 if planted("D4") else 2)
-        srv = subprocess.Popen([serve_bin, server_py, sock, str(sv_health), head40], stdout=subprocess.PIPE, text=True)
+        srv = subprocess.Popen([serve_bin, server_py, sock, str(sv_health), head40], stdout=subprocess.PIPE, text=True, preexec_fn=die_with_parent)
         procs.append(srv)
         srv.stdout.readline()  # "bound"
         main_pid = srv.pid
         if planted("D3"):
-            other = subprocess.Popen([serve_bin, "-c", "import time; time.sleep(600)"])
+            other = subprocess.Popen([serve_bin, "-c", "import time; time.sleep(600)"], preexec_fn=die_with_parent)
             procs.append(other)
             main_pid = other.pid
         # fake /proc: exe and fd point at the real entries, cgroup is the unit's
@@ -780,7 +813,7 @@ esac
                           "--evidence-root", ev_root, "--drill-root", drill_root, env=env, timeout=120)
         httpd.shutdown()
         rows = {l.split(" ", 1)[0]: l for l in out.splitlines() if l.split(" ", 1)[0] in ROWS}
-        print(f"control home={ctl} rows_rc={rc} control_ledger=synthetic")
+        print(f"control home={ctl} rows_rc={rc} control_ledger=synthetic swept_dead_controls={swept}")
         if err:
             print(f"control stderr={err.splitlines()[-1]}")
         met = 0

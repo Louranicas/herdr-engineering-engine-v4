@@ -1,4 +1,4 @@
-import importlib.machinery, importlib.util, os, unittest
+import importlib.machinery, importlib.util, os, signal, subprocess, sys, time, unittest
 from common import TOOLS, run
 
 CD = os.path.join(TOOLS, "check-deployed")
@@ -42,6 +42,37 @@ class CheckDeployedTests(unittest.TestCase):
             self.assertIn("detected=yes", row(out, "control " + n)[0])
         self.assertIn("control_ledger=synthetic", out)
         self.assertIn("in_mainpid_fds=no", row(out, "control D3")[0]); self.assertIn("held_by=", row(out, "control D3")[0])
+
+    def test_fire_killed_control_leaves_no_listener_and_is_swept(self):
+        root = os.path.expanduser("~/.cache/hee4-host")
+        before = set(os.listdir(root)) if os.path.isdir(root) else set()
+        ctl = subprocess.Popen([CD, "--control"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        server, t0 = None, time.monotonic()
+        while server is None and time.monotonic() - t0 < 20:  # wait until the control's listener child exists
+            for d in os.listdir("/proc"):
+                if d.isdigit():
+                    try:
+                        argv = open(f"/proc/{d}/cmdline", "rb").read().split(b"\0")
+                    except OSError:
+                        continue
+                    if len(argv) > 2 and b"cd-control-" in argv[1] and argv[1].endswith(b"server.py"):
+                        server = (int(d), argv[1].decode()); break
+            time.sleep(0.02)
+        self.assertIsNotNone(server, "the control never started its server child")
+        os.kill(ctl.pid, signal.SIGKILL); ctl.wait()
+        home = server[1].split("/lib/")[0]
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 5 and os.path.exists(f"/proc/{server[0]}"):
+            time.sleep(0.05)
+        self.assertFalse(os.path.exists(f"/proc/{server[0]}"), "the listener outlived its killed control")
+        holders = [d for d in os.listdir("/proc") if d.isdigit() and home.encode() in (open(f"/proc/{d}/cmdline", "rb").read() if os.path.exists(f"/proc/{d}/cmdline") else b"")]
+        self.assertEqual(holders, [], f"processes still under {home}")
+        self.assertTrue(os.path.isdir(home))  # the dir stays until the next control sweeps it
+        rc, out, err = run(CD, "--control", timeout=180)
+        self.assertEqual(rc, 0, out + err)
+        self.assertFalse(os.path.isdir(home), "the dead control's dir was not swept")
+        self.assertRegex(out, r"swept_dead_controls=[1-9]")
+        self.assertEqual(set(os.listdir(root)) - before, set())
 
     def test_fire_control_skip_removes_exactly_one_case(self):
         for n in ROWS:
