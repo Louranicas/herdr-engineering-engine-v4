@@ -13,7 +13,7 @@
 //! | Durable facts | Observation | Rule | Event | After |
 //! |---|---|---|---|---|
 //! | the latest `attempts` row contradicts the events: closed with no / a wrong `closed_seq`, an outcome that disagrees with the closing event, or running while a close follows its `dispatch_seq` | any | R03 | — (`Finding::Contradictory`; a contradiction cannot be transitioned away) | unchanged; `complete=false`, the engine does not listen, the operator restores |
-//! | running, attempt open, row with pid | `LiveSameIdentity` (probe: the process start ticks equal the row's) | R06 | — (observe-only, no reaper) | unchanged |
+//! | running, attempt open, row with pid | `LiveSameIdentity` (probe: the process start ticks equal the row's, its state is not `Z`/`X`, and the row's lease `clock_epoch`, when present, is this boot's `boot_id`; otherwise `Absent`) | R06 | — (observe-only, no reaper) | unchanged |
 //! | running, attempt open | `Absent` | R08 + reason: row unacknowledged → `DispatchUnacknowledged`; acknowledged → `AcknowledgedWorkerLost`; no row (pre-migration history) → `AcknowledgementUnrecorded` | `Recover(R08)` | effect_unknown |
 //! | running, attempt open | `PidReused` / `Unreadable` / `Unobserved` (a row with no pid probes `Unobserved`) | R07 + the same acknowledgement class | `Recover(R07)` | effect_unknown |
 //! | verifying, nothing sealed: no `Decide` after the latest `Dispatch`, receipts ≤ `Decide`s | any | R12 (no verdict exists to copy) | `Resolve(Quarantine(EffectUnknownPermanent{R12}))` | blocked |
