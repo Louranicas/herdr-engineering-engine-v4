@@ -12,17 +12,35 @@ A-02. A paged listing of the control catalogue: every action id with its version
 
 ## How to get to it (user POV)
 
-`hee4 tools.list` (binary), `hee4-sh tools.list query:=null page:=JSON` (wrapper), or the Pi tool `hee4_tools_list` (PROPOSAL Command Map P-1; v3 `habitat_tools_list`). Also `hee4-sh --actions`, which lists what the *wrapper* can name from its generated catalogue, which must equal this action's items for the same release.
+`hee4 tools.list` (binary), `hee4-sh tools.list query:=null page:=JSON` (wrapper), or the Pi tool `hee4_tools_list` (PROPOSAL Command Map P-1; v3 `habitat_tools_list`). Also `hee4-sh --actions`, which lists what the *wrapper* can name from its generated catalogue, which must equal this action's items for the same release. (UNMEASURED: hee4-sh exists in no crate)
 
 ## Driving it with hee4
+
+Concrete, deployed frame (rev 2026-10-05 drive) (run all of it with `tools/drive`):
+
+```bash
+hee4 tools.list --body '{"query":null}'
+# raw: {"request_id":"r","action":"tools.list","action_version":1,"idempotency_key":null,"body":{"query":"task","page":{"limit":5,"cursor":null}}}
+```
+
+Result `{catalogue_revision, page: {items: [{id, version, purpose, effect}], cursor}}`. The page bound is `MAX_PAGE_LIMIT` (hee4-contracts bounds; a missing page is a page at the bound) and the cursor is `actions/page.rs` `Cursor {after_key, boot, filter_sha256}` (both UNWRITTEN lines below resolved). Paths (`tools/drive.d/tools.py` `d_tools_list`; no count is written: the expected ids are the feature files, the bounds are read from the refusal messages):
+
+- `success`: page omitted, revision 64 hex, cursor followed to null, the union of ids equals `gates/features/*.md` minus README, crash-restart, multi-surface-journeys; every item has `id, version, purpose, effect`.
+- `query_subset` (`"task"`), `query_empty` (`"zz-no-such-id"` → items `[]`, cursor null).
+- `query_too_long`: 257 bytes → `invalid_argument` at `/body/query`, message names both numbers.
+- `limit_zero`, `limit_over` (`1000000`): `invalid_argument` at `/body/page/limit`, message names both numbers.
+- `paging`: limit 5 to a null cursor, pages disjoint, each ≤ 5, union equals `success`.
+- `revision_stable`: two calls, one revision.
+- `stale_cursor`: a real cursor with `boot + 1` → `resync_required` at `/body/page/cursor`, `because` `epoch moved`.
+- `no_operations_row`: with `--ledger`, the operations count is unchanged.
 
 Preconditions: README shared preconditions; a `Read` grant.
 
 ```bash
 hee4 tools.list
-hee4-sh tools.list query:=null 'page:={"limit":100,"cursor":null}'
-hee4-sh tools.list query=task 'page:={"limit":10,"cursor":null}'
-hee4-sh --actions
+hee4-sh tools.list query:=null 'page:={"limit":100,"cursor":null}'  # UNMEASURED: hee4-sh exists in no crate
+hee4-sh tools.list query=task 'page:={"limit":10,"cursor":null}'  # UNMEASURED: hee4-sh exists in no crate
+hee4-sh --actions  # UNMEASURED: hee4-sh exists in no crate
 ```
 
 Socket: request `body` `{query, page{limit, cursor}}`; result `body` `{catalogue_revision, page{items[{id, version, purpose, effect}], cursor}}` (API Map A-02).
@@ -32,8 +50,8 @@ Socket: request `body` `{query, page{limit, cursor}}`; result `body` `{catalogue
 - Error: `query` over 256 bytes → `invalid_argument` at `/body/query` naming the bound; `page.limit` 0 or over the bound → `invalid_argument` at `/body/page/limit`.
 - Persistence: none to verify; repeat yields identical `catalogue_revision` for the same binary, and a different one after `hee4 release install` of a different release.
 - Side effect: no `operations` row.
-- `UNWRITTEN: which page bound governs tools.list: v3 MAX_PAGE = 32 (actions.rs) or MAX_PAGE_LIMIT = 100 (contracts/control.rs). API Map P-3 says v4 keeps one and the slice records which; assert MAX and MAX+1 once it is chosen.`
-- `UNWRITTEN: the cursor type for this page (PageCursorV1 as task.list, or a catalogue-specific one).`
+- `RESOLVED (rev 2026-10-05 drive: MAX_PAGE_LIMIT), was UNWRITTEN: which page bound governs tools.list: v3 MAX_PAGE = 32 (actions.rs) or MAX_PAGE_LIMIT = 100 (contracts/control.rs). API Map P-3 says v4 keeps one and the slice records which; assert MAX and MAX+1 once it is chosen.`
+- `RESOLVED (rev 2026-10-05 drive: actions/page.rs Cursor {after_key, boot, filter_sha256}), was UNWRITTEN: the cursor type for this page (PageCursorV1 as task.list, or a catalogue-specific one).`
 
 ## Gotchas
 
