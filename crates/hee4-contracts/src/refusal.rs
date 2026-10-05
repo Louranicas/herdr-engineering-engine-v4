@@ -2,6 +2,7 @@
 
 use crate::brief::BriefField;
 use crate::state::{Event, Phase, RecoveryRule};
+use crate::verify::VerifyFault;
 
 /// Which hex newtype a malformed input was meant to become.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -136,4 +137,10 @@ pub enum Refusal {
     /// The worker's RESTATEMENT is empty; admission refuses it (narrative principle 13).
     #[error("RESTATEMENT is empty")]
     EmptyRestatement,
+    /// The brief's VERIFY looks at nothing: empty, nothing runnable, or only no-ops (V4-94).
+    #[error("VERIFY {cause}")]
+    VacuousVerify {
+        /// What makes it vacuous.
+        cause: VerifyFault,
+    },
 }
