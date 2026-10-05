@@ -155,6 +155,7 @@ pub fn plan_for_with(task: &NamespaceTask, present: impl Fn(&Path) -> bool) -> N
         ro_binds,
         work_dir: task.work_dir.clone(),
         model_door,
+        sockets: vec![],
         timeout: task.timeout,
     }
 }
@@ -296,9 +297,7 @@ mod tests {
         let ns = plan_for_with(&t, |_| true);
         let permit = Permit::mint(
             ReceiptId("r".into()),
-            SpawnScope {
-                programs: vec![PathBuf::from("/usr/bin/true")],
-            },
+            SpawnScope::of_programs(vec![PathBuf::from("/usr/bin/true")]),
         );
         let sp = plan(
             &permit,

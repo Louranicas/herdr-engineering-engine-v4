@@ -16,8 +16,10 @@ mod store;
 
 pub use backup::{BackupError, BackupReport, MAX_BACKUP_OBJECTS, RestoreReport, SameDisk};
 pub use recovery::{Observations, ProcessCustody, RecoveryReport, reconcile};
+pub use store::migration_names;
 pub use store::receipts;
 pub use store::roster;
+pub use store::service;
 pub use store::{
     Admission, AttemptId, AttemptIdFault, AttemptOutcome, AttemptRow, AttemptStart, AttemptState,
     CacheHeal, CachedRow, Cleanup, CursorVerdict, Effect, Lease, Operation, OperationKey,

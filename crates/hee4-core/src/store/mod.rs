@@ -15,6 +15,14 @@
 pub(crate) mod attempts;
 mod backup;
 pub(crate) mod migrations;
+
+/// The names of every migration this binary knows, in registration order. A file opened by this
+/// binary records each of them once (`schema_version` = their count), so tests derive their
+/// expectations from here instead of pinning a count that every new family would have to edit.
+#[must_use]
+pub fn migration_names() -> Vec<&'static str> {
+    migrations::MIGRATIONS.iter().map(|m| m.name).collect()
+}
 pub mod receipts;
 
 pub use attempts::{
@@ -22,6 +30,7 @@ pub use attempts::{
     Effect, Lease,
 };
 pub mod roster;
+pub mod service;
 
 use std::collections::BTreeSet;
 use std::os::unix::fs::PermissionsExt;

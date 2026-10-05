@@ -10,6 +10,7 @@
 pub mod page;
 pub mod registry;
 pub mod roster;
+pub mod service;
 pub mod task;
 pub mod tools;
 
@@ -39,6 +40,7 @@ pub fn composed() -> Result<Registry, RegistryFault> {
         task::EVENTS,
         tools::FAMILY,
         roster::FAMILY,
+        service::FAMILY,
     ])
 }
 

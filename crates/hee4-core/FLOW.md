@@ -62,6 +62,7 @@ migration; never edit the v1/v2 text.
 | `m002_cache_heals` | `cache_heals` |
 | `m003_operations_subject` | `operations` recreated with `operation_id` (`op-` + 24 hex of sha256 of the four key fields joined by `\n`), nullable `task_id`, `subject` (= `task_id` for the copied rows) |
 | `m004_serve_cgroup` | `tasks.serve_cgroup TEXT NOT NULL DEFAULT ''` |
+| `m005_service_facts` | `service_facts(service_id PK, owner_id, unit_id, owner_sha256 CHECK len 64, generation CHECK >= 1, cached_health_json NULL, updated_ts)`; SQL only in `store/service.rs` |
 
 ```
 tasks(id PK, phase CHECK(11 spellings), cancel 0|1, generation >= 0, updated_ts,

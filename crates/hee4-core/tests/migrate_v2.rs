@@ -182,18 +182,18 @@ fn a_v2_file_gains_the_named_rows_and_keeps_its_data() -> R {
     let receipt = build_v2(&path)?;
     let task: TaskId = LEGACY_TASK.parse()?;
     let store = Store::open(&path)?;
-    assert_eq!(store.schema_version()?, 5);
     assert_eq!(
-        migration_rows(&path)?,
-        [
-            "migration:m001_v1",
-            "migration:m002_cache_heals",
-            "migration:m003_operations_subject",
-            "migration:m004_serve_cgroup",
-            "migration:m005_checkpoints",
-            "migration:m005_roster"
-        ]
+        store.schema_version()?,
+        i64::try_from(hee4_core::migration_names().len())?
     );
+    let mut want: Vec<String> = hee4_core::migration_names()
+        .iter()
+        .map(|n| format!("migration:{n}"))
+        .collect();
+    want.sort();
+    let mut got = migration_rows(&path)?;
+    got.sort();
+    assert_eq!(got, want);
     assert_eq!(store.epoch()?, LEGACY_EPOCH, "epoch is kept, not re-minted");
     assert_eq!(store.history(&task)?, [Event::Admit]);
     assert_eq!(store.chain_head(&task)?, receipt.hash_self());
@@ -222,7 +222,10 @@ fn a_v2_file_gains_the_named_rows_and_keeps_its_data() -> R {
     drop(store);
 
     let again = Store::open(&path)?;
-    assert_eq!(again.schema_version()?, 5);
+    assert_eq!(
+        again.schema_version()?,
+        i64::try_from(hee4_core::migration_names().len())?
+    );
     assert_eq!(meta_count(&path)?, rows, "a second open adds no meta row");
     assert_eq!(again.boot()?, boot + 1);
     assert_eq!(again.history(&task)?, [Event::Admit]);

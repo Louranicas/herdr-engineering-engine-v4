@@ -14,26 +14,28 @@ A-17. A managed lifecycle act on a service's unit (start, stop, …) over S-4 D-
 
 ## How to get to it (user POV)
 
-`hee4 service.action` (binary); wrapper "generated"; Pi `hee4_service_action` (PROPOSAL). At v4.0, `unavailable`. From v4.2 an operator reaches it to start or stop a managed unit through the engine instead of `systemctl`.
+`hee4 service.action --key K --precondition JSON --body JSON` (binary, the generic client); Pi `hee4_service_action` (PROPOSAL). At v4.0, `unavailable`. From v4.2 an operator reaches it to start or stop a managed unit through the engine instead of `systemctl`.
 
 ## Driving it with hee4
 
-Preconditions (v4.2): a `ManagedLifecycle` grant; `service_id`, `unit_id`, current generation and owner digest from `service.inspect`; a fresh UUID.
+Preconditions (v4.2): a `ManagedLifecycle` grant; `service_id`, `unit_id`, the current `generation` and `owner_sha256` from `service.inspect`; a fresh key. The drive acts only on `drive` (`hee4-drive.service`, a transient `systemd-run --user --unit hee4-drive.service --collect /usr/bin/sleep 300`); `self` and `model` are seeded `actable = 0` in `service_facts`, so the server refuses an action on either (`forbidden` at `/body/service_id`, because `service not actable`) before any call; the drive also refuses client-side.
+
+Concrete, deployed frame (rev 2026-10-05 drive) (run all of it with `tools/drive --only service.action`):
 
 ```bash
 K=$(uuidgen)
-hee4 service.action                                                                                                      # v4.0: unavailable by name
-hee4-sh service.action service_id=<id> unit_id=<unit> action=<act> expected_owner_sha256=<hex> @idempotency_key=$K '@precondition:={"resource":"service","id":"<id>","generation":"<g>"}'   # v4.2
-systemctl --user show -p ActiveState,MainPID <unit>                                                                      # side effect
-hee4-sh service.inspect service_id=<id> 'operation:={"source_action":"service.action","idempotency_key":"'$K'"}'       # readback
+hee4 service.action --key "$K" --precondition '{"resource":"service","id":"drive","generation":<g>}' --body '{"service_id":"drive","unit_id":"hee4-drive.service","action":"stop","expected_owner_sha256":"<hex>"}'
+systemctl --user show -p ActiveState hee4-drive.service                                                  # side effect
+hee4 service.inspect --body '{"service_id":"drive","operation":{"source_action":"service.action","idempotency_key":"'"$K"'"}}'   # readback
 ```
 
-Socket: request `body` `{service_id, unit_id, action, expected_owner_sha256}` with `precondition{resource:"service", …}`; result `body` `{operation_id, service_id, owner_job_id, observed_state, useful_health}` (API Map A-17). `UNWRITTEN: the action value domain, observed_state and useful_health shapes, and the generated wrapper spelling.`
+Socket: request `body` `{service_id, unit_id, action ∈ start|stop|restart, expected_owner_sha256}` + `idempotency_key` + `precondition{resource:"service", id: service_id, generation}`; result `body` `{operation_id, service_id, owner_job_id, observed_state, useful_health}`. `owner_job_id` is the manager's job path (`/org/freedesktop/systemd1/job/N`) from `busctl --user call … StartUnit|StopUnit|RestartUnit ss <unit> replace`; `observed_state` is the `ActiveState` read back (`active` for start/restart, `inactive` for stop) within the 5 s budget; `useful_health` is that read-back as an `Observation` (the shape in `service.probe.md`).
 
-- v4.0 path: the `unavailable` refusal.
-- v4.2 success: `observed_state` equals `systemctl --user show -p ActiveState`; `service_facts` and `operations` gain rows; the D-Bus property read-back equals the request (cgroup-io AP-49 rule).
-- Error: `stale_generation`; `conflict` on an owner digest mismatch; `effect_unknown` with `retry=after_readback` and the settling read when the call's effect is uncertain; `busctl` digest mismatch → `unavailable` by name.
-- Persistence: replay returns the stored result; after `kill -KILL` of `serve` mid-call the operation is either recorded with its effect or absent, never recorded as success without the read-back.
+- Order of checks: body shape → unknown service `not_found` → `unit_id` ≠ the service's unit `invalid_argument` at `/body/unit_id` → a service seeded not actable `forbidden` at `/body/service_id` → precondition resource ≠ `service` or id ≠ `service_id` `invalid_argument` at `/precondition` → generation ≠ current `stale_generation` at `/precondition/generation` with `current_generation` → `expected_owner_sha256` ≠ the row's `conflict` at `/body/expected_owner_sha256` → the act. No precondition at all is dispatch's `invalid_argument` at `/precondition`.
+- Success: `observed_state` equals `systemctl --user show -p ActiveState`; `service_facts.generation` moves by one; `operations` gains one row.
+- Error: `effect_unknown` with `retry=after_readback`, `readback` `service.inspect`, `effect: "unknown"` when the call was sent but its read-back did not settle or faulted (digest, door, stdout bound after the call are all `effect_unknown`); it writes **no** operations row and does not move the generation, so a retry with the same key re-executes the act; busctl digest mismatch before the call → `unavailable` because `busctl digest`; a manager error reply (nothing happened) → `not_found` at `/body/unit_id` for `Unit X not found.`/`not loaded.`, else `unavailable` at `/body/unit_id` because `manager refused`.
+- Concurrency: one lock per seeded service is held across replay, checks, act and commit, so two requests on one service never both act; the second reads the moved generation (`stale_generation`) or its committed key (`replayed: true`).
+- Persistence: replay returns the stored result with `replayed: true` and runs no child; the commit re-checks generation and owner digest inside the transaction.
 - Cancel: none; the act is bounded by its child deadline.
 - Side effects to read: the unit's state on the host, `service_facts`, `operations`.
 
@@ -43,3 +45,4 @@ Socket: request `body` `{service_id, unit_id, action, expected_owner_sha256}` wi
 - `effect_unknown` on the wire reads `effect: unknown` in the envelope; it is the only code that does (Error map §0). It is not a failure; it is an obligation to read back.
 - `expected_owner_sha256` is a CAS guard, not authentication; the grant is.
 - Must not: every S-4 and `systemd-run` call is in K0h cgroup-io with K2/K5 supplying the plan (V4-60, DC-38); a `busctl` spawned anywhere else is a second door.
+- An `effect_unknown` reply has no operations row by design (nothing is committed without a read-back), so `service.inspect` by its key is `not_found`; read the unit with `service.probe` and retry with the same key.

@@ -615,7 +615,11 @@ fn open_read_only_verifies_writes_nothing_and_refuses_an_unmigrated_file() -> R 
 
     let conn = Connection::open(&path)?;
     let before = (meta(&conn, "recovery_complete")?, user_version(&conn)?);
-    assert_eq!(before.1, 5, "five migrations applied");
+    assert_eq!(
+        before.1,
+        i64::try_from(hee4_core::migration_names().len())?,
+        "every known migration applied"
+    );
     let ro = Store::open_read_only(&path)?;
     let report = ro.verify_ledger()?;
     assert_eq!((report.receipts, report.checkpoints), (3, 1));

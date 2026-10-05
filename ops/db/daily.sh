@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# hee4-ops.db daily upkeep (CN-04): keeps the DB current with no human in the loop. Host crontab, 02:30 daily,
-# through the same wrapper as the roster lines, before curator deep at 02:40 (which reads the DB's answers).
+# hee4-ops.db daily upkeep (CN-04): keeps the DB current with no human in the loop. User timer hee4-daily.timer,
+# 02:30 daily (systemd/hee4-daily.{timer,service}, installed by `just install-timers`; SuccessExitStatus=10).
 # Steps, in order, each logged `step=<name> rc=N`:
 #   ingest                      rebuild the derived tables from their file homes (+ FTS sidecar)
 #   runs                        record run --from-logs: backfills any run whose own db_record step failed (idempotent)
@@ -22,7 +22,12 @@ step() { # <name> <hee4db args…>
   local name=$1 rc; shift
   echo "## step=$name argv=hee4db $*" >> "$LOG"
   "$HEE4DB" "$@" >> "$LOG" 2>&1 </dev/null; rc=$?
-  echo "step=$name rc=$rc" >> "$LOG"
+  local why=""
+  if [ "$name" = jev-daily ] && [ "$rc" = 10 ]; then # the gap, by name: which senders the verb could not measure
+    local senders; senders=$(grep -o 'senders_fully_measured=[0-9]*/[0-9]*' "$LOG" | tail -n 1)
+    case "$senders" in *=0/*) why=" reason=no_sender_installed $senders" ;; *) why=" reason=senders_partial $senders" ;; esac
+  fi
+  echo "step=$name rc=$rc$why" >> "$LOG"
   case "$rc" in
     0) ok=$((ok + 1)) ;;
     10) ok=$((ok + 1)); if [ "$worst" = 0 ]; then worst=10; worst_step=$name; fi ;;

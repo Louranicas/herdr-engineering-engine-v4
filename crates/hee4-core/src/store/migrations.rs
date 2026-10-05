@@ -130,6 +130,7 @@ pub const MIGRATIONS: &[Migration] = &[
     super::attempts::MIGRATION,
     super::receipts::m005_checkpoints(),
     super::roster::MIGRATION,
+    super::service::MIGRATION,
 ];
 
 /// The migrations a legacy file (no `migration:` rows) has already applied, by its
