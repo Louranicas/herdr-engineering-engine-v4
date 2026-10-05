@@ -134,6 +134,9 @@ fn subscribe(engine: &Engine, body: &Value) -> Result<Answer, Fault> {
                     format!("future sequence; the event high water is {high_water}"),
                 );
             }
+            // Consistent cursor: no refusal. The stream that follows is the same gap-free
+            // tail a legacy (epoch-null) subscriber gets, not a replay this verdict authorises;
+            // K1's "snapshot answer, no replay" wording vs that tail is a DC proposal.
             CursorVerdict::SnapshotOnly => {}
         }
     }
@@ -553,6 +556,39 @@ mod tests {
         assert_eq!(admitted["kind"], "result", "{admitted}");
         assert_eq!(admitted["body"]["phase"], "admitted", "{admitted}");
         assert_eq!(e.store().task_ids()?.len(), 1);
+        Ok(())
+    }
+
+    /// K0's grammar admits these vacuous lines today (refuter, 2026-10-05; not in
+    /// hee4-contracts' named-not-caught table). Pinned here so the hole is named, not silent:
+    /// when K0 normalises before its no-op lookup, this test fails and moves them to the
+    /// refused list in `vacuous_verify_is_refused_at_submit_and_preview`.
+    #[test]
+    fn vacuous_verify_lines_k0_does_not_catch_yet_are_admitted_by_name()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let e = engine("not-caught")?;
+        reconcile(&e.store(), &Observations::worker_absent())?;
+        let holes = [
+            "/usr/bin/env true",
+            "sh: \"true\"",
+            "sh: exit 0;",
+            "sh: true;",
+            "/usr/bin/../bin/true",
+            "//usr/bin/true",
+        ];
+        for (i, verify) in holes.iter().enumerate() {
+            let text = BRIEF.replace(
+                "VERIFY: /usr/bin/test -d /usr",
+                &format!("VERIFY: {verify}"),
+            );
+            let admitted = handle(&e, &submit_line(&format!("h{i}"), &text));
+            assert_eq!(admitted["kind"], "result", "{verify:?}: {admitted}");
+            assert_eq!(
+                admitted["body"]["phase"], "admitted",
+                "{verify:?}: {admitted}"
+            );
+        }
+        assert_eq!(e.store().task_ids()?.len(), holes.len());
         Ok(())
     }
 
