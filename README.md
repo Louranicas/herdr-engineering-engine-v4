@@ -90,7 +90,7 @@ just gate commit        # fmt, clippy -D warnings, test, on a git archive of HEA
 just gate stack         # commit + a sealed deep-diff-forge observation (--require-files --require-hunks) + doc
 just gate cut           # stack + drill + drive + doctor
 just cut-check          # refuses unless the installed binary's head = HEAD; then mirror, gate cut, check-deployed (control first), cold-clone, push-scan, layers, watch -> one verdict and $HEE4_CUT_ROOT/<sha12>/cut-check.json
-just tag NAME confirm   # an annotated tag at HEAD from HEAD's PASS cut-check record, laid locally and read back; never pushed
+just tag NAME confirm   # an annotated tag at HEAD from HEAD's newest PASS cut-check record (installed binary = HEAD), laid locally and read back; never pushed
 ```
 
 `tools/gate` exports the subject at a sha, sets `HEE4_HEAD` for `build.rs`, builds in a per-subject target dir, and prints `step=<name> rc=<n> elapsed=<s>/<budget>s margin=<s>` per step and one verdict line. A step whose expected output is absent (zero tests collected) is marked `looked_at_nothing` and fails. Tiers and budgets live in `gate.toml` only.
