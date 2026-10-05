@@ -35,7 +35,9 @@ pub enum VerifyLine {
 /// Programs that succeed and print nothing, after lexical path normalisation.
 const TRUE_WORDS: [&str; 3] = ["true", "/bin/true", "/usr/bin/true"];
 
-/// Programs that print their arguments and succeed: a no-op whatever the args.
+/// Programs that print their arguments to fd 1 and succeed when that write succeeds: a no-op
+/// whatever the args while fd 1 is open for writing, and `echo -n` with nothing to print is a
+/// no-op whatever fd 1 is ([`echo_writes_nothing`]).
 const ECHO_WORDS: [&str; 3] = ["echo", "/bin/echo", "/usr/bin/echo"];
 
 /// `env <program> ..` runs `<program>` (an option or an assignment after `env` is not read).
@@ -198,57 +200,132 @@ enum Op {
     Background,
 }
 
-/// One shell word after quote removal; `dynamic` when its value depends on an expansion.
+/// One shell word after quote removal; `dynamic` when its value depends on an expansion,
+/// `quoted` when any part of it was quoted or escaped (so `"2">x` is an argument, not an fd).
 #[derive(Debug, Default)]
 struct Word {
     text: String,
     dynamic: bool,
+    quoted: bool,
 }
 
 #[derive(Debug)]
 enum Token {
     Word(Word),
-    /// A redirection operator; `dup` when it ends in `&` (`>&`, `<&`, `2>&`), so its target is
-    /// a file descriptor, not a file.
+    /// A redirection operator: the fd it moves (`None` for `&>`, which moves fd 1 and fd 2;
+    /// `usize::MAX` for an fd too large to read) and how it uses its target.
     Redirect {
-        dup: bool,
+        fd: Option<usize>,
+        op: RedirOp,
     },
     Op(Op),
 }
 
-/// The redirections on one command, as far as they decide whether it can fail. Ordered: a
-/// command's redirections are the worst of its parts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum Redir {
-    /// None.
-    None,
-    /// Only redirections that cannot fail for any command: to or from `/dev/null`, or a dup
-    /// onto fd 1 or 2.
-    Null,
-    /// A dup onto fd 0 or a close (`-`): harmless for a command that writes nothing (`true`,
-    /// `:`), but a write to the moved or closed fd fails, so `echo` can fail. The fd the
-    /// redirection applies to is not read: `echo x 2>&-` counts as one that can fail, which
-    /// admits a line and never refuses one.
-    Silent,
-    /// Any other: a file that may not open, an fd that may be closed, or no target.
-    Other,
+/// How a redirection uses its target word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RedirOp {
+    /// `<`: open the file to read.
+    Read,
+    /// `>`, `>>`, `>|`, `<>`, `&>`, `&>>`: open the file to write.
+    Write,
+    /// `>&`, `<&`: copy the fd named by the target, or close the fd (`-`).
+    Dup,
+}
+
+/// What an fd holds, as far as a redirection or a write through it can fail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fd {
+    /// Open, read-only: a write through it fails.
+    Read,
+    /// Open for writing.
+    Write,
+    /// Closed: a dup of it fails, a write through it fails.
+    Closed,
+    /// Not known: a dup of it may fail.
+    Unknown,
+}
+
+/// The fds a redirection can name and this reader follows (0-9); a larger fd is not tracked.
+const TRACKED_FDS: usize = 10;
+
+/// The redirections on one command, applied in order (as the shell does) to the fds the host
+/// gives a candidate: fd 0 from `/dev/null` read-only, fd 1 and fd 2 piped
+/// (`hee4-host/src/spawn.rs`, `start_with`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Redir {
+    /// The command has at least one redirection.
+    any: bool,
+    /// A redirection may fail: a file other than `/dev/null`, a dup of an fd that may be
+    /// closed, a dynamic target, or no target.
+    may_fail: bool,
+    /// fd 0 to fd 9 as the redirections so far leave them.
+    fds: [Fd; TRACKED_FDS],
 }
 
 impl Redir {
-    /// Add one redirection whose target is `target` (`None`: the line ended or an operator came
-    /// first).
-    fn add(self, dup: bool, target: Option<&Word>) -> Self {
-        let this = match target {
-            Some(w) if !w.dynamic && dup => match w.text.as_str() {
-                "1" | "2" => Self::Null,
-                "0" | "-" => Self::Silent,
-                _ => Self::Other,
+    /// No redirection: the fds as the host spawns a candidate.
+    const NONE: Self = Self {
+        any: false,
+        may_fail: false,
+        fds: [
+            Fd::Read,
+            Fd::Write,
+            Fd::Write,
+            Fd::Unknown,
+            Fd::Unknown,
+            Fd::Unknown,
+            Fd::Unknown,
+            Fd::Unknown,
+            Fd::Unknown,
+            Fd::Unknown,
+        ],
+    };
+
+    /// Apply one redirection of `fd` (`None`: fd 1 and fd 2) whose target is `target` (`None`:
+    /// the line ended or an operator came first).
+    fn add(&mut self, fd: Option<usize>, op: RedirOp, target: Option<&Word>) {
+        self.any = true;
+        let value = match target {
+            Some(w) if !w.dynamic => match op {
+                RedirOp::Dup if w.text == "-" => Some(Fd::Closed),
+                RedirOp::Dup
+                    if !w.text.is_empty() && w.text.bytes().all(|b| b.is_ascii_digit()) =>
+                {
+                    w.text
+                        .parse::<usize>()
+                        .ok()
+                        .and_then(|n| self.fds.get(n).copied())
+                        .filter(|f| matches!(f, Fd::Read | Fd::Write))
+                }
+                RedirOp::Read if w.text == "/dev/null" => Some(Fd::Read),
+                RedirOp::Write if w.text == "/dev/null" => Some(Fd::Write),
+                _ => None,
             },
-            Some(w) if !w.dynamic && w.text == "/dev/null" => Self::Null,
-            _ => Self::Other,
+            _ => None,
         };
-        self.max(this)
+        let Some(value) = value else {
+            self.may_fail = true;
+            return;
+        };
+        let moved: &[usize] = match fd {
+            Some(ref n) => std::slice::from_ref(n),
+            None => &[1, 2],
+        };
+        for &n in moved {
+            if let Some(slot) = self.fds.get_mut(n) {
+                *slot = value;
+            }
+        }
     }
+}
+
+/// `echo -n` with no argument, or only empty ones, prints nothing, so a closed or read-only
+/// fd 1 cannot make it fail (bash, dash and coreutils agree).
+fn echo_writes_nothing(args: &[Word]) -> bool {
+    matches!(args, [flag, rest @ ..]
+        if !flag.dynamic
+            && flag.text == "-n"
+            && rest.iter().all(|w| !w.dynamic && w.text.is_empty()))
 }
 
 /// One `;`- or `&`-terminated list: its and-or chain of pipelines (each with the operator that
@@ -292,21 +369,40 @@ fn lex_redirect(
     word: &mut Option<Word>,
     tokens: &mut Vec<Token>,
 ) -> Option<()> {
-    // A word of digits right before the operator is its fd (`2>`), not an argument.
-    if word.as_ref().is_some_and(|w| {
-        !w.dynamic && !w.text.is_empty() && w.text.bytes().all(|b| b.is_ascii_digit())
-    }) {
-        *word = None;
-    }
-    flush(word, tokens);
+    // An unquoted word of digits right before the operator is its fd (`2>`), not an argument.
+    let fd = match word.take() {
+        Some(w)
+            if !w.dynamic
+                && !w.quoted
+                && !w.text.is_empty()
+                && w.text.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            Some(w.text.parse::<usize>().unwrap_or(usize::MAX))
+        }
+        other => {
+            *word = other;
+            flush(word, tokens);
+            None
+        }
+    };
     if c == '<' && chars.peek() == Some(&'<') {
         return None;
     }
     let mut last = c;
+    let mut writes = c == '>';
     while let Some(n) = chars.next_if(|n| matches!(n, '<' | '>' | '&' | '|')) {
+        writes |= n == '>';
         last = n;
     }
-    tokens.push(Token::Redirect { dup: last == '&' });
+    let op = if last == '&' {
+        RedirOp::Dup
+    } else if writes {
+        RedirOp::Write
+    } else {
+        RedirOp::Read
+    };
+    let fd = fd.unwrap_or(usize::from(c == '>'));
+    tokens.push(Token::Redirect { fd: Some(fd), op });
     Some(())
 }
 
@@ -327,6 +423,7 @@ fn lex(script: &str) -> Option<Vec<Token>> {
             '#' if word.is_none() => break,
             '\'' => {
                 let w = word.get_or_insert_with(Word::default);
+                w.quoted = true;
                 loop {
                     match chars.next()? {
                         '\'' => break,
@@ -336,6 +433,7 @@ fn lex(script: &str) -> Option<Vec<Token>> {
             }
             '"' => {
                 let w = word.get_or_insert_with(Word::default);
+                w.quoted = true;
                 loop {
                     match chars.next()? {
                         '"' => break,
@@ -360,6 +458,7 @@ fn lex(script: &str) -> Option<Vec<Token>> {
             }
             '\\' => {
                 let w = word.get_or_insert_with(Word::default);
+                w.quoted = true;
                 w.text.push(chars.next().unwrap_or('\\'));
             }
             '$' => {
@@ -386,7 +485,10 @@ fn lex(script: &str) -> Option<Vec<Token>> {
                 // `&>` and `&>>` (bash): stdout and stderr to a file.
                 flush(&mut word, &mut tokens);
                 while chars.next_if_eq(&'>').is_some() {}
-                tokens.push(Token::Redirect { dup: false });
+                tokens.push(Token::Redirect {
+                    fd: None,
+                    op: RedirOp::Write,
+                });
             }
             '&' => {
                 flush(&mut word, &mut tokens);
@@ -420,31 +522,31 @@ fn lists(tokens: Vec<Token>, depth: u8) -> Option<Vec<List>> {
     let mut chain: Vec<(Op, Vec<Kind>)> = Vec::new();
     let mut pipeline: Vec<Kind> = Vec::new();
     let mut words: Vec<Word> = Vec::new();
-    let mut redirects = Redir::None;
+    let mut redirects = Redir::NONE;
     // A redirection waiting for its target word.
-    let mut pending: Option<bool> = None;
+    let mut pending: Option<(Option<usize>, RedirOp)> = None;
     let mut join = Op::Seq;
     for token in tokens {
         match token {
             Token::Word(w) => match pending.take() {
-                Some(dup) => redirects = redirects.add(dup, Some(&w)),
+                Some((fd, op)) => redirects.add(fd, op, Some(&w)),
                 None => words.push(w),
             },
-            Token::Redirect { dup } => {
-                if let Some(dup) = pending.replace(dup) {
-                    redirects = redirects.add(dup, None);
+            Token::Redirect { fd, op } => {
+                if let Some((fd, op)) = pending.replace((fd, op)) {
+                    redirects.add(fd, op, None);
                 }
             }
             Token::Op(op) => {
-                if let Some(dup) = pending.take() {
-                    redirects = redirects.add(dup, None);
+                if let Some((fd, op)) = pending.take() {
+                    redirects.add(fd, op, None);
                 }
-                if words.is_empty() && redirects == Redir::None {
+                if words.is_empty() && !redirects.any {
                     return None;
                 }
                 pipeline.push(kind(&words, redirects, false, depth));
                 words.clear();
-                redirects = Redir::None;
+                redirects = Redir::NONE;
                 if op == Op::Pipe {
                     continue;
                 }
@@ -461,10 +563,10 @@ fn lists(tokens: Vec<Token>, depth: u8) -> Option<Vec<List>> {
             }
         }
     }
-    if let Some(dup) = pending.take() {
-        redirects = redirects.add(dup, None);
+    if let Some((fd, op)) = pending.take() {
+        redirects.add(fd, op, None);
     }
-    if words.is_empty() && redirects == Redir::None {
+    if words.is_empty() && !redirects.any {
         return (pipeline.is_empty() && chain.is_empty()).then_some(out);
     }
     pipeline.push(kind(&words, redirects, false, depth));
@@ -478,9 +580,10 @@ fn lists(tokens: Vec<Token>, depth: u8) -> Option<Vec<List>> {
 
 /// Judge one command. `argv` is true for an exec (no shell: no built-ins, no keywords).
 ///
-/// A no-op whose only redirections cannot fail (`true 2>/dev/null`, `true >&-`, `echo x >&2`)
-/// is still a no-op; any other redirection makes the command one that can fail. `echo` writes,
-/// so a dup onto fd 0 or a close (`Redir::Silent`) makes it one that can fail.
+/// A no-op whose redirections cannot fail (`true 2>/dev/null`, `true >&-`, `echo x >&2`) is
+/// still a no-op; a redirection that may fail makes the command one that can fail. `echo`
+/// writes to fd 1, so it stays a no-op only while the redirections, in order, leave fd 1 open
+/// for writing, or when it prints nothing (`echo -n`).
 fn kind(words: &[Word], redirects: Redir, argv: bool, depth: u8) -> Kind {
     let Some((first, rest)) = words.split_first() else {
         return Kind::Other;
@@ -494,32 +597,34 @@ fn kind(words: &[Word], redirects: Redir, argv: bool, depth: u8) -> Kind {
         if RESERVED.contains(&p) {
             return Kind::Opaque;
         }
-        if p == "exit" && redirects == Redir::None {
+        if p == "exit" && !redirects.any {
             return match rest {
                 [] => Kind::ExitBare,
                 [w] if !w.dynamic && w.text == "0" => Kind::ExitZero,
                 _ => Kind::Escape,
             };
         }
-        if p == ":" && redirects != Redir::Other {
+        if p == ":" && !redirects.may_fail {
             return Kind::NoOp;
         }
         if ESCAPES.contains(&p) {
             return Kind::Escape;
         }
     }
-    if (TRUE_WORDS.contains(&p) && redirects != Redir::Other)
-        || (ECHO_WORDS.contains(&p) && redirects <= Redir::Null)
+    if (TRUE_WORDS.contains(&p) && !redirects.may_fail)
+        || (ECHO_WORDS.contains(&p)
+            && !redirects.may_fail
+            && (redirects.fds[1] == Fd::Write || echo_writes_nothing(rest)))
     {
         return Kind::NoOp;
     }
-    if redirects != Redir::None {
+    if redirects.any {
         return Kind::Other;
     }
     if ENV_WORDS.contains(&p) {
         return match rest.first() {
             Some(w) if !w.dynamic && !w.text.starts_with('-') && !w.text.contains('=') => {
-                kind(rest, Redir::None, true, depth)
+                kind(rest, Redir::NONE, true, depth)
             }
             _ => Kind::Other,
         };
@@ -629,10 +734,10 @@ fn exec_class(program: &str, args: &[String]) -> Class {
         .chain(args.iter().map(String::as_str))
         .map(|text| Word {
             text: text.to_owned(),
-            dynamic: false,
+            ..Word::default()
         })
         .collect();
-    match kind(&words, Redir::None, true, 0) {
+    match kind(&words, Redir::NONE, true, 0) {
         Kind::NoOp => Class::NoOp,
         Kind::CannotFail => Class::CannotFail,
         _ => Class::CanFail,
