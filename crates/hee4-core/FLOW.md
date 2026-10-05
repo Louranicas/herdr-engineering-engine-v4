@@ -123,7 +123,7 @@ dispatcher-backups-ddf); no trigger policy lives here.
 | verifying, a receipt sealed past the `Decide` count, or a `Decide` after the latest `Dispatch` | any | R12 | — (K4 re-decides) | unchanged |
 | verifying, no `Decide` after the latest `Dispatch` and no receipt beyond the `Decide` count (nothing sealed: the live ledger's parked `admit,dispatch,settle(ready)`) | any | R12 | `Resolve(Quarantine(EffectUnknownPermanent{rule: R12VerificationBoundary}))` | blocked{cr}; the operator's `Resolve(Abandon)` exits |
 | running with no open attempt; unreadable row; cache mismatch | any | R14 | — | finding |
-| admitted, blocked, cancellation_requested with no attempt | any | none | — | unchanged |
+| admitted, blocked, cancellation_requested with no attempt | any | none | — | unchanged (reconcile applies nothing; the dispatcher's pick applies `Stop` to cancellation_requested with no open attempt, `Facts::attempt_open`) |
 
 R03 (contradiction between an `attempts` row and the events), R09 (workspace + lease) and R13 (cursor, `recovery::cursor`) fire over the attempts ledger: schema, hook and the reconcile rows are the module doc of `src/store/attempts.rs` (migration `m005_attempts`) and of `src/recovery.rs`; `src/probe.rs` is the only IO. R13 (cursor) has its inputs here now: `epoch`,
 `event_high_water` and `restored_from`, read by `Store::cursor_check` (`PriorEpochOfRestore` →
