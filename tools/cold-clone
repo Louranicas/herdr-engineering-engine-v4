@@ -20,8 +20,13 @@ finally; the target dir is kept so the second cold run is warm. The cut tier is 
 the live unit, forbidden in a clone. Never GitHub, never the network.
 A cold run's own summary dir gets a `cold-clone` marker file and is never read back as the warm
 reference, so a second cold run without a warm run stays UNMEASURED (prints cold=<path>).
+Crash-safe: before the gate starts, an intent `<warm-root>/.cold-intents/<sha12>.<pid>.<ns>` holding
+the start time is written; it is removed only after the marker is on disk (the marker is written the
+moment the summary= line arrives). An intent left by a killed run makes every summary at that sha
+stamped in [start-1s, start+INTENT_WINDOW_S] untrusted, so the unmarked cold summary it may have left
+is never the warm reference (a warm run in that window is UNMEASURED too: never a false PASS).
 """
-import argparse, glob, json, os, re, shutil, subprocess, sys, tempfile, tomllib
+import argparse, calendar, glob, json, os, re, shutil, subprocess, sys, tempfile, time, tomllib
 
 def die(msg, code=2):
     print(f"cold-clone: {msg}", file=sys.stderr)
@@ -36,6 +41,35 @@ def resolve(repo, rev):
     return out if rc == 0 and out else None
 
 COLD_MARK = "cold-clone"  # written beside a cold run's summary.json: a cold run is never a warm reference
+INTENTS = ".cold-intents"  # under the warm root; a dot name, so no `*-<sha12>` glob reads it
+INTENT_WINDOW_S = 300  # the gate stamps its summary dir at its own start, seconds after the intent
+
+def write_intent(root, sha):
+    d = os.path.join(root, INTENTS)
+    os.makedirs(d, exist_ok=True)
+    t0 = time.time()
+    path = os.path.join(d, f"{sha[:12]}.{os.getpid()}.{time.time_ns()}")
+    with open(path, "x") as f:
+        f.write(f"{sha} {t0}\n")
+        f.flush()
+        os.fsync(f.fileno())
+    return path
+
+def intent_windows(root, sha):
+    """[(lo, hi)] epoch windows of every intent at sha (a live or a killed cold run); unreadable counts as now."""
+    out = []
+    for p in glob.glob(os.path.join(root, INTENTS, f"{sha[:12]}.*")):
+        try:
+            with open(p) as f:
+                t0 = float(f.read().split()[1])
+        except (OSError, ValueError, IndexError):
+            t0 = time.time()
+        out.append((t0 - 1, t0 + INTENT_WINDOW_S))
+    return out
+
+def dir_stamp(path):
+    m = re.match(r"(\d{8}T\d{6}Z)(?:\.\d+)?-", os.path.basename(path))
+    return calendar.timegm(time.strptime(m.group(1), "%Y%m%dT%H%M%SZ")) if m else None
 
 def covering_tiers(origin, sha, tier):
     """<tier> and every tier of the sha's gate.toml whose `includes` chain reaches it (the gate ran its steps)."""
@@ -59,8 +93,12 @@ def covering_tiers(origin, sha, tier):
 
 def warm_summary(root, sha, tiers):
     """The newest `<root>/*-<sha12>/summary.json` by stamp whose tier is in <tiers> and subject is sha, never a cold run's."""
+    windows = intent_windows(root, sha)
     for p in sorted(glob.glob(os.path.join(root, f"*-{sha[:12]}", "summary.json")), reverse=True):
         if os.path.exists(os.path.join(os.path.dirname(p), COLD_MARK)):
+            continue
+        st = dir_stamp(os.path.dirname(p))
+        if st is None or any(lo <= st <= hi for lo, hi in windows):
             continue
         try:
             with open(p) as f:
@@ -94,6 +132,7 @@ def main():
     os.makedirs(target, exist_ok=True)
     print(f"gate={os.path.abspath(a.gate)}")
     print("registry=host_cache")
+    warm_root = os.path.expanduser(a.warm_root)
     cache = os.path.expanduser("~/.cache")
     os.makedirs(cache, exist_ok=True)
     tmp = tempfile.mkdtemp(prefix="hee4-cold-", dir=cache)
@@ -105,28 +144,32 @@ def main():
         if rc:
             die(f"checkout {sha[:12]} failed: {err}")
         env = dict(os.environ, PYTHONUNBUFFERED="1")  # relay the gate's lines as they happen
+        intent = write_intent(warm_root, sha)
         p = subprocess.Popen([a.gate, a.tier, "--repo", tmp, "--subject", sha, "--target-dir", target],
                              cwd=tmp, env=env, stdout=subprocess.PIPE, text=True)
         summary_path = None
         for line in p.stdout:
+            m = re.fullmatch(r"summary=(\S+)\n?", line)
+            if m and summary_path is None:
+                summary_path = m.group(1)
+                with open(os.path.join(os.path.dirname(summary_path), COLD_MARK), "w") as f:
+                    f.write(f"cold run of {sha} cloned from {a.origin}\n")
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.unlink(intent)  # the marker now says cold; the intent's window is no longer needed
             sys.stdout.write(line)
             sys.stdout.flush()
-            m = re.fullmatch(r"summary=(\S+)\n?", line)
-            if m:
-                summary_path = m.group(1)
         gate_rc = p.wait()
-        if summary_path is None:
+        if summary_path is None:  # the intent stays: the gate may have written a summary it never printed
             die(f"gate exited {gate_rc} without a summary= line", 2 if gate_rc == 2 else 1)
         with open(summary_path) as f:
             cold = json.load(f)
-        with open(os.path.join(os.path.dirname(summary_path), COLD_MARK), "w") as f:
-            f.write(f"cold run of {sha} cloned from {a.origin}\n")
         print(f"cold={summary_path}")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     steps = cold.get("steps", [])
     head = f"cold-clone sha={sha[:12]} origin={a.origin} tier={a.tier} steps={len(steps)}"
-    warm_path, warm = warm_summary(os.path.expanduser(a.warm_root), sha, covering_tiers(a.origin, sha, a.tier))
+    warm_path, warm = warm_summary(warm_root, sha, covering_tiers(a.origin, sha, a.tier))
     if warm is None:
         print(f"{head} matched=UNMEASURED(no warm run at {sha[:12]}) verdict=UNMEASURED")
         sys.exit(3)

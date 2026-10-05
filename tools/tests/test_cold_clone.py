@@ -1,4 +1,5 @@
-import os, subprocess, tempfile, unittest
+import calendar, glob, os, signal, subprocess, sys, tempfile, time, unittest
+from importlib.machinery import SourceFileLoader
 from common import TOOLS, run, make_repo
 
 GATE, COLD = os.path.join(TOOLS, "gate"), os.path.join(TOOLS, "cold-clone")
@@ -102,6 +103,48 @@ class ColdCloneTests(unittest.TestCase):
         rc, out, _ = w.cold()
         self.assertEqual(rc, 3, out)
         self.assertIn(f"matched=UNMEASURED(no warm run at {w.sha[:12]})", out.strip().splitlines()[-1])
+
+    def test_fire_cold_clone_killed_after_the_cold_summary_leaves_it_untrusted(self):
+        # the cold gate has written its summary.json, but cold-clone is killed (kill -9) before it can
+        # mark it cold: a later cold run at the sha must not read that summary back as the warm reference
+        w = ColdWorld()
+        done = os.path.join(w.home, "gate-done")
+        stall = os.path.join(w.home, "stall-gate")
+        with open(stall, "w") as f:  # runs the real gate, hides its lines, then stalls so the kill lands now
+            f.write(f'#!/bin/sh\n{GATE} "$@" > {w.home}/gate.out 2>&1\ntouch {done}\nexec sleep 60\n')
+        os.chmod(stall, 0o755)
+        p = subprocess.Popen([COLD, "--sha", w.sha, "--origin", w.bare, "--tier", "t", "--repo", w.repo, "--gate", stall],
+                             env=dict(os.environ, **w.env), cwd=w.repo, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+        deadline = time.time() + 30
+        while not os.path.exists(done) and time.time() < deadline:
+            time.sleep(0.05)
+        self.assertTrue(os.path.exists(done), "the stalled gate never finished")
+        os.killpg(p.pid, signal.SIGKILL)
+        p.wait()
+        orphan = glob.glob(os.path.join(w.home, ".cache", "hee4-gate", f"*-{w.sha[:12]}", "summary.json"))
+        self.assertEqual(len(orphan), 1)
+        self.assertFalse(os.path.exists(os.path.join(os.path.dirname(orphan[0]), "cold-clone")), "the crash left no marker")
+        rc, out, _ = w.cold()
+        self.assertEqual(rc, 3, out)
+        self.assertIn(f"matched=UNMEASURED(no warm run at {w.sha[:12]})", out.strip().splitlines()[-1])
+        self.assertNotIn(f"warm={orphan[0]}", out)
+
+    def test_killed_run_intent_window_spares_a_later_warm_run(self):
+        cc = SourceFileLoader("cold_clone", COLD).load_module()
+        root, sha = tempfile.mkdtemp(prefix="gt-warm-"), "ab" * 20
+        t0 = calendar.timegm(time.strptime("20261005T120000Z", "%Y%m%dT%H%M%SZ"))
+        os.makedirs(os.path.join(root, cc.INTENTS))
+        with open(os.path.join(root, cc.INTENTS, f"{sha[:12]}.1.1"), "w") as f:
+            f.write(f"{sha} {t0}\n")
+        for stamp in ("20261005T120002Z", "20261005T121000Z"):  # the killed run's own, and a warm run 10 min on
+            os.makedirs(os.path.join(root, f"{stamp}-{sha[:12]}"))
+            with open(os.path.join(root, f"{stamp}-{sha[:12]}", "summary.json"), "w") as f:
+                f.write(f'{{"subject": "{sha}", "tier": "t", "steps": [], "verdict": "PASS"}}')
+        path, _ = cc.warm_summary(root, sha, {"t"})
+        self.assertEqual(path, os.path.join(root, f"20261005T121000Z-{sha[:12]}", "summary.json"))
+        os.unlink(path)
+        self.assertEqual(cc.warm_summary(root, sha, {"t"}), (None, None))
 
     def test_fire_unknown_sha_refused(self):
         w = ColdWorld()
