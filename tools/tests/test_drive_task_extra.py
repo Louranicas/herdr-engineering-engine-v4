@@ -134,5 +134,43 @@ class RacedTests(unittest.TestCase):
         self.assertIsNone(self.raced("cancelled", code="not_found"))
 
 
+class WaitRunningTests(unittest.TestCase):
+    """wait_running() names the cause of a terminal phase at once, and the bound only when it ran out."""
+
+    def wait(self, phase, bound=10):
+        load_tool("drive_d", os.path.join(TOOLS, "drive.d", "__init__.py"))
+        task = load_tool("drive_d.task", os.path.join(TOOLS, "drive.d", "task.py"))
+        F = type("F", (), {"req": lambda self, a, b, key=None: {"kind": "result", "body": {"phase": phase}}})()
+        t0 = time.monotonic()
+        up, why = task.wait_running(F, "t-" + "1" * 24, bound=bound)
+        return up, why, time.monotonic() - t0
+
+    def test_an_abandoned_task_names_no_eligible_model_not_the_bound(self):
+        up, why, dt = self.wait("abandoned")
+        self.assertFalse(up)
+        self.assertIn("no eligible model", why)
+        self.assertNotIn("within 10s", why)
+        self.assertLess(dt, 1.0, "a terminal phase must end the wait at once, not run out the bound")
+
+    def test_a_cancelled_task_names_the_cancel_before_dispatch_race(self):
+        up, why, _ = self.wait("cancelled")
+        self.assertIn("cancel-before-dispatch race", why)
+        self.assertNotIn("within", why)
+
+    def test_another_terminal_phase_names_the_phase_not_the_bound(self):
+        up, why, _ = self.wait("failed")
+        self.assertIn("terminal phase=failed", why)
+        self.assertNotIn("within", why)
+
+    def test_only_an_exhausted_bound_names_the_bound(self):
+        up, why, dt = self.wait("admitted", bound=0.2)
+        self.assertFalse(up)
+        self.assertIn("never reached running within 0.2s (last phase=admitted)", why)
+        self.assertGreaterEqual(dt, 0.2)
+
+    def test_running_is_up(self):
+        self.assertEqual(self.wait("running")[:2], (True, None))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -209,9 +209,21 @@ def submit_sleep(F):
 RUNNING_WAIT_S = 10  # the bound on waiting for a SLEEP_BRIEF task to reach `running` before cancel
 
 
+def stopped_first(t, ph):
+    """Why the dispatcher, not the drive, ended `t` in phase `ph`: abandoned names no eligible model
+    (e.g. roster.disable earlier in the run), cancelled names the cancel-before-dispatch race; None
+    for any other phase."""
+    if ph == "abandoned":
+        return f"dispatcher abandoned {t} before the drive's frame (no eligible model on this serve)"
+    if ph == "cancelled":
+        return f"dispatcher cancelled {t} before the drive's frame (cancel-before-dispatch race: the cancel landed before running)"
+    return None
+
+
 def wait_running(F, t, bound=RUNNING_WAIT_S):
-    """Poll task.get until `t` is `running`: (True, None), or (False, reason) naming the bound and
-    the last phase seen. A cancel on a running task with an open attempt stays cancellation_requested;
+    """Poll task.get until `t` is `running`: (True, None), or (False, reason). A terminal phase seen
+    first gives its cause (stopped_first) at once; only an exhausted bound names the bound and the
+    last phase seen. A cancel on a running task with an open attempt stays cancellation_requested;
     one that lands before dispatch is Stopped to `cancelled` by the dispatcher (wave 5)."""
     ph, t0 = None, time.monotonic()
     while time.monotonic() - t0 < bound:
@@ -219,23 +231,17 @@ def wait_running(F, t, bound=RUNNING_WAIT_S):
         if ph == "running":
             return True, None
         if ph in TERMINAL:
-            break
+            return False, stopped_first(t, ph) or f"task={t} reached terminal phase={ph} before running: no task to cancel"
         time.sleep(0.05)
     return False, f"task={t} never reached running within {bound}s (last phase={ph}): cancel would race the dispatch"
 
 
 def raced(F, t, reply):
-    """The reason a lifecycle path cannot be measured: the dispatcher abandoned the task first
-    (no eligible model, e.g. roster.disable ran earlier in this run), or stopped it to `cancelled`
-    because the cancel landed before dispatch; None when neither."""
+    """The reason a lifecycle path cannot be measured: a conflict on a task the dispatcher already
+    ended (stopped_first); None when the reply is no conflict or the task is not so ended."""
     if (reply or {}).get("code") != "conflict":
         return None
-    ph = get_phase(F, t)
-    if ph == "abandoned":
-        return f"dispatcher abandoned {t} before the drive's frame (no eligible model on this serve)"
-    if ph == "cancelled":
-        return f"dispatcher cancelled {t} before the drive's frame (cancel-before-dispatch race: the cancel landed before running)"
-    return None
+    return stopped_first(t, get_phase(F, t))
 
 
 def d_resolve(F, ctx):
