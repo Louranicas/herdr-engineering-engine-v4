@@ -1,4 +1,4 @@
-import http.server, json, os, socket, stat, tempfile, threading, unittest, uuid
+import http.server, json, os, shutil, socket, stat, tempfile, threading, unittest, uuid
 from common import TOOLS, run
 
 DOCTOR, DRILL = os.path.join(TOOLS, "doctor"), os.path.join(TOOLS, "drill")
@@ -90,6 +90,22 @@ class DoctorTests(unittest.TestCase):
     def test_help(self):
         for t in (DOCTOR, DRILL):
             rc, out, _ = run(t, "--help"); self.assertEqual(rc, 0); self.assertIn("verdict=", out)
+
+    def test_fire_missing_cargo_deny_is_fail_by_name(self):
+        # A PATH with python3 but no cargo-deny: the commit tier's `deps` step could not run, so the
+        # doctor says so by name before any gate does.
+        w = World(); self.addCleanup(w.close)
+        # Only the world's stubs and a python3 link: no host directory that might hold cargo-deny.
+        os.symlink(shutil.which("python3"), os.path.join(w.bin, "python3"))
+        rc, out, _ = run(DOCTOR, "--socket", w.sockpath, "--model-url", w.url, "--repo", TOOLS,
+                         env={"PATH": w.bin})
+        self.assertEqual(rc, 1, out)
+        self.assertIn("check=tool_cargo-deny status=FAIL detail=cannot run cargo-deny", out)
+
+    def test_quiet_cargo_deny_present_is_measured(self):
+        w = World(); self.addCleanup(w.close)
+        rc, out, _ = healthy_doctor(w, "--model", "m")
+        self.assertIn("check=tool_cargo-deny status=MEASURED detail=cargo-deny ", out)
 
     def test_fire_absent_unit_is_unmeasured_never_pass(self):
         w = World(); self.addCleanup(w.close)

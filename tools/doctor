@@ -6,7 +6,8 @@ Fresh-instance readiness (gates/features/README.md "doctor"). Each check prints
 UNMEASURED always names its reason; it is never a 0 and it is red. Last line
   doctor verdict=PASS|FAIL|UNMEASURED measured=k/n unmeasured=u fail=f advisory=a head=<sha12>
 Exit: 0 PASS (every counted check MEASURED and ok), 1 FAIL (any check measured bad), 3 UNMEASURED.
-Checks: tool cargo, tool bwrap, unit active, socket perms, ledger opens (hee4 health),
+Checks: tool cargo, tool bwrap, tool cargo-deny (the commit tier's `deps` step runs it; a fresh
+host also needs one `cargo fetch` before it passes offline), unit active, socket perms, ledger opens (hee4 health),
 budgets (the last line of hee4 health is the JSON reply; body.budgets must be a non-empty object of
 non-empty objects of positive integers whose key=value set equals the
 `doctor row=budgets present` line of `hee4 doctor` (the detail is that line), whose check is Budgets::parse; an error frame
@@ -114,6 +115,7 @@ def main():
 
     tool("cargo", ["--version"])
     tool("bwrap", ["--version"])
+    tool("cargo-deny", ["--version"])
 
     # unit
     rc, out, err = sh("systemctl", "--user", "show", "-p", "LoadState,ActiveState,MainPID", a.unit)
