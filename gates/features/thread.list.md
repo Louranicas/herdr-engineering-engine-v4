@@ -25,7 +25,7 @@ hee4-sh thread.list task_id=<id> 'states:=[…]' 'page:={"limit":2,"cursor":{…
 
 Socket: request `body` `{task_id, states[], page}` (FACT required all three); result `body` `{page: PageOutV1<thread head>}` (API Map A-19). `UNWRITTEN: the thread head fields, the thread state enum (≤ 6 states), and the generated wrapper spelling.`
 
-- v4.0 path: the `unavailable` refusal. Driven by `tools/drive` through `tools/drive.d/scoped.py`: the scope is read from `tools.inspect` (path `catalogued`), and the action, sent with a placeholder for each `Socket:` request member, must be refused `unavailable` at `/action` with exactly that scope's `because` from `Scope::because` (path `refused_by_scope`); the line is `verdict=PASS paths=2/2 scope=v4.2 (refused by release scope, as catalogued)`. Until `tools.inspect` carries `scope`, the line stays UNMEASURED `scope=unserved` naming the missing member.
+- v4.0 path: the `unavailable` refusal.
 - v4.2 success: every thread of the task appears across pages; continuation is disjoint and complete.
 - Error: stale cursor → `resync_required`; `states` over 6 or page bounds → `invalid_argument`.
 - Empty: a task with no threads → empty page.
