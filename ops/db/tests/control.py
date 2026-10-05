@@ -442,6 +442,29 @@ def main() -> int:
                             + ("" if ok else f" got={got}")))
         except Exception as e:
             results.append(("fault", "repo-root-is-the-tools-own-tree", False, f"setup_error {type(e).__name__}: {str(e)[:200]}"))
+        # U-harden-05 refuter: hee4.env sets HEE4_ROOT (`:=`) to the main checkout in every shell that sources it, so a
+        # tree's own tool must measure its own tree even when HEE4_ROOT names another one
+        n += 1
+        w = World(base, f"c{n:02d}", frozen)
+        w.copy_db_from(snap)
+        try:
+            tool = w.root / "repo/ops/db/hee4db"
+            tool.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(HEE4DB, tool)
+            if not (w.root / "repo/Cargo.toml").is_file():
+                (w.root / "repo/Cargo.toml").write_text("[workspace]\n")   # the copy is a v4 tree by the tool's own test
+            other = w.root / "other-tree"
+            other.mkdir()
+            env = dict(w.env, HEE4DB_SCHEMA_DIR=str(HEE4DB.parent / "schema"), HEE4_ROOT=str(other))
+            env.pop("HEE4DB_REPO", None)
+            p = subprocess.run([sys.executable, str(tool), "recipe", "restart"], env=env, capture_output=True, text=True, timeout=300)
+            want = json.dumps(str((w.root / "repo").resolve() / "CLAUDE.md"))
+            ok = p.returncode == 0 and f'"path": {want}' in p.stdout
+            got = re.findall(r'"path": "([^"]*/CLAUDE\.md)"', p.stdout)[:1]
+            results.append(("fault", "repo-root-ignores-another-trees-HEE4_ROOT", ok, f"rc={p.returncode} want_path={want}"
+                            + ("" if ok else f" got={got}")))
+        except Exception as e:
+            results.append(("fault", "repo-root-ignores-another-trees-HEE4_ROOT", False, f"setup_error {type(e).__name__}: {str(e)[:200]}"))
         case("register-unknown-module", "fault",
              lambda w: add_register_row(w, "| DC-96 | **Planted unknown module.** control fixture | control | P2 | roster, storr | **PROPOSED**: planted |"),
              ["ingest"], 20, ["ingest_malformed", "DC-96 names unknown module 'storr'"])

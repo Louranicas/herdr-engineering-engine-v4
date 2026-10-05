@@ -37,10 +37,22 @@ HOME = Path.home()
 HERE = Path(__file__).resolve().parent
 SCHEMA_DIR = Path(os.environ.get("HEE4DB_SCHEMA_DIR", HERE / "schema"))
 
+
+def _repo_root() -> Path:
+    """HEE4DB_REPO (the controls' seam) if set; else the tree this file ships in (ops/db/hee4db -> parents[1]) when
+    that tree is a v4 tree, so a worktree or an export measures itself. hee4.env sets HEE4_ROOT (`:=`) to the main
+    checkout in every shell that sources it, so HEE4_ROOT is consulted only for a copy of this file that sits outside
+    a v4 tree; it never redirects a tree's own tool to another tree."""
+    if "HEE4DB_REPO" in os.environ:
+        return Path(os.environ["HEE4DB_REPO"])
+    own = HERE.parents[1]
+    if (own / "Cargo.toml").is_file() and (own / "ops" / "db" / "hee4db").is_file():
+        return own
+    return Path(os.environ.get("HEE4_ROOT", own))
+
+
 ROOTS = {  # HEE4DB_<ROOT> (the controls' seam) wins over the machine-wide HEE4_* (hee4.env at the repo root)
-    # repo: the tree this file ships in (ops/db/hee4db -> parents[1]), so a worktree or an export measures itself;
-    # HEE4_ROOT is an explicit override only, never a fallback to the main checkout
-    "repo": Path(os.environ.get("HEE4DB_REPO", os.environ.get("HEE4_ROOT", HERE.parents[1]))),
+    "repo": _repo_root(),
     "evidence": Path(os.environ.get("HEE4DB_EVIDENCE", os.environ.get("HEE4_EVIDENCE", HOME / "hee4-evidence"))),
     "vault": Path(os.environ.get("HEE4DB_VAULT", os.environ.get(
         "HEE4_VAULT", "/mnt/storage-10tb/fedora-obsidian-vaults/herdr-engineering-engine-v4.vault"))),
