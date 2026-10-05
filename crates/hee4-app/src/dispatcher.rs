@@ -968,8 +968,9 @@ struct Sealing<'a> {
     budget: Duration,
 }
 
-/// After the attempt: settle, ask deep-diff-forge over the workspace diff, ledger each
-/// observation, `decide_and_seal`, append, decide.
+/// After the attempt: settle (a task cancelled mid-attempt is stopped here, before any
+/// observation), ask deep-diff-forge over the workspace diff, ledger each observation,
+/// `decide_and_seal`, append, decide.
 fn settle_and_decide(
     engine: &Engine,
     sealing: &Sealing<'_>,
@@ -987,7 +988,12 @@ fn settle_and_decide(
         apply(engine, task, Event::Settle(Settlement::NotReady))?;
         return Ok(Some((task.clone(), apply(engine, task, Event::Stop)?)));
     }
-    apply(engine, task, Event::Settle(Settlement::Ready))?;
+    // A cancel that landed while the attempt ran leaves `Settle(Ready)` in
+    // `cancellation_requested`, where `Observe` has no edge: stop it before anything is recorded.
+    if apply(engine, task, Event::Settle(Settlement::Ready))? == Phase::CancellationRequested {
+        eprintln!("dispatch task={task} cancelled mid-attempt; nothing observed or sealed");
+        return Ok(Some((task.clone(), apply(engine, task, Event::Stop)?)));
+    }
     let mut observations = outcome.observations.clone();
     observations.extend(ddf_observation(sealing));
     for obs in &observations {
@@ -1786,6 +1792,73 @@ mod tests {
             events(&engine, &task)?,
             [Event::Admit, Event::Cancel, Event::Stop]
         );
+        Ok(())
+    }
+
+    /// `task`'s observation rows, read through a read-only connection (SELECT only).
+    fn observation_rows(engine: &Engine, task: &TaskId) -> R<i64> {
+        let conn = rusqlite::Connection::open_with_flags(
+            engine.ledger(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        Ok(conn.query_row(
+            "SELECT count(*) FROM observations WHERE task_id = ?1",
+            [task.to_string()],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// A cancel that lands while the attempt runs: the attempt's steps pass, `Settle(Ready)`
+    /// leaves the task in `cancellation_requested`, and the dispatcher stops it there. No
+    /// observation row is written (there is no `Observe` edge from that phase), no receipt is
+    /// sealed, and `step` returns the `cancelled` phase, not an error.
+    #[test]
+    fn a_cancel_mid_attempt_ends_cancelled_without_observing() -> R<()> {
+        let engine = crate::actions::testing::engine("dispatch-cancel-mid")?;
+        let task: TaskId = "t-cancel-mid".parse()?;
+        let brief =
+            crate::actions::testing::BRIEF.replace("/usr/bin/test -d /usr", "/usr/bin/sleep 1");
+        fs::create_dir_all(engine.work().join("briefs"))?;
+        fs::write(engine.brief_path(&task), brief)?;
+        {
+            let store = engine.store();
+            assert!(hee4_core::reconcile(&store, &hee4_core::Observations::default())?.complete);
+            store.apply(&task, Event::Admit)?;
+        }
+        let stepped = std::thread::scope(|s| {
+            let canceller = s.spawn(|| -> Result<(), String> {
+                let t0 = std::time::Instant::now();
+                while t0.elapsed() < Duration::from_secs(20) {
+                    let store = engine.store();
+                    if store.phase(&task).map_err(|e| e.to_string())? == Some(Phase::Running) {
+                        store
+                            .apply(&task, Event::Cancel)
+                            .map_err(|e| e.to_string())?;
+                        return Ok(());
+                    }
+                    drop(store);
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err("the task never ran".into())
+            });
+            let stepped = step(&engine, &offline(), None);
+            (stepped, canceller.join())
+        });
+        let (stepped, cancelled) = stepped;
+        assert_eq!(cancelled.map_err(|_| "canceller panicked")?, Ok(()));
+        assert_eq!(stepped?, Some((task.clone(), Phase::Cancelled)));
+        assert_eq!(
+            events(&engine, &task)?,
+            [
+                Event::Admit,
+                Event::Dispatch,
+                Event::Cancel,
+                Event::Settle(Settlement::Ready),
+                Event::Stop
+            ]
+        );
+        assert_eq!(observation_rows(&engine, &task)?, 0);
+        assert_eq!(engine.store().receipt_count(&task)?, 0);
         Ok(())
     }
 
