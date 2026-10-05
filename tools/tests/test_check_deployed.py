@@ -4,10 +4,10 @@ from common import TOOLS, run
 CD = os.path.join(TOOLS, "check-deployed")
 ROWS = [f"D{n}" for n in range(1, 10)]
 
-# A `systemctl --user show -p ExecStart hee4.service` line saved from the live host (2026-10-05).
-LIVE_EXECSTART = ("{ path=/home/louranicas/.local/bin/hee4 ; argv[]=/home/louranicas/.local/bin/hee4 serve "
-                  "--socket /run/user/1000/hee4/control.sock --ledger /home/louranicas/.local/share/hee4/ledger.sqlite3 "
-                  "--work /home/louranicas/.local/share/hee4/work ; ignore_errors=no ; start_time=[Mon 2026-10-05 10:18:21 AEDT] ; "
+# A `systemctl --user show -p ExecStart hee4.service` line saved from the live host (2026-10-05), the owner's home rewritten to /home/op.
+LIVE_EXECSTART = ("{ path=/home/op/.local/bin/hee4 ; argv[]=/home/op/.local/bin/hee4 serve "
+                  "--socket /run/user/1000/hee4/control.sock --ledger /home/op/.local/share/hee4/ledger.sqlite3 "
+                  "--work /home/op/.local/share/hee4/work ; ignore_errors=no ; start_time=[Mon 2026-10-05 10:18:21 AEDT] ; "
                   "stop_time=[n/a] ; pid=2531320 ; code=(null) ; status=0/0 }")
 
 
@@ -29,8 +29,8 @@ class CheckDeployedTests(unittest.TestCase):
     def test_parse_execstart_live_shape(self):
         m = load()
         ex = m.parse_execstart(LIVE_EXECSTART)
-        self.assertEqual(ex, {"bin": "/home/louranicas/.local/bin/hee4", "socket": "/run/user/1000/hee4/control.sock",
-                              "ledger": "/home/louranicas/.local/share/hee4/ledger.sqlite3", "work": "/home/louranicas/.local/share/hee4/work"})
+        self.assertEqual(ex, {"bin": "/home/op/.local/bin/hee4", "socket": "/run/user/1000/hee4/control.sock",
+                              "ledger": "/home/op/.local/share/hee4/ledger.sqlite3", "work": "/home/op/.local/share/hee4/work"})
         self.assertEqual(m.parse_environment("HEE4_LIVE_MODEL=1 HEE4_MODEL=qwen2.5:0.5b"), {"HEE4_LIVE_MODEL": "1", "HEE4_MODEL": "qwen2.5:0.5b"})
 
     def test_quiet_control_every_plant_detected(self):
