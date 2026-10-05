@@ -12,8 +12,14 @@
 //! ones a file lacks and refuses one it does not know. `Store::operate` is the one idempotent
 //! operation primitive; [`Store::admit`] is its task-family caller.
 
+pub(crate) mod attempts;
 mod backup;
 pub(crate) mod migrations;
+
+pub use attempts::{
+    AttemptId, AttemptIdFault, AttemptOutcome, AttemptRow, AttemptStart, AttemptState, Cleanup,
+    Effect, Lease,
+};
 
 use std::collections::BTreeSet;
 use std::os::unix::fs::PermissionsExt;
@@ -80,6 +86,37 @@ pub enum StoreError {
     /// file is newer than the binary.
     #[error("migration {0} is not known to this binary")]
     UnknownMigration(String),
+    /// A close (`Settle`, `Recover(R07|R08)`) found no running `attempts` row, or a verb named
+    /// an id with no row; nothing was written.
+    #[error("attempt of task {task} generation {generation} has no open row")]
+    AttemptMissing {
+        /// The task.
+        task: TaskId,
+        /// The generation the event or verb addressed.
+        generation: u64,
+    },
+    /// A verb for a running attempt found the row closed (IA-3).
+    #[error("attempt {id} is {state}, not running")]
+    AttemptClosed {
+        /// The attempt.
+        id: AttemptId,
+        /// Its state.
+        state: AttemptState,
+    },
+    /// `attempt_cleanup_settled` on a row still running (R11 settles closed attempts only).
+    #[error("attempt {id} is still running")]
+    AttemptOpen {
+        /// The attempt.
+        id: AttemptId,
+    },
+    /// `attempt_started` named a workspace another unsettled attempt holds (S2).
+    #[error("workspace {workspace:?} is leased by attempt {other}")]
+    WorkspaceLeased {
+        /// The workspace.
+        workspace: PathBuf,
+        /// The attempt whose cleanup is not settled.
+        other: AttemptId,
+    },
 }
 
 /// The idempotency key of a mutating operation: `(principal, action, version, idem_key)`.
@@ -264,7 +301,7 @@ pub(crate) fn operation_id(op: &OperationKey) -> String {
     format!("op-{}", &digest[..24])
 }
 
-fn load_events(conn: &Connection, task: &TaskId) -> Result<Vec<Event>, StoreError> {
+fn load_events_with_seq(conn: &Connection, task: &TaskId) -> Result<Vec<(i64, Event)>, StoreError> {
     let mut stmt =
         conn.prepare_cached("SELECT seq, event_json FROM events WHERE task_id = ?1 ORDER BY seq")?;
     let rows = stmt.query_map([task.as_str()], |r| {
@@ -275,9 +312,16 @@ fn load_events(conn: &Connection, task: &TaskId) -> Result<Vec<Event>, StoreErro
         let (seq, text) = row?;
         let event = codec::decode(&text)
             .ok_or_else(|| corrupt(task, format!("events.seq={seq} is not an Event: {text}")))?;
-        events.push(event);
+        events.push((seq, event));
     }
     Ok(events)
+}
+
+fn load_events(conn: &Connection, task: &TaskId) -> Result<Vec<Event>, StoreError> {
+    Ok(load_events_with_seq(conn, task)?
+        .into_iter()
+        .map(|(_, e)| e)
+        .collect())
 }
 
 fn replay(task: &TaskId, events: &[Event]) -> Result<Option<TaskState>, StoreError> {
@@ -369,6 +413,7 @@ fn apply_in(
         "INSERT INTO events(task_id, event_json, ts) VALUES (?1, ?2, ?3)",
         params![task.as_str(), codec::encode(event)?, ts],
     )?;
+    attempts::on_event(tx, task, event, tx.last_insert_rowid(), generation, ts)?;
     Ok(phase)
 }
 
@@ -765,6 +810,15 @@ impl Store {
     /// [`StoreError::Corrupt`] for a row that is not an `Event`.
     pub fn history(&self, task: &TaskId) -> Result<Vec<Event>, StoreError> {
         load_events(&self.conn, task)
+    }
+
+    /// `task`'s history with each event's `events.seq`, oldest first (recovery matches an
+    /// attempt's `closed_seq` against its closing event).
+    ///
+    /// # Errors
+    /// [`StoreError::Corrupt`] for a row that is not an `Event`.
+    pub fn history_with_seq(&self, task: &TaskId) -> Result<Vec<(i64, Event)>, StoreError> {
+        load_events_with_seq(&self.conn, task)
     }
 
     /// `task`'s phase by replay of its events (the source of truth), `None` if never admitted.

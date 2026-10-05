@@ -3,15 +3,30 @@
 //! The shape is v3's (`migrated/v3-b5367bc/src/recovery.rs`): a pure policy over durable facts
 //! and caller-supplied observations (`reconcile` `:868-933`; claim checks `:874-900`; terminal
 //! history `:955-1027`; running custody `:1028-1108`; settled/boundary `:1147-1272`). The policy
-//! reads no clock and no `/proc` (EX-04) and writes nothing; [`reconcile`] feeds each decided
-//! event to [`Store::apply`], the one writer. Only R07 and R08 have a task edge in
-//! `hee4_contracts::transition`; every other rule leaves the task unchanged and is reported.
+//! reads no clock and no process table (EX-04) and writes nothing; [`reconcile`] feeds each decided
+//! event to [`Store::apply`], the one writer; [`crate::probe`] is the only IO. Only R07 and R08
+//! have a task edge in `hee4_contracts::transition`; every other rule leaves the task unchanged
+//! and is reported.
+//!
+//! # The attempts rows (`src/store/attempts.rs`)
+//!
+//! | Durable facts | Observation | Rule | Event | After |
+//! |---|---|---|---|---|
+//! | the latest `attempts` row contradicts the events: closed with no / a wrong `closed_seq`, an outcome that disagrees with the closing event, or running while a close follows its `dispatch_seq` | any | R03 | — (`Finding::Contradictory`; a contradiction cannot be transitioned away) | unchanged; `complete=false`, the engine does not listen, the operator restores |
+//! | running, attempt open, row with pid | `LiveSameIdentity` (probe: the process start ticks equal the row's) | R06 | — (observe-only, no reaper) | unchanged |
+//! | running, attempt open | `Absent` | R08 + reason: row unacknowledged → `DispatchUnacknowledged`; acknowledged → `AcknowledgedWorkerLost`; no row (pre-migration history) → `AcknowledgementUnrecorded` | `Recover(R08)` | effect_unknown |
+//! | R07/R08 over an open row, or R11 over a closed row with cleanup pending | `Writable{bytes}` workspace | R09 attached beside the rule: no lease → `NotLeasedWritable`; lease, no clock → `ClockUnavailable`; other clock epoch → `LeaseClockNotComparable`; same epoch, past deadline → `LeaseExpiredWritable`; same epoch, live → nothing | none for the attachment | unchanged; cleanup stays pending |
+//! | ledger `epoch`, `event_high_water`, `restored_from` · a cursor | — | R13 ([`cursor`], not a task rule) | — | `PriorEpochOfRestore` / `EpochChanged` / `FutureSequence` carry `R13CursorEpoch`; `SnapshotOnly` carries none; never a replay authorisation |
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
-use hee4_contracts::{Event, Phase, RecoveryRule, TaskId};
+use hee4_contracts::{Event, Phase, RecoveryRule, Settlement, TaskId};
 
-use crate::store::{Store, StoreError};
+use crate::store::{
+    AttemptId, AttemptOutcome, AttemptRow, AttemptState, Cleanup, CursorVerdict, Lease, Store,
+    StoreError,
+};
 
 /// A worker's physical custody as the caller observed it (v3 `ProcessCustody`, `:520-532`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -38,6 +53,32 @@ pub struct Claim {
     pub task_generation: u64,
 }
 
+/// What the probe read back of an attempt's workspace (R09).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WorkspaceReadback {
+    /// The path does not exist.
+    Absent,
+    /// A directory is there; `bytes` is the walked size, capped at the caller's bound.
+    Writable {
+        /// Bytes found before the walk stopped.
+        bytes: u64,
+    },
+    /// Could not look.
+    Unreadable,
+    /// Nothing was read.
+    #[default]
+    Unobserved,
+}
+
+/// The receiver clock the probe read, in which a lease's `deadline_ms` may be compared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Clock {
+    /// Now, ms since the Unix epoch.
+    pub now_ms: i64,
+    /// This boot's clock epoch (`boot_id`).
+    pub clock_epoch: String,
+}
+
 /// What the caller observed at startup. The policy consults nothing else.
 #[derive(Debug, Clone, Default)]
 pub struct Observations {
@@ -47,6 +88,10 @@ pub struct Observations {
     pub default_process: ProcessCustody,
     /// Claims per task.
     pub claims: BTreeMap<TaskId, Claim>,
+    /// Workspace readback per attempt (absent: `Unobserved`).
+    pub workspace: BTreeMap<AttemptId, WorkspaceReadback>,
+    /// The receiver clock, if readable.
+    pub clock: Option<Clock>,
 }
 
 impl Observations {
@@ -68,7 +113,7 @@ impl Observations {
 }
 
 /// The durable facts the policy reads for one task, derived from its events.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Facts {
     /// The replayed phase.
     pub phase: Phase,
@@ -76,15 +121,18 @@ pub struct Facts {
     pub generation: u64,
     /// A `Dispatch` with no later `Settle` or `Recover(R07|R08)`: an attempt was in flight.
     pub attempt_open: bool,
+    /// Every closing event (`Settle(_)`, `Recover(R07|R08)`) with its `events.seq`, for R03.
+    pub closes: Vec<(i64, Event)>,
 }
 
 impl Facts {
-    /// Derive the facts from a history whose replay gave `phase`.
+    /// Derive the facts from a history (with seqs) whose replay gave `phase`.
     #[must_use]
-    pub fn from_history(phase: Phase, events: &[Event]) -> Self {
+    pub fn from_history(phase: Phase, events: &[(i64, Event)]) -> Self {
         let mut generation = 0;
         let mut attempt_open = false;
-        for e in events {
+        let mut closes = Vec::new();
+        for (seq, e) in events {
             match e {
                 Event::Dispatch => {
                     generation += 1;
@@ -94,6 +142,7 @@ impl Facts {
                 | Event::Recover(RecoveryRule::R07ProcessNotOurs | RecoveryRule::R08WorkerAbsent) =>
                 {
                     attempt_open = false;
+                    closes.push((*seq, *e));
                 }
                 _ => {}
             }
@@ -102,8 +151,80 @@ impl Facts {
             phase,
             generation,
             attempt_open,
+            closes,
         }
     }
+}
+
+/// The latest `attempts` row of a task, as the policy reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttemptFacts {
+    /// The attempt.
+    pub id: AttemptId,
+    /// Its generation.
+    pub generation: u64,
+    /// The seq of its `Dispatch` event.
+    pub dispatch_seq: i64,
+    /// Lifecycle state.
+    pub state: AttemptState,
+    /// `attempt_started` was recorded.
+    pub acknowledged: bool,
+    /// The last recorded worker identity.
+    pub pid: Option<(u32, u64)>,
+    /// The workspace, once acknowledged.
+    pub workspace: Option<PathBuf>,
+    /// The lease, if one was issued.
+    pub lease: Option<Lease>,
+    /// Cleanup state.
+    pub cleanup: Cleanup,
+    /// The closing event's seq, once closed.
+    pub closed_seq: Option<i64>,
+    /// The closing outcome, once closed.
+    pub outcome: Option<AttemptOutcome>,
+}
+
+impl AttemptFacts {
+    /// The facts of a row.
+    #[must_use]
+    pub fn from_row(row: &AttemptRow) -> Self {
+        Self {
+            id: row.id.clone(),
+            generation: row.generation,
+            dispatch_seq: row.dispatch_seq,
+            state: row.state,
+            acknowledged: row.acknowledged(),
+            pid: row.pid,
+            workspace: row.started.as_ref().map(|s| s.workspace.clone()),
+            lease: row.started.as_ref().and_then(|s| s.lease.clone()),
+            cleanup: row.cleanup,
+            closed_seq: row.closed_seq,
+            outcome: row.outcome,
+        }
+    }
+}
+
+/// R08's reason: the acknowledgement class of the lost attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum R08Reason {
+    /// A row with no `attempt_started`: the worker never acknowledged.
+    DispatchUnacknowledged,
+    /// An acknowledged row: the worker was seen, then lost.
+    AcknowledgedWorkerLost,
+    /// No row at all: a history older than the attempts ledger.
+    AcknowledgementUnrecorded,
+}
+
+/// R09: why a writable workspace is not reused (attached beside the rule, never instead).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceReuseRefused {
+    /// Writable with no lease.
+    NotLeasedWritable,
+    /// Leased, but no receiver clock to compare in.
+    ClockUnavailable,
+    /// The lease was issued in another clock epoch: not comparable, expired or not.
+    LeaseClockNotComparable,
+    /// Same clock epoch, past the deadline: expiry alone never licenses reuse.
+    LeaseExpiredWritable,
 }
 
 /// The policy's answer for one task: which rule fired and the event (if any) to apply.
@@ -113,24 +234,106 @@ pub struct Decision {
     pub rule: Option<RecoveryRule>,
     /// The event for `Store::apply`; `None` leaves the task unchanged.
     pub event: Option<Event>,
+    /// R08's acknowledgement class.
+    pub reason: Option<R08Reason>,
+    /// R09's attachment.
+    pub workspace: Option<WorkspaceReuseRefused>,
+    /// R03: the attempt row and the events disagree; no event is ever applied.
+    pub contradiction: bool,
 }
 
 const fn keep(rule: RecoveryRule) -> Decision {
     Decision {
         rule: Some(rule),
         event: None,
+        reason: None,
+        workspace: None,
+        contradiction: false,
     }
 }
 
+const fn apply(rule: RecoveryRule) -> Decision {
+    Decision {
+        rule: Some(rule),
+        event: Some(Event::Recover(rule)),
+        reason: None,
+        workspace: None,
+        contradiction: false,
+    }
+}
+
+const NOTHING: Decision = Decision {
+    rule: None,
+    event: None,
+    reason: None,
+    workspace: None,
+    contradiction: false,
+};
+
+/// The outcome a closing event writes on the row.
+const fn outcome_of(event: Event) -> Option<AttemptOutcome> {
+    match event {
+        Event::Settle(Settlement::Ready) => Some(AttemptOutcome::Ready),
+        Event::Settle(Settlement::NotReady) => Some(AttemptOutcome::NotReady),
+        Event::Settle(Settlement::Unsettled) => Some(AttemptOutcome::Unsettled),
+        Event::Recover(RecoveryRule::R07ProcessNotOurs) => Some(AttemptOutcome::R07),
+        Event::Recover(RecoveryRule::R08WorkerAbsent) => Some(AttemptOutcome::R08),
+        _ => None,
+    }
+}
+
+/// R03: does the row contradict the events? (a) closed with no `closed_seq`, or one that is
+/// not a closing event after its `dispatch_seq`; (b) an outcome that disagrees with that
+/// event; (c) running while a closing event follows its `dispatch_seq`.
+fn contradicts(attempt: &AttemptFacts, facts: &Facts) -> bool {
+    let after_dispatch = |seq: i64| seq > attempt.dispatch_seq;
+    if attempt.state == AttemptState::Running {
+        return facts.closes.iter().any(|(seq, _)| after_dispatch(*seq));
+    }
+    let Some(closed_seq) = attempt.closed_seq.filter(|s| after_dispatch(*s)) else {
+        return true;
+    };
+    let Some((_, event)) = facts.closes.iter().find(|(seq, _)| *seq == closed_seq) else {
+        return true;
+    };
+    attempt.outcome.is_none() || attempt.outcome != outcome_of(*event)
+}
+
+/// R09 over a writable workspace.
+fn lease_refusal(lease: Option<&Lease>, clock: Option<&Clock>) -> Option<WorkspaceReuseRefused> {
+    let Some(lease) = lease else {
+        return Some(WorkspaceReuseRefused::NotLeasedWritable);
+    };
+    let Some(clock) = clock else {
+        return Some(WorkspaceReuseRefused::ClockUnavailable);
+    };
+    if clock.clock_epoch != lease.clock_epoch {
+        return Some(WorkspaceReuseRefused::LeaseClockNotComparable);
+    }
+    (clock.now_ms > lease.deadline_ms).then_some(WorkspaceReuseRefused::LeaseExpiredWritable)
+}
+
 /// The pure policy. Same inputs, same decision: a second pass converges (make it idempotent).
+/// Reads no clock and no process table: `clock` and `workspace` are what the caller observed.
 #[must_use]
 pub fn decide(
     ledger_epoch: &str,
-    facts: Facts,
+    facts: &Facts,
+    attempt: Option<&AttemptFacts>,
     custody: ProcessCustody,
+    workspace: WorkspaceReadback,
+    clock: Option<&Clock>,
     claim: Option<&Claim>,
 ) -> Decision {
     use RecoveryRule as R;
+    if let Some(a) = attempt
+        && contradicts(a, facts)
+    {
+        return Decision {
+            contradiction: true,
+            ..keep(R::R03CommitOrdering)
+        };
+    }
     if !facts.phase.is_terminal()
         && let Some(claim) = claim
     {
@@ -141,7 +344,7 @@ pub fn decide(
             return keep(R::R02StaleGeneration);
         }
     }
-    match facts.phase {
+    let mut decision = match facts.phase {
         Phase::Accepted => keep(R::R04AcceptanceStands),
         Phase::Cancelled => keep(R::R05CancellationStands),
         // v3 `history` returns None for these; the settled attempt goes to cleanup (`:1147`).
@@ -151,23 +354,59 @@ pub fn decide(
         Phase::Running | Phase::CancellationRequested if facts.attempt_open => match custody {
             ProcessCustody::LiveSameIdentity => keep(R::R06LiveOwnedChild),
             ProcessCustody::Absent => Decision {
-                rule: Some(R::R08WorkerAbsent),
-                event: Some(Event::Recover(R::R08WorkerAbsent)),
+                reason: Some(match attempt {
+                    None => R08Reason::AcknowledgementUnrecorded,
+                    Some(a) if a.acknowledged => R08Reason::AcknowledgedWorkerLost,
+                    Some(_) => R08Reason::DispatchUnacknowledged,
+                }),
+                ..apply(R::R08WorkerAbsent)
             },
             ProcessCustody::PidReused | ProcessCustody::Unreadable | ProcessCustody::Unobserved => {
-                Decision {
-                    rule: Some(R::R07ProcessNotOurs),
-                    event: Some(Event::Recover(R::R07ProcessNotOurs)),
-                }
+                apply(R::R07ProcessNotOurs)
             }
         },
         // `running` without an open attempt cannot come out of `transition`.
         Phase::Running => keep(R::R14UnexpectedState),
-        Phase::Admitted | Phase::CancellationRequested | Phase::Blocked { .. } => Decision {
-            rule: None,
-            event: None,
-        },
+        Phase::Admitted | Phase::CancellationRequested | Phase::Blocked { .. } => NOTHING,
+    };
+    if let (Some(a), WorkspaceReadback::Writable { .. }) = (attempt, workspace) {
+        let worker_gone = matches!(
+            decision.rule,
+            Some(R::R07ProcessNotOurs | R::R08WorkerAbsent)
+        ) && a.state == AttemptState::Running;
+        let cleanup_due = decision.rule == Some(R::R11CleanupReadback)
+            && a.state != AttemptState::Running
+            && a.cleanup == Cleanup::Pending;
+        if worker_gone || cleanup_due {
+            decision.workspace = lease_refusal(a.lease.as_ref(), clock);
+        }
     }
+    decision
+}
+
+/// R13 over a subscriber cursor: the foundation's verdict plus the rule it carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CursorDecision {
+    /// `Store::cursor_check`'s verdict.
+    pub verdict: CursorVerdict,
+    /// `R13CursorEpoch` for every verdict but `SnapshotOnly`.
+    pub rule: Option<RecoveryRule>,
+}
+
+/// R13: not a task rule. Reads `Store::cursor_check` and names the rule; never a replay
+/// authorisation.
+///
+/// # Errors
+/// SQLite errors.
+pub fn cursor(store: &Store, epoch: &str, seq: u64) -> Result<CursorDecision, StoreError> {
+    let verdict = store.cursor_check(epoch, seq)?;
+    let rule = match verdict {
+        CursorVerdict::PriorEpochOfRestore
+        | CursorVerdict::EpochChanged
+        | CursorVerdict::FutureSequence => Some(RecoveryRule::R13CursorEpoch),
+        CursorVerdict::SnapshotOnly => None,
+    };
+    Ok(CursorDecision { verdict, rule })
 }
 
 /// One task's reconcile outcome.
@@ -181,6 +420,10 @@ pub struct Row {
     pub before: Phase,
     /// Phase after the pass.
     pub after: Phase,
+    /// R08's acknowledgement class.
+    pub reason: Option<R08Reason>,
+    /// R09's attachment.
+    pub workspace: Option<WorkspaceReuseRefused>,
 }
 
 /// A reason `complete` is withheld.
@@ -210,6 +453,16 @@ pub enum Finding {
         /// The refusal text.
         detail: String,
     },
+    /// The task's latest `attempts` row contradicts its events (R03); no event is applied and
+    /// the operator restores.
+    Contradictory {
+        /// The task.
+        task_id: TaskId,
+        /// The row.
+        attempt_id: AttemptId,
+        /// `R03CommitOrdering`.
+        rule: RecoveryRule,
+    },
 }
 
 /// The result of [`reconcile`].
@@ -223,6 +476,15 @@ pub struct RecoveryReport {
     pub applied: usize,
     /// No findings: `recovery_complete` was set and dispatch may start.
     pub complete: bool,
+}
+
+/// The `tasks` cache row agrees with the replay (R14's cache check).
+fn cache_matches(store: &Store, task: &TaskId, facts: &Facts) -> Result<bool, StoreError> {
+    Ok(store.cached(task)?.is_some_and(|c| {
+        c.phase == facts.phase.as_str()
+            && c.cancel == facts.phase.cancel_requested()
+            && c.generation == facts.generation
+    }))
 }
 
 /// Apply R01–R14 to every task through [`Store::apply`], then set `recovery_complete` to
@@ -246,12 +508,13 @@ pub fn reconcile(store: &Store, observed: &Observations) -> Result<RecoveryRepor
         Err(e) => return Err(e),
     };
     for task in ids {
-        let (history, phase) = match store.history(&task).and_then(|h| {
+        let (history, phase, latest) = match store.history_with_seq(&task).and_then(|h| {
             let p = store.phase(&task)?;
-            Ok((h, p))
+            let a = store.latest_attempt(&task)?;
+            Ok((h, p, a))
         }) {
-            Ok((h, Some(p))) => (h, p),
-            Ok((_, None)) => {
+            Ok((h, Some(p), a)) => (h, p, a),
+            Ok((_, None, _)) => {
                 report.findings.push(Finding::Unreadable {
                     task_id: task.to_string(),
                     detail: "tasks row with no events".into(),
@@ -268,25 +531,35 @@ pub fn reconcile(store: &Store, observed: &Observations) -> Result<RecoveryRepor
             Err(e) => return Err(e),
         };
         let facts = Facts::from_history(phase, &history);
-        let cache_ok = store.cached(&task)?.is_some_and(|c| {
-            c.phase == phase.as_str()
-                && c.cancel == phase.cancel_requested()
-                && c.generation == facts.generation
-        });
-        if !cache_ok {
+        let attempt = latest.as_ref().map(AttemptFacts::from_row);
+        if !cache_matches(store, &task, &facts)? {
             report.findings.push(Finding::CacheMismatch {
                 task_id: task.clone(),
             });
         }
+        let workspace = attempt
+            .as_ref()
+            .and_then(|a| observed.workspace.get(&a.id).copied())
+            .unwrap_or_default();
         let decision = decide(
             &epoch,
-            facts,
+            &facts,
+            attempt.as_ref(),
             observed.custody(&task),
+            workspace,
+            observed.clock.as_ref(),
             observed.claims.get(&task),
         );
         if decision.rule == Some(RecoveryRule::R14UnexpectedState) {
             report.findings.push(Finding::Unexpected {
                 task_id: task.clone(),
+            });
+        }
+        if let (true, Some(a), Some(rule)) = (decision.contradiction, &attempt, decision.rule) {
+            report.findings.push(Finding::Contradictory {
+                task_id: task.clone(),
+                attempt_id: a.id.clone(),
+                rule,
             });
         }
         let after = match decision.event {
@@ -311,6 +584,8 @@ pub fn reconcile(store: &Store, observed: &Observations) -> Result<RecoveryRepor
             rule: decision.rule,
             before: phase,
             after,
+            reason: decision.reason,
+            workspace: decision.workspace,
         });
     }
     report.complete = report.findings.is_empty();
@@ -327,7 +602,25 @@ mod tests {
             phase,
             generation: 1,
             attempt_open,
+            closes: Vec::new(),
         }
+    }
+
+    fn plain(
+        ledger_epoch: &str,
+        facts: &Facts,
+        custody: ProcessCustody,
+        claim: Option<&Claim>,
+    ) -> Decision {
+        decide(
+            ledger_epoch,
+            facts,
+            None,
+            custody,
+            WorkspaceReadback::Unobserved,
+            None,
+            claim,
+        )
     }
 
     #[test]
@@ -416,12 +709,13 @@ mod tests {
             (Phase::Admitted, false, C::Absent, None, false),
         ];
         for (phase, open, custody, rule, moves) in cases {
-            let d = decide("e", facts(phase, open), custody, None);
+            let d = plain("e", &facts(phase, open), custody, None);
             assert_eq!(
                 (d.rule, d.event.is_some()),
                 (rule, moves),
                 "{phase:?} {custody:?}"
             );
+            assert!(!d.contradiction);
         }
     }
 
@@ -433,13 +727,13 @@ mod tests {
             epoch: "other".into(),
             task_generation: 1,
         };
-        let d = decide("e", facts(Phase::Running, true), C::Absent, Some(&stale));
+        let d = plain("e", &facts(Phase::Running, true), C::Absent, Some(&stale));
         assert_eq!(d, keep(R::R01StaleObservationEpoch));
         let old_gen = Claim {
             epoch: "e".into(),
             task_generation: 0,
         };
-        let d = decide("e", facts(Phase::Running, true), C::Absent, Some(&old_gen));
+        let d = plain("e", &facts(Phase::Running, true), C::Absent, Some(&old_gen));
         assert_eq!(d, keep(R::R02StaleGeneration));
     }
 }

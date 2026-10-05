@@ -10,12 +10,14 @@
 
 pub mod backup;
 mod codec;
+pub mod probe;
 pub mod recovery;
 mod store;
 
 pub use backup::{BackupError, BackupReport, MAX_BACKUP_OBJECTS, RestoreReport, SameDisk};
 pub use recovery::{Observations, ProcessCustody, RecoveryReport, reconcile};
 pub use store::{
-    Admission, CacheHeal, CachedRow, CursorVerdict, Operation, OperationKey, OperationRow, Store,
-    StoreError,
+    Admission, AttemptId, AttemptIdFault, AttemptOutcome, AttemptRow, AttemptStart, AttemptState,
+    CacheHeal, CachedRow, Cleanup, CursorVerdict, Effect, Lease, Operation, OperationKey,
+    OperationRow, Store, StoreError,
 };
