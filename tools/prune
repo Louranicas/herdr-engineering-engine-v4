@@ -3,11 +3,13 @@
 
 Build-cache prune (ops O2; DEPLOYMENT_ATLAS §6 "pure policy over the directory listing"). Dry-run by
 default: it lists and removes nothing. The policy is computed fresh from the listing on every run,
-and --apply removes only candidates that same run printed; just before each hee4-target-<name> rmtree
-it re-takes that dir's cargo locks (held through the removal) and re-reads its age, keeping it as
-in_use or young when a build started after the plan. Two declared patterns, nothing else:
-  (a) <root>/hee4-gate-target/<12 hex>   beyond the newest --keep by mtime; never the dir named by
-      HEAD[:12] or origin/main[:12] (no origin/main: `origin_main=UNMEASURED`, only HEAD is kept)
+and --apply removes only candidates that same run printed; just before each rmtree (both patterns)
+it re-takes that dir's cargo locks, held through the removal, keeping it as in_use when a build
+started after the plan; a hee4-target-<name> dir also re-reads its age (young). Two declared
+patterns, nothing else:
+  (a) <root>/hee4-gate-target/<12 hex>   beyond the newest --keep by mtime and whose debug/.cargo-lock
+      or release/.cargo-lock is not flocked; never the dir named by HEAD[:12] or origin/main[:12]
+      (no origin/main: `origin_main=UNMEASURED`, only HEAD is kept)
   (b) <root>/hee4-target-<[a-z0-9-]+>     whose newest mtime (dir, debug/, release/) is older than
       --older-than hours and whose debug/.cargo-lock or release/.cargo-lock is not flocked
 Never candidates: <root>/hee4-target (the deploy build), <root>/hee4-target-gate, the basename of
@@ -128,6 +130,8 @@ def plan(a, root):
                 print(f"prune_keep path={path} reason=origin_main")
             elif i < a.keep:
                 print(f"prune_keep path={path} reason=newest")
+            elif in_use(path):
+                print(f"prune_keep path={path} reason=in_use")
             else:
                 cands.append((path, size(path), "beyond_keep", gt, SHA12))
     protected = set(PROTECTED)
@@ -175,19 +179,17 @@ def main():
                 print(f"refuse_prune path={path} reason=recheck_failed")
                 failed = True
                 continue
-            held = []
-            if reason == "stale_target":
-                # the plan's in_use/young tests are stale by now (the size walk and earlier rmtrees take
-                # time): re-take the cargo locks and hold them through the rmtree, and re-read the age
-                held = hold_locks(path)
-                if held is None:
-                    print(f"prune_keep path={path} reason=in_use")
-                    continue
-                if newest_mtime(path) > a.cutoff:
-                    for fd in held:
-                        os.close(fd)
-                    print(f"prune_keep path={path} reason=young")
-                    continue
+            # the plan's in_use/young tests are stale by now (the size walk and earlier rmtrees take
+            # time): re-take the cargo locks of every candidate and hold them through the rmtree
+            held = hold_locks(path)
+            if held is None:
+                print(f"prune_keep path={path} reason=in_use")
+                continue
+            if reason == "stale_target" and newest_mtime(path) > a.cutoff:
+                for fd in held:
+                    os.close(fd)
+                print(f"prune_keep path={path} reason=young")
+                continue
             try:
                 shutil.rmtree(path)
             except OSError as e:
