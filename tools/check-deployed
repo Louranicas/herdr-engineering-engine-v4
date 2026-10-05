@@ -193,6 +193,23 @@ def drive_task_ids(evidence_root):
 
 # ---- the nine rows ----
 
+def feature_counts(feats):
+    """(l2, reasoned, unexplained) over `drive feature=` lines; every line lands in exactly one bucket.
+    PASS is l2; UNMEASURED with `scope=unserved` or `reason=` is reasoned; everything else (a FAIL, with
+    or without a reason, an UNMEASURED with neither, an unknown verdict) is unexplained."""
+    l2 = reasoned = unexplained = 0
+    for line in feats:
+        keys = {t.split("=", 1)[0]: t.split("=", 1)[1] for t in line.split() if "=" in t}
+        v = keys.get("verdict")
+        if v == "PASS":
+            l2 += 1
+        elif v == "UNMEASURED" and (keys.get("scope") == "unserved" or "reason" in keys):
+            reasoned += 1
+        else:
+            unexplained += 1
+    return l2, reasoned, unexplained
+
+
 def d8(a, ctx):
     r = Row("D8")
     cmd = shlex.split(a.drive_cmd)
@@ -207,10 +224,7 @@ def d8(a, ctx):
         r.check("drive", f"not_run({err})", False)
         return r
     feats = [l for l in out.splitlines() if l.startswith("drive feature=")]
-    explained = lambda l: "scope=unserved" in l or "reason=" in l
-    l2 = sum(1 for l in feats if " verdict=PASS" in l)
-    reasoned = sum(1 for l in feats if " verdict=UNMEASURED" in l and explained(l))
-    unexplained = sum(1 for l in feats if (" verdict=UNMEASURED" in l or " verdict=FAIL" in l) and not explained(l))
+    l2, reasoned, unexplained = feature_counts(feats)
     last = out.splitlines()[-1] if out else ""
     kv = dict(t.split("=", 1) for t in last.split() if "=" in t) if last.startswith("drive verdict=") else {}
     r.val("drive_rc", rc)

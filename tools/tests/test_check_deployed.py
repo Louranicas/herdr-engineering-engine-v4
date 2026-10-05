@@ -130,6 +130,17 @@ class CheckDeployedTests(unittest.TestCase):
         self.assertEqual(kv["version_head"], "mismatch(binary=d0bebb274a11,exe=54fd592aaaaa)")
         self.assertTrue(line.endswith(" FAIL"), line)
 
+    def test_feature_counts_every_line_lands_once(self):
+        m = load()
+        feats = ["drive feature=health verdict=PASS paths=6/6 evidence=e",
+                 "drive feature=a verdict=UNMEASURED paths=0/0 evidence=e scope=unserved reason=no procedure in tools/drive.d",
+                 "drive feature=b verdict=UNMEASURED paths=0/0 evidence=e reason=procedure UNWRITTEN",
+                 "drive feature=c verdict=UNMEASURED paths=1/3 evidence=e",
+                 "drive feature=d verdict=FAIL paths=2/3 evidence=e",
+                 "drive feature=e verdict=FAIL paths=2/3 evidence=e reason=a FAIL is never excused",
+                 "drive feature=f verdict=PASS_WITH_GAPS paths=2/3 evidence=e"]
+        self.assertEqual(m.feature_counts(feats), (1, 2, 4))
+
     def test_no_declaration_is_parsed(self):
         src = open(CD).read()
         self.assertNotIn("store.rs", src); self.assertNotIn("SCHEMA_VERSION", src)
