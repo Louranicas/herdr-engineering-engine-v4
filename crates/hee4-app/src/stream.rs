@@ -46,11 +46,14 @@ pub enum Stop {
 /// # Errors
 /// [`Stop`].
 pub fn offer(tx: &SyncSender<Value>, frames: Vec<Value>, stall: Duration) -> Result<(), Stop> {
-    // The retry interval: short enough that a draining reader is fed promptly, never longer than
-    // the window itself.
-    let step = stall.min(Duration::from_millis(5));
+    // The retry interval backs off from 1 ms to at most 50 ms (and never past the window), so a
+    // draining reader is fed promptly and a stalled one costs little CPU while it waits.
+    let first = stall.min(Duration::from_millis(1));
+    let ceiling = stall.min(Duration::from_millis(50));
     for mut frame in frames {
+        // Per frame, never per batch: each accepted frame restarts the window.
         let deadline = Instant::now() + stall;
+        let mut step = first;
         loop {
             match tx.try_send(frame) {
                 Ok(()) => break,
@@ -61,6 +64,7 @@ pub fn offer(tx: &SyncSender<Value>, frames: Vec<Value>, stall: Duration) -> Res
                     }
                     frame = back;
                     std::thread::sleep(step);
+                    step = (step * 2).min(ceiling);
                 }
             }
         }
@@ -281,6 +285,37 @@ mod tests {
         assert_eq!(rx.try_recv().ok(), Some(json!(1)));
         drop(rx);
         assert_eq!(offer(&tx, vec![json!(3)], stall), Err(Stop::Gone));
+    }
+
+    /// Each accepted frame restarts the window (the refuter's surviving mutant moved the deadline
+    /// above the frame loop, making it per batch): ten frames through a one-slot queue to a reader
+    /// taking one frame every 30 ms all arrive under a 50 ms window, though the batch takes ~300 ms.
+    #[test]
+    fn each_accepted_frame_restarts_the_stall_window() {
+        let stall = Duration::from_millis(50);
+        let (tx, rx) = sync_channel(1);
+        let reader = std::thread::spawn(move || {
+            let mut n = 0;
+            while rx.recv_timeout(Duration::from_secs(2)).is_ok() {
+                n += 1;
+                std::thread::sleep(Duration::from_millis(30));
+                if n == 10 {
+                    break;
+                }
+            }
+            n
+        });
+        let t0 = Instant::now();
+        assert_eq!(
+            offer(&tx, (0..10).map(|i| json!(i)).collect(), stall),
+            Ok(())
+        );
+        assert!(
+            t0.elapsed() > stall * 3,
+            "the batch outlasted many windows: {:?}",
+            t0.elapsed()
+        );
+        assert_eq!(reader.join().unwrap_or_default(), 10);
     }
 
     /// The defect the cut tier found: a reader slower than the server but steadily draining is

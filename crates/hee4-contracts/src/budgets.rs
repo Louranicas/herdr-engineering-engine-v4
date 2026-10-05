@@ -131,7 +131,7 @@ impl StreamBudget {
         batch_rows: 256,
         poll_ms: 100,
         close_deadline_ms: 200,
-        stall_ms: 10_000,
+        stall_ms: 5_000,
     };
 
     /// `poll_ms` as a [`Duration`].
@@ -727,11 +727,15 @@ const FIELDS: [Field; 29] = [
 
 /// Order rules, `(lesser, greater)` by field name: a body fits in the attempt's total; the
 /// stream can close inside the socket's write deadline; a stall window lasts at least one poll, so
-/// a subscriber always gets at least one poll's chance to drain before it is judged slow.
-const ORDER: [(&str, &str); 3] = [
+/// a subscriber always gets at least one poll's chance to drain before it is judged slow; and the
+/// stall window ends within the socket's write deadline, so `slow_consumer` is decided (and
+/// logged) before a blocked write could end the stream with a bare EOF. The defaults keep the
+/// last pair apart (5 s against 10 s), so the two timers do not race.
+const ORDER: [(&str, &str); 4] = [
     ("door.max_body_bytes", "door.max_total_bytes"),
     ("stream.close_deadline_ms", "socket.write_deadline_ms"),
     ("stream.poll_ms", "stream.stall_ms"),
+    ("stream.stall_ms", "socket.write_deadline_ms"),
 ];
 
 fn field(name: &str) -> Option<&'static Field> {

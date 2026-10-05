@@ -272,3 +272,19 @@ fn stall_ms_is_validated_and_lasts_at_least_a_poll() {
         Duration::from_millis(Budgets::DEFAULT.stream.stall_ms)
     );
 }
+
+/// The stall window must end within the socket's write deadline, so `slow_consumer` is decided
+/// before a blocked write can end the stream with a bare EOF (the refuter's equal-timer race).
+#[test]
+fn stall_ms_ends_within_the_write_deadline() {
+    let write = Budgets::DEFAULT.socket.write_deadline_ms;
+    assert!(
+        Budgets::DEFAULT.stream.stall_ms < write,
+        "the defaults must not race"
+    );
+    let long = refused(&with_field("stream.stall_ms", json!(write + 1)));
+    assert!(
+        matches!(long, BudgetRefusal::Order { lesser, greater } if lesser == "stream.stall_ms" && greater == "socket.write_deadline_ms"),
+        "{long:?}"
+    );
+}
