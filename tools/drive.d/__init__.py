@@ -15,7 +15,8 @@ import sys
 
 MARK = "(rev 2026-10-05 drive)"
 TERMINAL = {"accepted", "failed", "cancelled", "abandoned"}
-PHASES = TERMINAL | {"admitted", "running", "verifying", "cancellation_requested", "repair_pending"}
+# The eleven phases of hee4-contracts FLOW.md: a row in `blocked` or `effect_unknown` is a known phase, not a typing failure.
+PHASES = TERMINAL | {"admitted", "running", "verifying", "cancellation_requested", "repair_pending", "blocked", "effect_unknown"}
 NO_LEDGER_REASON = "--ledger not passed"
 
 
