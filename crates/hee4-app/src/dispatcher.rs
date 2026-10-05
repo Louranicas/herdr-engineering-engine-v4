@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use hee4_contracts::bounds::MAX_VIEW_ITEMS;
 use hee4_contracts::{
     AbandonReason, Brief, BriefField, Event, GitSha, Observation, Outcome, Phase, ReceiptId,
-    Resolution, Settlement, Sha256Hex, SourceId, TaskId, Verdict, VerifyLine,
+    Resolution, Settlement, Sha256Hex, SourceId, TaskId, VerifyLine,
 };
 use hee4_core::backup::{BackupError, SameDisk, backup_to};
 use hee4_core::recovery::Facts;
@@ -957,10 +957,11 @@ struct Sealing<'a> {
 }
 
 /// After the attempt: settle, ask deep-diff-forge over the workspace diff, ledger each
-/// observation, `decide_and_seal`, append, decide. A cancel can land at any point after the
-/// attempt (the workspace diff and deep-diff-forge run for up to the timebox), so every event
-/// here goes through [`unless_cancelled`]: the task is stopped where the cancel is seen, and
-/// each observation row is written only after its `Observe` was applied.
+/// observation, `decide_and_seal`, then seal and decide in one store transaction. A cancel can
+/// land at any point after the attempt (the workspace diff and deep-diff-forge run for up to the
+/// timebox), so every write here goes through [`unless_cancelled`] or [`seal_unless_cancelled`]:
+/// the task is stopped where the cancel is seen, and each observation row is written only after
+/// its `Observe` was applied.
 fn settle_and_decide(
     engine: &Engine,
     sealing: &Sealing<'_>,
@@ -987,23 +988,45 @@ fn settle_and_decide(
         return Ok(Some((task.clone(), stopped)));
     }
     let receipt = seal(engine, sealing, &observations)?;
-    let verdict = receipt.decision().verdict;
-    eprintln!(
-        "dispatch task={task} verdict={verdict:?} receipt={}",
-        receipt.hash_self()
-    );
-    let mut phase = match unless_cancelled(engine, task, Event::Decide(verdict))? {
+    #[cfg(test)]
+    tests::before_seal(engine, task);
+    let phase = match seal_unless_cancelled(engine, &receipt)? {
         Ok(p) => p,
         Err(stopped) => return Ok(Some((task.clone(), stopped))),
     };
-    if verdict == Verdict::Pass {
-        phase = match unless_cancelled(engine, task, Event::Accept)? {
-            Ok(p) => p,
-            Err(stopped) => return Ok(Some((task.clone(), stopped))),
-        };
-    }
+    eprintln!(
+        "dispatch task={task} verdict={:?} receipt={} phase={}",
+        receipt.decision().verdict,
+        receipt.hash_self(),
+        phase.as_str()
+    );
     checkpoint(engine)?;
     Ok(Some((task.clone(), phase)))
+}
+
+/// K1's `Store::seal_and_decide` (the receipt, its `Decide` and, on a `Pass`, `Accept`, one
+/// transaction), unless a cancel has landed. The store lock is held from the phase check to the
+/// commit, so a cancel through this engine lands either before (no receipt is sealed; `Stop`)
+/// or after (the task is already decided). `Err(phase)`: the task was stopped. A cancel the
+/// transaction itself sees (the `Decide` leaves `cancellation_requested`, or is refused from
+/// there and rolls the receipt back) is stopped the same way, as [`unless_cancelled`] does.
+fn seal_unless_cancelled(
+    engine: &Engine,
+    receipt: &hee4_contracts::Receipt,
+) -> Result<Result<Phase, Phase>, StoreError> {
+    let task = receipt.task_id();
+    let sealed = {
+        let store = engine.store();
+        if store.phase(task)? == Some(Phase::CancellationRequested) {
+            None
+        } else {
+            Some(store.seal_and_decide(receipt))
+        }
+    };
+    match sealed {
+        None => stop_cancelled(engine, task, "seal_and_decide"),
+        Some(sealed) => stop_if_cancelled(engine, task, "seal_and_decide", sealed),
+    }
 }
 
 /// Each observation: apply `Observe`, then write its row, so no row is written once a cancel
@@ -1033,17 +1056,40 @@ fn unless_cancelled(
     task: &TaskId,
     event: Event,
 ) -> Result<Result<Phase, Phase>, StoreError> {
-    match apply(engine, task, event) {
+    stop_if_cancelled(
+        engine,
+        task,
+        &format!("{event:?}"),
+        apply(engine, task, event),
+    )
+}
+
+/// The cancel test of [`unless_cancelled`] over a write's answer: a phase of
+/// `cancellation_requested`, or an `Illegal` refusal from there, is stopped.
+fn stop_if_cancelled(
+    engine: &Engine,
+    task: &TaskId,
+    what: &str,
+    written: Result<Phase, StoreError>,
+) -> Result<Result<Phase, Phase>, StoreError> {
+    match written {
         Ok(Phase::CancellationRequested)
         | Err(StoreError::Refused(hee4_contracts::Refusal::Illegal {
             from: Phase::CancellationRequested,
             ..
-        })) => {
-            eprintln!("dispatch task={task} cancelled before {event:?} completed; stopping");
-            apply(engine, task, Event::Stop).map(Err)
-        }
+        })) => stop_cancelled(engine, task, what),
         other => other.map(Ok),
     }
+}
+
+/// `Stop` a task whose cancel was seen before `what` completed; its phase as `Err`.
+fn stop_cancelled(
+    engine: &Engine,
+    task: &TaskId,
+    what: &str,
+) -> Result<Result<Phase, Phase>, StoreError> {
+    eprintln!("dispatch task={task} cancelled before {what} completed; stopping");
+    apply(engine, task, Event::Stop).map(Err)
 }
 
 /// After a receipt: K1's `checkpoint_if_due` under `ledger.checkpoint_every`, one
@@ -1448,6 +1494,8 @@ fn ddf_word(obs: &Observation) -> &'static str {
     }
 }
 
+/// Build the sealed receipt (`decide_and_seal`) over the ledgered observations. Writes nothing:
+/// [`seal_unless_cancelled`] appends it and applies its verdict in one transaction.
 fn seal(
     engine: &Engine,
     sealing: &Sealing<'_>,
@@ -1472,15 +1520,13 @@ fn seal(
         standards: source("gate.toml", crate::GATE_TOML)?,
     };
     let task = &sealing.subject.task_id;
-    let receipt = decide_and_seal(
+    Ok(decide_and_seal(
         store.chain_head(task)?,
         sealing.receipt_id.clone(),
         &ids,
         obs,
         sealing.subject,
-    )?;
-    store.append_receipt(&receipt)?;
-    Ok(receipt)
+    )?)
 }
 
 #[cfg(test)]
@@ -2087,7 +2133,7 @@ mod tests {
     fn a_cancel_at_verifying_stops_at_decide_or_accept() -> R<()> {
         let (engine, task) = cancelled_while_verifying("cancel-verifying-decide")?;
         assert_eq!(
-            unless_cancelled(&engine, &task, Event::Decide(Verdict::Pass))?,
+            unless_cancelled(&engine, &task, Event::Decide(hee4_contracts::Verdict::Pass))?,
             Err(Phase::Cancelled)
         );
         let (engine, task) = cancelled_while_verifying("cancel-verifying-accept")?;
@@ -2104,6 +2150,63 @@ mod tests {
                 Event::Cancel,
                 Event::Stop
             ]
+        );
+        Ok(())
+    }
+
+    type BeforeSeal = fn(&Engine, &TaskId);
+
+    thread_local! {
+        /// What this test thread runs on the settle path between the seal and
+        /// `seal_unless_cancelled` (the dispatcher is synchronous, so `step` runs it here).
+        static BEFORE_SEAL: std::cell::Cell<Option<BeforeSeal>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// The settle path's test seam: runs this thread's [`BEFORE_SEAL`], if any.
+    pub(super) fn before_seal(engine: &Engine, task: &TaskId) {
+        if let Some(f) = BEFORE_SEAL.with(std::cell::Cell::get) {
+            f(engine, task);
+        }
+    }
+
+    /// A cancel that lands after the last observation row and before the seal: the settle path
+    /// finds the task `cancellation_requested` at `seal_and_decide`, seals nothing and stops it.
+    /// `step` returns `cancelled`, not an error, and the store holds no receipt for it.
+    #[test]
+    fn a_cancel_landing_before_seal_and_decide_ends_cancelled_with_no_receipt() -> R<()> {
+        let engine = crate::actions::testing::engine("cancel-before-seal")?;
+        let task: TaskId = "t-cancel-before-seal".parse()?;
+        fs::create_dir_all(engine.work().join("briefs"))?;
+        fs::write(engine.brief_path(&task), crate::actions::testing::BRIEF)?;
+        {
+            let store = engine.store();
+            assert!(hee4_core::reconcile(&store, &hee4_core::Observations::default())?.complete);
+            store.apply(&task, Event::Admit)?;
+        }
+        BEFORE_SEAL.with(|c| {
+            c.set(Some(|engine: &Engine, task: &TaskId| {
+                let store = engine.store();
+                assert_eq!(store.phase(task).ok().flatten(), Some(Phase::Verifying));
+                assert_eq!(
+                    store.apply(task, Event::Cancel).ok(),
+                    Some(Phase::CancellationRequested)
+                );
+            }));
+        });
+        let stepped = step(&engine, &offline(), None);
+        BEFORE_SEAL.with(|c| c.set(None));
+        assert_eq!(stepped?, Some((task.clone(), Phase::Cancelled)));
+        assert_eq!(engine.store().receipt_count(&task)?, 0);
+        let events = events(&engine, &task)?;
+        assert_eq!(
+            events.iter().rev().take(2).collect::<Vec<_>>(),
+            [&Event::Stop, &Event::Cancel]
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::Decide(_) | Event::Accept)),
+            "{events:?}"
         );
         Ok(())
     }
