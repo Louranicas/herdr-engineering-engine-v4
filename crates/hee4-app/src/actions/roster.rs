@@ -172,7 +172,9 @@ fn roster_fault(e: RosterError) -> Fault {
         .with_generation(current),
         RosterError::NotFound(_) => Fault::new(Code::NotFound, "/body/record_id", "no such record"),
         RosterError::Id(e) => invalid("/body/record_id", e.to_string()),
-        e @ RosterError::KindImmutable { .. } => invalid("/body/definition/kind", e.to_string()),
+        e @ (RosterError::KindImmutable { .. } | RosterError::KindPrefixMismatch { .. }) => {
+            invalid("/body/definition/kind", e.to_string())
+        }
     }
 }
 
@@ -592,7 +594,7 @@ mod tests {
     }
 
     #[test]
-    fn update_kind_change_is_refused_at_definition_kind_and_exclusions_name_it() -> R {
+    fn update_kind_change_and_id_kind_mismatch_are_refused_at_definition_kind() -> R {
         let e = ready("roster-update-kind")?;
         let model = default_definition().to_json();
         let created = call(
@@ -612,17 +614,30 @@ mod tests {
         );
         assert_eq!(moved["code"], "invalid_argument", "{moved}");
         assert_eq!(moved["field"], "/body/definition/kind", "{moved}");
-        let odd = call(
-            &e,
-            "roster.update",
-            Some("k3"),
-            json!({"record_id": "model:y", "definition": agent, "audit_reason": "odd"}),
-        );
-        assert_eq!(odd["body"]["change"], "created", "{odd}");
+        for (n, (record_id, definition)) in [("model:y", &agent), ("agent:z", &model)]
+            .into_iter()
+            .enumerate()
+        {
+            let odd = call(
+                &e,
+                "roster.update",
+                Some(&format!("k3-{n}")),
+                json!({"record_id": record_id, "definition": definition, "audit_reason": "odd"}),
+            );
+            assert_eq!(odd["code"], "invalid_argument", "{record_id}: {odd}");
+            assert_eq!(odd["field"], "/body/definition/kind", "{record_id}: {odd}");
+            let inspected = call(
+                &e,
+                "roster.inspect",
+                None,
+                json!({"selector": {"record_id": record_id}}),
+            );
+            assert_eq!(inspected["code"], "not_found", "{record_id}: {inspected}");
+        }
         let (roster, exclusions) = dispatcher::roster_from_store(&e, &e.cfg)?;
         let routed: Vec<&str> = roster.models.iter().map(|m| m.name.as_str()).collect();
         assert_eq!(routed, vec!["x"]);
-        assert_eq!(exclusions, vec!["model:y".to_owned()]);
+        assert_eq!(exclusions, Vec::<String>::new());
         Ok(())
     }
 
