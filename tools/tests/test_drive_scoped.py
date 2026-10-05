@@ -199,7 +199,7 @@ class RealServeTests(unittest.TestCase):
         out_of_release = [n for n in no_procedure if inspected[n].get("served") is False]
         for n in UNSERVED_V42:
             self.assertIn(n, out_of_release, inspected)
-        rc, out, err = run(DRIVE, "--socket", self.sock, "--only", plugins[0], "--evidence-root",
+        rc, out, err = run(DRIVE, "--socket", self.sock, "--only", ",".join(out_of_release), "--evidence-root",
                            os.path.join(self.d, "ev"), timeout=100)
         for n in out_of_release:
             want = scoped.display(inspected[n]["scope"])
@@ -207,6 +207,16 @@ class RealServeTests(unittest.TestCase):
             self.assertEqual(len(hit), 1, out)
             self.assertRegex(hit[0], rf"verdict=PASS paths=2/2 .* scope={re.escape(want)} served=false "
                                      r"\(refused by release scope, as catalogued\)$")
+        self.assertRegex(out.splitlines()[-1], rf"^drive verdict=PASS features={len(out_of_release)}/{len(out_of_release)} ")
+        self.assertEqual(rc, 0, out + err)
+
+    def test_only_leaves_an_unnamed_unserved_feature_undriven(self):
+        rc, out, err = run(DRIVE, "--socket", self.sock, "--only", "thread.get", "--evidence-root",
+                           os.path.join(self.d, "ev2"), timeout=100)
+        self.assertRegex(out, r"(?m)^drive feature=thread\.get verdict=PASS paths=2/2 .* served=false ")
+        self.assertRegex(out, r"(?m)^drive feature=thread\.list verdict=UNMEASURED .*scope=unserved "
+                              r"reason=no procedure in tools/drive\.d \(not selected by --only\)$")
+        self.assertEqual(rc, 0, out + err)
 
 
 class ScopeTableTests(unittest.TestCase):

@@ -18,7 +18,9 @@ counted in features=k/n. Any other unserved feature prints UNMEASURED with scope
 reason names why it is not out of release, e.g. served=true) and is counted in unserved=, not in
 features=k/n. A feature file without the
 "(rev 2026-10-05 drive)" marker in its Driving block is UNMEASURED: procedure UNWRITTEN.
---only NAME[,NAME...]: run only these plugin features (a name no plugin serves exits 2).
+--only NAME[,NAME...]: run only these features: plugin features, or features with no procedure
+  (driven by their refusal when out of release); a name with neither a plugin nor a feature file
+  exits 2. An unserved feature not named prints UNMEASURED scope=unserved, not driven.
 --ledger PATH: the ledger a procedure may read back, read-only (ctx["ledger"]; drive_d.ledger_ro);
   without it a side-effect check is UNMEASURED "--ledger not passed".
 --doctor-first: run tools/doctor; if its unit or socket check is not MEASURED, print that line, exit 3.
@@ -209,11 +211,13 @@ def main():
         sys.exit(1)
     scoped = sys.modules["drive_d.scoped"]  # tools/drive.d/scoped.py, loaded by load_plugins: the unserved branch
     selected = list(served)
+    names = sorted(f[:-3] for f in os.listdir(fdir) if f.endswith(".md") and f != "README.md")
+    wanted = None
     if a.only:
         wanted = [n for n in a.only.split(",") if n]
         for n in wanted:
-            if n not in served:
-                print(f"drive: --only {n} is not a plugin feature (plugins: {', '.join(served)})", file=sys.stderr)
+            if n not in served and n not in names:
+                print(f"drive: --only {n} is not a plugin feature, nor a feature file (plugins: {', '.join(served)})", file=sys.stderr)
                 sys.exit(2)
         selected = [n for n in served if n in wanted]
 
@@ -222,12 +226,15 @@ def main():
     is_live = os.path.realpath(a.socket) == os.path.realpath(live)
     ctx = {"unit": a.unit, "restart_ok": a.allow_restart and is_live, "ledger": a.ledger,
            "restart_why": ("--allow-restart not passed" if not a.allow_restart else "socket is not the live unit's; restart only drives the live unit")}
-    names = sorted(f[:-3] for f in os.listdir(fdir) if f.endswith(".md") and f != "README.md")
     unserved = [n for n in names if n not in served]
     out_of_release = 0
     verdicts = []
     for name in unserved + selected:
         evp = os.path.join(ev, f"{name}.jsonl")
+        if name not in served and wanted is not None and name not in wanted:
+            open(evp, "w").write(json.dumps({"unmeasured": "no procedure in tools/drive.d; not selected by --only"}) + "\n")
+            print(f"drive feature={name} verdict=UNMEASURED paths=0/0 evidence={evp} scope=unserved reason=no procedure in tools/drive.d (not selected by --only)")
+            continue
         if name not in served:
             F = Feature(name, evp, a.socket, table)
             try:
