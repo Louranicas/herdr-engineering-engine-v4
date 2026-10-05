@@ -182,14 +182,15 @@ fn a_v2_file_gains_the_named_rows_and_keeps_its_data() -> R {
     let receipt = build_v2(&path)?;
     let task: TaskId = LEGACY_TASK.parse()?;
     let store = Store::open(&path)?;
-    assert_eq!(store.schema_version()?, 4);
+    assert_eq!(store.schema_version()?, 5);
     assert_eq!(
         migration_rows(&path)?,
         [
             "migration:m001_v1",
             "migration:m002_cache_heals",
             "migration:m003_operations_subject",
-            "migration:m004_serve_cgroup"
+            "migration:m004_serve_cgroup",
+            "migration:m005_checkpoints"
         ]
     );
     assert_eq!(store.epoch()?, LEGACY_EPOCH, "epoch is kept, not re-minted");
@@ -220,7 +221,7 @@ fn a_v2_file_gains_the_named_rows_and_keeps_its_data() -> R {
     drop(store);
 
     let again = Store::open(&path)?;
-    assert_eq!(again.schema_version()?, 4);
+    assert_eq!(again.schema_version()?, 5);
     assert_eq!(meta_count(&path)?, rows, "a second open adds no meta row");
     assert_eq!(again.boot()?, boot + 1);
     assert_eq!(again.history(&task)?, [Event::Admit]);
