@@ -12,8 +12,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hee4_contracts::bounds::MAX_VIEW_ITEMS;
 use hee4_contracts::{
-    AbandonReason, Brief, BriefField, Event, GitSha, Observation, Phase, ReceiptId, Resolution,
-    Settlement, Sha256Hex, SourceId, TaskId, Verdict, VerifyLine,
+    AbandonReason, Brief, BriefField, Event, GitSha, Observation, Outcome, Phase, ReceiptId,
+    Resolution, Settlement, Sha256Hex, SourceId, TaskId, Verdict, VerifyLine,
 };
 use hee4_core::backup::{BackupError, SameDisk, backup_to};
 use hee4_core::recovery::Facts;
@@ -1375,42 +1375,76 @@ const fn adapter_error_name(e: &AdapterError) -> &'static str {
 /// skip is a log line and nothing else: never a refusal, never an abandon.
 fn ddf_observation(sealing: &Sealing<'_>) -> Option<Observation> {
     let task = &sealing.subject.task_id;
-    let skipped = |reason: &str| {
-        eprintln!("dispatch task={task} ddf=skipped reason={reason}");
-        None
-    };
+    let log = &mut std::io::stderr();
     let diff = sealing
         .before
         .as_ref()
         .map_err(DiffFault::name)
         .and_then(|before| {
             workspace_diff(sealing.work_dir, before, DDF_DIFF_BYTES).map_err(|e| {
-                eprintln!("dispatch task={task} ddf diff_error={e}");
+                let _ = writeln!(log, "dispatch task={task} ddf diff_error={e}");
                 e.name()
             })
         });
-    let bytes = match diff {
-        Ok(bytes) => bytes,
-        Err(kind) => return skipped(&format!("diff_error:{kind}")),
-    };
-    match ddf::for_task(
-        Diff::Bytes(&bytes),
-        sealing.subject,
-        &SystemClock,
-        sealing.budget,
-    ) {
+    match diff {
+        Ok(bytes) => report_ddf(
+            task,
+            ddf::for_task(
+                Diff::Bytes(&bytes),
+                sealing.subject,
+                &SystemClock,
+                sealing.budget,
+            ),
+            log,
+        ),
+        Err(kind) => ddf_skipped(task, &format!("diff_error:{kind}"), log),
+    }
+}
+
+/// One `dispatch task= ddf=` line for deep-diff-forge's answer, written to `log` (stderr under
+/// `serve`), and the observation to record. Every `Observed` is returned, whatever its word:
+/// `decide` ignores an advisory row, and the dispatcher never reads the outcome.
+fn report_ddf(
+    task: &TaskId,
+    answer: Result<TaskObservation, AdapterError>,
+    log: &mut impl std::io::Write,
+) -> Option<Observation> {
+    match answer {
         Ok(TaskObservation::Observed(obs)) => {
-            eprintln!(
-                "dispatch task={task} ddf=observed tool={} {}",
-                obs.tool.name, obs.tool.version
+            let _ = writeln!(
+                log,
+                "dispatch task={task} ddf={} tool={} {}",
+                ddf_word(&obs),
+                obs.tool.name,
+                obs.tool.version
             );
             Some(obs)
         }
-        Ok(TaskObservation::Skipped(skip)) => skipped(skip.name()),
+        Ok(TaskObservation::Skipped(skip)) => ddf_skipped(task, skip.name(), log),
         Err(e) => {
-            eprintln!("dispatch task={task} ddf adapter_error={e}");
-            skipped(&format!("adapter_error:{}", adapter_error_name(&e)))
+            let _ = writeln!(log, "dispatch task={task} ddf adapter_error={e}");
+            ddf_skipped(
+                task,
+                &format!("adapter_error:{}", adapter_error_name(&e)),
+                log,
+            )
         }
+    }
+}
+
+fn ddf_skipped(task: &TaskId, reason: &str, log: &mut impl std::io::Write) -> Option<Observation> {
+    let _ = writeln!(log, "dispatch task={task} ddf=skipped reason={reason}");
+    None
+}
+
+/// The `ddf=` word of an observation, read from its own outcome: K4 builds `Error` only for a
+/// run past its budget (`ddf::timeout_observation`) and `Refused` only for exit 7 (the tool
+/// declined to rank); anything else is a ranking.
+fn ddf_word(obs: &Observation) -> &'static str {
+    match obs.outcome {
+        Outcome::Error => "timeout",
+        Outcome::Refused { .. } => "declined",
+        _ => "observed",
     }
 }
 
@@ -1582,6 +1616,80 @@ mod tests {
             "diff --git a/f b/f\nnew file mode 100644\n--- /dev/null\n+++ b/f\n@@ -0,0 +1 @@\n+x\n"
         );
         let _ = fs::remove_dir_all(&ws);
+        Ok(())
+    }
+
+    /// One of hee4-evidence's committed deep-diff-forge stubs (mode 755; read at run time, never
+    /// a baked path).
+    fn ddf_stub(name: &str) -> R<PathBuf> {
+        let manifest = std::env::var("CARGO_MANIFEST_DIR")?;
+        Ok(PathBuf::from(manifest)
+            .join("../hee4-evidence/tests/fixtures")
+            .join(name))
+    }
+
+    /// `report_ddf` over the stub `name` run on `diff` within `budget`: the observation it
+    /// returns and the one line it printed.
+    fn ddf_run(name: &str, diff: &[u8], budget: Duration) -> R<(Option<Observation>, String)> {
+        let subject = subject()?;
+        let answer = ddf::for_task_with(
+            &ddf_stub(name)?,
+            Diff::Bytes(diff),
+            &subject,
+            &SystemClock,
+            budget,
+        );
+        let mut log = Vec::new();
+        let obs = report_ddf(&subject.task_id, answer, &mut log);
+        Ok((obs, String::from_utf8(log)?))
+    }
+
+    /// A deep-diff-forge run past its budget is printed `ddf=timeout`, and its advisory
+    /// observation is still returned for sealing.
+    #[test]
+    fn a_ddf_run_past_its_budget_prints_ddf_timeout() -> R<()> {
+        let (obs, line) = ddf_run("ddf-sleep5.sh", b"x", Duration::from_millis(200))?;
+        let task = subject()?.task_id;
+        assert_eq!(
+            line,
+            format!("dispatch task={task} ddf=timeout tool=deep-diff-forge unknown\n")
+        );
+        let obs = obs.ok_or("the timeout observation was not returned")?;
+        assert!(obs.advisory);
+        assert_eq!(obs.outcome, Outcome::Error);
+        Ok(())
+    }
+
+    /// Exit 7 (the tool declined to rank) is printed `ddf=declined`, its advisory observation
+    /// still returned.
+    #[test]
+    fn a_ddf_exit_7_prints_ddf_declined() -> R<()> {
+        let (obs, line) = ddf_run("ddf-exit7-silent.sh", b"x", Duration::from_secs(5))?;
+        let task = subject()?.task_id;
+        assert!(
+            line.starts_with(&format!(
+                "dispatch task={task} ddf=declined tool=deep-diff-forge "
+            )),
+            "{line}"
+        );
+        assert_eq!(line.lines().count(), 1, "{line}");
+        let obs = obs.ok_or("the exit-7 observation was not returned")?;
+        assert!(obs.advisory);
+        assert!(matches!(obs.outcome, Outcome::Refused { .. }), "{obs:?}");
+        Ok(())
+    }
+
+    /// NEGATIVE: a ranking is still printed `ddf=observed tool=`.
+    #[test]
+    fn a_ddf_ranking_prints_ddf_observed() -> R<()> {
+        let diff = fs::read(ddf_stub("verdict.diff")?)?;
+        let (obs, line) = ddf_run("ddf-pass.sh", &diff, Duration::from_secs(5))?;
+        let task = subject()?.task_id;
+        assert_eq!(
+            line,
+            format!("dispatch task={task} ddf=observed tool=deep-diff-forge stub\n")
+        );
+        assert_eq!(obs.ok_or("no observation")?.outcome, Outcome::Pass);
         Ok(())
     }
 
