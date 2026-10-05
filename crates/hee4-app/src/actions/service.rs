@@ -40,10 +40,10 @@ pub const FAMILY: Family = Family {
     handlers: &[
         ("service.inspect", |engine, req| frame(inspect(engine, req))),
         ("service.probe", |engine, req| {
-            frame(runner().and_then(|r| probe(engine, req, r)))
+            frame(probe(engine, req, started()))
         }),
         ("service.action", |engine, req| {
-            frame(runner().and_then(|r| action(engine, req, r)))
+            frame(action(engine, req, started()))
         }),
     ],
     on_serve_start: Some(start),
@@ -53,14 +53,18 @@ fn frame(reply: Reply) -> Result<Answer, Fault> {
     reply.map(|(replayed, body)| Answer::Frame(replayed, body))
 }
 
-fn runner() -> Result<&'static dyn ServiceRunner, Fault> {
-    RUNNER
-        .get()
-        .map(|r| r as &dyn ServiceRunner)
-        .ok_or_else(|| {
-            Fault::new(Code::Unavailable, "/", "the service runner is not started")
-                .with_because("service runner not started")
-        })
+/// The runner `start` built, if `serve` ran the hook in this process.
+fn started() -> Option<&'static dyn ServiceRunner> {
+    RUNNER.get().map(|r| r as &dyn ServiceRunner)
+}
+
+/// The runner, consulted only after every request check passed: an engine built without
+/// `serve` (a test) answers a well-formed request `unavailable` because the runner is absent.
+fn runner_of(runner: Option<&dyn ServiceRunner>) -> Result<&dyn ServiceRunner, Fault> {
+    runner.ok_or_else(|| {
+        Fault::new(Code::Unavailable, "/", "the service runner is not started")
+            .with_because("service runner not started")
+    })
 }
 
 /// Seed `service_facts`, pin the busctl digest (env, else measured now), measure the busctl
@@ -296,7 +300,7 @@ fn probe_body(body: &Value) -> Result<(&str, ProbeId), Fault> {
 }
 
 /// `service.probe`: one bounded read through the runner, committed as an operation.
-fn probe(engine: &Engine, req: &Request, runner: &dyn ServiceRunner) -> Reply {
+fn probe(engine: &Engine, req: &Request, runner: Option<&dyn ServiceRunner>) -> Reply {
     let (service_id, probe) = probe_body(&req.body)?;
     let op = op_key(engine, req);
     let bytes = body_bytes(&req.body)?;
@@ -309,7 +313,7 @@ fn probe(engine: &Engine, req: &Request, runner: &dyn ServiceRunner) -> Reply {
     }
     let fact = fact_of(engine, service_id)?;
     let input = Sha256Hex::digest(&bytes);
-    let observation = runner
+    let observation = runner_of(runner)?
         .probe(&fact.unit_id, probe, &input, &ProbeBudget::DEFAULT)
         .map_err(|e| probe_fault(&e))?;
     let observed = json_of(&observation)?;
@@ -337,7 +341,7 @@ fn action_body(body: &Value) -> Result<(&str, &str, UnitAction, Sha256Hex), Faul
 
 /// `service.action`: a CAS-guarded act through the runner, committed only after its read-back
 /// settled. An unsettled read-back is `effect_unknown` and writes no operations row.
-fn action(engine: &Engine, req: &Request, runner: &dyn ServiceRunner) -> Reply {
+fn action(engine: &Engine, req: &Request, runner: Option<&dyn ServiceRunner>) -> Reply {
     let (service_id, unit_id, act, owner) = action_body(&req.body)?;
     let op = op_key(engine, req);
     let bytes = body_bytes(&req.body)?;
@@ -369,7 +373,7 @@ fn action(engine: &Engine, req: &Request, runner: &dyn ServiceRunner) -> Reply {
         return Err(owner_conflict());
     }
     let input = Sha256Hex::digest(&bytes);
-    let outcome = runner
+    let outcome = runner_of(runner)?
         .act(&fact.unit_id, act, &input, &ProbeBudget::DEFAULT)
         .map_err(|e| match &e {
             ActFault::Probe(p) => probe_fault(p),
@@ -585,12 +589,12 @@ mod tests {
         let e = ready("svc-probe")?;
         let s = ok_stub()?;
         let r = req("service.probe", Some("p1"), probe_body(json!({})), None)?;
-        let (replayed, b) = probe(&e, &r, &s).map_err(|f| f.message)?;
+        let (replayed, b) = probe(&e, &r, Some(&s)).map_err(|f| f.message)?;
         assert!(!replayed);
         assert_eq!(b["external_effect"], "none");
         assert_eq!(b["cost_microunits"], 0);
         assert_eq!(b["observation"]["evidence"][0]["label"], "active_state");
-        let (again, b2) = probe(&e, &r, &s).map_err(|f| f.message)?;
+        let (again, b2) = probe(&e, &r, Some(&s)).map_err(|f| f.message)?;
         assert!(again);
         assert_eq!(b2["operation_id"], b["operation_id"]);
         assert_eq!(
@@ -645,7 +649,7 @@ mod tests {
                 probe_body(over),
                 None,
             )?;
-            let f = err(probe(&e, &r, &s));
+            let f = err(probe(&e, &r, Some(&s)));
             assert_eq!(
                 (f["code"].as_str(), f["field"].as_str()),
                 (Some(code), Some(field)),
@@ -663,7 +667,7 @@ mod tests {
         let f = err(probe(
             &e,
             &req("service.probe", Some("d"), probe_body(json!({})), None)?,
-            &digest,
+            Some(&digest),
         ));
         assert_eq!(
             (f["code"].as_str(), f["because"].as_str()),
@@ -679,7 +683,7 @@ mod tests {
         let f = err(probe(
             &e,
             &req("service.probe", Some("b"), probe_body(json!({})), None)?,
-            &big,
+            Some(&big),
         ));
         assert_eq!(f["code"], "resource_exhausted");
         let msg = f["message"].as_str().unwrap_or_default();
@@ -697,12 +701,12 @@ mod tests {
             action_body(json!({})),
             Some(pre(1)),
         )?;
-        let (replayed, b) = action(&e, &r, &s).map_err(|f| f.message)?;
+        let (replayed, b) = action(&e, &r, Some(&s)).map_err(|f| f.message)?;
         assert!(!replayed);
         assert_eq!(b["observed_state"], "inactive");
         assert_eq!(b["owner_job_id"], "/org/freedesktop/systemd1/job/7");
         assert_eq!(inspect_drive(&e, &Value::Null)?["generation"], 2);
-        let (again, b2) = action(&e, &r, &s).map_err(|f| f.message)?;
+        let (again, b2) = action(&e, &r, Some(&s)).map_err(|f| f.message)?;
         assert!(again);
         assert_eq!(b2, b);
         assert_eq!(s.calls.load(Ordering::SeqCst), 1);
@@ -714,7 +718,7 @@ mod tests {
                 action_body(json!({})),
                 Some(pre(1)),
             )?,
-            &s,
+            Some(&s),
         ));
         assert_eq!(
             (stale["code"].as_str(), stale["field"].as_str()),
@@ -770,7 +774,7 @@ mod tests {
                 action_body(over),
                 p,
             )?;
-            let f = err(action(&e, &r, &s));
+            let f = err(action(&e, &r, Some(&s)));
             assert_eq!(
                 (f["code"].as_str(), f["field"].as_str()),
                 (Some(code), Some(field)),
@@ -804,7 +808,7 @@ mod tests {
                 action_body(json!({})),
                 Some(pre(1)),
             )?,
-            &digest,
+            Some(&digest),
         ));
         assert_eq!(
             (f["code"].as_str(), f["because"].as_str()),
@@ -829,7 +833,7 @@ mod tests {
             action_body(json!({})),
             Some(pre(1)),
         )?;
-        let f = err(action(&e, &r, &s));
+        let f = err(action(&e, &r, Some(&s)));
         assert_eq!(f["code"], "effect_unknown");
         assert_eq!(f["retry"], "after_readback");
         assert_eq!(f["effect"], "unknown");
