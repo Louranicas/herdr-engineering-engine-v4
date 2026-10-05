@@ -1,12 +1,27 @@
-"""The task family: health, task.submit, task.get, task.list, task.cancel (moved verbatim from tools/drive)."""
+"""The task family: health, task.submit, task.get, task.list, task.cancel (moved verbatim from
+tools/drive), task.preview, task.resolve (E2E-09) and events.subscribe (the stream helper)."""
+import json
 import os
 import re
+import socket
 import stat
 import subprocess
 import time
 import uuid
 
-from drive_d import BRIEF, PHASES, TERMINAL, VACUOUS_VERIFY_BRIEF, is_result
+from drive_d import BRIEF, NO_LEDGER_REASON, PHASES, TERMINAL, VACUOUS_VERIFY_BRIEF, is_result, ledger_ro
+from drive_d.roster import items_of, list_body
+
+# A brief whose VERIFY keeps the task non-terminal for at least five seconds once dispatched, so
+# E2E-09's cancel and resolve land on a live task without a race against the verdict.
+SLEEP_BRIEF = (BRIEF.replace("VERIFY: /usr/bin/test -w .", "VERIFY: /usr/bin/sleep 5")
+               .replace("RESTATEMENT: check the work dir is writable", "RESTATEMENT: run sleep in the namespace"))
+# The three vacuous VERIFY spellings the door refuses (hee4-contracts verify.rs no-op table).
+VACUOUS = {"sh_true": BRIEF.replace("VERIFY: /usr/bin/test -w .", "VERIFY: sh: true"),
+           "abs_true": VACUOUS_VERIFY_BRIEF,
+           "nothing_runs": BRIEF.replace("VERIFY: /usr/bin/test -w .", "VERIFY: model: hi")}
+NO_TASK = "t-" + "0" * 24
+WAIT_S = 10  # the longest any socket read waits (brief: <= 10 s)
 
 
 
@@ -121,4 +136,214 @@ def d_cancel(F, ctx):
     F.refuse("cancel_missing_key", F.req("task.cancel", {"task_id": term or "t-" + "0" * 24}), "invalid_argument", "/idempotency_key")
 
 
-FEATURES = [("health", d_health), ("task.submit", d_submit), ("task.get", d_get), ("task.list", d_list), ("task.cancel", d_cancel)]
+
+
+def body_of(r):
+    return ((r or {}).get("body") or {}) if is_result(r) else {}
+
+
+def task_count(F):
+    r = F.req("task.list", {})
+    return len(body_of(r).get("tasks", [])) if is_result(r) else None
+
+
+def ops_count(ctx):
+    c = ledger_ro(ctx)
+    if c is None:
+        return None
+    try:
+        return c.execute("select count(*) from operations").fetchone()[0]
+    finally:
+        c.close()
+
+
+def disabled_models(F):
+    """The model record ids this serve holds disabled (roster.disable retired them; re-enable is not an action)."""
+    r = F.req("roster.list", list_body(kinds=["model"], include_disabled=True))
+    return {i.get("id") for i in items_of(r) if i.get("disabled") is True}
+
+
+def d_preview(F, ctx):
+    ops0 = ops_count(ctx)
+    n0 = task_count(F)
+    r = F.req("task.preview", {"brief": BRIEF})
+    b = body_of(r)
+    retired = disabled_models(F) if is_result(r) and b.get("refusal") == "no_route" else set()
+    if b.get("exclusions") and set(b["exclusions"]) <= retired:
+        F.check("success", False, f"no eligible model: {sorted(retired)} disabled on this serve by an earlier roster.disable", unmeasured=True)
+    else:
+        F.check("success", is_result(r) and b.get("eligible") is True and isinstance(b.get("model"), str) and b["model"] != "", f"{r}")
+    restatement = BRIEF[BRIEF.index("RESTATEMENT:"):]
+    m = body_of(F.req("task.preview", {"brief": BRIEF.replace(restatement, "")}))
+    F.check("missing_restatement", m.get("eligible") is False and m.get("refusal") == "invalid_argument"
+            and "RESTATEMENT" in str(m.get("message")), f"{m}")
+    for name, brief in VACUOUS.items():
+        v = body_of(F.req("task.preview", {"brief": brief}))
+        F.check(f"preview_vacuous_{name}", v.get("eligible") is False and v.get("refusal") == "invalid_argument"
+                and "VERIFY" in str(v.get("message")), f"{v}")
+    F.refuse("brief_not_string", F.req("task.preview", {"brief": 5}), "invalid_argument", "/body/brief")
+    n1 = task_count(F)
+    F.check("no_admission", n0 is not None and n0 == n1, f"task.list rows before={n0} after={n1}")
+    ops1 = ops_count(ctx)
+    if ops0 is None:
+        F.check("no_operations_row", False, NO_LEDGER_REASON, unmeasured=True)
+    else:
+        F.check("no_operations_row", ops0 == ops1, f"operations before={ops0} after={ops1}")
+
+
+def get_phase(F, t):
+    return body_of(F.req("task.get", {"task_id": t})).get("phase")
+
+
+def resolve(F, t, resolution, reason=None, key=True):
+    body = {"task_id": t, "resolution": resolution}
+    if reason is not None:
+        body["reason"] = reason
+    return F.req("task.resolve", body, key=str(uuid.uuid4()) if key else None)
+
+
+def submit_sleep(F):
+    return body_of(F.req("task.submit", {"brief": SLEEP_BRIEF}, key=str(uuid.uuid4()))).get("task_id")
+
+
+def raced(F, t, reply):
+    """The reason a lifecycle path cannot be measured: the dispatcher abandoned the task first
+    (no eligible model, e.g. roster.disable ran earlier in this run); None when it did not."""
+    if (reply or {}).get("code") == "conflict" and get_phase(F, t) == "abandoned":
+        return f"dispatcher abandoned {t} before the drive's frame (no eligible model on this serve)"
+    return None
+
+
+def d_resolve(F, ctx):
+    """E2E-09: cancel then abandon -> cancelled; quarantine -> blocked; abandon a blocked task -> abandoned."""
+    # task.resolve's catalogue entry is PreconditionRule::None (crates/hee4-contracts/src/catalogue.rs:351).
+    print("  note=stale_generation unreachable reason=task.resolve PreconditionRule::None (catalogue.rs:351)")
+    t = submit_sleep(F)
+    c = F.req("task.cancel", {"task_id": t}, key=str(uuid.uuid4())) if t else None
+    why = raced(F, t, c) if t else None
+    if why:
+        F.check("cancel_then_abandon", False, why, unmeasured=True)
+    else:
+        a = resolve(F, t, "abandon", "attempt_failed")
+        got = get_phase(F, t)
+        ok = body_of(c).get("phase") == "cancellation_requested" and body_of(a).get("phase") == "cancelled" and got == "cancelled"
+        F.check("cancel_then_abandon", ok, f"task={t} cancel={c} resolve={a} get={got}")
+        if ok:
+            ctx["resolved_task"] = t
+    q = submit_sleep(F)
+    qr = resolve(F, q, "quarantine") if q else None
+    why = raced(F, q, qr) if q else None
+    if why:
+        F.check("quarantine", False, why, unmeasured=True)
+        F.check("abandon_blocked", False, why, unmeasured=True)
+    else:
+        got = get_phase(F, q)
+        F.check("quarantine", body_of(qr).get("phase") == "blocked" and got == "blocked", f"task={q} resolve={qr} get={got}")
+        ab = resolve(F, q, "abandon")
+        F.check("abandon_blocked", body_of(ab).get("phase") == "abandoned", f"{ab}")
+    if q:
+        F.refuse("resolve_terminal", resolve(F, q, "abandon"), "conflict", "/body/task_id")
+    else:
+        F.check("resolve_terminal", False, "no task admitted for the terminal path")
+    F.refuse("not_found", resolve(F, NO_TASK, "abandon"), "not_found", "/body/task_id")
+    F.refuse("bad_resolution", resolve(F, q or NO_TASK, "retry"), "invalid_argument", "/body/resolution")
+    F.refuse("bad_reason", resolve(F, q or NO_TASK, "quarantine", "attempt_failed"), "invalid_argument", "/body/reason")
+    F.refuse("missing_key", resolve(F, q or NO_TASK, "abandon", key=False), "invalid_argument", "/idempotency_key")
+
+
+def stream(F, body, timeout, until=lambda fr: False, after_ack=None):
+    """events.subscribe over one socket kept open: [ack, frame, ...] until `until(frame)`, EOF or
+    `timeout` seconds. Every line sent and received is logged to F.f as {"t","dir","raw"}; no read
+    waits longer than WAIT_S. `after_ack()` runs once the ack is in (the live-follow producer)."""
+    obj = {"request_id": "drive-" + uuid.uuid4().hex[:12], "action": "events.subscribe", "action_version": 1,
+           "idempotency_key": None, "body": body}
+    raw = json.dumps(obj, separators=(",", ":"))
+    F.f.write(json.dumps({"t": time.time(), "dir": "send", "raw": raw}) + "\n")
+    out, deadline = [], time.monotonic() + timeout
+    s = socket.socket(socket.AF_UNIX)
+    try:
+        s.settimeout(min(WAIT_S, timeout))
+        s.connect(F.sock)
+        s.sendall(raw.encode() + b"\n")
+        buf = b""
+        while time.monotonic() < deadline:
+            s.settimeout(max(0.05, min(WAIT_S, deadline - time.monotonic())))
+            try:
+                c = s.recv(65536)
+            except socket.timeout:
+                break
+            if not c:
+                break
+            buf += c
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                text = line.decode(errors="replace")
+                F.f.write(json.dumps({"t": time.time(), "dir": "recv", "raw": text}) + "\n")
+                try:
+                    fr = json.loads(text)
+                except ValueError:
+                    fr = None
+                out.append(fr)
+                if len(out) == 1 and after_ack:
+                    after_ack()
+                elif len(out) > 1 and fr and until(fr):
+                    return out
+    except OSError as e:
+        F.f.write(json.dumps({"t": time.time(), "dir": "io_error", "raw": str(e)}) + "\n")
+    finally:
+        s.close()
+        F.f.flush()
+    return out
+
+
+FRAME_KEYS = {"kind", "seq", "task_id", "event", "phase_after", "ts"}
+
+
+def d_subscribe(F, ctx):
+    t0 = time.monotonic()
+    ack = F.req("events.subscribe", {"since_seq": 0, "epoch": None})
+    a = body_of(ack)
+    epoch, hw = a.get("epoch"), a.get("high_water")
+    ok = (is_result(ack) and a.get("stream") == "events" and isinstance(epoch, str) and epoch != ""
+          and isinstance(hw, int) and hw >= 0 and a.get("since_seq") == 0)
+    F.check("ack", ok, f"{ack}")
+    if not ok:
+        return F.check("replay", False, "no ack to resume from")
+    frames = stream(F, {"since_seq": 0, "epoch": epoch}, WAIT_S, until=lambda fr: fr.get("seq", -1) >= hw)[1:] if hw else []
+    seqs = [fr.get("seq") for fr in frames if fr]
+    shaped = all(fr and set(fr) >= FRAME_KEYS and fr.get("kind") == "event" for fr in frames)
+    ascending = all(isinstance(x, int) for x in seqs) and all(x < y for x, y in zip(seqs, seqs[1:]))
+    F.check("replay", bool(frames) and shaped and ascending and seqs[-1] >= hw, f"frames={len(frames)} high_water={hw} shaped={shaped} ascending={ascending}")
+    mine = [fr for fr in frames if fr and fr.get("task_id") == ctx.get("task")]
+    if not ctx.get("task"):
+        F.check("replay_submit_admitted", False, "no task from task.submit", unmeasured=True)
+    else:
+        F.check("replay_submit_admitted", bool(mine) and mine[0].get("phase_after") == "admitted", f"first frame for {ctx['task']}: {mine[:1]}")
+    rt = ctx.get("resolved_task")
+    if not rt:
+        F.check("replay_resolve_producer", False, "no resolved task from task.resolve (cancel_then_abandon not measured)", unmeasured=True)
+    else:
+        F.check("replay_resolve_producer", any(fr.get("task_id") == rt and fr.get("phase_after") == "cancelled" for fr in frames if fr),
+                f"a cancelled frame for {rt}")
+    live = {}
+
+    def produce():
+        live["task"] = body_of(F.req("task.submit", {"brief": BRIEF}, key=str(uuid.uuid4()))).get("task_id")
+
+    got = stream(F, {"since_seq": hw, "epoch": epoch}, WAIT_S, after_ack=produce,
+                 until=lambda fr: fr.get("task_id") == live.get("task") and fr.get("phase_after") == "admitted")
+    hit = [fr for fr in got[1:] if fr and fr.get("task_id") == live.get("task") and fr.get("phase_after") == "admitted"]
+    F.check("live_follow", bool(live.get("task")) and bool(hit), f"task={live.get('task')} frames={len(got) - 1 if got else 0}")
+    last = max([x for x in seqs if isinstance(x, int)] + [fr.get("seq") for fr in got[1:] if fr and isinstance(fr.get("seq"), int)] or [hw])
+    again = stream(F, {"since_seq": last, "epoch": epoch}, 1)
+    dup = [fr.get("seq") for fr in again[1:] if fr and isinstance(fr.get("seq"), int) and fr["seq"] <= last]
+    F.check("resume_exactly_once", is_result(again[0] if again else None) and not dup, f"since_seq={last} frames at or below it={dup}")
+    F.refuse("bad_since_seq", F.req("events.subscribe", {"since_seq": -1, "epoch": None}), "invalid_argument", "/body/since_seq")
+    F.refuse("resync_wrong_epoch", F.req("events.subscribe", {"since_seq": 0, "epoch": "not-the-epoch"}), "resync_required", "/body/epoch")
+    F.refuse("resync_future_seq", F.req("events.subscribe", {"since_seq": hw + 1000, "epoch": epoch}), "resync_required", "/body/since_seq")
+    F.check("slot_freed", is_result(F.req("health", {})), "health answers after every stream closed")
+    print(f"  elapsed_s={time.monotonic() - t0:.1f}")
+
+
+FEATURES = [("health", d_health), ("task.submit", d_submit), ("task.get", d_get), ("task.list", d_list), ("task.cancel", d_cancel),
+            ("task.preview", d_preview), ("task.resolve", d_resolve), ("events.subscribe", d_subscribe)]

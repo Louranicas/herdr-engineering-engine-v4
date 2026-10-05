@@ -15,12 +15,26 @@ A-22. Read the judge admission state: question sets, admission state and shadow 
 
 ## Driving it with hee4
 
+Concrete, deployed frame (rev 2026-10-05 drive) (run all of it with `tools/drive`):
+
+```bash
+hee4 judge.inspect --body '{}'      # exits 1: unavailable, because names H-8
+# raw: {"request_id":"r","action":"judge.inspect","action_version":1,"idempotency_key":null,"body":{}}
+```
+
+Paths (`tools/drive.d/judge.py` `d_judge`; it sends nothing anywhere but the control socket):
+
+- `held`: error `unavailable` at `/action`, `because` names `H-8`.
+- `catalogued`: `tools.inspect {action:"judge.inspect", version:1}` → a result with `action` `judge.inspect`.
+- `listed`: `tools.list` query `judge` → items contain `judge.inspect`.
+- `no_operations_row`: with `--ledger`, the operations count is unchanged.
+
 Preconditions: README shared preconditions.
 
 ```bash
 hee4 judge.inspect                                   # unavailable by name, because=H-8 (held)
-hee4-sh tools.inspect action=judge.inspect version:=1   # catalogued: a result, not an error
-hee4-sh --check judge.inspect                        # the wrapper can name it and print a request
+hee4-sh tools.inspect action=judge.inspect version:=1   # catalogued: a result, not an error  # UNMEASURED: hee4-sh exists in no crate
+hee4-sh --check judge.inspect                        # the wrapper can name it and print a request  # UNMEASURED: hee4-sh exists in no crate
 ```
 
 Socket: request `body` not defined (no v3 schema; `UNWRITTEN: the request body, defined at P9`); reply Frame (PROPOSAL; `UNWRITTEN: the reply body from judge-admission §8`). The reachable reply today is the error frame `{code:"unavailable", retry:"after_condition", details:{…because…}}`.

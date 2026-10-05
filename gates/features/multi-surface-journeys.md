@@ -2,6 +2,9 @@
 
 The twelve end-to-end traces (E2E-01…12, home: `16 System Maps/End-to-End Flow Traces.md`) as journeys across the feature files in this directory. Each H2 lists the files it crosses in order, the done-line criterion (ATLAS §1 D1–D10) it evidences, and the phase at which it becomes drivable. Per-action invocations and refusals live in the linked files; read those first, then sequence the journey. README preconditions and the `doctor` procedure apply before every journey.
 
+
+Concrete, deployed frame (rev 2026-10-05 drive) (run all of it with `tools/drive`): `tools/drive.d/journeys.py` drives E2E-10 and E2E-12 (frames under their H2s) and prints every other journey as `  journey=E2E-nn covered_by=<file>` (E2E-09 → task.resolve.md, E2E-11 → judge.inspect.md, the rest → the first file of its `Files:` line), never as a path; each driven journey prints `  journey=E2E-nn elapsed_s=<x.y>`.
+
 ## E2E-01 · submit → accept (happy path)
 
 Files: `task.submit.md` → (dispatch, execute, verify, accept happen inside the engine) → `task.get.md`. Drivable from P4 in a disposable HOME (F06), through the unit at P7 (F06u).
@@ -73,6 +76,9 @@ Files: `service.probe.md` → `service.inspect.md`. Not drivable before P9; at v
 
 - Evidence: none (post-tag); moves `l2` in P9. Label UNMEASURED(P9).
 
+
+Concrete, deployed frames (driven by `journeys.py`; bodies from `service.py`): `hee4 service.probe --key $K --body '{"service_id":"drive","probe_id":"active_state","probe_version":1,"max_cost_microunits":0,"network_scope":"none"}'` then `hee4 service.inspect --body '{"service_id":"drive","operation":null}'`. Paths: `e2e10_probe` (result with `observation`, `operation_id`), `e2e10_inspect_equal` (`cached_health` equals the observation), `e2e10_inspect_by_key` (`operation {source_action:"service.probe", idempotency_key:K}` → the probe's `operation_id`). Without a user bus the three are UNMEASURED naming it. No action is sent for `self` or `model`.
+
 ## E2E-11 · judgment, held
 
 Files: `judge.inspect.md` (the only surface, and only its refusal). The flow itself is an internal `Advised<T>` port behind the `DataClass` check and K0e egress (S-8), held for H-8, H-10, H-11, H-12.
@@ -84,6 +90,9 @@ Files: `judge.inspect.md` (the only surface, and only its refusal). The flow its
 Files: `roster.list.md` (count ≤ cap), `roster.inspect.md` (`last_operation` under `Owner::Deploy`, never `roster.update`), `roster.update.md` (its idempotency space empty after install). Not drivable before P9/v4.1.
 
 - Evidence: none directly; `roster.list` count ≤ cap after N synthetic attempts in the gate (ATLAS §6 "Roster / observation growth").
+
+
+Concrete, deployed frames (driven by `journeys.py`; bodies from `roster.py`): `hee4 roster.list --body '{"kinds":["model"],"capability":null,"locality":null,"include_disabled":false,"page":{"limit":100,"cursor":null}}'` then `hee4 roster.inspect --body '{"selector":{"record_id":"<first id>"}}'`. Paths: `e2e12_list` (≥ 1 item, ≤ the limit sent), `e2e12_inspect` (`last_operation.action` `deploy.install`, never `roster.update`), `e2e12_update_space_empty` (with `--ledger`, no `roster.update` row about that record; UNMEASURED when roster.py already ran in the process or without `--ledger`). A serve whose deploy record an earlier drive retired prints the three UNMEASURED naming that.
 
 ## Coverage of the done-line by journey
 
