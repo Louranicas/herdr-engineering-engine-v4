@@ -23,18 +23,38 @@ Preconditions (v4.1): a `ConfigurationMutation` grant with the operator capabili
 ```bash
 K=$(uuidgen)
 hee4 roster.update                                                                  # v4.0: unavailable by name
-hee4-sh roster.update record_id=<id> 'definition:={…}' audit_reason=<text> @idempotency_key=$K      # v4.1
-hee4-sh roster.update record_id=<id> 'definition:={…same…}' audit_reason=<text> @idempotency_key=$K # replay
-hee4-sh roster.inspect 'selector:={"source_action":"roster.update","idempotency_key":"'$K'"}'      # readback
+hee4-sh roster.update record_id=<id> 'definition:={…}' audit_reason=<text> @idempotency_key=$K      # v4.1; UNMEASURED: no hee4-sh exists in the six crates
+hee4-sh roster.update record_id=<id> 'definition:={…same…}' audit_reason=<text> @idempotency_key=$K # replay; UNMEASURED: no hee4-sh
+hee4-sh roster.inspect 'selector:={"source_action":"roster.update","idempotency_key":"'$K'"}'      # readback; UNMEASURED: no hee4-sh
 ```
 
-Socket: request `body` `{record_id, definition, audit_reason}`; result `body` `{record, operation_id, change}` (API Map A-13). `UNWRITTEN: the definition schema, the change shape, whether a precondition (record generation) is required on revise, and the generated wrapper spelling.`
+Socket: request `body` `{record_id, definition, audit_reason}`; result `body` `{record, operation_id, change}` (API Map A-13).
+
+(rev 2026-10-05 drive) Served from v4.1 by `actions/roster.rs` (`tools/drive.d/roster.py` `d_update`):
+
+```bash
+K=$(uuidgen)
+D='{"kind":"model","caps":{"ctx_tokens":4096,"json_mode":true,"tool_use":false,"local":true},"cost_milli":0,"latency_ms":0,"quality":1,"capability":null,"locality":"local"}'
+hee4 roster.update --key "$K" --body '{"record_id":"model:x","definition":'"$D"',"audit_reason":"add"}'
+hee4 roster.update --key "$K" --body '{"record_id":"model:x","definition":'"$D"',"audit_reason":"add"}'   # replay
+hee4 roster.update --key "$(uuidgen)" --precondition '{"resource":"roster","id":"model:x","generation":1}' --body '{"record_id":"model:x","definition":'"$D"',"audit_reason":"revise"}'
+hee4 roster.inspect --body '{"selector":{"source_action":"roster.update","idempotency_key":"'"$K"'"}}'
+```
+
+- Definition schema: `{kind: agent|model|runtime, caps: {ctx_tokens: u32, json_mode: bool, tool_use: bool, local: bool}, cost_milli: u32, latency_ms: u32, quality: u32, capability: null|string, locality: local|remote}`, every member required, unknown members refused.
+- Record id: `<kind-word>:<name>` (`^[a-z]+:[A-Za-z0-9._:-]{1,128}$`-shaped); another shape → `invalid_argument` at `/body/record_id`.
+- Change: `change` is `"created"` (generation 1) or `"revised"` (generation + 1); each writes one `roster_revisions` row carrying the `operation_id`.
+- Precondition: optional on revise; when given it is `{resource:"roster", id:<record_id>, generation}`; `id` ≠ `record_id` → `invalid_argument` at `/precondition/id`; a generation behind the record's → `stale_generation` at `/precondition/generation` with `current_generation`.
+- Error: same key, other bytes → `conflict` at `/idempotency_key`; no key → `invalid_argument` at `/idempotency_key`.
+- Empty: `definition: {}` (or missing `kind`/`caps`) → `invalid_argument` at `/body/definition`: a refusal, never a no-op revision.
+- `forbidden` (operator capability): UNMEASURED, no grant exists in this release (owner: the grants slice; README.md:67 UNWRITTEN).
+- Retention of `roster_observations`: UNMEASURED, no writer in this release (owner: the retention slice).
 
 - v4.0 path: the `unavailable` refusal.
 - v4.1 success: `roster_revisions` gains one row; `operations` gains one row under `roster.update`; `roster.list` shows the record; `roster.inspect` by key returns it.
 - Persistence: replay → `replayed=true`, no second revision; after `kill -KILL` post-ack the revision is present on restart (D7 shape, applied to this table).
 - Error: `conflict`, `stale_generation` + `current_generation`, `forbidden` at `/action`.
-- Empty: `UNWRITTEN: whether an empty definition is a refusal or a no-op revision.`
+- Empty: a refusal (see the marker block: `invalid_argument` at `/body/definition`).
 - Side effects to read: `roster_records`, `roster_revisions`, `operations`.
 
 ## Gotchas

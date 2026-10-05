@@ -21,12 +21,27 @@ Preconditions (v4.1): a `ConfigurationMutation` grant with the operator capabili
 
 ```bash
 hee4 roster.disable                                                                                                   # v4.0: unavailable by name
-hee4-sh roster.disable record_id=<id> active_attempt_policy=<policy> audit_reason=<text> @idempotency_key=$(uuidgen) '@precondition:={"resource":"roster","id":"<id>","generation":"<g>"}'   # v4.1
-hee4-sh roster.inspect 'selector:={"record_id":"<id>"}'                                                               # readback
-hee4-sh task.get 'selector:={"task_id":"<running on it>"}' evidence=none                                              # cancellation_requested if request_cancel
+hee4-sh roster.disable record_id=<id> active_attempt_policy=<policy> audit_reason=<text> @idempotency_key=$(uuidgen) '@precondition:={"resource":"roster","id":"<id>","generation":"<g>"}'   # v4.1; UNMEASURED: no hee4-sh exists in the six crates
+hee4-sh roster.inspect 'selector:={"record_id":"<id>"}'                                                               # readback; UNMEASURED: no hee4-sh
+hee4-sh task.get 'selector:={"task_id":"<running on it>"}' evidence=none                                              # UNMEASURED: no hee4-sh
 ```
 
-Socket: request `body` `{record_id, active_attempt_policy, audit_reason}` with `precondition{resource:"roster", …}`; result `body` `{record, operation_id, active_attempts[], cancellation_obligations[]}` (API Map A-14). `UNWRITTEN: the active_attempt_policy value domain (request_cancel is the one named; the others are not) and the generated wrapper spelling.`
+Socket: request `body` `{record_id, active_attempt_policy, audit_reason}` with `precondition{resource:"roster", …}`; result `body` `{record, operation_id, active_attempts[], cancellation_obligations[]}` (API Map A-14).
+
+(rev 2026-10-05 drive) Served from v4.1 by `actions/roster.rs` (`tools/drive.d/roster.py` `d_disable`, run last: it disables the serve's only model record):
+
+```bash
+hee4 roster.disable --key "$(uuidgen)" --precondition '{"resource":"roster","id":"model:qwen2.5-coder:7b","generation":1}' --body '{"record_id":"model:qwen2.5-coder:7b","active_attempt_policy":"let_finish","audit_reason":"retire"}'
+hee4 roster.list --body '{"kinds":[],"capability":null,"locality":null,"include_disabled":true,"page":{"limit":100,"cursor":null}}'
+hee4 task.preview --body '{"brief":"<eleven fields>"}'   # eligible:false, exclusions names the record
+```
+
+- Policy domain: `active_attempt_policy` is `let_finish` or `request_cancel`; anything else → `invalid_argument` at `/body/active_attempt_policy`.
+- Precondition: required (`PreconditionRule::Required("roster")`); absent → `invalid_argument` at `/precondition`, refused by dispatch before the handler. `generation` is an unsigned integer, not a string.
+- Success: the record reads `disabled:true`, generation + 1; `roster.list` hides it, `include_disabled:true` shows it; both arrays present (empty with no active attempts); a later `task.preview` answers `eligible:false` with `exclusions` holding the record id, and a submitted task ends `abandoned` (`RouteRefused`): no fallback to `HEE4_MODEL` while records exist.
+- `request_cancel`: each listed task gets `Store::apply(Cancel)` after the disable commits; the obligation is `{task_id, phase_after}` or `{task_id, refusal}` (a refused edge is text in the obligation, never an error frame).
+- Error: stale generation → `stale_generation` at `/precondition/generation` with `current_generation`; unknown record → `not_found` at `/body/record_id`; over `MAX_VIEW_ITEMS` active attempts → `resource_exhausted` naming both numbers (the earlier "arrays over 100 → invalid_argument" line is superseded).
+- `forbidden` (operator capability): UNMEASURED, no grant exists in this release (owner: the grants slice; README.md:67 UNWRITTEN).
 
 - v4.0 path: the `unavailable` refusal.
 - v4.1 success: the record reads disabled; with `request_cancel`, each listed task shows `cancellation_requested` (or the `cancel` field on a waiting variant) and `cancellation_obligations` has one entry per task.
@@ -40,4 +55,5 @@ Socket: request `body` `{record_id, active_attempt_policy, audit_reason}` with `
 - The cancel on affected tasks is an **intent** (task.cancel.md): they close only when their attempts settle and `Stop` runs. The reply lists obligations, not closed tasks.
 - A dispatcher permit (RL-2 "roster permit") must refuse the disabled record for new dispatches; read a subsequent `task.preview` to see the record in `exclusions`.
 - The `request_cancel` → `transition(Cancel)` coupling is INTERP from the reply shape; no authority states it in prose. Pin it when the v4.1 slice names it.
+- Active attempts are INTERP until K1-attempts-ledger lands (that slice is the refinement): the tasks in `running`, `verifying` or `cancellation_requested` when the disabled record's id is `model:` + the model `route` selects now. No attempts table binds a task to a record yet.
 - No D-row; v4.1 slice evidence only.
