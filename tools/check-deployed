@@ -500,12 +500,15 @@ def d9(a, ctx):
         r.check("ledger", f"unreadable({e})", False)
         return r
     r.val("accepted", len(ids))
-    try:
-        reh = set(json.load(open(rehearsal_path(a, ctx["tree"]))).get("task_ids") or [])
-    except (OSError, ValueError):
-        reh = set()
+    reh, records = set(), 0  # every rehearsal record under the drill root: a drill task never counts as use, whatever tree it ran at
+    for tree in (os.listdir(a.drill_root) if os.path.isdir(a.drill_root) else []):
+        try:
+            reh |= set(json.load(open(rehearsal_path(a, tree))).get("task_ids") or [])
+            records += 1
+        except (OSError, ValueError):
+            continue
     drive, files = drive_task_ids(a.evidence_root)
-    r.val("rehearsal_excluded", len(ids & reh))
+    r.val("rehearsal_excluded", f"{len(ids & reh)} (from {records} records)")
     r.val("drive_excluded", f"{len(ids & drive)} (from {files} jsonl)")
     use = len(ids - reh - drive)
     r.check("use", use, use >= 1)
