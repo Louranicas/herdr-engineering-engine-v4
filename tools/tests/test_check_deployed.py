@@ -42,6 +42,8 @@ class CheckDeployedTests(unittest.TestCase):
             self.assertIn("detected=yes", row(out, "control " + n)[0])
         self.assertIn("control_ledger=synthetic", out)
         self.assertIn("in_mainpid_fds=no", row(out, "control D3")[0]); self.assertIn("held_by=", row(out, "control D3")[0])
+        d1 = dict(t.split("=", 1) for t in row(out, "control D1")[0].split() if "=" in t)  # the PATH stub says the tree; D1 asked the unit's binary
+        self.assertNotEqual(d1["binary"], d1["head"]); self.assertIn("exe_head", d1); self.assertNotEqual(d1["exe_head"], d1["binary"])
 
     def test_fire_killed_control_leaves_no_listener_and_is_swept(self):
         root = os.path.expanduser("~/.cache/hee4-host")

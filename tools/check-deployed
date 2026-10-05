@@ -13,6 +13,9 @@ prints UNMEASURED(<reason>) by name; a row that looked at nothing is UNMEASURED 
 Run order: D8 (the drive restarts the unit under --allow-restart) first, then D1..D7, D9; rows
 print in D1..D9 order. No value comes from a receipt, a plan row, a source file or an earlier run.
 
+Every `--version` and `health` read-back runs the unit's own binary (ExecStart argv[0], and
+/proc/<MainPID>/exe for the running copy), never whatever `hee4` is first on PATH.
+
 --control: a disposable HOME under ~/.cache/hee4-host (never /tmp) with stub systemctl/loginctl/
 hee4 on PATH, a real AF_UNIX listener held by a fake MainPID, a fake /api/ps, a synthetic ledger,
 a stub drive and a rehearsal record; one fault planted per row, each asserted by its row's own
@@ -129,9 +132,11 @@ def fd_targets(proc, pid):
     return out
 
 
-def health_cli(sock_path):
-    """`hee4 health --socket S` -> (rc, first line, parsed JSON reply or None)."""
-    rc, out, err = sh("hee4", "health", "--socket", sock_path, timeout=20)
+def health_cli(binp, sock_path):
+    """`<bin> health --socket S` (the unit's own binary, never PATH) -> (rc, first line, parsed JSON reply or None)."""
+    if not binp:
+        return None, "no ExecStart argv[0]", None
+    rc, out, err = sh(binp, "health", "--socket", sock_path, timeout=20)
     lines = out.splitlines()
     reply = None
     for l in lines[1:]:
@@ -231,12 +236,23 @@ def d1(a, ctx):
     if exe_sha and bin_sha:
         r.check("identity", "match" if exe_sha == bin_sha else "mismatch", exe_sha == bin_sha)
     r.val("head", ctx["tree"])
-    rc, out, err = sh("hee4", "--version")
-    if rc != 0 or not out.split():
-        r.unm("binary", f"hee4 --version rc={rc} {err}")
-    else:
-        bh = out.split()[-1][:12]
-        r.check("binary", bh, bh == ctx["tree"])
+    bh = None
+    if not binp:
+        r.unm("binary", "no ExecStart argv[0]")
+    else:  # the unit's own binary answers, never the `hee4` first on PATH
+        rc, out, err = sh(binp, "--version")
+        if rc != 0 or not out.split():
+            r.unm("binary", f"{binp} --version rc={rc} {err}")
+        else:
+            bh = out.split()[-1][:12]
+            r.check("binary", bh, bh == ctx["tree"])
+    if pid and exe_sha:  # the running copy's own head: must agree with argv[0]'s
+        rc, out, err = sh(os.path.join(a.proc, str(pid), "exe"), "--version")
+        if rc != 0 or not out.split():
+            r.unm("exe_head", f"exe --version rc={rc} {err}")
+        else:
+            eh = out.split()[-1][:12]
+            r.check("exe_head", eh, bh is not None and eh == bh)
     if binp and bin_sha:
         try:
             data = open(binp, "rb").read()
@@ -325,10 +341,10 @@ def d3(a, ctx):
                             holder = d
                             break
                 r.val("held_by", holder)
-    rc, first, _ = health_cli(sp)
+    rc, first, _ = health_cli(ctx["bin"], sp)
     ok = rc == 0 and all(t in first for t in HEALTH_TOKENS)
     if rc is None:
-        r.unm("health", "hee4 not on PATH")
+        r.unm("health", f"{ctx['bin'] or 'no ExecStart argv[0]'}: {first}")
     else:
         r.check("health", first.split(" head=")[0] if ok else f"rc={rc} {first}", ok)
     return r
@@ -354,10 +370,10 @@ def d4(a, ctx):
     except sqlite3.Error as e:
         uv = None
         r.check("user_version", f"unreadable({e})", False)
-    rc, first, reply = health_cli(ctx["socket"] or "")
+    rc, first, reply = health_cli(ctx["bin"], ctx["socket"] or "")
     body = (reply or {}).get("body") or {}
     if rc is None:
-        r.unm("schema_version", "hee4 not on PATH")
+        r.unm("schema_version", f"{ctx['bin'] or 'no ExecStart argv[0]'}: {first}")
     elif "schema_version" not in body:
         r.unm("schema_version", "health body carries no schema_version yet; lands with task-family-actions")
     else:
@@ -407,12 +423,12 @@ def d5(a, ctx):
         root = os.path.expanduser("~/.cache/hee4-host")
         os.makedirs(root, exist_ok=True)
         into = tempfile.mkdtemp(prefix="cd-restore-", dir=root)
-        rc, out, err = sh("hee4", "restore", "--into", into, newest, timeout=600)
+        rc, out, err = sh(ctx["bin"] or "hee4-absent", "restore", "--into", into, newest, timeout=600)
         shutil.rmtree(into, ignore_errors=True)
         if rc == 2 and "unknown verb" in err:
             r.unm("restore", "restore verb absent")
         elif rc is None:
-            r.unm("restore", "hee4 not on PATH")
+            r.unm("restore", f"{ctx['bin'] or 'no ExecStart argv[0]'} not runnable: {err}")
         else:
             r.check("restore", (out.splitlines() or [f"rc={rc}"])[-1], rc == 0)
     return r
@@ -568,7 +584,7 @@ def main_rows(a):
 # ---- the control: one plant per row, in a disposable HOME under ~/.cache/hee4-host ----
 
 PLANTS = {  # row -> (what is planted, the diagnostic text its row must carry)
-    "D1": ("ExecStart argv[0] is not the running exe", "identity=mismatch"),
+    "D1": ("PATH hee4 reports the tree; ExecStart argv[0] reports another head and is not the running exe", "identity=mismatch"),
     "D2": ("is-enabled answers disabled", "is_enabled=disabled"),
     "D3": ("the listener is held by another pid, not MainPID", "in_mainpid_fds=no"),
     "D4": ("ledger user_version is one below health schema_version", "schema=mismatch"),
@@ -669,27 +685,42 @@ def control(a):
         bindir, lib, rt = os.path.join(ctl, "bin"), os.path.join(ctl, "lib"), os.path.join(ctl, "rt")
         os.makedirs(bindir); os.makedirs(lib); os.makedirs(rt, mode=0o700)
         sock = os.path.join(rt, "control.sock")
-        # the fake unit's exe: a copy of this interpreter, so exe digest == ExecStart argv[0] digest
+        # the fake unit's binary (ExecStart argv[0]): a wrapper answering --version and health with the unit's
+        # own head; the fake /proc/<pid>/exe points at it (unplanted) or at the bare interpreter copy (D1 plant),
+        # while the `hee4` on PATH always reports the tree: a row that asked PATH would read green.
         serve_bin = os.path.join(lib, "hee4")
-        shutil.copy2(os.path.realpath(sys.executable), serve_bin)
+        interp = os.path.join(lib, "python-copy")
+        shutil.copy2(os.path.realpath(sys.executable), interp)
         server_py = os.path.join(lib, "server.py")
         write(server_py, SERVER_PY)
         sv_ledger, sv_health = 2, (3 if planted("D4") else 2)
-        srv = subprocess.Popen([serve_bin, server_py, sock, str(sv_health), head40], stdout=subprocess.PIPE, text=True, preexec_fn=die_with_parent)
+        bin_head = ("d1" + uuid.uuid4().hex)[:12] if planted("D1") else tree
+        bin_health = json.dumps({"kind": "result", "request_id": "ctl", "replayed": False,
+                                 "body": {"ok": True, "head_sha": head40, "recovery_complete": True, "uptime_s": 1, "schema_version": sv_health}})
+        write(serve_bin, f"""#!/usr/bin/env bash
+# the control unit's own binary: ExecStart argv[0]
+case "$1" in
+  --version) echo "hee4 4.0.0-control-unit {bin_head}" ;;
+  health) echo "ready=true recovery=complete database=ready socket=owned head={bin_head} uptime_s=1"; echo {shlex.quote(bin_health)} ;;
+  serve) shift; exec {shlex.quote(interp)} {shlex.quote(server_py)} "$@" ;;
+  *) echo "hee4: unknown verb $1" >&2; exit 2 ;;
+esac
+""", 0o755)
+        srv = subprocess.Popen([interp, server_py, sock, str(sv_health), head40], stdout=subprocess.PIPE, text=True, preexec_fn=die_with_parent)
         procs.append(srv)
         srv.stdout.readline()  # "bound"
         main_pid = srv.pid
         if planted("D3"):
-            other = subprocess.Popen([serve_bin, "-c", "import time; time.sleep(600)"], preexec_fn=die_with_parent)
+            other = subprocess.Popen([interp, "-c", "import time; time.sleep(600)"], preexec_fn=die_with_parent)
             procs.append(other)
             main_pid = other.pid
-        # fake /proc: exe and fd point at the real entries, cgroup is the unit's
+        # fake /proc: fd points at the real entries, exe at the unit's binary (or the plant), cgroup is the unit's
         proc = os.path.join(ctl, "proc")
         os.makedirs(os.path.join(proc, "net"))
         os.symlink("/proc/net/unix", os.path.join(proc, "net", "unix"))
         for p in procs:
             d = os.path.join(proc, str(p.pid)); os.makedirs(d)
-            os.symlink(f"/proc/{p.pid}/exe", os.path.join(d, "exe"))
+            os.symlink(interp if planted("D1") else serve_bin, os.path.join(d, "exe"))
             os.symlink(f"/proc/{p.pid}/fd", os.path.join(d, "fd"))
             write(os.path.join(d, "cgroup"), f"0::/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service/app.slice/{unit}\n")
         # ledger (synthetic subset) and work dir
@@ -731,8 +762,7 @@ def control(a):
         g = lambda *args: subprocess.run(["git", "-C", repo, "-c", "user.name=t", "-c", "user.email=t@t", *args], check=True, capture_output=True)
         g("init", "-q"); g("add", "-A"); g("commit", "-qm", "control")
         # stubs on PATH
-        execstart_bin = os.path.join(bindir, "hee4") if planted("D1") else serve_bin
-        execstart = (f"{{ path={execstart_bin} ; argv[]={execstart_bin} serve --socket {sock} --ledger {ledger} "
+        execstart = (f"{{ path={serve_bin} ; argv[]={serve_bin} serve --socket {sock} --ledger {ledger} "
                      f"--work {share}/work ; ignore_errors=no ; start_time=[Mon 2026-10-05 10:18:21 AEDT] ; pid={main_pid} }}")
         props = {"MainPID": str(main_pid), "ExecStart": execstart, "Environment": f"HEE4_LIVE_MODEL=1 HEE4_MODEL={model}",
                  "UnitFileState": "enabled", "ActiveState": "active", "LoadState": "loaded", "TimeoutStopUSec": "20s",
@@ -824,6 +854,9 @@ esac
                 print(f"control {n} plant=skipped line={line or 'MISSING'}")
                 continue
             hit = diag in line and not line.endswith(" PASS")
+            if n == "D1" and hit:  # the PATH stub reports the tree; the row must have asked the unit's binary instead
+                kv = dict(t.split("=", 1) for t in line.split() if "=" in t)
+                hit = kv.get("binary", "") != kv.get("head", "?") and kv.get("binary", "") not in ("", "mismatch")
             met += hit
             print(f"control {n} plant={what!r} detected={'yes' if hit else 'no'} line={line or 'MISSING'}")
         v = "PASS" if met == len(ROWS) else "FAIL"
