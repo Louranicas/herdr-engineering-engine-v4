@@ -694,9 +694,9 @@ mod tests {
     /// carry a socket.
     #[test]
     fn service_socket_scope_has_one_caller() -> Result<(), Box<dyn std::error::Error>> {
-        let crates = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .ok_or("no crates dir")?;
+        // Read at run time, never `env!`: a cached test binary outlives its export directory.
+        let manifest = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
+        let crates = manifest.parent().ok_or("no crates dir")?;
         let mut files = Vec::new();
         rust_files(crates, &mut files)?;
         let needle = concat!("with_", "sockets(");

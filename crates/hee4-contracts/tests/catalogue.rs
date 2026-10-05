@@ -13,7 +13,10 @@ use hee4_contracts::{Sha256Hex, canonical_json};
 const NOT_ACTIONS: [&str; 3] = ["README", "crash-restart", "multi-surface-journeys"];
 
 fn feature_ids() -> BTreeSet<String> {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../gates/features");
+    // Read at run time: `env!` would bake the compile-time path into a binary the gate reuses
+    // across `git archive` exports (brain/compile-time-paths-break-in-cached-exports.md).
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("run under cargo test");
+    let dir = PathBuf::from(manifest).join("../../gates/features");
     let mut ids = BTreeSet::new();
     for entry in std::fs::read_dir(&dir).expect("gates/features readable") {
         let name = entry.unwrap().file_name().to_string_lossy().into_owned();
