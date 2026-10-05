@@ -14,7 +14,11 @@ a row without a reason excludes nothing) plus one built-in: this script, whose R
 the literals it hunts. v3 roots are read through .claude/hooks/lib/v3_guard.py, never copied.
 --control builds a throwaway repo with one runtime-assembled plant per class, scans HEAD~1..HEAD
 and prints `push-scan control cases=k/3 verdict=PASS|FAIL` (exit 1 unless every class fires).
-No network: every read is `git -C <repo>`.
+No network: every read is `git -C <repo>`. The patch text is pinned, not trusted: the diff runs
+with prefixes, colour, external diff, textconv, renames and quoting fixed on the command line (a
+host's diff.noprefix, color.ui=always or diff.external cannot blank it), a `+++ `/`--- ` line is a
+header only between hunks (a content line `++ x` stays content), and the files the headers name
+are cross-checked against `git diff --name-only -z`: a mismatch is refused (rc 2), never a green.
 """
 import argparse, fnmatch, importlib.util, os, re, shutil, subprocess, sys, tempfile
 
@@ -33,14 +37,19 @@ RULES = [
     ("outward_name", "home_path", re.compile(r"/home/louranicas|/var/home/Louranicas")),
     ("outward_name", "owner_email", re.compile(r"lukeomahoney@")),
 ]
-HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+HUNK = re.compile(r"^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+# Every switch that a host's git config or environment could otherwise flip on the patch text.
+DIFF_PIN = ["-c", "core.quotePath=false", "-c", "color.ui=never", "-c", "diff.suppressBlankEmpty=false",
+            "diff", "--no-ext-diff", "--no-color", "--no-textconv", "--no-renames", "--no-relative", "--text",
+            "--src-prefix=a/", "--dst-prefix=b/", "--unified=0", "--inter-hunk-context=0"]
+DIFF_ENV = {k: v for k, v in os.environ.items() if k not in ("GIT_DIFF_OPTS", "GIT_EXTERNAL_DIFF")}
 
 def die(msg, code=2):
     print(f"push-scan: {msg}", file=sys.stderr)
     sys.exit(code)
 
-def git(repo, *args):
-    r = subprocess.run(["git", "-C", repo, *args], capture_output=True)
+def git(repo, *args, env=None):
+    r = subprocess.run(["git", "-C", repo, *args], capture_output=True, env=env)
     return r.returncode, r.stdout.decode("utf-8", "replace"), r.stderr.decode("utf-8", "replace")
 
 def v3_root_rules(repo):
@@ -79,20 +88,41 @@ def excluded(path, pats):
             return True
     return False
 
-def added_lines(diff_text):
-    """Yield (path, new_line_no, text) for every `+` content line, from the hunk headers."""
-    path, n = None, 0
+def parse_diff(diff_text):
+    """Returns (files, added): files as the `diff --git` headers name them, added as (path, new_line_no, text)
+    for every `+` content line. The hunk header's counts are consumed line by line, so `+++ `/`--- ` are
+    headers only while no hunk is open. Raises ValueError on text the grammar does not cover."""
+    files, added = [], []
+    path, n, old_left, new_left = None, 0, 0, 0
     for line in diff_text.splitlines():
-        if line.startswith("+++ "):
-            path = line[6:] if line.startswith("+++ b/") else None
-        elif line.startswith("--- ") or line.startswith("diff --git"):
+        if old_left > 0 or new_left > 0:  # inside a hunk every line is content (`\ No newline` consumes nothing)
+            if line.startswith("+"):
+                if path is None:
+                    raise ValueError(f"added line before a +++ header: {line!r}")
+                added.append((path, n, line[1:])); n += 1; new_left -= 1
+            elif line.startswith("-"):
+                old_left -= 1
+            elif line.startswith(" "):
+                n += 1; old_left -= 1; new_left -= 1
+            elif not line.startswith("\\"):
+                raise ValueError(f"unexpected line inside a hunk: {line!r}")
             continue
+        if line.startswith("diff --git a/"):
+            rest = line[len("diff --git a/"):]
+            name = rest[:(len(rest) - len(" b/")) // 2]
+            if rest != f"{name} b/{name}":
+                raise ValueError(f"unparsable file header: {line!r}")
+            files.append(name); path = None
+        elif line.startswith("+++ b/"):
+            path = line[len("+++ b/"):].removesuffix("\t")
         elif line.startswith("@@"):
             m = HUNK.match(line)
-            n = int(m.group(1)) if m else 0
-        elif line.startswith("+") and path is not None:
-            yield path, n, line[1:]
-            n += 1
+            if not m:
+                raise ValueError(f"unparsable hunk header: {line!r}")
+            old_left, n, new_left = int(m.group(1) or 1), int(m.group(2)), int(m.group(3) or 1)
+    if old_left > 0 or new_left > 0:
+        raise ValueError("patch ends inside a hunk")
+    return files, added
 
 def scan(repo, base, head, exclusions):
     """Returns (hits, commits, files, notes); a hit is (class, file, line, rule)."""
@@ -104,15 +134,24 @@ def scan(repo, base, head, exclusions):
     pats, note = load_exclusions(exclusions)
     notes["exclusions"] = note
     pats.append(SELF)
-    rc, diff, err = git(repo, "diff", "--unified=0", f"{base}..{head}")
+    rc, diff, err = git(repo, *DIFF_PIN, f"{base}..{head}", env=DIFF_ENV)
     if rc:
         die(f"cannot diff {base}..{head}: {err.strip()}")
+    rc, names, err = git(repo, "diff", "--name-only", "-z", "--no-renames", f"{base}..{head}", env=DIFF_ENV)
+    if rc:
+        die(f"cannot list {base}..{head}: {err.strip()}")
     rc, log, err = git(repo, "log", "--format=%H%x00%B", "-z", f"{base}..{head}")
     if rc:
         die(f"cannot log {base}..{head}: {err.strip()}")
-    hits, files = [], set()
-    for path, n, text in added_lines(diff):
-        files.add(path)
+    try:
+        files, added = parse_diff(diff)
+    except ValueError as e:
+        die(f"patch text of {base}..{head} is not what the parser covers: {e}")
+    listed = sorted(n for n in names.split("\0") if n)
+    if sorted(files) != listed:
+        die(f"diff headers name {len(files)} files but --name-only lists {len(listed)}: refusing to scan a patch the parser cannot follow")
+    hits = []
+    for path, n, text in added:
         if excluded(path, pats):
             continue
         for cls, name, rx in rules:

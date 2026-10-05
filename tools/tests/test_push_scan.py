@@ -86,6 +86,28 @@ class PushScanTests(unittest.TestCase):
         rc, out, _ = scan(d)
         self.assertEqual(rc, 1); self.assertIn(f"hit class=outward_name file=commit:{head[:12]} line=3 rule=home_path\n", out)
 
+    def test_fire_host_diff_config_cannot_blank_the_patch(self):
+        # diff.noprefix, color.ui=always, diff.external and GIT_DIFF_OPTS each reshape git's default patch text
+        d = planted({"p.rs": f"// a\nlet k = \"{AKIA}\";\n"})
+        env = {"GIT_CONFIG_COUNT": "3", "GIT_CONFIG_KEY_0": "diff.noprefix", "GIT_CONFIG_VALUE_0": "true",
+               "GIT_CONFIG_KEY_1": "color.ui", "GIT_CONFIG_VALUE_1": "always",
+               "GIT_CONFIG_KEY_2": "diff.external", "GIT_CONFIG_VALUE_2": "false", "GIT_DIFF_OPTS": "--unified=3"}
+        rc, out, err = run(SCAN, "HEAD~1..HEAD", "--repo", d, env=env, cwd=d)
+        self.assertEqual(rc, 1, out + err); self.assertIn("hit class=secret file=p.rs line=2 rule=aws_akia\n", out)
+        self.assertRegex(out.strip().splitlines()[-1], r" files=1 hits=1 verdict=FAIL$")
+
+    def test_fire_non_ascii_filename_is_named_and_scanned(self):
+        d = planted({"\u00fc.rs": f"let k = \"{AKIA}\";\n"})
+        rc, out, _ = scan(d)
+        self.assertEqual(rc, 1, out); self.assertIn("hit class=secret file=\u00fc.rs line=1 rule=aws_akia\n", out)
+
+    def test_fire_content_line_starting_plus_plus_is_content(self):
+        # `++ x` arrives as `+++ x` in the patch: a header only between hunks, never inside one
+        d = planted({"p.rs": f"++ x\nlet k = \"{AKIA}\";\n"})
+        rc, out, _ = scan(d)
+        self.assertEqual(rc, 1, out); self.assertIn("hit class=secret file=p.rs line=2 rule=aws_akia\n", out)
+        self.assertRegex(out.strip().splitlines()[-1], r" files=1 hits=1 verdict=FAIL$")
+
     def test_fire_unknown_range_refused(self):
         d = planted({"p.rs": "fn main() {}\n"})
         rc, out, err = run(SCAN, "nosuch..HEAD", "--repo", d)
