@@ -1,0 +1,830 @@
+#!/usr/bin/env python3
+"""check-deployed [--unit hee4.service] [--repo DIR] [--drive-cmd CMD] [--control [--control-skip D<n>]] ...
+
+The deployed read-back (ATLAS D1-D9, the v4 readings): nine rows, each read live from the unit
+(`systemctl show` key=value), the socket (`/proc/net/unix` + `/proc/<MainPID>/fd`), the ledger
+(Python sqlite3, `file:<path>?mode=ro`, PRAGMA and read-only SELECTs) and the tree. Each row prints
+  D<n> key=value ... PASS|FAIL|UNMEASURED
+and the last line is
+  deployed=<PASS rows>/9 tree=<sha12> dirty=<git status --porcelain lines> verdict=PASS|FAIL|UNMEASURED
+PASS only when all nine rows PASS and dirty=0 (exit 0); FAIL when any row FAILs (exit 1);
+UNMEASURED when nothing FAILs and any row is UNMEASURED (exit 3). A field that could not be read
+prints UNMEASURED(<reason>) by name; a row that looked at nothing is UNMEASURED and red.
+Run order: D8 (the drive restarts the unit under --allow-restart) first, then D1..D7, D9; rows
+print in D1..D9 order. No value comes from a receipt, a plan row, a source file or an earlier run.
+
+--control: a disposable HOME under ~/.cache/hee4-host (never /tmp) with stub systemctl/loginctl/
+hee4 on PATH, a real AF_UNIX listener held by a fake MainPID, a fake /api/ps, a synthetic ledger,
+a stub drive and a rehearsal record; one fault planted per row, each asserted by its row's own
+diagnostic text. Prints `check-deployed control cases=k/9 verdict=PASS|FAIL`.
+--control-skip D<n> (test only) removes that one plant: the control must then print cases=8/9.
+"""
+import argparse, hashlib, http.server, json, os, shlex, shutil, socket, sqlite3, stat, subprocess, sys, tempfile, threading, time, uuid
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+ROWS = ["D1", "D2", "D3", "D4", "D5", "D6", "D7", "D8", "D9"]
+V3_PATTERNS = ["/var/home/herdr-engineering-engine-v3", "/run/host/var/home", "hee3-evidence", "hee3-worktrees",
+               "hee3-implementation", "/lib/herdr-engineering-engine-v3"]  # .claude/agents/hee4-watch-fence.md:94
+V3_LIMIT = "over-counts a literal in a help string; under-counts an encoded path"
+REPAIR_ENTRY_EVENTS = [{"settle": "not_ready"}, {"decide": "fail"}]  # hee4_contracts::Event serde spelling, the two edges into repair_pending
+HEALTH_TOKENS = ("ready=true", "recovery=complete", "database=ready", "socket=owned")
+
+
+def sh(*cmd, timeout=60, env=None):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+        return r.returncode, r.stdout.strip(), r.stderr.strip()
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return None, "", str(e)
+
+
+class Row:
+    """One D row: fields in order, the verdict from what was measured."""
+    def __init__(self, name):
+        self.name, self.parts, self.failed, self.unmeasured = name, [], False, False
+
+    def val(self, key, value):
+        self.parts.append(f"{key}={value}")
+
+    def check(self, key, value, ok):
+        self.parts.append(f"{key}={value}")
+        if not ok:
+            self.failed = True
+
+    def unm(self, key, why):
+        self.parts.append(f"{key}=UNMEASURED({why})")
+        self.unmeasured = True
+
+    def verdict(self):
+        return "FAIL" if self.failed else "UNMEASURED" if self.unmeasured or not self.parts else "PASS"
+
+    def line(self):
+        return f"{self.name} {' '.join(self.parts)} {self.verdict()}"
+
+
+# ---- read-backs: every one is a parse, never a regex over a declaration ----
+
+def show(unit, *keys):
+    rc, out, err = sh("systemctl", "--user", "show", "-p", ",".join(keys), unit)
+    return rc, dict(l.split("=", 1) for l in out.splitlines() if "=" in l), err
+
+
+def parse_execstart(value):
+    """`{ path=P ; argv[]=A B C ; ... }` -> {bin, socket, ledger, work} from the argv[] member."""
+    body = value.strip()
+    if body.startswith("{") and body.endswith("}"):
+        body = body[1:-1]
+    members = dict(m.strip().split("=", 1) for m in body.split(" ; ") if "=" in m)
+    argv = shlex.split(members.get("argv[]", ""))
+    out = {"bin": argv[0] if argv else ""}
+    for i, tok in enumerate(argv):
+        if tok in ("--socket", "--ledger", "--work") and i + 1 < len(argv):
+            out[tok[2:]] = argv[i + 1]
+    return out
+
+
+def parse_environment(value):
+    return dict(kv.split("=", 1) for kv in value.split() if "=" in kv)
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def ledger_ro(path):
+    return sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+
+
+def listener_inodes(proc, sock_path):
+    """sockfs inodes bound to sock_path with the accept flag, parsed from <proc>/net/unix."""
+    out = set()
+    try:
+        lines = open(os.path.join(proc, "net", "unix")).read().splitlines()[1:]
+    except OSError:
+        return None
+    for line in lines:
+        f = line.split()
+        if len(f) >= 8 and f[7] == sock_path and int(f[3], 16) & 0x10000:
+            out.add(f[6])
+    return out
+
+
+def fd_targets(proc, pid):
+    d = os.path.join(proc, str(pid), "fd")
+    out = set()
+    try:
+        for n in os.listdir(d):
+            try:
+                out.add(os.readlink(os.path.join(d, n)))
+            except OSError:
+                pass
+    except OSError:
+        return None
+    return out
+
+
+def health_cli(sock_path):
+    """`hee4 health --socket S` -> (rc, first line, parsed JSON reply or None)."""
+    rc, out, err = sh("hee4", "health", "--socket", sock_path, timeout=20)
+    lines = out.splitlines()
+    reply = None
+    for l in lines[1:]:
+        try:
+            reply = json.loads(l)
+            break
+        except ValueError:
+            continue
+    return rc, lines[0] if lines else err, reply
+
+
+def drive_task_ids(evidence_root):
+    """Every body.task_id in a recv frame under <evidence-root>/*/*.jsonl (the drive's own ids)."""
+    ids, files = set(), 0
+    if not os.path.isdir(evidence_root):
+        return ids, files
+    for sub in os.listdir(evidence_root):
+        d = os.path.join(evidence_root, sub)
+        if not os.path.isdir(d):
+            continue
+        for name in os.listdir(d):
+            if not name.endswith(".jsonl"):
+                continue
+            files += 1
+            try:
+                for line in open(os.path.join(d, name)):
+                    try:
+                        fr = json.loads(line)
+                        if fr.get("dir") != "recv" or not fr.get("raw"):
+                            continue
+                        t = (json.loads(fr["raw"]).get("body") or {}).get("task_id")
+                        if t:
+                            ids.add(t)
+                    except (ValueError, AttributeError):
+                        continue
+            except OSError:
+                continue
+    return ids, files
+
+
+# ---- the nine rows ----
+
+def d8(a, ctx):
+    r = Row("D8")
+    cmd = shlex.split(a.drive_cmd)
+    rc, out, err = sh(*cmd, timeout=900)
+    fdir = os.path.join(a.repo, "gates", "features")
+    try:
+        flows = len([f for f in os.listdir(fdir) if f.endswith(".md") and f != "README.md"])
+        r.val("flows", flows)
+    except OSError:
+        r.unm("flows", f"no {fdir}")
+    if rc is None:
+        r.check("drive", f"not_run({err})", False)
+        return r
+    feats = [l for l in out.splitlines() if l.startswith("drive feature=")]
+    explained = lambda l: "scope=unserved" in l or "reason=" in l
+    l2 = sum(1 for l in feats if " verdict=PASS" in l)
+    reasoned = sum(1 for l in feats if " verdict=UNMEASURED" in l and explained(l))
+    unexplained = sum(1 for l in feats if (" verdict=UNMEASURED" in l or " verdict=FAIL" in l) and not explained(l))
+    last = out.splitlines()[-1] if out else ""
+    kv = dict(t.split("=", 1) for t in last.split() if "=" in t) if last.startswith("drive verdict=") else {}
+    r.val("drive_rc", rc)
+    r.val("l2", l2)
+    r.val("reasoned", reasoned)
+    r.check("unexplained", unexplained, unexplained == 0)
+    if not feats:
+        r.check("feature_lines", 0, False)
+    v = kv.get("verdict")
+    if v is None:
+        r.check("drive_verdict", "absent", False)
+    else:
+        r.check("drive_verdict", v, v != "FAIL")
+    return r
+
+
+def d1(a, ctx):
+    r = Row("D1")
+    pid, binp = ctx["pid"], ctx["bin"]
+    exe_sha = bin_sha = None
+    if not pid:
+        r.unm("exe_sha", "no MainPID")
+    else:
+        try:
+            exe_sha = sha256_file(os.path.join(a.proc, str(pid), "exe"))
+            r.val("exe_sha", exe_sha[:16])
+        except OSError as e:
+            r.unm("exe_sha", f"{a.proc}/{pid}/exe unreadable: {e}")
+    if not binp:
+        r.unm("bin_sha", "no ExecStart argv[0]")
+    else:
+        try:
+            bin_sha = sha256_file(binp)
+            r.val("bin_sha", bin_sha[:16])
+        except OSError as e:
+            r.unm("bin_sha", f"{binp} unreadable: {e}")
+    if exe_sha and bin_sha:
+        r.check("identity", "match" if exe_sha == bin_sha else "mismatch", exe_sha == bin_sha)
+    r.val("head", ctx["tree"])
+    rc, out, err = sh("hee4", "--version")
+    if rc != 0 or not out.split():
+        r.unm("binary", f"hee4 --version rc={rc} {err}")
+    else:
+        bh = out.split()[-1][:12]
+        r.check("binary", bh, bh == ctx["tree"])
+    if binp and bin_sha:
+        try:
+            data = open(binp, "rb").read()
+            r.val("v3_refs", f"{sum(data.count(p.encode()) for p in V3_PATTERNS)} (limit: {V3_LIMIT})")
+        except OSError as e:
+            r.unm("v3_refs", str(e))
+    return r
+
+
+def d2(a, ctx):
+    r = Row("D2")
+    unit = a.unit
+    rc, out, _ = sh("systemctl", "--user", "is-enabled", unit)
+    r.check("is_enabled", out or f"rc={rc}", out == "enabled")
+    rc, out, _ = sh("systemctl", "--user", "is-active", unit)
+    r.check("is_active", out or f"rc={rc}", out == "active")
+    rc, out, _ = sh("loginctl", "show-user", "-p", "Linger", "--value", os.environ.get("USER", ""))
+    if rc == 0 and out in ("yes", "no"):
+        r.val("linger", out)
+    else:
+        r.unm("linger", f"loginctl rc={rc} out={out!r}")
+    rc, p, err = show(unit, "MainPID", "ExecStart", "TimeoutStopUSec", "KillMode")
+    if rc != 0:
+        r.unm("show", f"systemctl show rc={rc} {err}")
+    else:
+        r.val("main_pid", p.get("MainPID", "?"))
+        r.val("timeout_stop", p.get("TimeoutStopUSec", "?"))
+        r.val("kill_mode", p.get("KillMode", "?"))
+    pid = ctx["pid"]
+    if not pid:
+        r.unm("cgroup", "no MainPID")
+    else:
+        try:
+            lines = [l for l in open(os.path.join(a.proc, str(pid), "cgroup")).read().splitlines() if l.strip()]
+            last = lines[-1] if lines else ""
+            r.check("cgroup", last.split(":", 2)[-1] if last else "empty", last.endswith(f"/{unit}"))
+        except OSError as e:
+            r.unm("cgroup", str(e))
+    inst = os.path.expanduser(f"~/.config/systemd/user/{unit}")
+    src = os.path.join(a.repo, "systemd", unit)
+    try:
+        si, ss = sha256_file(inst), sha256_file(src)
+        r.check("unit_file", "installed==repo" if si == ss else f"installed={si[:12]} repo={ss[:12]}", si == ss)
+    except OSError as e:
+        r.unm("unit_file", str(e))
+    return r
+
+
+def d3(a, ctx):
+    r = Row("D3")
+    sp, pid = ctx["socket"], ctx["pid"]
+    if not sp:
+        r.unm("socket", "no --socket in ExecStart")
+        return r
+    try:
+        sd, ss = os.stat(os.path.dirname(sp)), os.stat(sp)
+    except OSError as e:
+        r.check("socket", f"absent({e})", False)
+        return r
+    md, ms = stat.S_IMODE(sd.st_mode), stat.S_IMODE(ss.st_mode)
+    r.check("dir", f"{md:o}", md == 0o700)
+    r.check("sock", f"{ms:o}", ms == 0o600)
+    r.check("uid_ok", ss.st_uid == os.getuid(), ss.st_uid == os.getuid())
+    r.check("is_socket", stat.S_ISSOCK(ss.st_mode), stat.S_ISSOCK(ss.st_mode))
+    inodes = listener_inodes(a.proc, sp)
+    if inodes is None:
+        r.unm("listener", f"{a.proc}/net/unix unreadable")
+    elif not inodes:
+        r.check("listener", "none_bound", False)
+    elif not pid:
+        r.unm("in_mainpid_fds", "no MainPID")
+    else:
+        fds = fd_targets(a.proc, pid)
+        if fds is None:
+            r.unm("in_mainpid_fds", f"{a.proc}/{pid}/fd unreadable")
+        else:
+            held = any(f"socket:[{i}]" in fds for i in inodes)
+            r.check("in_mainpid_fds", "yes" if held else "no", held)
+            r.val("main_pid", pid)
+            if not held:
+                holder = "none"
+                for d in os.listdir(a.proc):
+                    if d.isdigit() and d != str(pid):
+                        t = fd_targets(a.proc, int(d)) or set()
+                        if any(f"socket:[{i}]" in t for i in inodes):
+                            holder = d
+                            break
+                r.val("held_by", holder)
+    rc, first, _ = health_cli(sp)
+    ok = rc == 0 and all(t in first for t in HEALTH_TOKENS)
+    if rc is None:
+        r.unm("health", "hee4 not on PATH")
+    else:
+        r.check("health", first.split(" head=")[0] if ok else f"rc={rc} {first}", ok)
+    return r
+
+
+def d4(a, ctx):
+    r = Row("D4")
+    lp = ctx["ledger"]
+    if not lp:
+        r.unm("ledger", "no --ledger in ExecStart")
+        return r
+    try:
+        md = stat.S_IMODE(os.stat(os.path.dirname(lp)).st_mode)
+        ml = stat.S_IMODE(os.stat(lp).st_mode)
+    except OSError as e:
+        r.check("ledger", f"absent({e})", False)
+        return r
+    r.check("dir", f"{md:o}", md == 0o700)
+    r.check("ledger_mode", f"{ml:o}" + ("" if ml == 0o600 else " want 600"), ml == 0o600)
+    try:
+        uv = ledger_ro(lp).execute("PRAGMA user_version").fetchone()[0]
+        r.val("user_version", uv)
+    except sqlite3.Error as e:
+        uv = None
+        r.check("user_version", f"unreadable({e})", False)
+    rc, first, reply = health_cli(ctx["socket"] or "")
+    body = (reply or {}).get("body") or {}
+    if rc is None:
+        r.unm("schema_version", "hee4 not on PATH")
+    elif "schema_version" not in body:
+        r.unm("schema_version", "health body carries no schema_version yet; lands with task-family-actions")
+    else:
+        sv = body["schema_version"]
+        r.val("schema_version", sv)
+        r.check("schema", "match" if uv == sv else "mismatch", uv == sv)
+    r.val("commission", "Store::open")
+    return r
+
+
+def d5(a, ctx):
+    r = Row("D5")
+    b = a.backups
+    if not os.path.isdir(b):
+        r.unm("backups", f"no backup dir at {b}")
+        return r
+    ids = [d for d in os.listdir(b) if os.path.isfile(os.path.join(b, d, "manifest.json"))]
+    if not ids:
+        r.check("manifest", "absent", False)
+    else:
+        newest = max(ids, key=lambda d: os.stat(os.path.join(b, d, "manifest.json")).st_mtime)
+        mp = os.path.join(b, newest, "manifest.json")
+        try:
+            m = json.load(open(mp))
+            objs = m.get("objects")
+            r.val("newest", newest)
+            r.val("objects", len(objs) if isinstance(objs, list) else objs)
+            r.val("age_s", int(time.time() - os.stat(mp).st_mtime))
+        except (OSError, ValueError) as e:
+            r.check("manifest", f"unparseable({e})", False)
+    lg = os.path.join(b, "restore.log")
+    try:
+        lines = open(lg).read().splitlines()
+        r.val("restore_log", lines[-1] if lines else "empty")
+    except OSError:
+        r.unm("restore_log", f"no {lg}")
+    rc, out, _ = sh("systemctl", "--user", "is-enabled", "hee4-backup.timer")
+    r.check("timer", out or f"rc={rc}", out == "enabled")
+    rc, p, _ = show("hee4-backup.service", "Result", "ExecMainStatus")
+    r.val("last_run", f"{p.get('Result', '?')}/{p.get('ExecMainStatus', '?')}")
+    try:
+        same = os.stat(b).st_dev == os.stat(os.path.expanduser("~")).st_dev
+        r.check("other_device", "no" if same else "yes", not same)
+    except OSError as e:
+        r.unm("other_device", str(e))
+    if ids:
+        root = os.path.expanduser("~/.cache/hee4-host")
+        os.makedirs(root, exist_ok=True)
+        into = tempfile.mkdtemp(prefix="cd-restore-", dir=root)
+        rc, out, err = sh("hee4", "restore", "--into", into, newest, timeout=600)
+        shutil.rmtree(into, ignore_errors=True)
+        if rc == 2 and "unknown verb" in err:
+            r.unm("restore", "restore verb absent")
+        elif rc is None:
+            r.unm("restore", "hee4 not on PATH")
+        else:
+            r.check("restore", (out.splitlines() or [f"rc={rc}"])[-1], rc == 0)
+    return r
+
+
+def d6(a, ctx):
+    r = Row("D6")
+    lp = ctx["ledger"]
+    try:
+        c = ledger_ro(lp)
+        n = c.execute("select count(distinct t.id) from tasks t join observations o on o.task_id=t.id "
+                      "where t.phase='accepted' and json_extract(o.json,'$.tool.name')='model-door'").fetchone()[0]
+        r.check("accepted_with_model_door", n, n >= 1)
+        legs = 0
+        for (tid,) in c.execute("select id from tasks where phase='accepted'"):
+            evs = [json.loads(e) for (e,) in c.execute("select event_json from events where task_id=? order by seq", (tid,))]
+            if any(e in REPAIR_ENTRY_EVENTS for e in evs):
+                legs += 1
+        r.val("repair_leg", f"{legs} (B16 leg lands in app-runtime-budgets-attempts)" if legs == 0 else legs)
+    except (sqlite3.Error, ValueError, TypeError) as e:
+        r.check("ledger", f"unreadable({e})", False)
+    model = a.model
+    try:
+        with urllib_open(a.model_url + "/api/ps") as resp:
+            models = json.load(resp).get("models", [])
+    except (OSError, ValueError) as e:
+        r.check("model_endpoint", f"unreachable({e})", False)
+        return r
+    r.val("model", model or "none")
+    if not model:
+        r.unm("gpu", "no pinned model name")
+        return r
+    hit = [m for m in models if m.get("name") == model or m.get("model") == model]
+    if not hit:
+        r.unm("gpu", f"model {model} not resident (ollama unloads idle models)")
+    else:
+        vram = hit[0].get("size_vram", 0) or 0
+        r.check("gpu", f"size_vram={vram}", vram > 0)
+    return r
+
+
+def urllib_open(url):
+    import urllib.request
+    return urllib.request.build_opener(urllib.request.ProxyHandler({})).open(url, timeout=5)
+
+
+def rehearsal_path(a, tree):
+    return os.path.join(a.drill_root, tree, "rehearsal.json")
+
+
+def d7(a, ctx):
+    r = Row("D7")
+    p = rehearsal_path(a, ctx["tree"])
+    try:
+        rec = json.load(open(p))
+    except (OSError, ValueError):
+        r.unm("rehearsal", f"no rehearsal record at tree={ctx['tree']}; run tools/drill --submit N")
+        return r
+    steps = rec.get("steps") or []
+    measured = sum(1 for s in steps if s.get("status") == "MEASURED")
+    r.check("steps", f"{measured}/{len(steps)}", steps and measured == len(steps))
+    sub = rec.get("submitted", 0)
+    ap = str(rec.get("acked_present", ""))
+    k, _, n = ap.partition("/")
+    r.val("submitted", sub)
+    if not isinstance(sub, int) or sub < 1:
+        r.unm("acked_present", f"rehearsal submitted={sub}; run tools/drill --submit N")
+    else:
+        r.check("acked_present", ap, k.isdigit() and n.isdigit() and int(k) == int(n) == sub)
+    r.val("task_ids", len(rec.get("task_ids") or []))
+    return r
+
+
+def d9(a, ctx):
+    r = Row("D9")
+    try:
+        c = ledger_ro(ctx["ledger"])
+        cols = [row[1] for row in c.execute("PRAGMA table_info(tasks)")]
+        if "serve_cgroup" in cols:
+            ids = {t for (t,) in c.execute("select id from tasks where phase='accepted' and serve_cgroup like ?", (f"%/{a.unit}",))}
+            r.val("provenance", "serve_cgroup")
+        else:
+            ids = {t for (t,) in c.execute("select id from tasks where phase='accepted'")}
+            r.val("provenance", "ledger_path")
+    except sqlite3.Error as e:
+        r.check("ledger", f"unreadable({e})", False)
+        return r
+    r.val("accepted", len(ids))
+    try:
+        reh = set(json.load(open(rehearsal_path(a, ctx["tree"]))).get("task_ids") or [])
+    except (OSError, ValueError):
+        reh = set()
+    drive, files = drive_task_ids(a.evidence_root)
+    r.val("rehearsal_excluded", len(ids & reh))
+    r.val("drive_excluded", f"{len(ids & drive)} (from {files} jsonl)")
+    use = len(ids - reh - drive)
+    r.check("use", use, use >= 1)
+    return r
+
+
+def tree_of(a):
+    if a.tree:
+        return a.tree[:12]
+    h = os.environ.get("HEE4_HEAD", "").strip()
+    if not h:
+        rc, h, _ = sh("git", "-C", a.repo, "rev-parse", "HEAD")
+        h = h if rc == 0 else ""
+    return h[:12] if h else "unmeasured"
+
+
+def run_rows(a):
+    """The nine rows against the world the flags name; returns the row lines in D1..D9 order."""
+    ctx = {"tree": tree_of(a), "pid": 0, "bin": a.bin, "socket": a.socket, "ledger": a.ledger}
+    rc, p, _ = show(a.unit, "MainPID", "ExecStart", "Environment")
+    if rc == 0:
+        ctx["pid"] = int(p.get("MainPID", "0") or 0)
+        ex = parse_execstart(p.get("ExecStart", ""))
+        ctx["bin"] = ctx["bin"] or ex.get("bin", "")
+        ctx["socket"] = ctx["socket"] or ex.get("socket", "")
+        ctx["ledger"] = ctx["ledger"] or ex.get("ledger", "")
+        if not a.model:
+            a.model = os.environ.get("HEE4_MODEL") or parse_environment(p.get("Environment", "")).get("HEE4_MODEL", "")
+    rows = {}
+    rows["D8"] = d8(a, ctx)
+    rc, p, _ = show(a.unit, "MainPID")  # post-restart MainPID: the drive restarts the unit
+    if rc == 0:
+        ctx["pid"] = int(p.get("MainPID", "0") or 0)
+    for name, fn in (("D1", d1), ("D2", d2), ("D3", d3), ("D4", d4), ("D5", d5), ("D6", d6), ("D7", d7), ("D9", d9)):
+        try:
+            rows[name] = fn(a, ctx)
+        except Exception as e:  # a crash in a reader is a FAIL row, never a silent skip
+            rows[name] = Row(name)
+            rows[name].check("reader", f"{type(e).__name__}: {e}", False)
+    return [rows[n] for n in ROWS], ctx
+
+
+def main_rows(a):
+    rows, ctx = run_rows(a)
+    for r in rows:
+        print(r.line())
+    rc, out, _ = sh("git", "-C", a.repo, "status", "--porcelain")
+    dirty = len(out.splitlines()) if rc == 0 else None
+    vs = [r.verdict() for r in rows]
+    passed = vs.count("PASS")
+    v = "FAIL" if "FAIL" in vs else "UNMEASURED" if "UNMEASURED" in vs or dirty is None else "PASS" if dirty == 0 else "FAIL"
+    print(f"deployed={passed}/9 tree={ctx['tree']} dirty={'UNMEASURED(not a git tree)' if dirty is None else dirty} verdict={v}")
+    sys.exit({"PASS": 0, "FAIL": 1, "UNMEASURED": 3}[v])
+
+
+# ---- the control: one plant per row, in a disposable HOME under ~/.cache/hee4-host ----
+
+PLANTS = {  # row -> (what is planted, the diagnostic text its row must carry)
+    "D1": ("ExecStart argv[0] is not the running exe", "identity=mismatch"),
+    "D2": ("is-enabled answers disabled", "is_enabled=disabled"),
+    "D3": ("the listener is held by another pid, not MainPID", "in_mainpid_fds=no"),
+    "D4": ("ledger user_version is one below health schema_version", "schema=mismatch"),
+    "D5": ("a backup dir with no manifest", "manifest=absent"),
+    "D6": ("the accepted task has no model-door observation", "accepted_with_model_door=0"),
+    "D7": ("rehearsal record with acked_present 2/3", "acked_present=2/3"),
+    "D8": ("a drive feature line UNMEASURED with neither scope= nor reason=", "unexplained=1"),
+    "D9": ("the one accepted task id is in the rehearsal record", "use=0"),
+}
+
+SERVER_PY = r'''
+import json, os, socket, sys
+path, sv, head = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+s = socket.socket(socket.AF_UNIX); s.bind(path); os.chmod(path, 0o600); s.listen(8)
+sys.stdout.write("bound\n"); sys.stdout.flush()
+while True:
+    c, _ = s.accept()
+    try:
+        line = c.makefile("rb").readline()
+        try:
+            req = json.loads(line)
+        except ValueError:
+            req = {}
+        body = {"ok": True, "head_sha": head, "recovery_complete": True, "uptime_s": 1, "schema_version": sv}
+        c.sendall((json.dumps({"kind": "result", "request_id": req.get("request_id"), "replayed": False, "body": body}) + "\n").encode())
+    except OSError:
+        pass
+    c.close()
+'''
+
+
+class PsHandler(http.server.BaseHTTPRequestHandler):
+    models = []
+
+    def do_GET(self):
+        b = json.dumps({"models": self.models}).encode()
+        self.send_response(200); self.end_headers(); self.wfile.write(b)
+
+    def log_message(self, *a):
+        pass
+
+
+def write(path, body, mode=0o644):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write(body)
+    os.chmod(path, mode)
+
+
+def control(a):
+    skip = set(a.control_skip or [])
+    bad = skip - set(ROWS)
+    if bad:
+        print(f"check-deployed control refused: --control-skip {','.join(sorted(bad))} is not one of {','.join(ROWS)}")
+        sys.exit(2)
+    planted = lambda n: n not in skip
+    root = os.path.expanduser("~/.cache/hee4-host")
+    os.makedirs(root, exist_ok=True)
+    ctl = tempfile.mkdtemp(prefix="cd-control-", dir=root)
+    procs = []
+    try:
+        head40 = "c0ffee" + uuid.uuid4().hex + "0" * 2
+        head40 = head40[:40]
+        tree = head40[:12]
+        unit, model = "hee4.service", "ctl-model"
+        bindir, lib, rt = os.path.join(ctl, "bin"), os.path.join(ctl, "lib"), os.path.join(ctl, "rt")
+        os.makedirs(bindir); os.makedirs(lib); os.makedirs(rt, mode=0o700)
+        sock = os.path.join(rt, "control.sock")
+        # the fake unit's exe: a copy of this interpreter, so exe digest == ExecStart argv[0] digest
+        serve_bin = os.path.join(lib, "hee4")
+        shutil.copy2(os.path.realpath(sys.executable), serve_bin)
+        server_py = os.path.join(lib, "server.py")
+        write(server_py, SERVER_PY)
+        sv_ledger, sv_health = 2, (3 if planted("D4") else 2)
+        srv = subprocess.Popen([serve_bin, server_py, sock, str(sv_health), head40], stdout=subprocess.PIPE, text=True)
+        procs.append(srv)
+        srv.stdout.readline()  # "bound"
+        main_pid = srv.pid
+        if planted("D3"):
+            other = subprocess.Popen([serve_bin, "-c", "import time; time.sleep(600)"])
+            procs.append(other)
+            main_pid = other.pid
+        # fake /proc: exe and fd point at the real entries, cgroup is the unit's
+        proc = os.path.join(ctl, "proc")
+        os.makedirs(os.path.join(proc, "net"))
+        os.symlink("/proc/net/unix", os.path.join(proc, "net", "unix"))
+        for p in procs:
+            d = os.path.join(proc, str(p.pid)); os.makedirs(d)
+            os.symlink(f"/proc/{p.pid}/exe", os.path.join(d, "exe"))
+            os.symlink(f"/proc/{p.pid}/fd", os.path.join(d, "fd"))
+            write(os.path.join(d, "cgroup"), f"0::/user.slice/user-{os.getuid()}.slice/user@{os.getuid()}.service/app.slice/{unit}\n")
+        # ledger (synthetic subset) and work dir
+        share = os.path.join(ctl, ".local", "share", "hee4")
+        os.makedirs(share, mode=0o700)
+        ledger = os.path.join(share, "ledger.sqlite3")
+        c = sqlite3.connect(ledger)
+        c.executescript("""
+            CREATE TABLE tasks(id TEXT PRIMARY KEY NOT NULL, phase TEXT NOT NULL, cancel INTEGER NOT NULL,
+              generation INTEGER NOT NULL, updated_ts INTEGER NOT NULL);
+            CREATE TABLE events(seq INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, event_json TEXT NOT NULL, ts INTEGER NOT NULL);
+            CREATE TABLE observations(id TEXT PRIMARY KEY NOT NULL, task_id TEXT NOT NULL, json TEXT NOT NULL, ts INTEGER NOT NULL);
+        """)
+        t_real, t_drive, t_failed = "t-" + "a" * 24, "t-" + "b" * 24, "t-" + "c" * 24
+        now = int(time.time())
+        for tid, ph in ((t_real, "accepted"), (t_drive, "accepted"), (t_failed, "failed")):
+            c.execute("insert into tasks values (?,?,0,1,?)", (tid, ph, now))
+        for tid, evs in ((t_real, ['"admit"', '"dispatch"', '{"settle":"ready"}', '{"decide":"pass"}', '"accept"']),
+                         (t_drive, ['"admit"', '"dispatch"', '{"settle":"ready"}', '{"decide":"pass"}', '"accept"']),
+                         (t_failed, ['"admit"', '"dispatch"', '{"settle":"ready"}', '{"decide":{"refused":"invalid"}}'])):
+            for e in evs:
+                c.execute("insert into events(task_id,event_json,ts) values (?,?,?)", (tid, e, now))
+        obs = json.dumps({"source": "ctl", "tool": {"name": "model-door", "version": model}, "outcome": "pass"})
+        if not planted("D6"):
+            c.execute("insert into observations values (?,?,?,?)", ("o-1", t_real, obs, now))
+            c.execute("insert into observations values (?,?,?,?)", ("o-2", t_drive, obs, now))
+        c.execute(f"PRAGMA user_version={sv_ledger}")
+        c.commit(); c.close()
+        for ext in ("", "-wal", "-shm"):
+            if os.path.exists(ledger + ext):
+                os.chmod(ledger + ext, 0o600)
+        # the repo: the unit file and the feature files the drive step counts
+        repo = os.path.join(ctl, "repo")
+        unit_text = f"[Service]\nExecStart={serve_bin} serve\n"
+        write(os.path.join(repo, "systemd", unit), unit_text)
+        write(os.path.join(ctl, ".config", "systemd", "user", unit), unit_text)
+        for n in ("README", "health", "task.submit", "task.get", "task.list", "roster.list"):
+            write(os.path.join(repo, "gates", "features", f"{n}.md"), f"# {n}\n")
+        g = lambda *args: subprocess.run(["git", "-C", repo, "-c", "user.name=t", "-c", "user.email=t@t", *args], check=True, capture_output=True)
+        g("init", "-q"); g("add", "-A"); g("commit", "-qm", "control")
+        # stubs on PATH
+        execstart_bin = os.path.join(bindir, "hee4") if planted("D1") else serve_bin
+        execstart = (f"{{ path={execstart_bin} ; argv[]={execstart_bin} serve --socket {sock} --ledger {ledger} "
+                     f"--work {share}/work ; ignore_errors=no ; start_time=[Mon 2026-10-05 10:18:21 AEDT] ; pid={main_pid} }}")
+        props = {"MainPID": str(main_pid), "ExecStart": execstart, "Environment": f"HEE4_LIVE_MODEL=1 HEE4_MODEL={model}",
+                 "UnitFileState": "enabled", "ActiveState": "active", "LoadState": "loaded", "TimeoutStopUSec": "20s",
+                 "KillMode": "control-group", "Result": "success", "ExecMainStatus": "0"}
+        cases = "\n".join(f'      {k}) v={shlex.quote(v)};;' for k, v in props.items())
+        write(os.path.join(bindir, "systemctl"), f"""#!/usr/bin/env bash
+# control stub: answers is-enabled, is-active, show -p K1,K2 [--value] UNIT, start
+verb=""; keys=""; value=no
+for arg in "$@"; do
+  case "$arg" in
+    --user) ;;
+    --value) value=yes ;;
+    is-enabled|is-active|show|start) verb=$arg ;;
+    -p) ;;
+    *) if [ "$verb" = show ] && [ -z "$keys" ]; then keys=$arg; fi ;;
+  esac
+done
+case "$verb" in
+  is-enabled) echo {"disabled" if planted("D2") else "enabled"} ;;
+  is-active) echo active ;;
+  start) exit 0 ;;
+  show)
+    IFS=, read -ra ks <<< "$keys"
+    for k in "${{ks[@]}}"; do
+      case "$k" in
+{cases}
+      *) v="";;
+      esac
+      if [ "$value" = yes ]; then echo "$v"; else echo "$k=$v"; fi
+    done ;;
+esac
+""", 0o755)
+        write(os.path.join(bindir, "loginctl"), "#!/usr/bin/env bash\necho no\n", 0o755)
+        health_json = json.dumps({"kind": "result", "request_id": "ctl", "replayed": False,
+                                  "body": {"ok": True, "head_sha": head40, "recovery_complete": True, "uptime_s": 1, "schema_version": sv_health}})
+        write(os.path.join(bindir, "hee4"), f"""#!/usr/bin/env bash
+case "$1" in
+  --version) echo "hee4 4.0.0-control {tree}" ;;
+  health) echo "ready=true recovery=complete database=ready socket=owned head={tree} uptime_s=1"; echo {shlex.quote(health_json)} ;;
+  *) echo "hee4: unknown verb $1" >&2; exit 2 ;;
+esac
+""", 0o755)
+        # backups: planted = a dir with no manifest; unplanted = no dir (UNMEASURED by name)
+        backups = os.path.join(ctl, "backups")
+        if planted("D5"):
+            os.makedirs(os.path.join(backups, "b-0001"))
+        # the model endpoint
+        PsHandler.models = [{"name": model, "model": model, "size_vram": 1}]
+        httpd = http.server.HTTPServer(("127.0.0.1", 0), PsHandler)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        # rehearsal record (D7, D9) and drive evidence (D9)
+        drill_root = os.path.join(ctl, ".cache", "hee4-drill")
+        ids = ["t-" + uuid.uuid4().hex[:24] for _ in range(3)] + ([t_real] if planted("D9") else [])
+        rec = {"tree": tree, "unit": unit, "submitted": 3, "acked_present": "2/3" if planted("D7") else "3/3", "task_ids": ids,
+               "steps": [{"name": n, "status": "MEASURED", "elapsed": 0.1, "detail": "control"} for n in
+                         ("unit_active", "submit", "kill9", "unit_restarted", "socket_perms", "health_ready", "acked_present")],
+               "ts": time.time()}
+        write(os.path.join(drill_root, tree, "rehearsal.json"), json.dumps(rec))
+        ev_root = os.path.join(ctl, ".cache", "hee4-drive")
+        recv = json.dumps({"kind": "result", "request_id": "drive-1", "replayed": False, "body": {"task_id": t_drive, "phase": "admitted"}})
+        write(os.path.join(ev_root, tree, "task.submit.jsonl"),
+              json.dumps({"t": time.time(), "dir": "send", "raw": "{}"}) + "\n" + json.dumps({"t": time.time(), "dir": "recv", "raw": recv}) + "\n")
+        # the drive stub
+        lines = ["drive feature=health verdict=PASS paths=6/6 evidence=ctl",
+                 "drive feature=task.submit verdict=PASS paths=7/7 evidence=ctl",
+                 "drive feature=roster.list verdict=UNMEASURED paths=0/0 evidence=ctl scope=unserved reason=no action in the deployed catalogue"]
+        if planted("D8"):
+            lines.append("drive feature=task.get verdict=UNMEASURED paths=0/0 evidence=ctl")
+        lines.append(f"drive verdict=UNMEASURED features=2/5 unserved=1 head={tree}")
+        drive_stub = os.path.join(bindir, "drive-stub")
+        write(drive_stub, "#!/usr/bin/env bash\n" + "".join(f"echo {shlex.quote(l)}\n" for l in lines) + "exit 3\n", 0o755)
+        # run the real rows as a subprocess in that world
+        env = dict(os.environ)
+        env.update({"HOME": ctl, "PATH": bindir + ":" + os.environ.get("PATH", ""), "HEE4_HEAD": head40, "USER": os.environ.get("USER", "ctl")})
+        env.pop("HEE4_MODEL", None)
+        rc, out, err = sh(sys.executable, os.path.abspath(__file__), "--unit", unit, "--repo", repo, "--proc", proc,
+                          "--backups", backups, "--drive-cmd", drive_stub, "--model-url", f"http://127.0.0.1:{httpd.server_port}",
+                          "--evidence-root", ev_root, "--drill-root", drill_root, env=env, timeout=120)
+        httpd.shutdown()
+        rows = {l.split(" ", 1)[0]: l for l in out.splitlines() if l.split(" ", 1)[0] in ROWS}
+        print(f"control home={ctl} rows_rc={rc} control_ledger=synthetic")
+        if err:
+            print(f"control stderr={err.splitlines()[-1]}")
+        met = 0
+        for n in ROWS:
+            line = rows.get(n, "")
+            what, diag = PLANTS[n]
+            if n in skip:
+                print(f"control {n} plant=skipped line={line or 'MISSING'}")
+                continue
+            hit = diag in line and not line.endswith(" PASS")
+            met += hit
+            print(f"control {n} plant={what!r} detected={'yes' if hit else 'no'} line={line or 'MISSING'}")
+        v = "PASS" if met == len(ROWS) else "FAIL"
+        print(f"check-deployed control cases={met}/{len(ROWS)} verdict={v}")
+        sys.exit(0 if v == "PASS" else 1)
+    finally:
+        for p in procs:
+            p.kill()
+        shutil.rmtree(ctl, ignore_errors=True)
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="check-deployed", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--unit", default="hee4.service")
+    ap.add_argument("--socket", default="", help="default: the unit's ExecStart --socket")
+    ap.add_argument("--ledger", default="", help="default: the unit's ExecStart --ledger")
+    ap.add_argument("--bin", default="", help="default: the unit's ExecStart argv[0]")
+    ap.add_argument("--tree", default="", help="default: HEE4_HEAD, else git rev-parse HEAD of --repo")
+    ap.add_argument("--repo", default=REPO)
+    ap.add_argument("--evidence-root", default=os.path.expanduser("~/.cache/hee4-drive"))
+    ap.add_argument("--drill-root", default=os.path.expanduser("~/.cache/hee4-drill"))
+    ap.add_argument("--backups", default="/mnt/storage-10tb/hee4-backups")
+    ap.add_argument("--model", default="", help="default: HEE4_MODEL env, else the unit's Environment")
+    ap.add_argument("--model-url", default="http://127.0.0.1:11434")
+    ap.add_argument("--drive-cmd", default=f"{HERE}/drive --doctor-first --allow-restart")
+    ap.add_argument("--proc", default="/proc", help="the proc root (the control points it at a fake)")
+    ap.add_argument("--control", action="store_true")
+    ap.add_argument("--control-skip", action="append", metavar="D<n>", help="test only: remove one plant")
+    a = ap.parse_args()
+    if a.control:
+        control(a)
+    elif a.control_skip:
+        print("check-deployed refused: --control-skip needs --control")
+        sys.exit(2)
+    else:
+        main_rows(a)
+
+
+if __name__ == "__main__":
+    main()
