@@ -3628,7 +3628,7 @@ def readiness_md(rows: list[dict], s: dict, w: dict) -> str:
         "",
         f"`module-readiness deploy_ready={s['deploy_ready']}/{s['modules']} ready_to_build={c['READY TO BUILD']} "
         f"arch_review={c['ARCH REVIEW']} blocked_luke={c['BLOCKED (LUKE)']} deferred={c['DEFERRED']} "
-        f"rs_files_outside_migrated={s['rs_files']}{' (HOLD)' if s['rs_files'] == 0 else ''}`",
+        f"code_outside_migrated={'none (HOLD)' if s['rs_files'] == 0 else 'present'}`",
         "",
         "**Sources (the deciders), each ingested by `hee4db ingest`:**",
         "- `modules/MODULES.toml`: phases, v3 audit flag, migrated paths, held ids.",
@@ -3638,7 +3638,9 @@ def readiness_md(rows: list[dict], s: dict, w: dict) -> str:
         "- ATLAS §5: which held items block which phase (tables `held_items`, `held_item_phases`).",
         "",
         "**Rules (applied in this order; the first that holds wins):**",
-        f"- *Deploy* is NOT READY for every module while there is no code: {s['rs_files']} `.rs` files outside `migrated/`, and the HOLD stands.",
+        "- *Deploy* is NOT READY for every module while there is no code (no `.rs` file outside `migrated/`) and the HOLD stands; "
+        "once code exists it is UNMEASURED until a deploy gate exists. The file count changes with every new source file, so it "
+        "is not in this note: `hee4db readiness` prints it (`rs_files=`).",
         f"- *DEFERRED*: the module's scope at tag is {', '.join(DEFERRED_SCOPES)} (first token of the Anti-Bloat \"Scope at tag\" cell).",
         "- *BLOCKED (LUKE)*: a module-specific held item (the module's own H ids, minus the universal P0 holds) is open and blocks "
         "the module's first phase, or an OPEN (held-for-Luke) design conflict lands in one of its phases (the one such row, DC-27 / H-26, "

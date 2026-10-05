@@ -395,6 +395,34 @@ def main() -> int:
         case("readiness-note-edit", "fault",
              edit("vault/00 Hub/Module Readiness 2026-10-01.md", "**READY TO BUILD** | P1,P2,P3", "**ARCH REVIEW** | P1,P2,P3"),
              ["check"], 20, ["check=readiness_note verdict=FAIL", "readiness_note_differs"])
+        # U-harden-05: the note carries no count a new source file changes (V4-100's hand regen drifted on the next .rs)
+        def plant_rs(w):
+            p = w.root / "repo/crates/planted-control/src/planted.rs"
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("")
+        n += 1
+        w = World(base, f"c{n:02d}", frozen)
+        w.copy_db_from(snap)
+        try:
+            plant_rs(w)
+            rs_now = sum(1 for _ in (w.root / "repo").rglob("*.rs"))
+            rrc, rout = w.run("readiness")
+            rc, out = w.run("check")
+            bad = red_checks(out)
+            saw = re.search(rf"\brs_files={rs_now}\b", rout) is not None   # the generator counted the planted file
+            ok = rc in (0, 10) and "check=readiness_note verdict=PASS" in out and not bad and rrc == 0 and saw
+            results.append(("quiet", "readiness-note-survives-a-new-rs-file", ok,
+                            f"rc={rc} readiness_rc={rrc} rs_files={rs_now} counted={'yes' if saw else 'no'}"
+                            + (f" red={','.join(bad)}" if bad else "")))
+        except Exception as e:
+            results.append(("quiet", "readiness-note-survives-a-new-rs-file", False, f"setup_error {type(e).__name__}: {str(e)[:200]}"))
+
+        def plant_rs_and_row(w):
+            plant_rs(w)
+            edit("vault/00 Hub/Module Readiness 2026-10-01.md", "**READY TO BUILD** | P1,P2,P3", "**ARCH REVIEW** | P1,P2,P3")(w)
+        case("readiness-note-real-change-still-fails", "fault", plant_rs_and_row,
+             ["check"], 20, ["check=readiness_note verdict=FAIL", "readiness_note_differs"])
+
         case("register-unknown-module", "fault",
              lambda w: add_register_row(w, "| DC-96 | **Planted unknown module.** control fixture | control | P2 | roster, storr | **PROPOSED**: planted |"),
              ["ingest"], 20, ["ingest_malformed", "DC-96 names unknown module 'storr'"])
