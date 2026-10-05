@@ -416,20 +416,38 @@ fn the_connection_after_the_cap_is_refused_by_name_and_health_still_answers() ->
 /// every dispatcher step is one `synchronous=FULL` transaction plus a brief `fsync`): measured
 /// 33 ms per submit on this machine's `/home` (dm-crypt) and 0.3 ms on tmpfs, with or without a
 /// subscriber, so the disk is the test's clock and not what it proves.
-fn fsync_cheap_dir(name: &str) -> R<PathBuf> {
-    let shm = PathBuf::from("/dev/shm").join(format!(
-        "hee4-e2e-{}",
-        std::env::var("CARGO_PKG_NAME").unwrap_or_default()
-    ));
-    let root = if fs::create_dir_all(&shm).is_ok() {
+///
+/// `/dev/shm` is machine-global, so the root is unique per run (package, pid, nanosecond
+/// stamp): concurrent slices or cargo invocations never share, delete or `pkill -f` each
+/// other's directories. The guard removes the root when the test ends, pass or panic.
+struct RunDir(PathBuf);
+
+impl Drop for RunDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn fsync_cheap_dir(name: &str) -> R<(RunDir, PathBuf)> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    let run = format!(
+        "hee4-e2e-{}-{}-{nanos}",
+        env!("CARGO_PKG_NAME"),
+        std::process::id()
+    );
+    let shm = PathBuf::from("/dev/shm").join(&run);
+    let root = if fs::create_dir(&shm).is_ok() {
         shm
     } else {
-        PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(&run);
+        fs::create_dir_all(&tmp)?;
+        tmp
     };
     let dir = root.join(name);
-    let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir)?;
-    Ok(dir)
+    Ok((RunDir(root), dir))
 }
 
 /// The server's `slow_consumer` log line: the reader dropped the subscriber, or the close frame
@@ -448,7 +466,7 @@ fn is_close_frame(line: &str) -> bool {
 /// signals, so the test finishes in seconds without weakening `delivered || logged`.
 #[test]
 fn a_subscriber_that_never_reads_gets_the_close_frame_or_the_log_line() -> R<()> {
-    let dir = fsync_cheap_dir("e2e-slow")?;
+    let (_run, dir) = fsync_cheap_dir("e2e-slow")?;
     let mut server = start(&dir, "serve.log")?;
     let log = dir.join("serve.log");
     let mut sub = subscribe(&server.sock, 0, None)?;
@@ -514,9 +532,10 @@ fn a_subscriber_that_never_reads_gets_the_close_frame_or_the_log_line() -> R<()>
     );
     server.child.kill()?;
     server.child.wait()?;
+    // Sandboxed children outlive the killed server; the pattern is this run's unique root, so
+    // it can match no other run's processes. `_run` removes the root on return.
     let work = dir.join("work").to_string_lossy().into_owned();
     let _ = Command::new("pkill").args(["-KILL", "-f", &work]).status();
-    let _ = fs::remove_dir_all(&dir);
     Ok(())
 }
 
