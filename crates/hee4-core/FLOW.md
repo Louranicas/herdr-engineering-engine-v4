@@ -21,8 +21,9 @@ name alone. The shell form of the same door:
 `grep -rn -E '(^|[^A-Za-z0-9_])rusqlite([^A-Za-z0-9_]|$)' crates/hee4-core/src --include=*.rs |
 grep -v src/store/` prints nothing.
 
-Inside the door, `apply_in` is the only code that writes `events` or `tasks`; `Store::apply` and
-`Store::admit` (through `operate`) are its two callers. `src/backup.rs` is the non-SQL half of
+Inside the door, `apply_in` is the only code that writes `events` or `tasks`; `Store::apply`,
+`Store::admit` (through `operate`), `Store::seal_and_decide` and `Store::finish_sealed` are its
+callers. `src/backup.rs` is the non-SQL half of
 the backup door: it imports no rusqlite item and calls `Store` doors only.
 
 ## Writers (each one transaction, committed under WAL + `synchronous=FULL` before it returns)
@@ -35,6 +36,8 @@ the backup door: it imports no rusqlite item and calls `Store` doors only.
 | `store/roster.rs`: `roster_update`, `roster_disable`, `roster_compose_deploy` (each one `operate` closure; m005_roster `roster_records` + append-only `roster_revisions`) | the record row (generation 1 or +1, `disabled`) + one `roster_revisions` row carrying the `operation_id`; the deploy record under principal `deploy`, action `deploy.install` | `StaleGeneration{current}`, `NotFound`, `Conflict`; a replay writes nothing |
 | `Store::record_observation(task, id, obs)` | `observations` row | same id, other body |
 | `Store::append_receipt(receipt)` | `receipts` row | chain with it fails `Receipt::verify_chain`; cites an observation not ledgered for its task |
+| `Store::seal_and_decide(receipt)` (the settle path; one `BEGIN IMMEDIATE`) | the `receipts` row, `Decide(receipt.decision().verdict)` and, when that leaves a `Pass` in verifying, `Accept`, each event through `apply_in`: a sealed-but-undecided task cannot exist | as `append_receipt`, or `transition` refuses the `Decide` (e.g. the task is not verifying): the whole transaction rolls back, no receipt and no event |
+| `Store::finish_sealed(task)` (reconcile's R12 convergence; one `BEGIN IMMEDIATE`) | re-reads history and chain in the transaction and picks `sealed_step`: `Decide(<latest sealed verdict>)` [+ `Accept`], or `Accept` | nothing to finish (or another writer finished first) → `None`, no write |
 | `Store::checkpoint_if_due(every: NonZeroU64)` (`src/store/receipts.rs`, migration `m005_checkpoints`) | one `checkpoints` row (`seq`, `upto_receipt_seq`, `count`, `root`; UPDATE/DELETE abort): `root` = `Receipt::checkpoint` (RFC 6962) over every `receipts.hash_self` in `seq` order up to `max(seq)`, so each root covers a prefix of the whole log across tasks; `every` is the caller's `ledger.checkpoint_every` budget field | fewer than `every` receipts since the last checkpoint → `None`, nothing written. Readers in the same file: `Store::open_read_only(path)` (`SQLITE_OPEN_READ_ONLY`, no pragma, migration or `meta` write; refuses a file without `migration:m005_checkpoints` as `Corrupt`; a WAL file in an unwritable directory is reopened `immutable=1` unless a non-empty `-wal` sits beside it), `verify_chain(task)` → `ChainReport{task, receipts, head}` and `verify_ledger()` → `LedgerReport{receipts, tasks, checkpoints, root}`, both `Err(VerifyError::Fault(ChainFault{receipt, seq, cause: Link|SelfHash|ColumnMismatch|Unparsable|RootMismatch|MissingReceipt|MissingCheckpoint}))` at the first row that does not re-derive (or `VerifyError::Store` when unreadable); `hee4 verify-ledger --ledger P` is their offline caller |
 | `recovery::reconcile(store, observations)` | events only through `Store::apply`; the `meta.recovery_complete` flag | — |
 | `Store::open(path)` | every `migration:<name>` row the file lacks (with its DDL), `PRAGMA user_version = count`, `meta.epoch` once at creation, `meta.boot += 1`, `meta.serve_cgroup` (this process's `/proc/self/cgroup` `0::` path), `meta.recovery_complete=0`; then ledger, `-wal`, `-shm` → 0600 and the dir → 0700 (idempotent) | a `migration:` row (or legacy `user_version`) this binary does not know → `UnknownMigration(name)` |
@@ -93,14 +96,25 @@ transaction; `Store::cache_heals()` reads them.
 `MAX_BACKUP_OBJECTS`, else `ObjectsOverBound`), and `manifest.json` LAST, renamed into place
 (`id`, `ts_ms`, `epoch`, `boot`, `task_count`, `objects_n`, `objects_bound`, `files: {path:
 sha256}`); `id` is `b-<ts_ms 12 hex>-<boot 8 hex>`, lexically sortable. A dir without a
-manifest is incomplete by construction and `restore` refuses it (`Incomplete`). `SameDisk::Refuse`
+manifest is incomplete by construction and `restore` refuses it (`Incomplete`).
+Retention runs inside `backup_to` only after the manifest rename succeeds: the pure
+`retain(metas, keep, just_written)` orders the complete `b-*` backups under `dest_root` (a real
+dir whose manifest `id` equals its name, with an integer `ts_ms`) by manifest `ts_ms`, never by
+name, keeps `BACKUP_KEEP` (14, UNMEASURED, INFERRED from the habitat `--keep 14`; a K0
+`backup.keep` field is a scribe proposal) with the one just written always among them, and each
+removed backup is renamed `.pruning-<id>` before `remove_dir_all` (a leftover `.pruning-b-*` is
+removed by the next prune). Incomplete dirs, foreign files and non-`b-*` dirs are never touched.
+`BackupReport.pruned` lists the removed ids; a failed removal is `prune_failed` (a typed
+`PruneFailure{path, kind}`) and never fails the backup. `SameDisk::Refuse`
 (serve's default) refuses a `dest_root` on the ledger's device (`SameDevice`).
-`restore(backup_dir, into)` refuses `TargetOccupied` when `<into>/ledger.sqlite3` exists,
+`restore(backup_dir, into)` first refuses any manifest `files` key other than `ledger.sqlite3`
+or `objects/<one normal component>.brief` (`Manifest{field: "files"}`: a `..`, absolute or nested
+key is never joined, stat'ed or read), refuses `TargetOccupied` when `<into>/ledger.sqlite3` exists,
 verifies every sha256 before copying anything (`DigestMismatch{file}`, `ObjectsMissing{n,
 total}`), then stages the ledger and `work/briefs/*.brief` under `<into>/.restore-<id>.tmp/`,
 opens the staged ledger, records `restored_from` (the manifest's epoch), mints a fresh epoch and
 runs `reconcile` with unobserved custody there, and only then renames the briefs and, LAST, the
-ledger into place. A failure after the copy (`BackupError::Store`: a snapshot newer than the
+ledger into place; `RestoreReport.objects_n` counts the briefs actually staged. A failure after the copy (`BackupError::Store`: a snapshot newer than the
 binary answers `UnknownMigration`) removes the staging dir, so `<into>` holds no ledger and the
 retry is not `TargetOccupied`; a `<into>/ledger.sqlite3` therefore means a completed restore.
 
@@ -121,7 +135,8 @@ dispatcher-backups-ddf); no trigger policy lives here.
 | same | absent (`kill -KILL`) | R08 | `Recover(R08)` | effect_unknown{cr} |
 | effect_unknown | any | R10 | — (quarantine is a DC proposal) | unchanged |
 | repair_pending, failed, abandoned | any | R11 | — | unchanged |
-| verifying, a receipt sealed past the `Decide` count, or a `Decide` after the latest `Dispatch` | any | R12 | — (K4 re-decides) | unchanged |
+| verifying, receipts > `Decide`s (a legacy three-write settle sealed, then stopped) | any | R12 + `SealedStep::DecideFromSeal` (`Row::sealed`) | `Decide(<latest sealed receipt's decision().verdict, copied, never recomputed>)`, then `Accept` on a `Pass` left in verifying, one transaction (`Store::finish_sealed`) | the phase the verdict names (accepted, repair_pending, failed, effect_unknown) |
+| verifying, a `Decide(Pass)` after the latest `Dispatch`, no `Accept` | any | R12 + `SealedStep::AcceptAfterPass` | `Accept` (`Store::finish_sealed`) | accepted |
 | verifying, no `Decide` after the latest `Dispatch` and no receipt beyond the `Decide` count (nothing sealed: the live ledger's parked `admit,dispatch,settle(ready)`) | any | R12 | `Resolve(Quarantine(EffectUnknownPermanent{rule: R12VerificationBoundary}))` | blocked{cr}; the operator's `Resolve(Abandon)` exits |
 | running with no open attempt; unreadable row; cache mismatch | any | R14 | — | finding |
 | admitted, blocked, cancellation_requested with no attempt | any | none | — | unchanged (reconcile applies nothing; the dispatcher's pick applies `Stop` to cancellation_requested with no open attempt, `Facts::attempt_open`) |

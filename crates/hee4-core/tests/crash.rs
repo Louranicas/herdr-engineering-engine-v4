@@ -10,6 +10,12 @@
 //! In `HEE4_CRASH_AFTER_DISPATCH` mode no pid was recorded, so the probe reads `Unobserved` (R07, with the
 //! same `DispatchUnacknowledged` class, proven probe-only); the R08 row there uses custody the
 //! parent supplies from its own reap of the child (hand-supplied, not probed).
+//!
+//! Three legacy-settle modes build the state the dispatcher's old three-write settle (seal,
+//! then `Decide`, then `Accept`, separate transactions) left behind when killed between them:
+//! `HEE4_CRASH_SEALED_PASS=1` / `HEE4_CRASH_SEALED_FAIL=1` stop after `append_receipt`, and
+//! `HEE4_CRASH_DECIDED_PASS=1` after `Decide(Pass)`. The parent `SIGKILL`s, reopens and
+//! checks that `reconcile` finishes the task from the sealed verdict (R12's convergence).
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -17,10 +23,13 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
 
-use hee4_contracts::{Event, Phase, RecoveryRule, TaskId};
+use hee4_contracts::{
+    Decision, Event, GitSha, Observation, ObservationId, Outcome, Phase, Receipt, ReceiptBody,
+    RecoveryRule, Settlement, Sha256Hex, TaskId, ToolId, Verdict,
+};
 use hee4_core::recovery::{
-    AttemptFacts, Facts, ProcessCustody, R08Reason, WorkspaceReadback, WorkspaceReuseRefused,
-    decide,
+    AttemptFacts, Facts, ProcessCustody, R08Reason, SealedStep, WorkspaceReadback,
+    WorkspaceReuseRefused, decide,
 };
 use hee4_core::{
     AttemptId, AttemptOutcome, AttemptRow, AttemptStart, AttemptState, Cleanup, Effect,
@@ -31,6 +40,9 @@ const CHILD_ENV: &str = "HEE4_CRASH_CHILD";
 const AFTER_ADMIT_ENV: &str = "HEE4_CRASH_AFTER_ADMIT";
 const ATTEMPT_ENV: &str = "HEE4_CRASH_ATTEMPT";
 const AFTER_DISPATCH_ENV: &str = "HEE4_CRASH_AFTER_DISPATCH";
+const SEALED_PASS_ENV: &str = "HEE4_CRASH_SEALED_PASS";
+const SEALED_FAIL_ENV: &str = "HEE4_CRASH_SEALED_FAIL";
+const DECIDED_PASS_ENV: &str = "HEE4_CRASH_DECIDED_PASS";
 const KILL_AFTER_ACKS: usize = 60;
 
 fn crash_dir() -> Result<PathBuf, Box<dyn Error>> {
@@ -51,6 +63,55 @@ fn flag(env: &str) -> bool {
     std::env::var_os(env).is_some_and(|v| v == "1")
 }
 
+/// A passing observation: the verdict a recomputation from it would give is `Pass`, so a
+/// `Decide(Fail)` after recovery can only have been copied from the seal.
+fn passing_observation() -> Result<Observation, Box<dyn Error>> {
+    Ok(Observation {
+        source: "cargo-test".parse()?,
+        input_sha256: Sha256Hex::digest(b"input"),
+        tool: ToolId {
+            name: "cargo".parse()?,
+            version: "1.99".parse()?,
+        },
+        head_sha: "a".repeat(40).parse::<GitSha>()?,
+        outcome: Outcome::Pass,
+        evidence: vec![],
+        advisory: false,
+        elapsed_ms: 1,
+        budget_ms: 10,
+    })
+}
+
+/// The legacy three-write settle, stopped after the seal (`decide == false`) or after
+/// `Decide(Pass)`: each write its own transaction, as the dispatcher wrote them before
+/// `Store::seal_and_decide`.
+fn legacy_settle(
+    store: &Store,
+    task: &TaskId,
+    verdict: Verdict,
+    decide: bool,
+) -> Result<(), Box<dyn Error>> {
+    store.apply(task, Event::Admit)?;
+    store.apply(task, Event::Dispatch)?;
+    store.apply(task, Event::Settle(Settlement::Ready))?;
+    let obs: ObservationId = format!("o-{task}").parse()?;
+    store.record_observation(task, &obs, &passing_observation()?)?;
+    store.apply(task, Event::Observe)?;
+    store.append_receipt(&Receipt::seal(
+        Sha256Hex::GENESIS,
+        ReceiptBody {
+            id: format!("r-{task}").parse()?,
+            task_id: task.clone(),
+            decision: Decision { verdict },
+            observed: vec![obs],
+        },
+    ))?;
+    if decide {
+        store.apply(task, Event::Decide(verdict))?;
+    }
+    Ok(())
+}
+
 /// The child half. A no-op unless `HEE4_CRASH_CHILD` names a database.
 #[test]
 fn crash_child() -> Result<(), Box<dyn Error>> {
@@ -61,6 +122,21 @@ fn crash_child() -> Result<(), Box<dyn Error>> {
     reconcile(&store, &Observations::default())?;
     let mut out = std::io::stdout().lock();
     let after_admit = flag(AFTER_ADMIT_ENV);
+    let legacy = [
+        (SEALED_PASS_ENV, Verdict::Pass, false, "sealed"),
+        (SEALED_FAIL_ENV, Verdict::Fail, false, "sealed"),
+        (DECIDED_PASS_ENV, Verdict::Pass, true, "decided"),
+    ];
+    if let Some((_, verdict, decide, ack)) = legacy.into_iter().find(|(env, ..)| flag(env)) {
+        let task: TaskId = "task-000000".parse()?;
+        legacy_settle(&store, &task, verdict, decide)?;
+        writeln!(out, "ACK {task} {ack}")?;
+        out.flush()?;
+        // Hold until the parent kills us.
+        let mut hold = String::new();
+        std::io::stdin().read_line(&mut hold)?;
+        return Ok(());
+    }
     let attempt_mode = flag(ATTEMPT_ENV);
     if attempt_mode || flag(AFTER_DISPATCH_ENV) {
         let task: TaskId = "task-000000".parse()?;
@@ -485,5 +561,103 @@ fn sigkill_mid_loop_then_reconcile() -> Result<(), Box<dyn Error>> {
     );
     let open = store.open_attempts()?.len();
     assert_eq!(open, 0, "no running row survives two passes");
+    Ok(())
+}
+
+/// Kill the child in a legacy-settle mode, reopen, check the stranded state, reconcile twice.
+/// Returns the first report's only row and the task's history after it.
+fn legacy_crash(
+    db_name: &str,
+    mode_env: &str,
+    expected_ack: &str,
+) -> Result<(hee4_core::recovery::Row, Vec<Event>, Store), Box<dyn Error>> {
+    let path = fresh_db(db_name)?;
+    let (pid, acked, status) = kill_after_first_ack(&path, mode_env)?;
+    println!("crash: mode={mode_env} child pid={pid} acked={acked:?} status={status}");
+    assert_eq!(acked, expected_ack);
+    let store = Store::open(&path)?;
+    let task: TaskId = "task-000000".parse()?;
+    assert_eq!(store.phase(&task)?, Some(Phase::Verifying), "stranded");
+    assert_eq!(store.receipt_count(&task)?, 1, "sealed");
+    let report = reconcile(&store, &Observations::worker_absent())?;
+    assert!(report.complete, "{:?}", report.findings);
+    assert_eq!(report.rows.len(), 1);
+    let row = report.rows[0].clone();
+    assert_eq!(row.rule, Some(RecoveryRule::R12VerificationBoundary));
+    let history = store.history(&task)?;
+    let second = reconcile(&store, &Observations::worker_absent())?;
+    assert_eq!(
+        (second.applied, second.complete),
+        (0, true),
+        "a second pass appends nothing"
+    );
+    assert_eq!(store.history(&task)?, history, "idempotent");
+    assert_eq!(second.rows[0].sealed, None);
+    assert_eq!(store.integrity_check()?, "ok");
+    Ok((row, history, store))
+}
+
+/// Killed after the seal and before `Decide`: reconcile copies the sealed verdict. The `Fail`
+/// case seals `Fail` over a passing observation, so the `Decide(Fail)` it lands proves the
+/// verdict was copied from the receipt, not recomputed from the observations.
+#[test]
+fn a_sealed_undecided_verifying_task_is_finished_by_recovery() -> Result<(), Box<dyn Error>> {
+    for (db_name, mode_env, verdict, phase, tail) in [
+        (
+            "crash-sealed-pass.sqlite",
+            SEALED_PASS_ENV,
+            Verdict::Pass,
+            Phase::Accepted,
+            vec![Event::Decide(Verdict::Pass), Event::Accept],
+        ),
+        (
+            "crash-sealed-fail.sqlite",
+            SEALED_FAIL_ENV,
+            Verdict::Fail,
+            Phase::RepairPending,
+            vec![Event::Decide(Verdict::Fail)],
+        ),
+    ] {
+        let (row, history, _store) = legacy_crash(db_name, mode_env, "task-000000 sealed")?;
+        assert_eq!(row.sealed, Some(SealedStep::DecideFromSeal), "{verdict:?}");
+        assert_eq!((row.before, row.after), (Phase::Verifying, phase));
+        let settled = [
+            Event::Admit,
+            Event::Dispatch,
+            Event::Settle(Settlement::Ready),
+            Event::Observe,
+        ];
+        let expected: Vec<Event> = settled.into_iter().chain(tail).collect();
+        assert_eq!(history, expected, "{verdict:?}");
+        println!(
+            "crash: mode={mode_env} rule={:?} sealed={:?} after={:?}",
+            row.rule, row.sealed, row.after
+        );
+    }
+    Ok(())
+}
+
+/// Killed after `Decide(Pass)` and before `Accept`: reconcile writes the `Accept`.
+#[test]
+fn a_decided_pass_awaiting_accept_is_accepted_by_recovery() -> Result<(), Box<dyn Error>> {
+    let (row, history, _store) = legacy_crash(
+        "crash-decided-pass.sqlite",
+        DECIDED_PASS_ENV,
+        "task-000000 decided",
+    )?;
+    assert_eq!(row.sealed, Some(SealedStep::AcceptAfterPass));
+    assert_eq!((row.before, row.after), (Phase::Verifying, Phase::Accepted));
+    assert_eq!(
+        history[history.len() - 2..],
+        [Event::Decide(Verdict::Pass), Event::Accept]
+    );
+    assert_eq!(
+        history
+            .iter()
+            .filter(|e| matches!(e, Event::Decide(_)))
+            .count(),
+        1,
+        "no second Decide"
+    );
     Ok(())
 }

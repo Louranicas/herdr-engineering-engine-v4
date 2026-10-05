@@ -16,7 +16,17 @@ Firstmate is **L1, the outer loop**, and the collaboration layer of the roster. 
 - **What it never holds:** engine task state (HEE K1 `store` + `transition` is the single home — README "must never share a file, a schema or a writer"); `backlog.md` (tasks-axi owns it); `.wake-queue` (the watcher's, lock-bound).
 - **Writer rules (from `ops/db/README.md` "Writer safety"):** one writer, `ops/firstmate/fm-db`, Python sqlite3 under a flock with `BEGIN IMMEDIATE`; `tursodb` only ever `--readonly` one-shot for read-back (`fm-db q`, `fm-db status`). Crew append claims through `fm-db record claim`, never raw SQL. Schema in `ops/firstmate/schema/*.sql`, applied by `fm-db init`, which refuses a changed applied file.
 - **Allocation:** one DB per `FM_HOME`. A secondmate home gets its own by running `fm-db init` with `FM_HOME` set to that home. `hee4.env` exports `FM_HOME` (default `~/firstmate`) and `FM_DB`.
-- **Doors this gives the meta goal (rung 2):** unlabelled claim → refused by CHECK; self-verification → refused by trigger; spawn beyond `planned_agents` → refused; spawn under an open andon → refused; STOP without `measured=1` → refused by CHECK; spawn without a recorded brief → refused (`no brief recorded for unit`); a brief missing a `LABEL:` field or with summarised standing orders → refused (`brief_field_missing=`, `standing_not_verbatim`; the shas are computed, never caller-typed); `fm-db close-unit` refuses an open andon or a spawn without an exit (`spawn_without_exit`).
+- **Doors this gives the meta goal (rung 2):** each refusal is typed (exit 20 unless noted) and named in `ops/firstmate/fm-db`; `ops/firstmate/tests/control.py` plants each fault.
+  - unlabelled claim → refused by CHECK; self-verification → refused by trigger; STOP without `measured=1` → refused by CHECK.
+  - spawn beyond `planned_agents` → refused; spawn under an open andon → refused; spawn into a closed unit → `unit_closed`.
+  - spawn without a recorded brief → `no brief recorded for unit`.
+  - spawn that names no brief → `brief_sha_missing`; in SQLite too, `schema/003_spawn_brief_required.sql` refuses a raw INSERT with a NULL `brief_sha` or one that is not its unit's brief (spawns recorded before 002 keep NULL).
+  - spawn naming an unrecorded brief → `brief_sha_unknown`.
+  - spawn naming a brief of another unit → `brief_sha_unit_mismatch`.
+  - a brief missing a `LABEL:` field or with summarised standing orders → `brief_field_missing=`, `standing_not_verbatim` (the shas are computed, never caller-typed); the same brief twice → `brief_already_recorded sha=<12hex> unit=<u>`.
+  - a VERIFY line that cannot fail → `verify_line_cannot_fail line=N shape=S`, in the `VERIFY:` field and in every `VERIFY (...):` section, inside the command string of `bash -c`/`sh -c`/`env [-u NAME] [-C DIR] [VAR=v] bash -c` (words after the string, such as `2>&1` or `_`, do not hide it), and in a prose-opener `( ... )` that holds `|`, `;`, `&&` or `||`.
+  - a DB whose `schema_migrations` lacks a `schema/*.sql` file → `schema_behind=<file>` (exit 3) from every verb but `init`, before any write; the captain runs `fm-db init` on each home before a new migration merges.
+  - `fm-db close-unit` refuses an open andon or a spawn without an exit (`spawn_without_exit`).
 
 ## 4 · Reconciliations with Firstmate's conventions
 | Topic | Firstmate | Roster/PROTOCOL | Resolution |

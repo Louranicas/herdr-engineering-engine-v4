@@ -9,11 +9,15 @@ Verbs (each one transaction, BEGIN IMMEDIATE, under the writer flock; stdlib onl
                                          refuses a missing `LABEL:` field or summarised standing orders (PROTOCOL §2), and
                                          a VERIFY line that cannot fail (verify_line_cannot_fail line=N shape=S); the door
                                          judges each new `record brief`, never a row already recorded
-  record spawn ... [--brief-sha X]       refuses a unit with no recorded brief, a closed unit, a brief of another unit
+  record spawn ... --brief-sha X         refuses a missing brief sha (brief_sha_missing), an unrecorded one
+                                         (brief_sha_unknown), a brief of another unit (brief_sha_unit_mismatch), a unit with
+                                         no recorded brief and a closed unit; schema/003 refuses a NULL brief_sha in SQLite too
   clear-andon --id N --by WHO
   close-unit --id U --by WHO             refuses an open andon or a spawn without an exit; reports unverified MEASURED claims
   q 'SELECT ...'                         one bounded read-only SELECT through tursodb --readonly (exit 30 if absent)
   status                                 open units, spawned vs planned, briefs, open andon (JSON)
+Every verb but init first compares schema/*.sql with schema_migrations and refuses `schema_behind=<file>` (exit 3);
+`status` on a home with no database stays UNMEASURED (exit 30).
 Exit codes: 0 ok · 2 usage · 3 setup · 20 refused · 30 unmeasured.
 Engine roles follow ops/db/README.md "Writer safety": Python sqlite3 writes; tursodb is never opened read-write.
 Homes: FM_HOME selects the home; FM_DB (hee4.env exports it) overrides the file but must lie inside FM_HOME when both are
@@ -43,6 +47,10 @@ Q_CAP = 200  # rows per read-back; a larger answer is a report, not a query
 # The eleven I1 fields; a field is a line that starts at column 0 with `LABEL:` (crates/hee4-contracts/src/brief.rs:63-64,
 # BriefField::opens). fm-db mirrors that one rule for its file door; it owns no second grammar.
 BRIEF_FIELDS = ("GOAL", "SCOPE", "CONTEXT", "ACCEPTANCE", "VERIFY", "TIMEBOX", "FORBIDDEN", "REPORT", "STANDING", "RECON", "RESTATEMENT")
+# A section opener as agents read one: a field name at column 0, an optional `(...)` qualifier, then `:`. It is the
+# workflow curator's section reader (bin/workflow-curator brief_sections), so `VERIFY (from the worktree root):` opens a
+# VERIFY section that the door judges like the `VERIFY:` field itself.
+SECTION_LABEL = re.compile(r"^(" + "|".join(BRIEF_FIELDS) + r")(\s*\([^)]*\))?:")
 BRIEF_KEYS = ["unit_id", "path", "head_sha", "ts"]   # the caller's keys for `record brief`; every sha is computed here
 
 
@@ -95,6 +103,26 @@ class Writer:
         fcntl.flock(self.lock, fcntl.LOCK_UN)
         self.lock.close()
         return False
+
+
+def schema_behind() -> str | None:
+    """The first schema/*.sql file that this DB's schema_migrations does not hold, as the setup refusal; None when the DB
+    is level with the files. Read-only: an absent DB or table is behind by every file and nothing is created."""
+    files = sorted(p.name for p in (HERE / "schema").glob("*.sql"))
+    applied: set[str] = set()
+    if DB.exists():
+        try:
+            con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+            try:
+                applied = {r[0] for r in con.execute("SELECT file FROM schema_migrations")}
+            finally:
+                con.close()
+        except sqlite3.OperationalError:
+            applied = set()                                              # no schema_migrations table: nothing applied
+    missing = [f for f in files if f not in applied]
+    if missing:
+        return f"schema_behind={missing[0]}: this DB lacks {len(missing)} of schema/*.sql ({', '.join(missing)}); run fm-db init"
+    return None
 
 
 FIRST_MIGRATION = "001_init.sql"   # sets PRAGMA journal_mode (illegal inside a transaction) and is IF NOT EXISTS throughout
@@ -158,15 +186,24 @@ def collapsed(text: str) -> list[str]:
 
 
 # A VERIFY line whose exit status is not its check's: the shape names why. fm-db owns this detector: it is the door, the
-# highest rung. The workflow curator's `cannot_fail` (bin/workflow-curator) is an older, looser copy; control.py's
-# `brief-verify-curator-parity` case requires every line the curator flags across the roster briefs to be refused here.
+# highest rung. The workflow curator keeps no copy; it loads `verify_cannot_fail` from here. control.py's
+# `brief-verify-section-parity` case requires every roster VERIFY line the curator's section reader finds, and this
+# detector flags, to be among this door's `verify_findings`.
 VERIFY_SINKS = {"tail": "pipe_into_tail_head", "head": "pipe_into_tail_head", "wc": "pipe_into_sink", "cat": "pipe_into_sink",
                 "sort": "pipe_into_sink", "uniq": "pipe_into_sink", "tee": "pipe_into_sink"}
 VERIFY_SWALLOWERS = ("echo", "printf", "true", ":")              # each exits 0 whatever ran before it
-# A whole-line `( ... )` is a description, not a subshell, only when it opens with one of these prose words. `at`, `as`,
-# `expect` and `see` are left out because each is also a command name.
+# A whole-line `( ... )` is a description, not a subshell, only when it opens with one of these prose words and holds no
+# shell operator (SHELL_OPERATOR, outside quotes). `at`, `as`, `expect` and `see` are left out because each is also a
+# command name.
 VERIFY_DESCRIPTION = re.compile(r"^\(\s*(from|run from|the|each|every|all|in|on|with|expected|note|where|after|before|per|"
                                 r"using|judged|this|these|only)\b", re.IGNORECASE)
+SHELL_OPERATOR = re.compile(r"[|;]|&&")
+# `bash -c '...'`, `sh -lc "..."`, `env [opts] [VAR=v ...] bash -c '...' [args] [redirections]`: read word by word on the
+# masked text by `_shell_c`. These env options take the next word as their argument (`-u NAME`, `-C DIR`, `-S STRING`).
+ENV_ARG_SHORT = "uCS"
+ENV_ARG_LONG = ("--unset", "--chdir", "--split-string")
+SHELLS = ("bash", "sh")
+ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 PIPEFAIL_ON = re.compile(r"(?:^|\s)-[A-Za-z]*o\s+pipefail\b")
 PIPEFAIL_OFF = re.compile(r"(?:^|\s)\+[A-Za-z]*o\s+pipefail\b")
 PIPESTATUS_READ = re.compile(r"^(exit|test|\[\[?)\s+.*\$\{PIPESTATUS\[[^\]]*\]\}")
@@ -204,6 +241,84 @@ def _split(bare: str, raw: str, sep: str) -> list[tuple[str, str, str]]:
     return out
 
 
+def _description(bare: str, raw: str) -> bool:
+    """A whole `( ... )` that opens with a prose word and holds no unquoted shell operator: prose, not a subshell."""
+    return raw.startswith("(") and raw.endswith(")") and bool(VERIFY_DESCRIPTION.match(raw)) and not SHELL_OPERATOR.search(bare)
+
+
+def _words(bare: str) -> list[tuple[int, int]]:
+    """(start, end) of each whitespace-separated word of the masked text; a quoted word is one word because it is masked."""
+    return [(m.start(), m.end()) for m in re.finditer(r"\S+", bare)]
+
+
+def _unquote(raw: str) -> str:
+    """One shell word's text: a word wholly inside one pair of quotes loses them; any other word is kept as written."""
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "'\"" and raw[0] not in raw[1:-1]:
+        return raw[1:-1]
+    return raw
+
+
+def _shell_c(bare: str, raw: str) -> set[str]:
+    """The shapes of the command string when this command is `bash -c '...'` / `sh -c` / `env ... bash -c`; else none.
+
+    Leading `VAR=v` words and an `env` prefix (its options, the argument of `-u`/`-C`/`-S`/`--unset`/`--chdir`, and its
+    `VAR=v` words) are skipped. The shell's first non-option word after a `-c` cluster is the command string; words after
+    it (`2>&1`, `_`, positional arguments) are not part of it. `env -S STRING` is itself a command line and is read the same
+    way. `bash -o pipefail -c '...'` judges the string with pipefail on."""
+    words = [(bare[a:b], raw[a:b]) for a, b in _words(bare)]
+    i = 0
+    while i < len(words) and ASSIGNMENT.match(words[i][0]):
+        i += 1
+    if i < len(words) and os.path.basename(words[i][0]) == "env":
+        i += 1
+        while i < len(words) and words[i][0].startswith("-") and words[i][0] != "-":
+            w, wr = words[i]
+            i += 1
+            if w == "--":
+                break
+            split = None
+            if w.startswith("--"):
+                if w in ENV_ARG_LONG and i < len(words):
+                    split, i = (words[i][1] if w == "--split-string" else None), i + 1
+                elif w.startswith("--split-string="):
+                    split = wr.split("=", 1)[1]
+            else:
+                for k, ch in enumerate(w[1:], start=1):
+                    if ch in ENV_ARG_SHORT:
+                        if k + 1 < len(w):
+                            split = wr[k + 1:]
+                        elif i < len(words):
+                            split, i = words[i][1], i + 1
+                        if ch != "S":
+                            split = None
+                        break
+            if split is not None:                                     # `-S STRING`: the rest of the command is that string
+                inner = _unquote(split) + " " + " ".join(r for _, r in words[i:])
+                return _shell_c(_mask(inner), inner)
+        while i < len(words) and ASSIGNMENT.match(words[i][0]):
+            i += 1
+    if i >= len(words) or os.path.basename(words[i][0]) not in SHELLS:
+        return set()
+    i += 1
+    has_c, pipefail = False, False
+    while i < len(words) and words[i][0][:1] in "-+" and len(words[i][0]) > 1 and words[i][0] != "--":
+        w = words[i][0]
+        i += 1
+        if w.startswith("--"):
+            continue
+        if w[1:].endswith("o") and i < len(words):                    # `-o NAME` / `+o NAME` / `-eo NAME`
+            if words[i][0] == "pipefail":
+                pipefail = w[0] == "-"
+            i += 1
+        has_c = has_c or (w[0] == "-" and "c" in w[1:])
+    if i < len(words) and words[i][0] == "--":
+        i += 1
+    if not has_c or i >= len(words):
+        return set()
+    inner = _unquote(words[i][1])
+    return set(verify_cannot_fail(("set -o pipefail; " if pipefail else "") + inner))
+
+
 def _pipefail(bare: str, on: bool) -> bool:
     """The pipefail setting after one command: only `set -o pipefail` (or `-eo`, `-euo` ...) sets it, `set +o` clears it."""
     if _first_word(bare) != "set":
@@ -228,17 +343,20 @@ def _judge(bare: str, raw: str) -> set[str]:
     if len(parts) > 1 and parts[-1][0] == "||" and (_first_word(parts[-1][1]) in VERIFY_SWALLOWERS
                                                     or re.match(r"^exit\s+0$", parts[-1][1])):
         shapes.add("or_true")
-    for i, (_, b, _r) in enumerate(parts):
+    for i, (_, b, r) in enumerate(parts):
         on = _pipefail(b, on)
-        segs = [x.strip() for x in re.split(r"\|&?", b) if x.strip()]   # `|&` pipes stderr too; its sink is the next word
-        if not segs:
+        stages = [(sb, sr) for _, sb, sr in _split(b, r, r"\|&?") if sb.strip()]   # `|&` pipes stderr too; its sink is the next word
+        if not stages:
             continue
+        segs = [sb.strip() for sb, _ in stages]
         sink = _first_word(segs[-1])
         read = i + 1 < len(parts) and parts[i + 1][0] == "&&" and bool(PIPESTATUS_READ.match(parts[i + 1][2]))
         if len(segs) > 1 and not on and not read and sink in VERIFY_SINKS:
             shapes.add(VERIFY_SINKS[sink])
         if sink in ("grep", "egrep", "rg") and any(re.match(r"^-[A-Za-z]*v", o) for o in segs[-1].split()[1:]):
             shapes.add("inverted_grep")
+        for sb, sr in (stages if on else stages[-1:]):                   # the stages whose status is this part's
+            shapes |= _shell_c(sb, sr)
     return shapes
 
 
@@ -247,8 +365,9 @@ def verify_cannot_fail(line: str) -> list[str]:
 
     What is judged: a markdown bullet (`- `, `* `, `1. `) and a backtick wrapper are stripped; quoted text and `$(..)` are
     masked; an unquoted `#` at the start or after whitespace starts a comment, which is dropped; a whole line `( ... )`
-    that opens with a prose word (VERIFY_DESCRIPTION: `(from the worktree root; ...)`) is a description and is not judged,
-    and any other parenthesised text is a subshell, judged as a command. A trailing annotation after two or more spaces,
+    that opens with a prose word (VERIFY_DESCRIPTION: `(from the worktree root)`) and holds no unquoted `|`, `;`, `&&` or
+    `||` is a description and is not judged, and any other parenthesised text is a subshell, judged as a command. The command
+    string of `bash -c`, `sh -c` or `env [options] [VAR=v] bash -c` is judged as a line of its own, recursively (`_shell_c`). A trailing annotation after two or more spaces,
     `x  (rc=0; ...)`, is cut off, and the line before it and the annotation (unless a description) are judged apart.
 
     How: `a; b` exits with b, so only the last `;` command counts; in it every `&&`/`||` part must carry its status to
@@ -266,26 +385,27 @@ def verify_cannot_fail(line: str) -> list[str]:
         s, bare = s[:comment.start()].rstrip(), bare[:comment.start()].rstrip()
     if not s:
         return []
-    if s.startswith("(") and s.endswith(")") and VERIFY_DESCRIPTION.match(s):
+    if _description(bare, s):
         return []
     note = re.search(r"\s{2,}\(", bare)
     if not note:
         return sorted(_judge(bare, s))
     cut = note.end() - 1
     shapes = _judge(bare[:cut], s[:cut])
-    if not (s.endswith(")") and VERIFY_DESCRIPTION.match(s[cut:])):
+    if not _description(bare[cut:], s[cut:]):
         shapes |= _judge(bare[cut:], s[cut:])
     return sorted(shapes)
 
 
 def verify_findings(text: str) -> list[tuple[int, list[str], str]]:
-    """(file line number, shapes, line) for every VERIFY line of a brief that cannot fail."""
+    """(file line number, shapes, line) for every VERIFY line of a brief that cannot fail. Every VERIFY section is read:
+    the `VERIFY:` field and any `VERIFY (...):` section after it (SECTION_LABEL), each running to the next section label."""
     out, in_verify = [], False
     for n, ln in enumerate(text.splitlines(), start=1):
-        label = next((f for f in BRIEF_FIELDS if ln.startswith(f + ":")), None)   # column 0, `LABEL:` — brief.rs:63-64
+        label = SECTION_LABEL.match(ln)
         if label is not None:
-            in_verify = label == "VERIFY"
-            ln = ln[len(label) + 1:]
+            in_verify = label.group(1) == "VERIFY"
+            ln = ln[label.end():]
         if in_verify:
             shapes = verify_cannot_fail(ln)
             if shapes:
@@ -373,12 +493,17 @@ def record(kind: str, args: list[str]) -> int:
                     return out("record", "REFUSED", 20, detail="open andon on this unit: no spawn until the captain clears it")
                 if not con.execute("SELECT 1 FROM briefs WHERE unit_id=?", (u,)).fetchone():   # PROTOCOL §2: the brief is the only start
                     return out("record", "REFUSED", 20, detail=f"no brief recorded for unit {u}; record the brief first")
-                if row["brief_sha"] is not None:
-                    b = con.execute("SELECT unit_id FROM briefs WHERE brief_sha=?", (row["brief_sha"],)).fetchone()
-                    if b is None:
-                        return out("record", "REFUSED", 20, detail=f"brief_sha_unknown: {row['brief_sha']} is not a recorded brief")
-                    if b[0] != u:
-                        return out("record", "REFUSED", 20, detail=f"brief_sha_unit_mismatch: brief belongs to unit {b[0]}, spawn names {u}")
+                if not row["brief_sha"]:                                 # V4-99: the spawn names the brief it starts from
+                    return out("record", "REFUSED", 20, detail=f"brief_sha_missing: pass --brief-sha (the sha of unit {u}'s recorded brief)")
+                b = con.execute("SELECT unit_id FROM briefs WHERE brief_sha=?", (row["brief_sha"],)).fetchone()
+                if b is None:
+                    return out("record", "REFUSED", 20, detail=f"brief_sha_unknown: {row['brief_sha']} is not a recorded brief")
+                if b[0] != u:
+                    return out("record", "REFUSED", 20, detail=f"brief_sha_unit_mismatch: brief belongs to unit {b[0]}, spawn names {u}")
+            if kind == "brief":
+                b = con.execute("SELECT unit_id FROM briefs WHERE brief_sha=?", (row["brief_sha"],)).fetchone()
+                if b is not None:
+                    return out("record", "REFUSED", 20, detail=f"brief_already_recorded sha={row['brief_sha'][:12]} unit={b[0]}")
             given = [c for c in cols if row[c] is not None]          # absent keys take the schema's defaults
             cur = con.execute(f"INSERT INTO {table} ({','.join(given)}) VALUES ({','.join('?' * len(given))})", [row[c] for c in given])
             rid = cur.lastrowid
@@ -435,8 +560,9 @@ def status() -> int:
     if not DB.exists():
         return out("status", "UNMEASURED", 30, detail="no database; run fm-db init")
     con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
-    names = ("unit_id", "project", "kind", "planned_agents", "spawned", "open_andon", "briefs")   # open_units, 002_brief_link.sql
-    units = [dict(zip(names, r)) for r in con.execute("SELECT * FROM open_units")]
+    cur = con.execute("SELECT * FROM open_units")
+    names = [c[0] for c in cur.description]                              # the view's own columns, never a typed list
+    units = [dict(zip(names, r, strict=True)) for r in cur]
     unverified = con.execute("SELECT count(*) FROM claims c WHERE c.label='MEASURED' AND NOT EXISTS (SELECT 1 FROM verifications v WHERE v.claim_id=c.claim_id)").fetchone()[0]
     con.close()
     return out("status", "PASS", 0, open_units=units, measured_claims_unverified=unverified)
@@ -450,6 +576,10 @@ def main(argv: list[str]) -> int:
     if homes:
         return out(v, "SETUP", 3, detail=homes)
     if v == "init": return init()
+    if v in ("record", "clear-andon", "close-unit", "q", "status") and (DB.exists() or v != "status"):
+        behind = schema_behind()                                         # before any write or read-back
+        if behind:
+            return out(v, "SETUP", 3, detail=behind)
     if v == "record": return record(argv[2], argv[3:]) if len(argv) > 2 else out("record", "USAGE", 2)
     if v == "clear-andon": return clear_andon(argv[2:])
     if v == "close-unit": return close_unit(argv[2:])

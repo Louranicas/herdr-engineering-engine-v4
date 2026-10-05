@@ -581,6 +581,18 @@ pub enum RosterError {
         /// The kind the revise asked for.
         requested: &'static str,
     },
+    /// A create whose id and kind disagree: a `model:` id needs kind `model`, and kind `model`
+    /// needs a `model:` id. Refused at creation, because the kind is fixed from then on and a
+    /// `model:<name>` record of another kind would refuse the deploy compose at serve start.
+    #[error(
+        "record {id} cannot be created as a {kind} record: a `model:` id and kind model go together"
+    )]
+    KindPrefixMismatch {
+        /// The record.
+        id: RosterId,
+        /// The kind the create asked for.
+        kind: &'static str,
+    },
 }
 
 /// A `roster_records` row as SQLite hands it over.
@@ -687,7 +699,8 @@ fn expect_in(
 }
 
 /// Create (generation 1) or revise (generation + 1) `id` with `definition`, then append the
-/// revision row; a revise keeps the `disabled` mark and refuses a kind change.
+/// revision row; a create refuses an id/kind mismatch, a revise keeps the `disabled` mark and
+/// refuses a kind change.
 fn upsert_in(
     tx: &Transaction<'_>,
     id: &RosterId,
@@ -697,6 +710,12 @@ fn upsert_in(
     operation_id: &str,
 ) -> Result<(RosterChange, RosterRecord), RosterError> {
     let (generation, change) = match before {
+        None if id.model_name().is_some() != (definition.kind == RosterKind::Model) => {
+            return Err(RosterError::KindPrefixMismatch {
+                id: id.clone(),
+                kind: definition.kind.wire_name(),
+            });
+        }
         None => (1, RosterChange::Created),
         Some(r) if r.head.kind != definition.kind => {
             return Err(RosterError::KindImmutable {
@@ -903,6 +922,8 @@ impl Store {
     /// [`RosterError::StaleGeneration`] when `expected_generation` is not the record's;
     /// [`RosterError::NotFound`] when one was given for a record that does not exist;
     /// [`RosterError::KindImmutable`] when a revise names another kind;
+    /// [`RosterError::KindPrefixMismatch`] when a create pairs a `model:` id with another kind,
+    /// or kind `model` with another prefix;
     /// [`StoreError::Conflict`] (wrapped) for the same key with other bytes.
     pub fn roster_update(
         &self,
@@ -1437,7 +1458,14 @@ mod tests {
         };
         store.roster_update(&key("k1"), b"a", &up, &definition(1), "add", None)?;
         store.roster_update(&key("k2"), b"b", &off, &definition(1), "add", None)?;
-        store.roster_update(&key("k3"), b"c", &odd, &agent, "add", None)?;
+        // A `model:` id of another kind is refused at creation now; this row is one written
+        // before that refusal existed, so it goes in by SQL, as such a ledger would hold it.
+        store.conn.execute(
+            "INSERT INTO roster_records(id, kind, definition_json, capability, locality,
+               disabled, generation, updated_ts)
+             VALUES (?1, 'agent', ?2, NULL, 'local', 0, 1, 0)",
+            params![odd.as_str(), agent.to_json().to_string()],
+        )?;
         store.roster_update(&key("k4"), b"d", &id("agent:x")?, &agent, "add", None)?;
         store.roster_disable(
             &key("k5"),
@@ -1452,6 +1480,66 @@ mod tests {
             store.roster_excluded(MAX_TOKEN_BYTES)?,
             vec![odd.to_string(), off.to_string()]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_model_prefix_needs_kind_model() -> R {
+        let store = fresh("prefix-kind")?;
+        let rows = |store: &Store| -> Result<(i64, i64), rusqlite::Error> {
+            Ok((
+                store
+                    .conn
+                    .query_row("SELECT count(*) FROM roster_records", [], |r| r.get(0))?,
+                store
+                    .conn
+                    .query_row("SELECT count(*) FROM roster_revisions", [], |r| r.get(0))?,
+            ))
+        };
+        let agent = RosterDefinition {
+            kind: RosterKind::Agent,
+            ..definition(1)
+        };
+        let runtime = RosterDefinition {
+            kind: RosterKind::Runtime,
+            ..definition(1)
+        };
+        for (n, (rid, def, kind)) in [
+            ("model:x", &agent, "agent"),
+            ("model:y", &runtime, "runtime"),
+            ("agent:x", &definition(1), "model"),
+            ("runtime:x", &definition(1), "model"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let rid = id(rid)?;
+            let k = key(&format!("mismatch-{n}"));
+            let refused = store.roster_update(&k, b"a", &rid, def, "add", None);
+            assert!(
+                matches!(&refused, Err(RosterError::KindPrefixMismatch { id: i, kind: got })
+                    if *i == rid && *got == kind),
+                "{rid}: {refused:?}"
+            );
+            assert_eq!(
+                rows(&store)?,
+                (0, 0),
+                "{rid}: a refused create writes nothing"
+            );
+            assert!(store.operation_by_key(&k)?.is_none(), "{rid}");
+        }
+        let ok =
+            store.roster_update(&key("ok-agent"), b"a", &id("agent:x")?, &agent, "add", None)?;
+        assert_eq!(ok.result["change"], "created");
+        let ok = store.roster_update(
+            &key("ok-model"),
+            b"a",
+            &id("model:x")?,
+            &definition(1),
+            "add",
+            None,
+        )?;
+        assert_eq!(ok.result["change"], "created");
         Ok(())
     }
 

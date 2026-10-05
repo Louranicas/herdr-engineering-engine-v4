@@ -12,5 +12,6 @@ workspace = true
 [dependencies]
 hee4-contracts = { path = "../hee4-contracts" }
 hee4-host = { path = "../hee4-host" }
+rustix = { workspace = true, features = ["process"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

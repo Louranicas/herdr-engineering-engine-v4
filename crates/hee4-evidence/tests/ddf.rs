@@ -254,11 +254,12 @@ fn a_timed_out_task_run_is_an_observed_timeout() {
         panic!("expected Observed timeout, got {got:?}");
     };
     assert_eq!(o.outcome, Outcome::Error);
-    assert!(!o.advisory);
+    assert!(o.advisory);
     assert!(o.elapsed_ms > o.budget_ms);
     assert_eq!(
-        decide(&all_wired(), &[o], &subject()).verdict,
-        Verdict::Refused(Reason::Timeout)
+        decide(&all_wired(), &[o, stub_pass()], &subject()).verdict,
+        Verdict::Pass,
+        "a hung deep-diff-forge does not gate a task whose tier-0 rows pass"
     );
 }
 
@@ -429,7 +430,7 @@ fn an_empty_ranking_looked_at_nothing() {
 }
 
 #[test]
-fn a_tool_that_never_exits_is_killed_at_the_budget_and_refused_timeout() {
+fn a_tool_that_never_exits_is_killed_at_the_budget_and_is_an_advisory_timeout() {
     let budget = Duration::from_millis(300);
     let t0 = Instant::now();
     let got = ddf::observe_with(
@@ -448,24 +449,125 @@ fn a_tool_that_never_exits_is_killed_at_the_budget_and_refused_timeout() {
     assert_eq!(b, budget);
     let o = ddf::timeout_observation(b, FIXTURE, &subject()).unwrap();
     assert_eq!(o.outcome, Outcome::Error);
-    assert!(!o.advisory);
+    assert!(
+        o.advisory,
+        "deep-diff-forge is never a second verdict authority (V4-81)"
+    );
     assert!(o.elapsed_ms > o.budget_ms);
-    let pin = |n: &str| {
-        Identity::Wired(Source {
-            name: n.parse().unwrap(),
-            digest: Sha256Hex::digest(n.as_bytes()),
-        })
-    };
-    let ids = Identities {
-        collector: pin("c"),
-        locks: pin("l"),
-        standards: pin("s"),
-    };
+    assert_eq!(labels(&o), ["deadline"]);
     let _ = Why::NotWired;
+    // Alone: the floor, never a pass. Beside a tier-0 Pass: it moves nothing.
     assert_eq!(
-        decide(&ids, &[o], &subject()).verdict,
+        decide(&all_wired(), std::slice::from_ref(&o), &subject()).verdict,
+        Verdict::Refused(Reason::Invalid)
+    );
+    assert_eq!(
+        decide(&all_wired(), &[o, stub_pass()], &subject()).verdict,
+        Verdict::Pass
+    );
+}
+
+/// The lattice is unchanged: only the flag moved. The same timeout row made tier-0 is
+/// still `Refused(timeout)`, alone and beside a tier-0 Pass.
+#[test]
+fn a_non_advisory_timeout_row_still_decides_refused_timeout() {
+    let mut o = ddf::timeout_observation(Duration::from_millis(300), FIXTURE, &subject()).unwrap();
+    o.advisory = false;
+    assert_eq!(
+        decide(&all_wired(), std::slice::from_ref(&o), &subject()).verdict,
         Verdict::Refused(Reason::Timeout)
     );
+    assert_eq!(
+        decide(&all_wired(), &[o, stub_pass()], &subject()).verdict,
+        Verdict::Refused(Reason::Timeout)
+    );
+}
+
+/// Run the grandchild stub in `mode` (`wait` or `exit`); return what the adapter said, how long
+/// the call took, and the grandchild's pid.
+fn run_grandchild_stub(
+    mode: &str,
+    budget: Duration,
+) -> (
+    Result<hee4_contracts::Observation, AdapterError>,
+    Duration,
+    rustix::process::Pid,
+) {
+    let pidfile = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("ddf-grandchild-{mode}-{}.pid", std::process::id()));
+    let _ = std::fs::remove_file(&pidfile);
+    let mut diff = pidfile.as_os_str().as_encoded_bytes().to_vec();
+    diff.extend_from_slice(format!(" {mode}\n").as_bytes());
+    let t0 = Instant::now();
+    let got = ddf::observe_with(
+        &stub("ddf-grandchild.sh"),
+        &diff,
+        &subject(),
+        &TestClock::new(0),
+        budget,
+    );
+    let elapsed = t0.elapsed();
+    let text = std::fs::read_to_string(&pidfile).expect("the stub wrote the grandchild pid");
+    let _ = std::fs::remove_file(&pidfile);
+    let pid = rustix::process::Pid::from_raw(text.trim().parse().expect("a pid"))
+        .expect("a positive pid");
+    (got, elapsed, pid)
+}
+
+/// Whether `pid` is gone (`kill(pid, 0)` is `ESRCH`). A killed orphan is a zombie until its new
+/// parent reaps it, so give that a moment; a survivor is killed so a red run leaks nothing.
+fn assert_gone(pid: rustix::process::Pid) {
+    use rustix::io::Errno;
+    use rustix::process::{Signal, kill_process, test_kill_process};
+
+    let gone_by = Instant::now() + Duration::from_secs(5);
+    let mut alive = test_kill_process(pid);
+    while alive.is_ok() && Instant::now() < gone_by {
+        std::thread::sleep(Duration::from_millis(20));
+        alive = test_kill_process(pid);
+    }
+    if alive.is_ok() {
+        let _ = kill_process(pid, Signal::KILL); // never leak the sleeper, even when red
+    }
+    assert_eq!(alive, Err(Errno::SRCH), "grandchild {pid:?} survived");
+}
+
+/// The stub forks a sleeping grandchild (`sleep 30`) and writes its pid. At the deadline the
+/// adapter kills the whole process group, so the grandchild is gone too.
+#[test]
+fn a_grandchild_is_gone_after_the_timeout() {
+    let (got, _, pid) = run_grandchild_stub("wait", Duration::from_millis(500));
+    assert!(matches!(got, Err(AdapterError::Timeout { .. })), "{got:?}");
+    assert_gone(pid);
+}
+
+/// The tool exits 0 at once (with no output) but leaves a grandchild holding stdout and stderr.
+/// The adapter kills the group as soon as the tool has exited, so the drains end and the call
+/// returns long before the grandchild's `sleep 30` (or the budget) would; the grandchild is gone.
+#[test]
+fn a_grandchild_holding_the_pipes_after_a_normal_exit_neither_holds_the_call_nor_survives() {
+    let (got, elapsed, pid) = run_grandchild_stub("exit", Duration::from_secs(20));
+    println!("MEASURED exit-with-grandchild elapsed={elapsed:?}");
+    assert!(matches!(got, Err(AdapterError::Malformed(_))), "{got:?}");
+    assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+    assert_gone(pid);
+}
+
+/// A grandchild that left the group (`setsid`) survives the group kill and keeps the pipes open.
+/// The drains after a normal exit are bounded by what is left of the budget, so the call is a
+/// timeout at the deadline, never a wait for the grandchild. The escaped grandchild is not the
+/// adapter's to kill (FLOW.md, "The deadline"); the test kills it by its exact pid.
+#[test]
+fn an_escaped_grandchild_holding_the_pipes_cannot_hold_the_call_past_the_deadline() {
+    let budget = Duration::from_millis(700);
+    let (got, elapsed, pid) = run_grandchild_stub("escape", budget);
+    println!("MEASURED escaped-grandchild elapsed={elapsed:?}");
+    let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+    assert!(
+        matches!(got, Err(AdapterError::Timeout { budget: b }) if b == budget),
+        "{got:?}"
+    );
+    assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
 }
 
 #[test]

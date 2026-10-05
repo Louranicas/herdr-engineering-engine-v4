@@ -3,12 +3,16 @@
 
 use std::fmt;
 use std::io::{Read as _, Write as _};
+use std::os::unix::process::CommandExt as _;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::mpsc::{self, RecvTimeoutError, TryRecvError};
 use std::time::{Duration, Instant};
 
 use hee4_contracts::{Evidence, Observation, Outcome, RefusalText, Sha256Hex, ToolId};
 use hee4_host::clock::Clock;
+use rustix::io::Errno;
+use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group, waitid};
 use serde_json::Value;
 
 use crate::decide::Subject;
@@ -53,7 +57,8 @@ pub enum AdapterError {
         /// Digest the tool reported.
         sealed: Sha256Hex,
     },
-    /// The deadline passed; the child was killed and reaped. Map it with [`timeout_observation`].
+    /// The deadline passed; the child's whole process group was killed and the child reaped.
+    /// Map it with [`timeout_observation`].
     #[error("{BIN} ran past its {budget:?} budget and was killed")]
     Timeout {
         /// The budget the caller passed.
@@ -122,8 +127,8 @@ pub enum TaskObservation {
 ///   spawns;
 /// - a binary that is not on `PATH` → `Skipped(ToolAbsent)`; a present file that fails to exec
 ///   is `Err(Spawn)`;
-/// - a run past `budget` → `Observed` with [`timeout_observation`] (`Refused(timeout)` in
-///   `decide`);
+/// - a run past `budget` → `Observed` with [`timeout_observation`], advisory (a hung tool
+///   does not gate the task);
 /// - exit 7 → `Observed` with [`Outcome::Refused`], `advisory: true` (the tool declined to
 ///   rank; it does not gate the task); a pass → `Observed`, tier-0, bound to
 ///   `subject.input_sha256`.
@@ -196,9 +201,13 @@ pub fn observe(
     observe_with(Path::new(BIN), diff, subject, clock, budget)
 }
 
-/// The tier-0 observation for a run that hit its deadline: outcome `error`, `elapsed_ms` one
-/// past `budget_ms`, one evidence item (the digest of the diff that was sent). `decide` reads
-/// the elapsed-over-budget row first, so this yields `Refused(timeout)` and never a pass.
+/// The advisory observation for a run that hit its deadline: outcome `error`, `elapsed_ms` one
+/// past `budget_ms`, one evidence item (the digest of the diff that was sent).
+///
+/// Advisory, as exit 7 is: deep-diff-forge adds evidence and is never a second verdict
+/// authority (V4-81), so a hung tool must not gate the task. `decide` ignores an advisory row:
+/// beside a tier-0 Pass the task passes, alone it is the floor (`Refused(invalid)`), never a
+/// pass. The timeout is still sealed in `observed`.
 ///
 /// # Errors
 /// [`AdapterError::Malformed`] if a fixed token fails to parse (a bug, not an input).
@@ -222,7 +231,7 @@ pub fn timeout_observation(
             label: "deadline".parse().map_err(bad)?,
             sha256: Sha256Hex::digest(diff),
         }],
-        advisory: false,
+        advisory: true,
         elapsed_ms: budget_ms.saturating_add(1),
         budget_ms,
     })
@@ -287,46 +296,62 @@ pub fn observe_with(
     budget: Duration,
 ) -> Result<Observation, AdapterError> {
     let started = clock.now();
+    // Its own process group (pgid = the child's pid), so the deadline kills every process the
+    // tool forked, not only the direct child.
     let mut child = Command::new(bin)
         .args(ARGS)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .process_group(0)
         .spawn()?;
-    // Owned, detached threads: a grandchild that keeps a pipe open must not hold us past the
-    // deadline. Draining while we poll keeps a chatty child from blocking on a full pipe.
+    let deadline = Instant::now() + budget;
+    let pid = i32::try_from(child.id())
+        .ok()
+        .and_then(Pid::from_raw)
+        .ok_or_else(|| std::io::Error::other("child pid out of range"))?;
+    // Detached, never joined: a tool that exits before reading all of stdin breaks the pipe, and
+    // its exit code speaks. Draining while we poll keeps a chatty child from blocking on a full
+    // pipe; the drains report over a channel so waiting for them is bounded by the deadline.
     let stdin = child.stdin.take();
     let input = diff.to_vec();
-    let writer = std::thread::spawn(move || stdin.map_or(Ok(()), |mut w| w.write_all(&input)));
-    let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+    std::thread::spawn(move || stdin.map(|mut w| w.write_all(&input)));
+    let (tx, rx) = mpsc::channel::<(Stream, Vec<u8>)>();
+    let drain = |pipe: Option<Box<dyn std::io::Read + Send>>, stream: Stream| {
+        let tx = tx.clone();
         std::thread::spawn(move || {
             let mut buf = Vec::new();
             if let Some(mut p) = pipe {
                 let _ = p.read_to_end(&mut buf);
             }
-            buf
-        })
+            let _ = tx.send((stream, buf));
+        });
     };
-    let out_t = drain(child.stdout.take().map(|p| Box::new(p) as _));
-    let err_t = drain(child.stderr.take().map(|p| Box::new(p) as _));
-    let deadline = Instant::now() + budget;
+    drain(child.stdout.take().map(|p| Box::new(p) as _), Stream::Out);
+    drain(child.stderr.take().map(|p| Box::new(p) as _), Stream::Err);
+    drop(tx);
     let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
+        if exited_unreaped(pid)? {
+            // The child is a zombie, so its pid (= the pgid) cannot be reused yet: kill whatever
+            // it left in the group (a grandchild holding the pipes), then reap it.
+            kill_leftovers(pid)?;
+            break child.wait()?;
         }
         if Instant::now() >= deadline {
-            child.kill()?;
+            kill_group(pid, &mut child)?;
             child.wait()?;
             return Err(AdapterError::Timeout { budget });
         }
         std::thread::sleep(POLL);
     };
-    // A tool that exits before reading all of stdin breaks the pipe; its exit code speaks.
-    let _ = writer.join();
+    // A process outside the group (it called `setsid`) may still hold a pipe at the deadline.
+    let Some((stdout, stderr)) = drained_by(&rx, deadline) else {
+        return Err(AdapterError::Timeout { budget });
+    };
     let output = std::process::Output {
         status,
-        stdout: out_t.join().unwrap_or_default(),
-        stderr: err_t.join().unwrap_or_default(),
+        stdout,
+        stderr,
     };
     let elapsed_ms =
         u64::try_from(clock.now().saturating_sub(started).as_millis()).unwrap_or(u64::MAX);
@@ -375,6 +400,74 @@ pub fn observe_with(
         return Err(AdapterError::LookedAtNothing);
     }
     pass_observation(tool, &output.stdout, sealed, subject, elapsed_ms, budget)
+}
+
+/// Which pipe a drain thread read.
+#[derive(Debug, Clone, Copy)]
+enum Stream {
+    Out,
+    Err,
+}
+
+/// The two drains' bytes `(stdout, stderr)`, waiting no later than `deadline`; `None` when a pipe
+/// is still open then. A drain thread that died leaves its stream empty.
+fn drained_by(
+    rx: &mpsc::Receiver<(Stream, Vec<u8>)>,
+    deadline: Instant,
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+    for _ in 0..2 {
+        let got = match rx.try_recv() {
+            Err(TryRecvError::Empty) => {
+                rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            }
+            Ok(v) => Ok(v),
+            Err(TryRecvError::Disconnected) => Err(RecvTimeoutError::Disconnected),
+        };
+        match got {
+            Ok((Stream::Out, b)) => stdout = b,
+            Ok((Stream::Err, b)) => stderr = b,
+            Err(RecvTimeoutError::Timeout) => return None,
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    Some((stdout, stderr))
+}
+
+/// Whether the child has exited, without reaping it (`waitid(WEXITED | WNOHANG | WNOWAIT)`), so
+/// its pid stays reserved for the group kill that follows. An interrupted call is "not yet".
+fn exited_unreaped(pid: Pid) -> std::io::Result<bool> {
+    let opts = WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT;
+    match waitid(WaitId::Pid(pid), opts) {
+        Ok(status) => Ok(status.is_some()),
+        Err(Errno::INTR) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// After a normal exit: `SIGKILL` whatever the tool left in its process group. The unreaped
+/// child keeps the group alive, so `ESRCH` only means there is nothing to kill.
+///
+/// # Errors
+/// [`AdapterError::Spawn`] when the group could not be signalled for any other reason.
+fn kill_leftovers(pgid: Pid) -> Result<(), AdapterError> {
+    match kill_process_group(pgid, Signal::KILL) {
+        Ok(()) | Err(Errno::SRCH) => Ok(()),
+        Err(e) => Err(AdapterError::Spawn(e.into())),
+    }
+}
+
+/// At the deadline: `SIGKILL` the child's process group (spawned with `process_group(0)`, so its
+/// pgid is its pid). The child is not yet reaped, so the group still exists; should the kernel
+/// refuse the group anyway, the direct child is still killed.
+///
+/// # Errors
+/// [`AdapterError::Spawn`] when neither the group nor the child could be signalled.
+fn kill_group(pgid: Pid, child: &mut std::process::Child) -> Result<(), AdapterError> {
+    match kill_process_group(pgid, Signal::KILL) {
+        Ok(()) => Ok(()),
+        Err(_) => Ok(child.kill()?),
+    }
 }
 
 /// The tier-0 Pass observation for a sealed, non-empty ranking. It is bound to the subject's

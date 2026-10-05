@@ -37,8 +37,22 @@ HOME = Path.home()
 HERE = Path(__file__).resolve().parent
 SCHEMA_DIR = Path(os.environ.get("HEE4DB_SCHEMA_DIR", HERE / "schema"))
 
+
+def _repo_root() -> Path:
+    """HEE4DB_REPO (the controls' seam) if set; else the tree this file ships in (ops/db/hee4db -> parents[1]) when
+    that tree is a v4 tree, so a worktree or an export measures itself. hee4.env sets HEE4_ROOT (`:=`) to the main
+    checkout in every shell that sources it, so HEE4_ROOT is consulted only for a copy of this file that sits outside
+    a v4 tree; it never redirects a tree's own tool to another tree."""
+    if "HEE4DB_REPO" in os.environ:
+        return Path(os.environ["HEE4DB_REPO"])
+    own = HERE.parents[1]
+    if (own / "Cargo.toml").is_file() and (own / "ops" / "db" / "hee4db").is_file():
+        return own
+    return Path(os.environ.get("HEE4_ROOT", own))
+
+
 ROOTS = {  # HEE4DB_<ROOT> (the controls' seam) wins over the machine-wide HEE4_* (hee4.env at the repo root)
-    "repo": Path(os.environ.get("HEE4DB_REPO", os.environ.get("HEE4_ROOT", HOME / "herdr-engineering-engine-v4"))),
+    "repo": _repo_root(),
     "evidence": Path(os.environ.get("HEE4DB_EVIDENCE", os.environ.get("HEE4_EVIDENCE", HOME / "hee4-evidence"))),
     "vault": Path(os.environ.get("HEE4DB_VAULT", os.environ.get(
         "HEE4_VAULT", "/mnt/storage-10tb/fedora-obsidian-vaults/herdr-engineering-engine-v4.vault"))),
@@ -3628,7 +3642,7 @@ def readiness_md(rows: list[dict], s: dict, w: dict) -> str:
         "",
         f"`module-readiness deploy_ready={s['deploy_ready']}/{s['modules']} ready_to_build={c['READY TO BUILD']} "
         f"arch_review={c['ARCH REVIEW']} blocked_luke={c['BLOCKED (LUKE)']} deferred={c['DEFERRED']} "
-        f"rs_files_outside_migrated={s['rs_files']}{' (HOLD)' if s['rs_files'] == 0 else ''}`",
+        f"code_outside_migrated={'none (HOLD)' if s['rs_files'] == 0 else 'present'}`",
         "",
         "**Sources (the deciders), each ingested by `hee4db ingest`:**",
         "- `modules/MODULES.toml`: phases, v3 audit flag, migrated paths, held ids.",
@@ -3638,7 +3652,9 @@ def readiness_md(rows: list[dict], s: dict, w: dict) -> str:
         "- ATLAS §5: which held items block which phase (tables `held_items`, `held_item_phases`).",
         "",
         "**Rules (applied in this order; the first that holds wins):**",
-        f"- *Deploy* is NOT READY for every module while there is no code: {s['rs_files']} `.rs` files outside `migrated/`, and the HOLD stands.",
+        "- *Deploy* is NOT READY for every module while there is no code (no `.rs` file outside `migrated/`) and the HOLD stands; "
+        "once code exists it is UNMEASURED until a deploy gate exists. The file count changes with every new source file, so it "
+        "is not in this note: `hee4db readiness` prints it (`rs_files=`).",
         f"- *DEFERRED*: the module's scope at tag is {', '.join(DEFERRED_SCOPES)} (first token of the Anti-Bloat \"Scope at tag\" cell).",
         "- *BLOCKED (LUKE)*: a module-specific held item (the module's own H ids, minus the universal P0 holds) is open and blocks "
         "the module's first phase, or an OPEN (held-for-Luke) design conflict lands in one of its phases (the one such row, DC-27 / H-26, "

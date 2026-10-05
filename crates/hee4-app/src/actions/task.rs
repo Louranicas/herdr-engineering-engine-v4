@@ -547,10 +547,21 @@ mod tests {
         let e = engine("vacuous")?;
         reconcile(&e.store(), &Observations::worker_absent())?;
         let briefs_dir = e.work().join("briefs");
-        for (i, verify) in ["sh: true", "/usr/bin/true", "sh: echo ok", "model: hi", ""]
-            .iter()
-            .enumerate()
-        {
+        let vacuous = [
+            "sh: true",
+            "/usr/bin/true",
+            "sh: echo ok",
+            "model: hi",
+            "",
+            // Normalised by K0 before its no-op lookup (h5-k0-verify-budgets).
+            "/usr/bin/env true",
+            "sh: \"true\"",
+            "sh: exit 0;",
+            "sh: true;",
+            "/usr/bin/../bin/true",
+            "//usr/bin/true",
+        ];
+        for (i, verify) in vacuous.iter().enumerate() {
             let text = BRIEF.replace(
                 "VERIFY: /usr/bin/test -d /usr",
                 &format!("VERIFY: {verify}"),
@@ -598,39 +609,6 @@ mod tests {
         assert_eq!(admitted["kind"], "result", "{admitted}");
         assert_eq!(admitted["body"]["phase"], "admitted", "{admitted}");
         assert_eq!(e.store().task_ids()?.len(), 1);
-        Ok(())
-    }
-
-    /// K0's grammar admits these vacuous lines today (refuter, 2026-10-05; not in
-    /// hee4-contracts' named-not-caught table). Pinned here so the hole is named, not silent:
-    /// when K0 normalises before its no-op lookup, this test fails and moves them to the
-    /// refused list in `vacuous_verify_is_refused_at_submit_and_preview`.
-    #[test]
-    fn vacuous_verify_lines_k0_does_not_catch_yet_are_admitted_by_name()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let e = engine("not-caught")?;
-        reconcile(&e.store(), &Observations::worker_absent())?;
-        let holes = [
-            "/usr/bin/env true",
-            "sh: \"true\"",
-            "sh: exit 0;",
-            "sh: true;",
-            "/usr/bin/../bin/true",
-            "//usr/bin/true",
-        ];
-        for (i, verify) in holes.iter().enumerate() {
-            let text = BRIEF.replace(
-                "VERIFY: /usr/bin/test -d /usr",
-                &format!("VERIFY: {verify}"),
-            );
-            let admitted = handle(&e, &submit_line(&format!("h{i}"), &text));
-            assert_eq!(admitted["kind"], "result", "{verify:?}: {admitted}");
-            assert_eq!(
-                admitted["body"]["phase"], "admitted",
-                "{verify:?}: {admitted}"
-            );
-        }
-        assert_eq!(e.store().task_ids()?.len(), holes.len());
         Ok(())
     }
 
