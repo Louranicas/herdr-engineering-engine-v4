@@ -14,6 +14,7 @@
 
 mod backup;
 pub(crate) mod migrations;
+pub mod roster;
 
 use std::collections::BTreeSet;
 use std::os::unix::fs::PermissionsExt;
