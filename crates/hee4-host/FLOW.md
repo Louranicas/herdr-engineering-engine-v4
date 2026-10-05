@@ -43,7 +43,7 @@ Refusal table (JSON body `{"refused":"<why>"}`):
 - `429` door request budget exhausted: more than `max_requests` forwarded.
 - `503` model unreachable: the upstream did not accept or write failed.
 
-(`431` header too large also exists: header block over 64 KiB.) Budget literals (64 requests, 1 MiB per body, 8 MiB total, 2 s, 10 s, 120 s) are K1 `budget` stand-ins, UNMEASURED. Tested against std `TcpListener` mocks; no live daemon contacted.
+(`431` header too large also exists: header block over `max_header_bytes`.) `DoorBudget` is `hee4_contracts::DoorBudget` re-exported here (one owner, K0 `budgets.rs`); the defaults are its `DEFAULT` (64 requests, 1 MiB per body, 8 MiB total, 2 s, 10 s, 120 s, 64 KiB header, pool 8; UNMEASURED stand-ins); `max_header_bytes` and `pool` are fields read at their one use each, the deadlines through the `*_ms` accessors; `OllamaClient::tags_within(timeout)` takes the `/api/tags` deadline from the caller (`tags()` = `ModelBudget::DEFAULT.tags_timeout()`). Tested against std `TcpListener` mocks; no live daemon contacted.
 
 ## model
 Used by the dispatcher's availability probe and doctor only; the attempt path makes no in-process model call. `OllamaClient::new(base)`, `.tags()` (`GET /api/tags`), `.generate(model, prompt, timeout)` (`POST /api/generate`, `stream:false`). Errors: `ModelUnreachable | ModelTimeout | ModelMalformed` (non-200 counts as malformed). Tested only against a std `TcpListener` mock on 127.0.0.1; no live daemon was contacted.
