@@ -8,8 +8,9 @@ Documentation=file://%h/herdr-engineering-engine-v4/crates/hee4-app/FLOW.md
 Type=simple
 Environment=HEE4_LIVE_MODEL=1
 Environment=HEE4_MODEL=qwen2.5:0.5b
+Environment=HEE4_REQUIRE_BACKUPS=1
 # Environment=HEE4_BUDGETS=%h/.config/hee4/budgets.json
-ExecStart=%h/.local/bin/hee4 serve --socket %t/hee4/control.sock --ledger %h/.local/share/hee4/ledger.sqlite3 --work %h/.local/share/hee4/work
+ExecStart=%h/.local/bin/hee4 serve --socket %t/hee4/control.sock --ledger %h/.local/share/hee4/ledger.sqlite3 --work %h/.local/share/hee4/work --backups /mnt/storage-10tb/hee4-backups
 Restart=on-failure
 RestartSec=2
 TimeoutStopSec=20
@@ -22,7 +23,7 @@ RuntimeDirectoryMode=0700
 RuntimeDirectoryPreserve=yes
 NoNewPrivileges=yes
 ProtectSystem=strict
-ReadWritePaths=%h/.local/share/hee4 %t/hee4
+ReadWritePaths=%h/.local/share/hee4 %t/hee4 /mnt/storage-10tb/hee4-backups
 PrivateTmp=yes
 
 [Install]
