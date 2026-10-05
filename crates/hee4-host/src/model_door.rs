@@ -20,7 +20,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub use hee4_contracts::DoorBudget;
-use hee4_contracts::Sha256Hex;
+use hee4_contracts::{BudgetRefusal, Budgets, Sha256Hex};
 
 /// A loopback HTTP upstream, parsed from `http://<loopback-ip>:<port>`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,6 +99,10 @@ pub enum DoorError {
     /// Binding or spawning failed.
     #[error("door io: {0}")]
     Io(#[from] std::io::Error),
+    /// The budget fails the contracts' `door.*` checks (a zero `pool`, a field over its
+    /// ceiling, `max_body_bytes` over `max_total_bytes`): refused before anything is bound.
+    #[error("door budget refused: {0}")]
+    Budget(#[from] BudgetRefusal),
 }
 
 /// A running door. [`Door::close`] stops it and returns the log; dropping it also stops it.
@@ -155,12 +159,19 @@ impl Drop for Door {
 /// connection on its own thread, at most `budget.pool` at once.
 ///
 /// # Errors
-/// [`DoorError`] when the path holds a non-socket or the socket cannot be bound.
+/// [`DoorError::Budget`] when `budget` fails [`Budgets::validate`] as the `door` section (checked
+/// before the path is touched); [`DoorError::Occupied`] when the path holds a non-socket;
+/// [`DoorError::Io`] when the socket cannot be bound.
 pub fn serve(
     socket_path: &Path,
     upstream: Upstream,
     budget: DoorBudget,
 ) -> Result<Door, DoorError> {
+    Budgets {
+        door: budget,
+        ..Budgets::DEFAULT
+    }
+    .validate()?;
     match std::fs::symlink_metadata(socket_path) {
         Ok(m) if m.file_type().is_socket() => std::fs::remove_file(socket_path)?,
         Ok(_) => return Err(DoorError::Occupied(socket_path.to_path_buf())),
@@ -211,7 +222,7 @@ fn accept_loop(
     });
     let pool = as_usize(budget.pool);
     let mut live: Vec<thread::JoinHandle<()>> = Vec::new();
-    for conn in listener.incoming() {
+    'accept: for conn in listener.incoming() {
         if stop.load(Ordering::SeqCst) {
             break;
         }
@@ -220,6 +231,9 @@ fn accept_loop(
             live.retain(|h| !h.is_finished());
             if live.len() < pool {
                 break;
+            }
+            if stop.load(Ordering::SeqCst) {
+                break 'accept;
             }
             thread::sleep(Duration::from_millis(5));
         }
@@ -315,6 +329,10 @@ fn read_request(s: &mut UnixStream, budget: DoorBudget) -> Result<Request, Bad> 
             line_ok = true;
         }
         if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            // A block that arrived in one read is measured here, terminator included.
+            if i + 4 > max_header {
+                return Err(bad(431, "header too large", &buf));
+            }
             break i;
         }
         if buf.len() > max_header {
@@ -481,7 +499,6 @@ fn handle(
 mod tests {
     type R = Result<(), Box<dyn std::error::Error>>;
     use super::*;
-    use hee4_contracts::Budgets;
     use std::net::TcpListener;
     use std::sync::mpsc;
 
@@ -618,6 +635,58 @@ mod tests {
         assert!(log.iter().any(|r| r.reason == "header timeout"
             && r.fate == DoorFate::Refused(408)
             && r.bytes == 11));
+        Ok(())
+    }
+
+    #[test]
+    fn header_over_budget_in_one_write_answers_431() -> R {
+        let (up, rx) = mock("{}")?;
+        let pad =
+            "x".repeat(200 - "GET /api/tags HTTP/1.1\r\nHost: model\r\nX-Pad: \r\n\r\n".len());
+        let raw = format!("GET /api/tags HTTP/1.1\r\nHost: model\r\nX-Pad: {pad}\r\n\r\n");
+        assert_eq!(raw.len(), 200);
+        let path = sock("431-one");
+        let door = serve(&path, up, door_budget(r#"{"max_header_bytes":64}"#)?)?;
+        let resp = ask(&path, &raw)?;
+        assert!(resp.starts_with("HTTP/1.1 431 "), "{resp}");
+        assert!(resp.contains(r#"{"refused":"header too large"}"#), "{resp}");
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
+        let log = door.close();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].fate, DoorFate::Refused(431));
+        assert_eq!(log[0].reason, "header too large");
+        assert_eq!(log[0].bytes, 200);
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_budget_is_refused_before_bind() -> R {
+        let (up, _rx) = mock("{}")?;
+        let path = sock("pool0");
+        let pool0 = DoorBudget {
+            pool: 0,
+            ..DoorBudget::DEFAULT
+        };
+        let r = serve(&path, up, pool0);
+        assert!(
+            matches!(
+                r,
+                Err(DoorError::Budget(BudgetRefusal::Zero {
+                    field: "door.pool"
+                }))
+            ),
+            "{r:?}"
+        );
+        assert!(std::fs::symlink_metadata(&path).is_err(), "nothing bound");
+        let inverted = DoorBudget {
+            max_body_bytes: 200,
+            max_total_bytes: 100,
+            ..DoorBudget::DEFAULT
+        };
+        assert!(matches!(
+            serve(&path, up, inverted),
+            Err(DoorError::Budget(BudgetRefusal::Order { .. }))
+        ));
         Ok(())
     }
 

@@ -125,8 +125,9 @@ impl Attempt {
         Self::with_budget(model, head_sha, DoorBudget::DEFAULT)
     }
 
-    /// An attempt whose model door runs under `door` (a validated `hee4_contracts::DoorBudget`,
-    /// handed down by the loader).
+    /// An attempt whose model door runs under `door` (a `hee4_contracts::DoorBudget`, handed
+    /// down by the loader). Not checked here: `run` refuses a budget that fails the contracts'
+    /// `door.*` checks through `model_door::serve` (`DoorError::Budget`).
     #[must_use]
     pub fn with_budget(model: &str, head_sha: GitSha, door: DoorBudget) -> Self {
         Self {
