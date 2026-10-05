@@ -969,9 +969,11 @@ struct Sealing<'a> {
     budget: Duration,
 }
 
-/// After the attempt: settle (a task cancelled mid-attempt is stopped here, before any
-/// observation), ask deep-diff-forge over the workspace diff, ledger each observation,
-/// `decide_and_seal`, append, decide.
+/// After the attempt: settle, ask deep-diff-forge over the workspace diff, ledger each
+/// observation, `decide_and_seal`, append, decide. A cancel can land at any point after the
+/// attempt (the workspace diff and deep-diff-forge run for up to the timebox), so every event
+/// here goes through [`unless_cancelled`]: the task is stopped where the cancel is seen, and
+/// each observation row is written only after its `Observe` was applied.
 fn settle_and_decide(
     engine: &Engine,
     sealing: &Sealing<'_>,
@@ -989,18 +991,13 @@ fn settle_and_decide(
         apply(engine, task, Event::Settle(Settlement::NotReady))?;
         return Ok(Some((task.clone(), apply(engine, task, Event::Stop)?)));
     }
-    // A cancel that landed while the attempt ran leaves `Settle(Ready)` in
-    // `cancellation_requested`, where `Observe` has no edge: stop it before anything is recorded.
-    if apply(engine, task, Event::Settle(Settlement::Ready))? == Phase::CancellationRequested {
-        eprintln!("dispatch task={task} cancelled mid-attempt; nothing observed or sealed");
-        return Ok(Some((task.clone(), apply(engine, task, Event::Stop)?)));
+    if let Err(stopped) = unless_cancelled(engine, task, Event::Settle(Settlement::Ready))? {
+        return Ok(Some((task.clone(), stopped)));
     }
     let mut observations = outcome.observations.clone();
     observations.extend(ddf_observation(sealing));
-    for obs in &observations {
-        let id = observation_id(task, obs)?;
-        engine.store().record_observation(task, &id, obs)?;
-        apply(engine, task, Event::Observe)?;
+    if let Err(stopped) = observe(engine, task, &observations)? {
+        return Ok(Some((task.clone(), stopped)));
     }
     let receipt = seal(engine, sealing, &observations)?;
     let verdict = receipt.decision().verdict;
@@ -1008,12 +1005,58 @@ fn settle_and_decide(
         "dispatch task={task} verdict={verdict:?} receipt={}",
         receipt.hash_self()
     );
-    let mut phase = apply(engine, task, Event::Decide(verdict))?;
+    let mut phase = match unless_cancelled(engine, task, Event::Decide(verdict))? {
+        Ok(p) => p,
+        Err(stopped) => return Ok(Some((task.clone(), stopped))),
+    };
     if verdict == Verdict::Pass {
-        phase = apply(engine, task, Event::Accept)?;
+        phase = match unless_cancelled(engine, task, Event::Accept)? {
+            Ok(p) => p,
+            Err(stopped) => return Ok(Some((task.clone(), stopped))),
+        };
     }
     checkpoint(engine)?;
     Ok(Some((task.clone(), phase)))
+}
+
+/// Each observation: apply `Observe`, then write its row, so no row is written once a cancel
+/// is seen. `Err(phase)`: the task was stopped. A cancel between an `Observe` and its row
+/// leaves the rows of the observations already applied, never more.
+fn observe(
+    engine: &Engine,
+    task: &TaskId,
+    observations: &[Observation],
+) -> Result<Result<(), Phase>, DispatchError> {
+    for obs in observations {
+        let id = observation_id(task, obs)?;
+        if let Err(stopped) = unless_cancelled(engine, task, Event::Observe)? {
+            return Ok(Err(stopped));
+        }
+        engine.store().record_observation(task, &id, obs)?;
+    }
+    Ok(Ok(()))
+}
+
+/// Apply one settle-path event, or stop a task whose cancel has landed. A cancel shows in
+/// two ways: the event leaves the task in `cancellation_requested` (`Settle`, `Decide`), or
+/// `transition` refuses it from there (`Observe`, `Accept` have no edge). Either way `Stop`
+/// is applied and its phase returned as `Err`; any other refusal is the caller's error.
+fn unless_cancelled(
+    engine: &Engine,
+    task: &TaskId,
+    event: Event,
+) -> Result<Result<Phase, Phase>, StoreError> {
+    match apply(engine, task, event) {
+        Ok(Phase::CancellationRequested)
+        | Err(StoreError::Refused(hee4_contracts::Refusal::Illegal {
+            from: Phase::CancellationRequested,
+            ..
+        })) => {
+            eprintln!("dispatch task={task} cancelled before {event:?} completed; stopping");
+            apply(engine, task, Event::Stop).map(Err)
+        }
+        other => other.map(Ok),
+    }
 }
 
 /// After a receipt: K1's `checkpoint_if_due` under `ledger.checkpoint_every`, one
@@ -1877,6 +1920,106 @@ mod tests {
         );
         assert_eq!(observation_rows(&engine, &task)?, 0);
         assert_eq!(engine.store().receipt_count(&task)?, 0);
+        Ok(())
+    }
+
+    /// A task in `verifying`, then cancelled: the window after `Settle(Ready)` returned, while
+    /// the workspace diff, deep-diff-forge and the seal run.
+    fn cancelled_while_verifying(name: &str) -> R<(Engine, TaskId)> {
+        let engine = crate::actions::testing::engine(name)?;
+        let task: TaskId = format!("t-{name}").parse()?;
+        {
+            let store = engine.store();
+            assert!(hee4_core::reconcile(&store, &hee4_core::Observations::default())?.complete);
+            store.apply(&task, Event::Admit)?;
+            store.apply(&task, Event::Dispatch)?;
+            assert_eq!(
+                store.apply(&task, Event::Settle(Settlement::Ready))?,
+                Phase::Verifying
+            );
+            assert_eq!(
+                store.apply(&task, Event::Cancel)?,
+                Phase::CancellationRequested
+            );
+        }
+        Ok((engine, task))
+    }
+
+    fn an_observation() -> R<Observation> {
+        Ok(Observation {
+            source: "deep-diff-forge".parse()?,
+            input_sha256: Sha256Hex::digest(b"diff"),
+            tool: hee4_contracts::ToolId {
+                name: "ddf".parse()?,
+                version: "1".parse()?,
+            },
+            head_sha: "a".repeat(40).parse()?,
+            outcome: hee4_contracts::Outcome::Pass,
+            evidence: Vec::new(),
+            advisory: true,
+            elapsed_ms: 1,
+            budget_ms: 10,
+        })
+    }
+
+    /// A cancel that lands at `verifying` (after `Settle(Ready)`): the next `Observe` has no
+    /// edge, so the task is stopped there, `cancelled`, and no observation row is written.
+    #[test]
+    fn a_cancel_at_verifying_stops_before_any_observation_row() -> R<()> {
+        let (engine, task) = cancelled_while_verifying("cancel-verifying-observe")?;
+        assert_eq!(
+            observe(&engine, &task, &[an_observation()?])?,
+            Err(Phase::Cancelled)
+        );
+        assert_eq!(observation_rows(&engine, &task)?, 0);
+        assert_eq!(engine.store().phase(&task)?, Some(Phase::Cancelled));
+        Ok(())
+    }
+
+    /// A cancel that lands after the seal: `Decide` leaves the task in
+    /// `cancellation_requested`, and it is stopped there instead of erroring on `Accept`.
+    #[test]
+    fn a_cancel_at_verifying_stops_at_decide_or_accept() -> R<()> {
+        let (engine, task) = cancelled_while_verifying("cancel-verifying-decide")?;
+        assert_eq!(
+            unless_cancelled(&engine, &task, Event::Decide(Verdict::Pass))?,
+            Err(Phase::Cancelled)
+        );
+        let (engine, task) = cancelled_while_verifying("cancel-verifying-accept")?;
+        assert_eq!(
+            unless_cancelled(&engine, &task, Event::Accept)?,
+            Err(Phase::Cancelled)
+        );
+        assert_eq!(
+            events(&engine, &task)?,
+            [
+                Event::Admit,
+                Event::Dispatch,
+                Event::Settle(Settlement::Ready),
+                Event::Cancel,
+                Event::Stop
+            ]
+        );
+        Ok(())
+    }
+
+    /// NEGATIVE: an event refused from any other phase is still the caller's error.
+    #[test]
+    fn unless_cancelled_passes_other_refusals_through() -> R<()> {
+        let engine = crate::actions::testing::engine("cancel-other-refusal")?;
+        let task: TaskId = "t-cancel-other-refusal".parse()?;
+        {
+            let store = engine.store();
+            assert!(hee4_core::reconcile(&store, &hee4_core::Observations::default())?.complete);
+            store.apply(&task, Event::Admit)?;
+        }
+        assert!(matches!(
+            unless_cancelled(&engine, &task, Event::Accept),
+            Err(StoreError::Refused(hee4_contracts::Refusal::Illegal {
+                from: Phase::Admitted,
+                event: Event::Accept
+            }))
+        ));
         Ok(())
     }
 

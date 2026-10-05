@@ -155,9 +155,9 @@ DC proposal below.
 | attempt | `Attempt::with_budget(model, head, budgets.door).run(.., on_start)` (bwrap for Run steps; `sh:` steps run without a door when not live, `UNMEASURED` printed) | error or a `Failed` step: `Settle(NotReady)` → `Stop` → failed, no receipt |
 | attempt_pid | `on_start(pid, start_ticks)` from `spawn::start` before the wait, per Run step: `Store::attempt_pid(id, pid, start_ticks)`, prints `dispatch task= attempt= pid= start_ticks=`; the worker calls no store | a store error is printed `attempt_pid error=` (the child is already running) |
 | repair | D6: `Settle(NotReady)` or `Decide(Fail)` → `repair_pending` → redispatch under `attempt.max_generations`, else `Stop`. `attempt.max_generations` is absent from K0's `AttemptBudget`, so today's parking stands (`Settle(NotReady)` → `Stop` → failed) and `next_task` ignores `repair_pending`; the two repair e2e tests print `UNMEASURED: attempt.max_generations absent` and fail once the field lands | — |
-| settle | `Settle(Ready)` → verifying. When a cancel landed while the attempt ran, `Settle(Ready)` leaves the task `cancellation_requested`, where `Observe` has no edge: the dispatcher applies `Stop` → `cancelled` and returns before any observation, ddf call or seal (`dispatcher::tests::a_cancel_mid_attempt_ends_cancelled_without_observing`) | — |
+| settle | `Settle(Ready)` → verifying. A cancel can land at any point until the verdict, so every event from here on goes through `unless_cancelled`: an event that leaves the task `cancellation_requested` (`Settle`, `Decide`) or that `transition` refuses from there (`Observe`, `Accept` have no edge) is followed by `Stop` → `cancelled`, and `step` returns that phase, never an error. A cancel during the attempt stops the task at `Settle(Ready)`, before any observation, ddf call or seal (`dispatcher::tests::a_cancel_mid_attempt_ends_cancelled_without_observing`); one at `verifying` stops it at the next `Observe` with no row written (`a_cancel_at_verifying_stops_before_any_observation_row`) or at `Decide`/`Accept` (`a_cancel_at_verifying_stops_at_decide_or_accept`). A cancel after the seal leaves a sealed receipt on a `cancelled` task until the seal, `Decide` and `Accept` are one store transaction (Gaps) | — |
 | ddf | before the attempt, `Snapshot::of(ns.work_dir(), DDF_DIFF_BYTES)`; after it, `workspace_diff(ws, &before, DDF_DIFF_BYTES)`, with or without a `<ws>/.git` (the engine never creates one and the sandbox cannot run git; `dispatcher::tests::workspace_diff_without_git_dir_is_a_patch`): a `.git` that is a file or symlink (`symlink_metadata`, never followed) → `git_dir_not_dir`; else the workspace walked in-process (no symlink followed, FIFOs/devices skipped, every `.git` entry left out) and diffed against the snapshot as a unified patch. **No git runs on the host over a candidate-written workspace**: a planted `core.fsmonitor`, `filter.*.clean`, `diff.*.textconv` or `gitdir:` pointer is never read (e2e `a_candidate_git_config_runs_nothing_on_the_host`). Then K4 `ddf::for_task(diff, &subject, &SystemClock, timebox)` (the attempt's TIMEBOX). `Observed(o)` of any outcome (Pass, exit-7 advisory `Refused`, timeout `Error`) joins the observations; prints `dispatch task= ddf=observed tool=<name> <version>` | a log line and nothing else: `dispatch task= ddf=skipped reason=no_diff\|tool_absent\|adapter_error:<variant>\|diff_error:<io\|too_large\|git_dir_not_dir>`; never a refusal, never an abandon, never `Settle(NotReady)`; the dispatcher never reads the outcome, the lattice does |
-| observe | per observation (the attempt's, then the ddf one): `observation_id`, `Store::record_observation`, `apply(Observe)` | — |
+| observe | per observation (the attempt's, then the ddf one): `observation_id`, `apply(Observe)` through `unless_cancelled`, then `Store::record_observation`, so no row is written after a cancel is seen; a cancel between an `Observe` and its row leaves only the rows already applied | — |
 | decide + seal | `decide_and_seal(chain_head, receipt_id, ids, obs, subject)`; ids: collector = digest(ledger epoch), locks = digest(permit), standards = digest(`gate.toml` baked at build); the one subject (built once in `step`, `subject_of`) has input = digest(VERIFY text), the same subject ddf bound its observation to | — |
 | receipt | `Store::append_receipt` (K1 re-runs `verify_chain`) | — |
 | verdict | `apply(Decide(verdict))`; `Pass` → `apply(Accept)`. Three writes after the seal: a crash between them strands a sealed `verifying` task (Gaps) | — |
@@ -210,14 +210,18 @@ three threads. Resume with `since_seq` = the last `seq` received: exactly-once b
   plan/DECISIONS.md:199-204) until K0 adds `backup.freshness_ms` / `backup.batch_tasks` to
   `Budgets` (hee4-contracts-architect follow-up); they are the only copy.
 - ddf has no per-attempt budget field: it runs under the attempt's TIMEBOX (`dispatcher::timebox`).
-  Its timeout observation is tier-0, so a hung deep-diff-forge gates the task (K4 DC, evidence FLOW).
+  Its timeout observation is tier-0 on this base, so a deep-diff-forge that overruns the TIMEBOX
+  fails an otherwise passing task (`Refused(Timeout)` → failed, refuter MEASURED). Every attempt
+  is now diffed, so this branch must not merge before h5-gate-timers-ddf makes that timeout
+  advisory; after the rebase a dispatcher test with an overrunning fake ddf asserts `accepted`.
 - The sandbox mounts no `/dev`, so `git` cannot run inside a VERIFY (exit 128, `/dev/null`;
   MEASURED); the e2e's candidate makes its `.git` with `mkdir`. The diff no longer needs one
   (every attempt is diffed), so ddf observes live attempts without it; the `--dev /dev` mount
   widens the sandbox and stays hee4-isolation's call (not made here).
 - Seal, `Decide` and `Accept` are three writes (verdict row above): a crash after the seal leaves
-  a sealed `verifying` task nothing finishes. h5-core-ledger's one-transaction verb closes it;
-  this dispatcher moves onto it once that slice merges (not on this base).
+  a sealed `verifying` task nothing finishes, and a cancel after the seal leaves a sealed
+  receipt on a `cancelled` task. h5-core-ledger's one-transaction verb closes both; this
+  dispatcher moves onto it once that slice merges (not on this base).
 - `DDF_DIFF_BYTES` (16 MiB, each walk) is a const in `dispatcher.rs`, an UNMEASURED stand-in
   until K0 adds an `attempt.diff_bytes` `Budgets` field. The patch is whole-file hunks, not a
   minimal diff.
