@@ -63,6 +63,7 @@ migration; never edit the v1/v2 text.
 | `m003_operations_subject` | `operations` recreated with `operation_id` (`op-` + 24 hex of sha256 of the four key fields joined by `\n`), nullable `task_id`, `subject` (= `task_id` for the copied rows) |
 | `m004_serve_cgroup` | `tasks.serve_cgroup TEXT NOT NULL DEFAULT ''` |
 | `m005_service_facts` | `service_facts(service_id PK, owner_id, unit_id, owner_sha256 CHECK len 64, generation CHECK >= 1, cached_health_json NULL, updated_ts)`; SQL only in `store/service.rs` |
+| `m006_service_claims` | `service_claims(service_id PK FK service_facts, generation CHECK >= 1, operation_id, claimed_ts)`: one act claim per service, taken by `service_claim` (one `BEGIN IMMEDIATE`, row must be at the generation, a live claim refuses `ClaimHeld`), deleted by `service_release` (holder only); stale = older than `CLAIM_STALE_MS` (60 s, proposed `Budgets.service.claim_stale_ms`) or generation left, reported by `service_stale_claims` and superseded by the next claim; SQL only in `store/service.rs` |
 
 ```
 tasks(id PK, phase CHECK(11 spellings), cancel 0|1, generation >= 0, updated_ts,

@@ -211,8 +211,18 @@ fn not_actable() -> Fault {
     .with_because("service not actable")
 }
 
+fn claim_held() -> Fault {
+    Fault::new(
+        Code::Conflict,
+        "/body/service_id",
+        "another act holds this service's claim",
+    )
+    .with_because("service claim held")
+}
+
 fn service_fault(e: ServiceError) -> Fault {
     match e {
+        ServiceError::ClaimHeld(_) => claim_held(),
         ServiceError::NotActable(_) => not_actable(),
         ServiceError::Store(e) => store_fault(e),
         ServiceError::UnknownService(_) => not_found(),

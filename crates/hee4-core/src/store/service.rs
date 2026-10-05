@@ -1,5 +1,5 @@
-//! The service family's store half (K1): the `service_facts` migration, its reader, the seed,
-//! and the two `Store::operate` commits. Every byte of SQL for `service_facts` lives here (the
+//! The service family's store half (K1): the `service_facts` and `service_claims` migrations,
+//! their readers, the seed, the durable act claim, and the two `Store::operate` commits. Every byte of SQL for `service_facts` lives here (the
 //! one-door rule, `FLOW.md`); the runner (K5) never sees this file, and the actions (K6) commit
 //! through these verbs and never hold a `Transaction`.
 
@@ -36,6 +36,135 @@ pub(super) const MIGRATION: Migration = Migration {
 fn m005_service_facts(tx: &Transaction<'_>) -> Result<(), StoreError> {
     tx.execute_batch(SCHEMA_M005)?;
     Ok(())
+}
+
+/// `m006_service_claims`: at most one act claim per service, by primary key (a second row for
+/// one service is unrepresentable). [`Store::service_claim`] inserts it before `runner.act`;
+/// [`Store::service_release`] deletes it after the commit. The row is the cross-process guard:
+/// two serves on one ledger (or a serve restarted mid-act) cannot both hold it.
+const SCHEMA_M006: &str = "
+CREATE TABLE service_claims(
+  service_id TEXT PRIMARY KEY NOT NULL REFERENCES service_facts(service_id),
+  generation INTEGER NOT NULL CHECK (generation >= 1),
+  operation_id TEXT NOT NULL,
+  claimed_ts INTEGER NOT NULL
+) STRICT;
+";
+
+/// The act-claim migration: the one line it registers in `MIGRATIONS`.
+pub(super) const CLAIM_MIGRATION: Migration = Migration {
+    name: "m006_service_claims",
+    apply: m006_service_claims,
+};
+
+fn m006_service_claims(tx: &Transaction<'_>) -> Result<(), StoreError> {
+    tx.execute_batch(SCHEMA_M006)?;
+    Ok(())
+}
+
+/// How old (ms) a claim may grow before [`Store::service_claim`] supersedes it and
+/// [`Store::service_stale_claims`] reports it. It bounds how long a serve that died mid-act
+/// blocks its service. It must exceed one act: the busctl call and its settle share the
+/// runner's 5 s probe timeout, and the commit waits at most the 5 s busy timeout.
+/// `Budgets` has no service section; the proposed field is `service.claim_stale_ms`.
+pub const CLAIM_STALE_MS: i64 = 60_000;
+
+/// One `service_claims` row: who holds the act on a service, at which generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceClaim {
+    /// The claimed service.
+    pub service_id: String,
+    /// The generation the holder acts on.
+    pub generation: u64,
+    /// The holder's derived operation id (`op-...`).
+    pub operation_id: String,
+    /// When the claim was taken (ms since the Unix epoch).
+    pub claimed_ts: i64,
+}
+
+/// A claim no live act holds any more: older than [`CLAIM_STALE_MS`], or at a generation the
+/// service has already left.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleClaim {
+    /// The claim as stored.
+    pub claim: ServiceClaim,
+    /// Its age when it was found (ms).
+    pub age_ms: i64,
+    /// Why it is stale.
+    pub reason: StaleReason,
+}
+
+/// Why a claim is stale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaleReason {
+    /// Older than [`CLAIM_STALE_MS`]: its holder died or hung mid-act.
+    Expired,
+    /// The service's generation is no longer the claim's: its act already committed.
+    GenerationMoved,
+}
+
+impl StaleReason {
+    /// The reason's stable spelling for a log line.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Expired => "expired",
+            Self::GenerationMoved => "generation_moved",
+        }
+    }
+}
+
+/// A claim row read back, before its generation is checked.
+type RawClaim = (String, i64, String, i64);
+
+fn parse_claim(raw: RawClaim) -> Result<ServiceClaim, StoreError> {
+    let (service_id, generation, operation_id, claimed_ts) = raw;
+    let generation = u64::try_from(generation).map_err(|_| StoreError::Corrupt {
+        task: service_id.clone(),
+        detail: "service_claims.generation < 0".into(),
+    })?;
+    Ok(ServiceClaim {
+        service_id,
+        generation,
+        operation_id,
+        claimed_ts,
+    })
+}
+
+fn claim_row(conn: &Connection, service_id: &str) -> Result<Option<ServiceClaim>, StoreError> {
+    conn.query_row(
+        "SELECT service_id, generation, operation_id, claimed_ts
+         FROM service_claims WHERE service_id = ?1",
+        [service_id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    )
+    .optional()?
+    .map(parse_claim)
+    .transpose()
+}
+
+/// Whether `claim` is stale at `now` against the service's `current` generation.
+fn staleness(claim: ServiceClaim, current: u64, now: i64) -> Result<StaleClaim, ServiceClaim> {
+    let age_ms = now.saturating_sub(claim.claimed_ts);
+    let reason = if claim.generation != current {
+        StaleReason::GenerationMoved
+    } else if age_ms >= CLAIM_STALE_MS {
+        StaleReason::Expired
+    } else {
+        return Err(claim);
+    };
+    Ok(StaleClaim {
+        claim,
+        age_ms,
+        reason,
+    })
+}
+
+fn generation_i64(service_id: &str, generation: u64) -> Result<i64, StoreError> {
+    i64::try_from(generation).map_err(|_| StoreError::Corrupt {
+        task: service_id.to_owned(),
+        detail: "expected generation overflows i64".into(),
+    })
 }
 
 /// One `service_facts` row, parsed.
@@ -80,6 +209,9 @@ pub enum ServiceError {
     /// The row is seeded not actable (the engine itself, the model).
     #[error("service {0} is not actable")]
     NotActable(String),
+    /// Another act holds the service's live claim (this or another serve on the ledger).
+    #[error("service {} is claimed by {} at generation {}", .0.service_id, .0.operation_id, .0.generation)]
+    ClaimHeld(ServiceClaim),
 }
 
 /// A row read back, before its digest and JSON are parsed.
@@ -278,6 +410,105 @@ impl Store {
         })?)
     }
 
+    /// Take the act claim on `service_id` at `generation` for `op` (single writer: one
+    /// `BEGIN IMMEDIATE`). The row must be at `generation`; a live claim refuses; a stale one
+    /// (older than [`CLAIM_STALE_MS`], or at a generation the row has left) is superseded and
+    /// returned so the caller reports it by name.
+    ///
+    /// # Errors
+    /// [`ServiceError::ClaimHeld`] with the live claim (also for the same `op`: a concurrent
+    /// same-key request never acts twice); [`ServiceError::StaleGeneration`];
+    /// [`ServiceError::UnknownService`]; SQLite errors.
+    pub fn service_claim(
+        &self,
+        service_id: &str,
+        generation: u64,
+        op: &OperationKey,
+    ) -> Result<Option<StaleClaim>, ServiceError> {
+        let at = generation_i64(service_id, generation)?;
+        let tx = self.begin().map_err(StoreError::from)?;
+        let fact = fact_row(&tx, service_id)?
+            .ok_or_else(|| ServiceError::UnknownService(service_id.to_owned()))?;
+        if fact.generation != generation {
+            return Err(ServiceError::StaleGeneration {
+                current: fact.generation,
+            });
+        }
+        let now = now_ms();
+        let superseded = match claim_row(&tx, service_id)? {
+            None => None,
+            Some(held) => {
+                Some(staleness(held, fact.generation, now).map_err(ServiceError::ClaimHeld)?)
+            }
+        };
+        tx.execute(
+            "INSERT OR REPLACE INTO service_claims(service_id, generation, operation_id, claimed_ts)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![service_id, at, operation_id(op), now],
+        )
+        .map_err(StoreError::from)?;
+        tx.commit().map_err(StoreError::from)?;
+        Ok(superseded)
+    }
+
+    /// Release `op`'s claim on `service_id`: deletes the row only while `op` holds it (a claim
+    /// superseded by another act is left alone). Idempotent; returns whether a row went.
+    ///
+    /// # Errors
+    /// SQLite errors.
+    pub fn service_release(&self, service_id: &str, op: &OperationKey) -> Result<bool, StoreError> {
+        let tx = self.begin()?;
+        let gone = tx.execute(
+            "DELETE FROM service_claims WHERE service_id = ?1 AND operation_id = ?2",
+            params![service_id, operation_id(op)],
+        )?;
+        tx.commit()?;
+        Ok(gone == 1)
+    }
+
+    /// The live claim on `service_id`, if any (stale or not).
+    ///
+    /// # Errors
+    /// SQLite errors; [`StoreError::Corrupt`] for a negative generation.
+    pub fn service_claim_get(&self, service_id: &str) -> Result<Option<ServiceClaim>, StoreError> {
+        claim_row(&self.conn, service_id)
+    }
+
+    /// Every stale claim in the ledger, by service id: the recovery readback a serve prints at
+    /// start. A stale claim does not block: the next [`Store::service_claim`] supersedes it.
+    ///
+    /// # Errors
+    /// SQLite errors; [`StoreError::Corrupt`] for an unreadable row.
+    pub fn service_stale_claims(&self) -> Result<Vec<StaleClaim>, StoreError> {
+        let rows = {
+            let mut stmt = self.conn.prepare(
+                "SELECT c.service_id, c.generation, c.operation_id, c.claimed_ts, f.generation
+                 FROM service_claims c JOIN service_facts f USING (service_id)
+                 ORDER BY c.service_id",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    (r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?),
+                    r.get::<_, i64>(4)?,
+                ))
+            })?;
+            rows.collect::<Result<Vec<(RawClaim, i64)>, _>>()?
+        };
+        let now = now_ms();
+        let mut stale = Vec::new();
+        for (raw, current) in rows {
+            let claim = parse_claim(raw)?;
+            let current = u64::try_from(current).map_err(|_| StoreError::Corrupt {
+                task: claim.service_id.clone(),
+                detail: "service_facts.generation < 0".into(),
+            })?;
+            if let Ok(found) = staleness(claim, current, now) {
+                stale.push(found);
+            }
+        }
+        Ok(stale)
+    }
+
     /// Commit an action: the row must still be at `expected.generation` with
     /// `expected.owner_sha256` (compare-and-set), then `generation + 1`, `cached_health_json =
     /// health`, `updated_ts`, plus the operations row, in one transaction. A replay returns the
@@ -315,10 +546,7 @@ impl Store {
             }
         }
         let health = serde_json::to_string(health).map_err(StoreError::Json)?;
-        let generation = i64::try_from(expected.generation).map_err(|_| StoreError::Corrupt {
-            task: service_id.to_owned(),
-            detail: "expected generation overflows i64".into(),
-        })?;
+        let generation = generation_i64(service_id, expected.generation)?;
         Ok(self.operate(op, request, |tx| {
             let changed = tx.execute(
                 "UPDATE service_facts
@@ -538,6 +766,121 @@ mod tests {
         assert!(replay.replayed);
         assert_eq!(replay.result, done.result);
         assert_eq!(store.service_get("drive")?.map(|f| f.generation), Some(2));
+        Ok(())
+    }
+
+    fn drive_at(generation: u64) -> Expected {
+        Expected {
+            generation,
+            owner_sha256: Sha256Hex::digest(b"deploy"),
+        }
+    }
+
+    #[test]
+    fn service_claim_on_a_second_handle_is_refused_while_the_first_holds_it() -> R {
+        let first = open("claim-two")?;
+        let second = Store::open(first.path())?;
+        first.service_seed(SEEDS)?;
+        let (k1, k2) = (key("service.action", "c1"), key("service.action", "c2"));
+        assert_eq!(first.service_claim("drive", 1, &k1)?, None);
+        for k in [&k2, &k1] {
+            match second.service_claim("drive", 1, k) {
+                Err(ServiceError::ClaimHeld(held)) => {
+                    assert_eq!(held.operation_id, operation_id(&k1));
+                    assert_eq!((held.service_id.as_str(), held.generation), ("drive", 1));
+                }
+                other => return Err(format!("expected ClaimHeld, got {other:?}").into()),
+            }
+        }
+        assert!(matches!(
+            second.service_claim("drive", 2, &k2),
+            Err(ServiceError::StaleGeneration { current: 1 })
+        ));
+        assert!(matches!(
+            second.service_claim("nope", 1, &k2),
+            Err(ServiceError::UnknownService(_))
+        ));
+        assert!(
+            !second.service_release("drive", &k2)?,
+            "a non-holder releases nothing"
+        );
+        assert!(second.service_release("drive", &k1)?);
+        assert!(
+            !first.service_release("drive", &k1)?,
+            "release is idempotent"
+        );
+        assert_eq!(second.service_claim("drive", 1, &k2)?, None);
+        assert_eq!(
+            first.service_claim_get("drive")?.map(|c| c.operation_id),
+            Some(operation_id(&k2))
+        );
+        assert_eq!(first.service_stale_claims()?, Vec::new());
+        Ok(())
+    }
+
+    #[test]
+    fn a_stale_claim_is_reported_by_name_then_superseded() -> R {
+        let dead = open("claim-stale")?;
+        dead.service_seed(SEEDS)?;
+        let (k1, k2) = (key("service.action", "s1"), key("service.action", "s2"));
+        dead.service_claim("drive", 1, &k1)?;
+        let restarted = Store::open(dead.path())?;
+        assert_eq!(restarted.service_stale_claims()?, Vec::new());
+        assert!(matches!(
+            restarted.service_claim("drive", 1, &k2),
+            Err(ServiceError::ClaimHeld(_))
+        ));
+        dead.conn.execute(
+            "UPDATE service_claims SET claimed_ts = claimed_ts - ?1",
+            [CLAIM_STALE_MS],
+        )?;
+        let found = restarted.service_stale_claims()?;
+        let [only] = found.as_slice() else {
+            return Err(format!("expected one stale claim, got {found:?}").into());
+        };
+        assert_eq!(only.claim.service_id, "drive");
+        assert_eq!(only.claim.operation_id, operation_id(&k1));
+        assert_eq!(only.reason, StaleReason::Expired);
+        assert!(only.age_ms >= CLAIM_STALE_MS);
+        let superseded = restarted
+            .service_claim("drive", 1, &k2)?
+            .ok_or("the stale claim was not reported")?;
+        assert_eq!(superseded.claim, only.claim);
+        assert_eq!(restarted.service_stale_claims()?, Vec::new());
+        assert!(
+            !dead.service_release("drive", &k1)?,
+            "the superseded holder releases nothing"
+        );
+        assert_eq!(
+            restarted
+                .service_claim_get("drive")?
+                .map(|c| c.operation_id),
+            Some(operation_id(&k2))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_claim_left_behind_a_committed_act_is_stale_by_generation() -> R {
+        let store = open("claim-moved")?;
+        store.service_seed(SEEDS)?;
+        let k1 = key("service.action", "m1");
+        store.service_claim("drive", 1, &k1)?;
+        let obs = observation("inactive")?;
+        store.service_action_commit(&k1, b"{}", "drive", drive_at(1), &obs, |_| json!(null))?;
+        let found = store.service_stale_claims()?;
+        assert_eq!(
+            found
+                .iter()
+                .map(|s| (s.claim.service_id.as_str(), s.reason))
+                .collect::<Vec<_>>(),
+            vec![("drive", StaleReason::GenerationMoved)]
+        );
+        let k2 = key("service.action", "m2");
+        let superseded = store
+            .service_claim("drive", 2, &k2)?
+            .ok_or("not reported")?;
+        assert_eq!(superseded.reason, StaleReason::GenerationMoved);
         Ok(())
     }
 }

@@ -131,6 +131,7 @@ pub const MIGRATIONS: &[Migration] = &[
     super::receipts::m005_checkpoints(),
     super::roster::MIGRATION,
     super::service::MIGRATION,
+    super::service::CLAIM_MIGRATION,
 ];
 
 /// The migrations a legacy file (no `migration:` rows) has already applied, by its
