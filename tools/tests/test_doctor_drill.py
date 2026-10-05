@@ -216,5 +216,41 @@ class DrillTests(unittest.TestCase):
         self.assertEqual(r.stdout.count("drill_step="), 5); self.assertNotIn("drill_step=kill9 status=MEASURED", r.stdout)
         self.assertIsNone(w.proc.poll(), "the fake main was killed")
 
+    def test_fire_plain_run_keeps_the_submitting_record(self):
+        w = World(); self.addCleanup(w.close)
+        root = tempfile.mkdtemp(prefix="dr-")
+        for extra in (["--submit", "3"], []):  # the cut tier's plain drill after the captain's --submit 3, same tree
+            restarter(self, w)
+            rc, out, _ = run(DRILL, "--socket", w.sockpath, "--restart-budget", "10", "--repo", TOOLS, *extra, "--drill-root", root, env=w.env)
+            self.assertEqual(rc, 0, out)
+        self.assertIn(f"drill rehearsal=KEPT(prior submitted=3 at tree={head_of(TOOLS)}; this run submitted=0 does not replace it)", out)
+        rec = json.load(open(os.path.join(root, head_of(TOOLS), "rehearsal.json")))
+        self.assertEqual(rec["submitted"], 3); self.assertEqual(rec["acked_present"], "3/3")
+        self.assertEqual(sorted(rec["task_ids"]), sorted(w.submitted))
+
+    def test_fire_failed_write_leaves_the_old_record_whole(self):
+        import argparse, importlib.machinery, importlib.util, io, contextlib
+        from unittest import mock
+        loader = importlib.machinery.SourceFileLoader("drill_under_test", DRILL)
+        mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader)); loader.exec_module(mod)
+        root = tempfile.mkdtemp(prefix="dr-")
+        tree = os.path.join(root, "abcdef012345"); os.makedirs(tree)
+        p = os.path.join(tree, "rehearsal.json")
+        old = json.dumps({"tree": "abcdef012345", "submitted": 3, "acked_present": "3/3", "task_ids": ["t-old"], "steps": []})
+        open(p, "w").write(old)
+        a = argparse.Namespace(drill_root=root, unit="hee4.service", submit=2, restart_budget=1)
+        r = mod.Run(a, "abcdef012345"); r.ids = ["t-new1", "t-new2"]
+        buf = io.StringIO()
+        with mock.patch("os.fsync", side_effect=OSError(28, "No space left on device")), contextlib.redirect_stdout(buf):
+            r.save("0/2")  # the write dies after the bytes went out: a reader must still see the old record, whole
+        self.assertIn("drill rehearsal=UNWRITTEN(", buf.getvalue())
+        self.assertEqual(open(p).read(), old)
+        self.assertEqual(os.listdir(tree), ["rehearsal.json"], "a temp file was left behind")
+        with contextlib.redirect_stdout(io.StringIO()):
+            r.save("2/2")
+        rec = json.load(open(p))
+        self.assertEqual((rec["submitted"], rec["acked_present"], rec["task_ids"]), (2, "2/2", ["t-old", "t-new1", "t-new2"]))
+        self.assertEqual(os.listdir(tree), ["rehearsal.json"])
+
 if __name__ == "__main__":
     unittest.main()
