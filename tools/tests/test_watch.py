@@ -314,6 +314,15 @@ class TestCutRecipes(unittest.TestCase):
         self.assertEqual(self.w.record()["verdict"], "FAIL")
         self.refused(3, "cut_check_failed", "tag", "v4.0.0", "confirm")
 
+    def test_a_refused_rerun_voids_the_earlier_pass(self):
+        self.green()
+        rec = os.path.join(self.w.cut, self.w.head12(), "cut-check.json")
+        self.w.deploy("0123456789ab")
+        self.refused(2, "binary_head_mismatch", "cut-check")
+        self.assertFalse(os.path.exists(rec), "a refused run left the earlier PASS record")
+        self.w.deploy()
+        self.refused(3, "no_cut_check_at_sha", "tag", "v4.0.0", "confirm")
+
     def test_a_record_older_than_the_newest_run_is_stale(self):
         self.green()
         os.makedirs(os.path.join(self.w.cut, f"99991231T235959Z-{self.w.head12()}"))
