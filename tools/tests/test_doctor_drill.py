@@ -1,4 +1,4 @@
-import http.server, json, os, socket, stat, tempfile, threading, unittest
+import http.server, json, os, socket, stat, tempfile, threading, unittest, uuid
 from common import TOOLS, run
 
 DOCTOR, DRILL = os.path.join(TOOLS, "doctor"), os.path.join(TOOLS, "drill")
@@ -9,21 +9,26 @@ def stub(dirpath, name, body):
         f.write("#!/usr/bin/env bash\n" + body)
     os.chmod(p, 0o755)
 
-class H(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        b = json.dumps({"models": [{"name": "m", "size_vram": 1}]}).encode()
-        self.send_response(200); self.end_headers(); self.wfile.write(b)
-    def log_message(self, *a): pass
+def ps_handler(models):
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            b = json.dumps({"models": models}).encode()
+            self.send_response(200); self.end_headers(); self.wfile.write(b)
+        def log_message(self, *a): pass
+    return H
 
 class World:
-    """Fake unit, socket, hee4 and model, all under a temp dir."""
-    def __init__(self, drill=False):
+    """Fake unit, socket (answering health/task.submit/task.list), hee4 and model, all under a temp dir.
+    `missing` drops that many of the submitted ids from task.list (the plant)."""
+    def __init__(self, models=None, missing=0):
         self.d = tempfile.mkdtemp(prefix="dw-")
         self.bin = os.path.join(self.d, "bin"); os.mkdir(self.bin)
         rt = os.path.join(self.d, "rt"); os.mkdir(rt, 0o700)
         self.sockpath = os.path.join(rt, "control.sock")
-        self.s = socket.socket(socket.AF_UNIX); self.s.bind(self.sockpath); os.chmod(self.sockpath, 0o600)
-        self.srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+        self.s = socket.socket(socket.AF_UNIX); self.s.bind(self.sockpath); os.chmod(self.sockpath, 0o600); self.s.listen(8)
+        self.missing, self.submitted = missing, []
+        threading.Thread(target=self.serve, daemon=True).start()
+        self.srv = http.server.HTTPServer(("127.0.0.1", 0), ps_handler([{"name": "m", "size_vram": 1}] if models is None else models))
         threading.Thread(target=self.srv.serve_forever, daemon=True).start()
         self.url = f"http://127.0.0.1:{self.srv.server_port}"
         self.pidfile = os.path.join(self.d, "pid")
@@ -32,6 +37,27 @@ class World:
         stub(self.bin, "systemctl", f'echo LoadState=loaded; echo ActiveState=active; echo MainPID=$(cat {self.pidfile})\n')
         stub(self.bin, "hee4", 'case "$1" in --version) echo "hee4 HEADSHA";; *) echo "ready=true recovery=complete database=ready socket=owned";; esac\n')
         self.env = {"PATH": self.bin + ":" + os.environ["PATH"]}
+    def serve(self):
+        while True:
+            try:
+                c, _ = self.s.accept()
+            except OSError:
+                return
+            try:
+                req = json.loads(c.makefile("rb").readline() or b"{}")
+                act = req.get("action")
+                if act == "task.submit":
+                    t = "t-" + uuid.uuid4().hex[:24]; self.submitted.append(t)
+                    body = {"task_id": t, "phase": "admitted"}
+                elif act == "task.list":
+                    shown = self.submitted[:len(self.submitted) - self.missing] if self.missing else self.submitted
+                    body = {"tasks": [{"task_id": t, "phase": "admitted"} for t in shown]}
+                else:
+                    body = {"ok": True, "head_sha": "0" * 40, "recovery_complete": True, "uptime_s": 1}
+                c.sendall((json.dumps({"kind": "result", "request_id": req.get("request_id"), "replayed": False, "body": body}) + "\n").encode())
+            except (OSError, ValueError):
+                pass
+            c.close()
     def start_main(self):
         import subprocess
         self.proc = subprocess.Popen(["sleep", "300"])
@@ -43,6 +69,11 @@ class World:
 
 def head_of(repo):
     return run("git", "-C", repo, "rev-parse", "HEAD")[1].strip()[:12]
+
+def healthy_doctor(w, *extra):
+    head = head_of(TOOLS)
+    stub(w.bin, "hee4", f'case "$1" in --version) echo "hee4 {head}";; *) echo "ready=true recovery=complete database=ready socket=owned";; esac\n')
+    return run(DOCTOR, "--socket", w.sockpath, "--model-url", w.url, "--repo", TOOLS, *extra, env=w.env)
 
 class DoctorTests(unittest.TestCase):
     def test_help(self):
@@ -59,21 +90,51 @@ class DoctorTests(unittest.TestCase):
 
     def test_fire_model_down_is_fail(self):
         rc, out, _ = run(DOCTOR, "--unit", "nope.service", "--model-url", "http://127.0.0.1:9", "--repo", TOOLS)
-        self.assertEqual(rc, 1); self.assertIn("check=model status=FAIL", out)
+        self.assertEqual(rc, 1); self.assertIn("check=model_endpoint status=FAIL", out)
 
     def test_quiet_healthy_world_passes(self):
         w = World(); self.addCleanup(w.close)
-        head = head_of(TOOLS)
-        stub(w.bin, "hee4", f'case "$1" in --version) echo "hee4 {head}";; *) echo "ready=true recovery=complete database=ready socket=owned";; esac\n')
-        rc, out, _ = run(DOCTOR, "--socket", w.sockpath, "--model-url", w.url, "--repo", TOOLS, env=w.env)
+        rc, out, _ = healthy_doctor(w, "--model", "m")
         self.assertEqual(rc, 0, out)
-        self.assertRegex(out.strip().splitlines()[-1], r"^doctor verdict=PASS measured=(\d+)/\1 unmeasured=0 fail=0 ")
+        self.assertIn("check=model_endpoint status=MEASURED", out); self.assertIn("check=model_gpu status=MEASURED", out)
+        self.assertRegex(out.strip().splitlines()[-1], r"^doctor verdict=PASS measured=(\d+)/\1 unmeasured=0 fail=0 advisory=0 ")
+
+    def test_quiet_idle_endpoint_gpu_is_advisory(self):
+        w = World(models=[]); self.addCleanup(w.close)
+        rc, out, _ = healthy_doctor(w, "--model", "m")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("check=model_endpoint status=MEASURED", out)
+        gpu = [l for l in out.splitlines() if l.startswith("check=model_gpu ")][0]
+        self.assertIn("status=UNMEASURED", gpu); self.assertIn("not resident", gpu); self.assertIn("scope=advisory", gpu)
+        self.assertRegex(out.strip().splitlines()[-1], r"^doctor verdict=PASS .* advisory=1 ")
+        self.assertEqual([l for l in out.splitlines() if "status=MEASURED" in l and "UNMEASURED" in l], [])
+
+    def test_fire_idle_endpoint_with_require_gpu_is_unmeasured(self):
+        w = World(models=[]); self.addCleanup(w.close)
+        rc, out, _ = healthy_doctor(w, "--model", "m", "--require-gpu")
+        self.assertEqual(rc, 3, out)
+        self.assertIn("check=model_gpu status=UNMEASURED", out); self.assertIn("scope=required", out)
+        self.assertRegex(out.strip().splitlines()[-1], r"^doctor verdict=UNMEASURED .* advisory=0 ")
+
+    def test_fire_cpu_copy_is_fail(self):
+        w = World(models=[{"name": "m", "size_vram": 0}]); self.addCleanup(w.close)
+        rc, out, _ = healthy_doctor(w, "--model", "m")
+        self.assertEqual(rc, 1, out); self.assertIn("check=model_gpu status=FAIL", out)
 
     def test_fire_bad_socket_perms(self):
         w = World(); self.addCleanup(w.close)
         os.chmod(w.sockpath, 0o666)
         rc, out, _ = run(DOCTOR, "--socket", w.sockpath, "--model-url", w.url, "--repo", TOOLS, env=w.env)
         self.assertEqual(rc, 1); self.assertIn("check=socket status=FAIL", out)
+
+def restarter(tc, w):
+    """When the old main dies, a new one appears (the unit's Restart=)."""
+    old = int(open(w.pidfile).read())
+    stub(w.bin, "restarter", f'while kill -0 {old} 2>/dev/null; do sleep 0.1; done; sleep 0.5; sleep 300 & echo $! > {w.pidfile}; wait\n')
+    import subprocess
+    r = subprocess.Popen([os.path.join(w.bin, "restarter")], env={**os.environ, **w.env}, start_new_session=True)
+    tc.addCleanup(lambda: (os.killpg(r.pid, 9), None))
+    return old
 
 class DrillTests(unittest.TestCase):
     def test_fire_absent_unit_every_step_unmeasured(self):
@@ -85,12 +146,7 @@ class DrillTests(unittest.TestCase):
 
     def test_quiet_kill9_and_restart(self):
         w = World(); self.addCleanup(w.close)
-        old = int(open(w.pidfile).read())
-        # a restarter: when the old main dies, a new one appears
-        stub(w.bin, "restarter", f'while kill -0 {old} 2>/dev/null; do sleep 0.1; done; sleep 0.5; sleep 300 & echo $! > {w.pidfile}; wait\n')
-        import subprocess
-        r = subprocess.Popen([os.path.join(w.bin, "restarter")], env={**os.environ, **w.env}, start_new_session=True)
-        self.addCleanup(lambda: (os.killpg(r.pid, 9), None))
+        old = restarter(self, w)
         rc, out, _ = run(DRILL, "--socket", w.sockpath, "--restart-budget", "10", "--repo", TOOLS, env=w.env)
         self.assertEqual(rc, 0, out)
         self.assertRegex(out.strip().splitlines()[-1], r"^drill verdict=PASS steps=(\d+)/\1 ")
