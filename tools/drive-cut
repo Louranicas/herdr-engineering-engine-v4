@@ -4,7 +4,9 @@
 The cut tier's drive: the feature map driven twice and merged path by path.
 
   live        tools/drive --doctor-first --allow-restart --ledger <live ledger> against the deployed
-              unit: every path that is safe on the live unit, the restart path included.
+              unit: every path that is safe on the live unit, the restart path included. Its frames go
+              to tools/drive's own evidence root (--live-evidence-root, default ~/.cache/hee4-drive),
+              which check-deployed D9 reads to exclude drive tasks from 'use'.
   disposable  tools/drive --ledger <its own ledger> against a throwaway `hee4 serve` started from
               the INSTALLED binary (--binary, default ~/.local/bin/hee4, the one the unit runs) with
               its own socket, ledger and work dir under the evidence root, and
@@ -126,7 +128,11 @@ def main():
     ap.add_argument("--ledger", default=os.path.expanduser("~/.local/share/hee4/ledger.sqlite3"), help="the LIVE ledger, read back read-only")
     ap.add_argument("--socket", default=f"{xdg}/hee4/control.sock", help="the LIVE unit's socket")
     ap.add_argument("--repo", default=REPO)
-    ap.add_argument("--evidence-root", default=os.path.expanduser("~/.cache/hee4-drive-cut"))
+    ap.add_argument("--evidence-root", default=os.path.expanduser("~/.cache/hee4-drive-cut"),
+                    help="where the disposable serve and the merged record live")
+    ap.add_argument("--live-evidence-root", default=os.path.expanduser("~/.cache/hee4-drive"),
+                    help="the live run's frames: tools/drive's own root, which check-deployed D9 reads to "
+                         "exclude drive tasks from 'use' (a live drive task must never count as use)")
     ap.add_argument("--keep", action="store_true", help="keep the disposable serve's directory")
     ap.add_argument("--live-args", default="--doctor-first --allow-restart", help="extra args for the live run")
     a = ap.parse_args()
@@ -134,7 +140,7 @@ def main():
     os.makedirs(a.evidence_root, exist_ok=True)
     env = dict(os.environ)
     live_args = [*a.live_args.split(), "--socket", a.socket, "--ledger", a.ledger, "--repo", a.repo,
-                 "--evidence-root", os.path.join(a.evidence_root, "live")]
+                 "--evidence-root", a.live_evidence_root]
     rc_live, live_out = run_drive(live_args, env, 600)
 
     root = tempfile.mkdtemp(prefix="disposable-", dir=a.evidence_root)

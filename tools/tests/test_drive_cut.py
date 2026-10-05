@@ -72,8 +72,16 @@ class IntegrationTests(unittest.TestCase):
         t0 = time.monotonic()
         while not os.path.exists(sock) and time.monotonic() - t0 < 20:
             time.sleep(0.1)
+        live_ev = os.path.join(d, "drive-ev")
         rc, out, err = run(CUT, "--binary", BIN, "--socket", sock, "--ledger", ledger, "--live-args", "",
-                           "--evidence-root", os.path.join(d, "ev"), timeout=900, env=env)
+                           "--evidence-root", os.path.join(d, "ev"), "--live-evidence-root", live_ev,
+                           timeout=900, env=env)
+        # The live run's frames land where check-deployed D9 looks for drive task ids, so a task
+        # the live drive submitted is excluded from 'use' (a check-deployed reader finds them).
+        cd = load_tool("check_deployed", os.path.join(TOOLS, "check-deployed"))
+        ids, files = cd.drive_task_ids(live_ev)
+        self.assertGreater(files, 0, "no live drive evidence where D9 reads it")
+        self.assertGreater(len(ids), 0, "D9 would see no drive task ids from the live run")
         self.assertIn(rc, (0, 3), out + err)  # 3 only for paths unmeasured in BOTH runs, named below
         self.assertRegex(out, r"drive settle-disposable serve=stopped")
         self.assertRegex(out.strip().splitlines()[-1], r"^drive verdict=(PASS|UNMEASURED) features=\d+/\d+ unserved=0 head=\S+ \(merged live\+disposable\)$")
