@@ -109,7 +109,22 @@ pub enum StoreError {
         /// The attempt.
         id: AttemptId,
     },
-    /// `attempt_started` named a workspace another unsettled attempt holds (S2).
+    /// `attempt_started` on a row whose start facts are already recorded, with other facts
+    /// (acknowledgement is write-once; an identical repeat is accepted as a no-op).
+    #[error("attempt {id} is already acknowledged with other start facts")]
+    AttemptAcknowledged {
+        /// The attempt.
+        id: AttemptId,
+    },
+    /// `attempt_started` named a workspace that is not an absolute, normal UTF-8 path (a `.`,
+    /// `..` or empty component, or a trailing `/`).
+    #[error("workspace {workspace:?} is not an absolute normal path")]
+    WorkspaceNotNormal {
+        /// The workspace as given.
+        workspace: PathBuf,
+    },
+    /// `attempt_started` named a workspace that equals, contains or lies inside the workspace
+    /// of another unsettled attempt (S2).
     #[error("workspace {workspace:?} is leased by attempt {other}")]
     WorkspaceLeased {
         /// The workspace.
@@ -419,7 +434,7 @@ fn apply_in(
 
 /// Apply every migration the file lacks, inside `tx`; seed a legacy file's rows from its
 /// `user_version`; refuse a row this binary does not know. Returns the count of applied rows.
-fn migrate(tx: &Transaction<'_>) -> Result<usize, StoreError> {
+fn migrate(tx: &Transaction<'_>, list: &[migrations::Migration]) -> Result<usize, StoreError> {
     let user_version: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     let mut applied: BTreeSet<String> = BTreeSet::new();
     if table_exists(tx, "meta")? {
@@ -434,12 +449,12 @@ fn migrate(tx: &Transaction<'_>) -> Result<usize, StoreError> {
             .ok_or_else(|| StoreError::UnknownMigration(format!("user_version={user_version}")))?;
         applied.extend(seeded.iter().map(|s| (*s).to_owned()));
     }
-    let known: BTreeSet<&str> = migrations::MIGRATIONS.iter().map(|m| m.name).collect();
+    let known: BTreeSet<&str> = list.iter().map(|m| m.name).collect();
     if let Some(unknown) = applied.iter().find(|name| !known.contains(name.as_str())) {
         return Err(StoreError::UnknownMigration(unknown.clone()));
     }
     let stamp = format!("{:x}", now_ms());
-    for m in migrations::MIGRATIONS {
+    for m in list {
         if !applied.contains(m.name) {
             (m.apply)(tx)?;
             applied.insert(m.name.to_owned());
@@ -503,6 +518,12 @@ impl Store {
     /// # Errors
     /// SQLite or IO errors, or [`StoreError::UnknownMigration`] for a newer file.
     pub fn open(path: &Path) -> Result<Self, StoreError> {
+        Self::open_with(path, migrations::MIGRATIONS)
+    }
+
+    /// `open` with a prefix of [`migrations::MIGRATIONS`]: a test builds a file as an older
+    /// binary left it (e.g. foundation-era, before `m005_attempts`).
+    fn open_with(path: &Path, list: &[migrations::Migration]) -> Result<Self, StoreError> {
         let serve_cgroup = read_serve_cgroup()?;
         let mut conn = Connection::open(path)?;
         let mode: String = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
@@ -516,7 +537,7 @@ impl Store {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Exclusive)?;
-        migrate(&tx)?;
+        migrate(&tx, list)?;
         if meta_get(&tx, "epoch")?.is_none() {
             meta_set(&tx, "epoch", &format!("{:x}", now_ms()))?;
         }

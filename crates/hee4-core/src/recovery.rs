@@ -15,13 +15,15 @@
 //! | the latest `attempts` row contradicts the events: closed with no / a wrong `closed_seq`, an outcome that disagrees with the closing event, or running while a close follows its `dispatch_seq` | any | R03 | — (`Finding::Contradictory`; a contradiction cannot be transitioned away) | unchanged; `complete=false`, the engine does not listen, the operator restores |
 //! | running, attempt open, row with pid | `LiveSameIdentity` (probe: the process start ticks equal the row's) | R06 | — (observe-only, no reaper) | unchanged |
 //! | running, attempt open | `Absent` | R08 + reason: row unacknowledged → `DispatchUnacknowledged`; acknowledged → `AcknowledgedWorkerLost`; no row (pre-migration history) → `AcknowledgementUnrecorded` | `Recover(R08)` | effect_unknown |
+//! | running, attempt open | `PidReused` / `Unreadable` / `Unobserved` (a row with no pid probes `Unobserved`) | R07 + the same acknowledgement class | `Recover(R07)` | effect_unknown |
+//! | terminal phase | latest row still `running` | R03 (a `Stop` or `Resolve(Abandon)` closes the row `stopped` / `abandoned`; a running row under a terminal phase contradicts) | — | unchanged; `complete=false` |
 //! | R07/R08 over an open row, or R11 over a closed row with cleanup pending | `Writable{bytes}` workspace | R09 attached beside the rule: no lease → `NotLeasedWritable`; lease, no clock → `ClockUnavailable`; other clock epoch → `LeaseClockNotComparable`; same epoch, past deadline → `LeaseExpiredWritable`; same epoch, live → nothing | none for the attachment | unchanged; cleanup stays pending |
 //! | ledger `epoch`, `event_high_water`, `restored_from` · a cursor | — | R13 ([`cursor`], not a task rule) | — | `PriorEpochOfRestore` / `EpochChanged` / `FutureSequence` carry `R13CursorEpoch`; `SnapshotOnly` carries none; never a replay authorisation |
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use hee4_contracts::{Event, Phase, RecoveryRule, Settlement, TaskId};
+use hee4_contracts::{Event, Phase, RecoveryRule, Resolution, Settlement, TaskId};
 
 use crate::store::{
     AttemptId, AttemptOutcome, AttemptRow, AttemptState, Cleanup, CursorVerdict, Lease, Store,
@@ -119,9 +121,11 @@ pub struct Facts {
     pub phase: Phase,
     /// Count of `Dispatch` events.
     pub generation: u64,
-    /// A `Dispatch` with no later `Settle` or `Recover(R07|R08)`: an attempt was in flight.
+    /// A `Dispatch` with no later close (`Settle`, `Recover(R07|R08)`, `Stop`,
+    /// `Resolve(Abandon)`): an attempt was in flight.
     pub attempt_open: bool,
-    /// Every closing event (`Settle(_)`, `Recover(R07|R08)`) with its `events.seq`, for R03.
+    /// Every closing event (`Settle(_)`, `Recover(R07|R08)`, `Stop`, `Resolve(Abandon)`) with
+    /// its `events.seq`, for R03.
     pub closes: Vec<(i64, Event)>,
 }
 
@@ -139,6 +143,8 @@ impl Facts {
                     attempt_open = true;
                 }
                 Event::Settle(_)
+                | Event::Stop
+                | Event::Resolve(Resolution::Abandon(_))
                 | Event::Recover(RecoveryRule::R07ProcessNotOurs | RecoveryRule::R08WorkerAbsent) =>
                 {
                     attempt_open = false;
@@ -203,7 +209,8 @@ impl AttemptFacts {
     }
 }
 
-/// R08's reason: the acknowledgement class of the lost attempt.
+/// The acknowledgement class of the lost attempt, carried by R08 and by R07 (named for R08,
+/// the brief's spelling).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum R08Reason {
     /// A row with no `attempt_started`: the worker never acknowledged.
@@ -234,7 +241,7 @@ pub struct Decision {
     pub rule: Option<RecoveryRule>,
     /// The event for `Store::apply`; `None` leaves the task unchanged.
     pub event: Option<Event>,
-    /// R08's acknowledgement class.
+    /// R07/R08's acknowledgement class.
     pub reason: Option<R08Reason>,
     /// R09's attachment.
     pub workspace: Option<WorkspaceReuseRefused>,
@@ -278,17 +285,22 @@ const fn outcome_of(event: Event) -> Option<AttemptOutcome> {
         Event::Settle(Settlement::Unsettled) => Some(AttemptOutcome::Unsettled),
         Event::Recover(RecoveryRule::R07ProcessNotOurs) => Some(AttemptOutcome::R07),
         Event::Recover(RecoveryRule::R08WorkerAbsent) => Some(AttemptOutcome::R08),
+        Event::Stop => Some(AttemptOutcome::Stopped),
+        Event::Resolve(Resolution::Abandon(_)) => Some(AttemptOutcome::Abandoned),
         _ => None,
     }
 }
 
 /// R03: does the row contradict the events? (a) closed with no `closed_seq`, or one that is
 /// not a closing event after its `dispatch_seq`; (b) an outcome that disagrees with that
-/// event; (c) running while a closing event follows its `dispatch_seq`.
+/// event; (c) running while a closing event follows its `dispatch_seq`, or while the task is
+/// terminal. (`Blocked` with a running row is legal: `Resolve(Quarantine)` does not close the
+/// attempt, and `(Blocked, Settle)` is an edge.)
 fn contradicts(attempt: &AttemptFacts, facts: &Facts) -> bool {
     let after_dispatch = |seq: i64| seq > attempt.dispatch_seq;
     if attempt.state == AttemptState::Running {
-        return facts.closes.iter().any(|(seq, _)| after_dispatch(*seq));
+        return facts.phase.is_terminal()
+            || facts.closes.iter().any(|(seq, _)| after_dispatch(*seq));
     }
     let Some(closed_seq) = attempt.closed_seq.filter(|s| after_dispatch(*s)) else {
         return true;
@@ -351,20 +363,26 @@ pub fn decide(
         Phase::Failed | Phase::Abandoned | Phase::RepairPending => keep(R::R11CleanupReadback),
         Phase::Verifying => keep(R::R12VerificationBoundary),
         Phase::EffectUnknown { .. } => keep(R::R10EffectAmbiguity),
-        Phase::Running | Phase::CancellationRequested if facts.attempt_open => match custody {
-            ProcessCustody::LiveSameIdentity => keep(R::R06LiveOwnedChild),
-            ProcessCustody::Absent => Decision {
-                reason: Some(match attempt {
-                    None => R08Reason::AcknowledgementUnrecorded,
-                    Some(a) if a.acknowledged => R08Reason::AcknowledgedWorkerLost,
-                    Some(_) => R08Reason::DispatchUnacknowledged,
-                }),
-                ..apply(R::R08WorkerAbsent)
-            },
-            ProcessCustody::PidReused | ProcessCustody::Unreadable | ProcessCustody::Unobserved => {
-                apply(R::R07ProcessNotOurs)
+        Phase::Running | Phase::CancellationRequested if facts.attempt_open => {
+            let reason = Some(match attempt {
+                None => R08Reason::AcknowledgementUnrecorded,
+                Some(a) if a.acknowledged => R08Reason::AcknowledgedWorkerLost,
+                Some(_) => R08Reason::DispatchUnacknowledged,
+            });
+            match custody {
+                ProcessCustody::LiveSameIdentity => keep(R::R06LiveOwnedChild),
+                ProcessCustody::Absent => Decision {
+                    reason,
+                    ..apply(R::R08WorkerAbsent)
+                },
+                ProcessCustody::PidReused
+                | ProcessCustody::Unreadable
+                | ProcessCustody::Unobserved => Decision {
+                    reason,
+                    ..apply(R::R07ProcessNotOurs)
+                },
             }
-        },
+        }
         // `running` without an open attempt cannot come out of `transition`.
         Phase::Running => keep(R::R14UnexpectedState),
         Phase::Admitted | Phase::CancellationRequested | Phase::Blocked { .. } => NOTHING,
@@ -420,7 +438,7 @@ pub struct Row {
     pub before: Phase,
     /// Phase after the pass.
     pub after: Phase,
-    /// R08's acknowledgement class.
+    /// R07/R08's acknowledgement class.
     pub reason: Option<R08Reason>,
     /// R09's attachment.
     pub workspace: Option<WorkspaceReuseRefused>,

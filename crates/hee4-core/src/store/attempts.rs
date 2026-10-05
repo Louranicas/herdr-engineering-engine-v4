@@ -21,7 +21,7 @@
 //!          deadline_ms, clock_epoch, pid, pid_start_ticks,
 //!          state IN (running, settled, unknown), effect IN (none, pending, committed, unknown),
 //!          cleanup IN (none, pending, settled, unknown), closed_seq FK events,
-//!          outcome IN (ready, not_ready, unsettled, r07, r08),
+//!          outcome IN (ready, not_ready, unsettled, r07, r08, stopped, abandoned),
 //!          UNIQUE (task_id, generation)) STRICT
 //! attempts_open: partial index on task_id WHERE state = 'running'
 //! attempts_no_delete   BEFORE DELETE                     → 'attempts are append-only'
@@ -29,6 +29,7 @@
 //!                                                        → 'attempt identity is immutable'
 //! attempts_no_reopen   BEFORE UPDATE WHEN OLD.state != 'running' AND NEW.state = 'running'
 //!                                                        → 'IA-1: a closed attempt never reopens'
+//! meta attempts_from_seq = max(events.seq) when m005 applied (pre-ledger dispatches)
 //! ```
 //!
 //! # Event hook (inside `apply_in`, after the events INSERT)
@@ -38,10 +39,18 @@
 //! | `Dispatch` | INSERT `a-<task>-<generation>`: running / none / none, `dispatch_seq` = the event's seq |
 //! | `Settle(Ready)` / `Settle(NotReady)` | the running row → settled, outcome `ready` / `not_ready`, cleanup pending, `closed_seq` = seq |
 //! | `Settle(Unsettled)` / `Recover(R07)` / `Recover(R08)` | the running row → unknown, effect unknown, cleanup pending, outcome `unsettled` / `r07` / `r08`, `closed_seq` = seq |
-//! | anything else | no-op |
+//! | `Stop` / `Resolve(Abandon)` | the running row, if any → unknown, effect unknown, cleanup pending, outcome `stopped` / `abandoned`, `closed_seq` = seq; none is a no-op (both are legal with no attempt in flight) |
+//! | `Resolve(Quarantine)` and anything else | no-op (a quarantined attempt may still `Settle`) |
 //!
-//! A close that finds no running row is [`StoreError::AttemptMissing`]: the whole transaction
-//! rolls back and the event is not written (fail closed).
+//! A `Settle` / `Recover` that finds no running row is [`StoreError::AttemptMissing`]: the
+//! whole transaction rolls back and the event is not written (fail closed). The one exception
+//! is a pre-ledger attempt: no row exists for `(task, generation)` and its `Dispatch` seq is at
+//! or below `meta.attempts_from_seq`; its close writes the event and no row.
+//!
+//! `attempt_started` writes the start facts once (an identical repeat is a no-op, other facts
+//! are [`StoreError::AttemptAcknowledged`]) and takes only an absolute, normal workspace
+//! ([`StoreError::WorkspaceNotNormal`]); S2 refuses a workspace equal to, inside or containing
+//! another unsettled attempt's ([`StoreError::WorkspaceLeased`]).
 //!
 //! # Reconcile rows this table enables (`recovery.rs`)
 //!
@@ -54,11 +63,13 @@ use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use hee4_contracts::{Event, GitSha, ReceiptId, RecoveryRule, Refusal, Settlement, TaskId};
+use hee4_contracts::{
+    Event, GitSha, ReceiptId, RecoveryRule, Refusal, Resolution, Settlement, TaskId,
+};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use super::migrations::Migration;
-use super::{Store, StoreError, corrupt, io_at};
+use super::{Store, StoreError, corrupt, load_events_with_seq, meta_get, meta_set};
 
 /// The `m005_attempts` DDL, applied once by `Store::open`.
 pub(crate) const SCHEMA: &str = "
@@ -81,7 +92,8 @@ CREATE TABLE attempts(
   effect TEXT NOT NULL CHECK (effect IN ('none','pending','committed','unknown')),
   cleanup TEXT NOT NULL CHECK (cleanup IN ('none','pending','settled','unknown')),
   closed_seq INTEGER REFERENCES events(seq),
-  outcome TEXT CHECK (outcome IS NULL OR outcome IN ('ready','not_ready','unsettled','r07','r08')),
+  outcome TEXT CHECK (outcome IS NULL OR outcome IN ('ready','not_ready','unsettled','r07','r08',
+    'stopped','abandoned')),
   UNIQUE (task_id, generation)
 ) STRICT;
 CREATE INDEX attempts_open ON attempts(task_id) WHERE state = 'running';
@@ -101,8 +113,14 @@ pub(crate) const MIGRATION: Migration = Migration {
     apply: migrate,
 };
 
+/// `meta` key: the highest `events.seq` when `m005_attempts` was applied. A `Dispatch` at or
+/// below it predates the attempts ledger and has no row (never backfilled).
+pub(crate) const FROM_SEQ_KEY: &str = "attempts_from_seq";
+
 fn migrate(tx: &Transaction<'_>) -> Result<(), StoreError> {
     tx.execute_batch(SCHEMA)?;
+    let high: i64 = tx.query_row("SELECT coalesce(max(seq), 0) FROM events", [], |r| r.get(0))?;
+    meta_set(tx, FROM_SEQ_KEY, &high.to_string())?;
     Ok(())
 }
 
@@ -220,7 +238,8 @@ spelled!(
         Running = "running",
         /// Closed by `Settle(Ready | NotReady)`.
         Settled = "settled",
-        /// Closed by `Settle(Unsettled)` or `Recover(R07 | R08)`: the effect is unknown.
+        /// Closed by `Settle(Unsettled)`, `Recover(R07 | R08)`, `Stop` or `Resolve(Abandon)`:
+        /// the effect is unknown.
         Unknown = "unknown",
     }
 );
@@ -266,6 +285,10 @@ spelled!(
         R07 = "r07",
         /// `Recover(R08WorkerAbsent)`.
         R08 = "r08",
+        /// `Stop` (`CancellationRequested` → `Cancelled`) over a running attempt.
+        Stopped = "stopped",
+        /// `Resolve(Abandon)` over a running attempt.
+        Abandoned = "abandoned",
     }
 );
 
@@ -494,6 +517,24 @@ fn state_of(conn: &Connection, id: &AttemptId) -> Result<Option<AttemptState>, S
     .transpose()
 }
 
+/// The workspace as the ledger stores it: UTF-8, absolute, no `.`/`..`/empty component and no
+/// trailing `/`, so that equal directories are equal strings and overlap is a prefix test.
+fn normal_workspace(path: &std::path::Path) -> Result<&str, StoreError> {
+    let refuse = || StoreError::WorkspaceNotNormal {
+        workspace: path.to_path_buf(),
+    };
+    let text = path.to_str().ok_or_else(refuse)?;
+    let body = text.strip_prefix('/').ok_or_else(refuse)?;
+    if body.is_empty()
+        || body
+            .split('/')
+            .any(|c| c.is_empty() || c == "." || c == "..")
+    {
+        return Err(refuse());
+    }
+    Ok(text)
+}
+
 /// Refuse unless the row exists and is running.
 fn require_running(conn: &Connection, id: &AttemptId) -> Result<(), StoreError> {
     match state_of(conn, id)? {
@@ -562,6 +603,18 @@ pub(crate) fn on_event(
             Some(Effect::Unknown),
             AttemptOutcome::R08,
         ),
+        Event::Stop => (
+            AttemptState::Unknown,
+            Some(Effect::Unknown),
+            AttemptOutcome::Stopped,
+        ),
+        Event::Resolve(Resolution::Abandon(_)) => (
+            AttemptState::Unknown,
+            Some(Effect::Unknown),
+            AttemptOutcome::Abandoned,
+        ),
+        // `Resolve(Quarantine)` leaves the row running: `transition` keeps `(Blocked, Settle)`,
+        // so the quarantined attempt may still settle, and a later `Resolve(Abandon)` closes it.
         _ => return Ok(()),
     };
     let changed = tx.execute(
@@ -577,31 +630,68 @@ pub(crate) fn on_event(
             task.as_str()
         ],
     )?;
-    if changed == 0 {
-        return Err(StoreError::AttemptMissing {
-            task: task.clone(),
-            generation,
-        });
+    if changed > 0 {
+        return Ok(());
     }
-    Ok(())
+    // `Stop` and `Resolve(Abandon)` are legal with no attempt in flight (from `Admitted`,
+    // `Verifying`, `RepairPending`, `EffectUnknown`, `Blocked`, or after a `Settle`): closing
+    // nothing is correct for them.
+    if matches!(outcome, AttemptOutcome::Stopped | AttemptOutcome::Abandoned) {
+        return Ok(());
+    }
+    if pre_ledger_attempt(tx, task, generation)? {
+        return Ok(());
+    }
+    Err(StoreError::AttemptMissing {
+        task: task.clone(),
+        generation,
+    })
+}
+
+/// The attempt `(task, generation)` was dispatched before `m005_attempts` was applied: no row
+/// exists for it and its `Dispatch` seq is at or below `attempts_from_seq`. Its close writes the
+/// event and no row (`AcknowledgementUnrecorded`); every other row-less close fails closed.
+fn pre_ledger_attempt(
+    tx: &Transaction<'_>,
+    task: &TaskId,
+    generation: u64,
+) -> Result<bool, StoreError> {
+    let Some(from_seq) = meta_get(tx, FROM_SEQ_KEY)?.and_then(|v| v.parse::<i64>().ok()) else {
+        return Ok(false);
+    };
+    let has_row: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM attempts WHERE task_id = ?1 AND generation = ?2)",
+        params![
+            task.as_str(),
+            i64::try_from(generation).map_err(|_| corrupt(task, "generation overflow"))?
+        ],
+        |r| r.get(0),
+    )?;
+    if has_row {
+        return Ok(false);
+    }
+    let dispatch_seq = load_events_with_seq(tx, task)?
+        .into_iter()
+        .filter(|(_, e)| *e == Event::Dispatch)
+        .map(|(seq, _)| seq)
+        .next_back();
+    Ok(dispatch_seq.is_some_and(|seq| seq <= from_seq))
 }
 
 impl Store {
     /// Record the acknowledgement facts of a running attempt: receipt, permit, model, head,
-    /// workspace and lease. The workspace must not be held by another attempt whose cleanup is
-    /// not settled (S2: a fresh workspace per attempt).
+    /// workspace and lease, written once. The workspace must be an absolute, normal path that
+    /// neither equals, contains nor lies inside the workspace of another attempt whose cleanup
+    /// is not settled (S2: a fresh workspace per attempt). An identical repeat is a no-op.
     ///
     /// # Errors
-    /// [`StoreError::AttemptMissing`] for an unknown id; [`StoreError::AttemptClosed`] when
-    /// the row is not running (IA-3); [`StoreError::WorkspaceLeased`] when another unsettled
-    /// attempt holds `start.workspace`.
+    /// [`StoreError::WorkspaceNotNormal`] for a relative path or one with `.`, `..`, an empty
+    /// component or a trailing `/`; [`StoreError::AttemptMissing`] for an unknown id;
+    /// [`StoreError::AttemptClosed`] when the row is not running (IA-3);
+    /// [`StoreError::AttemptAcknowledged`] when other start facts are already recorded;
+    /// [`StoreError::WorkspaceLeased`] when another unsettled attempt's workspace overlaps.
     pub fn attempt_started(&self, id: &AttemptId, start: &AttemptStart) -> Result<(), StoreError> {
-        let workspace = start.workspace.to_str().ok_or_else(|| {
-            io_at(
-                &start.workspace,
-                std::io::Error::new(std::io::ErrorKind::InvalidData, "workspace is not UTF-8"),
-            )
-        })?;
+        let workspace = normal_workspace(&start.workspace)?;
         let permit = i64::try_from(start.permit_id).map_err(|_| {
             corrupt(
                 id.task_id(),
@@ -610,10 +700,23 @@ impl Store {
         })?;
         let tx = self.begin()?;
         require_running(&tx, id)?;
+        if let Some(recorded) = rows(&tx, "WHERE id = ?1", [id.to_string()])?
+            .pop()
+            .and_then(|r| r.started)
+        {
+            if recorded == *start {
+                return Ok(());
+            }
+            return Err(StoreError::AttemptAcknowledged { id: id.clone() });
+        }
         let holder: Option<String> = tx
             .query_row(
                 "SELECT id FROM attempts
-                 WHERE workspace = ?1 AND id != ?2 AND cleanup != 'settled' LIMIT 1",
+                 WHERE id != ?2 AND cleanup != 'settled' AND workspace IS NOT NULL
+                   AND (workspace = ?1
+                        OR substr(?1, 1, length(workspace) + 1) = workspace || '/'
+                        OR substr(workspace, 1, length(?1) + 1) = ?1 || '/')
+                 LIMIT 1",
                 params![workspace, id.to_string()],
                 |r| r.get(0),
             )
@@ -631,7 +734,7 @@ impl Store {
             "UPDATE attempts
              SET receipt_id = ?1, permit_id = ?2, model = ?3, head_sha = ?4, workspace = ?5,
                  deadline_ms = ?6, clock_epoch = ?7
-             WHERE id = ?8 AND state = 'running'",
+             WHERE id = ?8 AND state = 'running' AND receipt_id IS NULL",
             params![
                 start.receipt_id.as_str(),
                 permit,
@@ -740,5 +843,109 @@ impl Store {
             [task.as_str()],
         )?
         .pop())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! A real foundation-era file (opened with `m001`..`m004` only, never a DROP simulation)
+    //! holding attempts dispatched before the attempts ledger existed.
+
+    use super::super::migrations::MIGRATIONS;
+    use super::*;
+    use crate::codec;
+    use crate::recovery::{Observations, R08Reason, reconcile};
+    use hee4_contracts::Phase;
+
+    type R = Result<(), Box<dyn std::error::Error>>;
+
+    /// Write `Admit` + `Dispatch` for `task` as a binary without the attempts hook did: the
+    /// `tasks` row and two `events` rows, no `attempts` row.
+    fn plant_running(conn: &Connection, task: &str) -> R {
+        conn.execute(
+            "INSERT INTO tasks(id, phase, cancel, generation, updated_ts) VALUES (?1, 'running', 0, 1, 1)",
+            [task],
+        )?;
+        for event in [Event::Admit, Event::Dispatch] {
+            conn.execute(
+                "INSERT INTO events(task_id, event_json, ts) VALUES (?1, ?2, 1)",
+                params![task, codec::encode(event)?],
+            )?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_pre_ledger_open_attempt_recovers_and_settles() -> R {
+        let dir = std::env::temp_dir().join(format!("hee4-core-attempts-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("pre-ledger.sqlite");
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+        {
+            let old = Store::open_with(&path, &MIGRATIONS[..4])?;
+            assert_eq!(old.schema_version()?, 4);
+            assert!(meta_get(&old.conn, "migration:m005_attempts")?.is_none());
+            plant_running(&old.conn, "lost")?;
+            plant_running(&old.conn, "settles")?;
+        }
+        let store = Store::open(&path)?;
+        assert_eq!(
+            meta_get(&store.conn, FROM_SEQ_KEY)?.as_deref(),
+            Some("4"),
+            "the high-water seq at m005"
+        );
+        let lost: TaskId = "lost".parse()?;
+        let settles: TaskId = "settles".parse()?;
+        assert_eq!(store.attempts(&lost)?, Vec::new(), "never backfilled");
+
+        // A Settle of a pre-ledger attempt is accepted: the event is written, no row.
+        assert_eq!(
+            store.apply(&settles, Event::Settle(Settlement::Ready))?,
+            Phase::Verifying
+        );
+        assert_eq!(store.attempts(&settles)?, Vec::new());
+
+        let report = reconcile(&store, &Observations::worker_absent())?;
+        let row = report
+            .rows
+            .iter()
+            .find(|r| r.task_id == lost)
+            .ok_or("lost row")?;
+        assert_eq!(
+            (row.rule, row.reason, row.after),
+            (
+                Some(RecoveryRule::R08WorkerAbsent),
+                Some(R08Reason::AcknowledgementUnrecorded),
+                Phase::EffectUnknown { cancel: false }
+            )
+        );
+        assert_eq!(
+            (report.applied, report.complete),
+            (1, true),
+            "{:?}",
+            report.findings
+        );
+        assert!(store.recovery_complete()?);
+        assert_eq!(store.attempts(&lost)?, Vec::new());
+
+        // A post-ledger Dispatch with no row (planted past the hook) still fails closed.
+        plant_running(&store.conn, "planted")?;
+        let planted: TaskId = "planted".parse()?;
+        let before = store.event_count()?;
+        let err = store.apply(&planted, Event::Settle(Settlement::Ready));
+        assert!(
+            matches!(&err, Err(StoreError::AttemptMissing { task, generation: 1 }) if *task == planted),
+            "{err:?}"
+        );
+        assert_eq!(store.event_count()?, before);
+
+        // And a fresh Dispatch after the migration opens a row as usual.
+        let fresh: TaskId = "fresh".parse()?;
+        store.apply(&fresh, Event::Admit)?;
+        store.apply(&fresh, Event::Dispatch)?;
+        assert_eq!(store.attempts(&fresh)?.len(), 1);
+        Ok(())
     }
 }

@@ -6,7 +6,10 @@ use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use hee4_contracts::{Event, Phase, RecoveryRule, Refusal, Settlement, TaskId};
+use hee4_contracts::{
+    AbandonReason, Event, Phase, QuarantineReason, RecoveryRule, Refusal, Resolution, Settlement,
+    TaskId,
+};
 use hee4_core::recovery::{
     AttemptFacts, Clock, Facts, Finding, ProcessCustody, R08Reason, WorkspaceReadback,
     WorkspaceReuseRefused, cursor, decide,
@@ -303,6 +306,69 @@ fn close_without_open_row_is_refused_and_writes_nothing() -> R {
     Ok(())
 }
 
+/// `verbs_refuse_by_name`, continued: S2 by spelling and write-once acknowledgement, with
+/// `a2` holding `shared` (cleanup not settled) and `a3` running, unacknowledged.
+fn workspace_spellings_and_write_once(
+    store: &Store,
+    a3: &AttemptId,
+    a2: &AttemptId,
+    shared: &Path,
+) -> R {
+    // S2 by spelling: every alias of the leased directory is refused at the verb, and a
+    // directory that contains it or lies inside it is leased too.
+    let text = shared.to_str().ok_or("utf-8")?;
+    let (parent, leaf) = text.rsplit_once('/').ok_or("no parent")?;
+    for alias in [
+        format!("{text}/"),
+        format!("{text}/."),
+        format!("{parent}/./{leaf}"),
+        format!("{parent}//{leaf}"),
+        format!("{text}/../{leaf}"),
+        format!("{parent}/{leaf}/sub/.."),
+        "relative/ws".to_owned(),
+        "/".to_owned(),
+        String::new(),
+    ] {
+        let err = store.attempt_started(a3, &start("t3", Path::new(&alias), None)?);
+        assert!(
+            matches!(&err, Err(StoreError::WorkspaceNotNormal { workspace })
+                if workspace.as_os_str() == alias.as_str()),
+            "{alias:?}: {err:?}"
+        );
+    }
+    for overlap in [
+        format!("{text}/sub"),
+        format!("{text}/sub/deeper"),
+        parent.to_owned(),
+    ] {
+        let err = store.attempt_started(a3, &start("t3", Path::new(&overlap), None)?);
+        assert!(
+            matches!(&err, Err(StoreError::WorkspaceLeased { other, .. }) if *other == *a2),
+            "{overlap:?}: {err:?}"
+        );
+    }
+    let sibling = format!("{text}-sibling");
+    store.attempt_started(a3, &start("t3", Path::new(&sibling), None)?)?;
+    // Acknowledgement is write-once: an identical repeat is a no-op, other facts are refused
+    // and nothing is overwritten (IA-3).
+    store.attempt_started(a3, &start("t3", Path::new(&sibling), None)?)?;
+    let other_facts = AttemptStart {
+        receipt_id: "r-t3-other".parse()?,
+        ..start("t3", &workspace("t3-second")?, None)?
+    };
+    let err = store.attempt_started(a3, &other_facts);
+    assert!(
+        matches!(&err, Err(StoreError::AttemptAcknowledged { id }) if *id == *a3),
+        "{err:?}"
+    );
+    let kept = store.attempt(a3)?.ok_or("row")?.started.ok_or("started")?;
+    assert_eq!(
+        (kept.receipt_id.as_str(), kept.workspace.to_str()),
+        ("r-t3-test", Some(sibling.as_str()))
+    );
+    Ok(())
+}
+
 #[test]
 fn verbs_refuse_by_name() -> R {
     let (store, _) = ready("verbs")?;
@@ -362,6 +428,7 @@ fn verbs_refuse_by_name() -> R {
         !store.attempt(&a3)?.ok_or("row")?.acknowledged(),
         "refused: nothing written"
     );
+    workspace_spellings_and_write_once(&store, &a3, &a2, &shared)?;
 
     let err = store.attempt_cleanup_settled(&a2);
     assert!(
@@ -370,15 +437,17 @@ fn verbs_refuse_by_name() -> R {
     );
     store.apply(&t2, Event::Settle(Settlement::Ready))?;
     assert_eq!(store.attempt(&a2)?.ok_or("row")?.cleanup, Cleanup::Pending);
-    let err = store.attempt_started(&a3, &start("t3", &shared, None)?);
+    let _t4 = dispatched(&store, "t4")?;
+    let a4 = aid("a-t4-1")?;
+    let err = store.attempt_started(&a4, &start("t4", &shared, None)?);
     assert!(
         matches!(err, Err(StoreError::WorkspaceLeased { .. })),
         "closed but cleanup pending still leases"
     );
     store.attempt_cleanup_settled(&a2)?;
     assert_eq!(store.attempt(&a2)?.ok_or("row")?.cleanup, Cleanup::Settled);
-    store.attempt_started(&a3, &start("t3", &shared, None)?)?;
-    assert!(store.attempt(&a3)?.ok_or("row")?.acknowledged());
+    store.attempt_started(&a4, &start("t4", &shared, None)?)?;
+    assert!(store.attempt(&a4)?.ok_or("row")?.acknowledged());
 
     store.attempt_pid(&a3, 4242, 7)?;
     store.attempt_pid(&a3, 4243, 8)?;
@@ -439,7 +508,7 @@ fn decide_reason_table() -> R {
     let open = facts(Phase::Running, true);
     let unacked = attempt_facts(false, None)?;
     let acked = attempt_facts(true, None)?;
-    let cases: [ReasonCase<'_>; 5] = [
+    let cases: [ReasonCase<'_>; 7] = [
         (
             None,
             C::Absent,
@@ -466,7 +535,23 @@ fn decide_reason_table() -> R {
             C::PidReused,
             Some(R::R07ProcessNotOurs),
             Some(Event::Recover(R::R07ProcessNotOurs)),
+            Some(R08Reason::AcknowledgedWorkerLost),
+        ),
+        // A row with no pid probes `Unobserved` (never absent): R07, and the class still
+        // names the unacknowledged dispatch.
+        (
+            Some(&unacked),
+            C::Unobserved,
+            Some(R::R07ProcessNotOurs),
+            Some(Event::Recover(R::R07ProcessNotOurs)),
+            Some(R08Reason::DispatchUnacknowledged),
+        ),
+        (
             None,
+            C::Unreadable,
+            Some(R::R07ProcessNotOurs),
+            Some(Event::Recover(R::R07ProcessNotOurs)),
+            Some(R08Reason::AcknowledgementUnrecorded),
         ),
         (
             Some(&acked),
@@ -717,7 +802,7 @@ fn pid_reused_is_r07() -> R {
         (
             Some(RecoveryRule::R07ProcessNotOurs),
             Phase::EffectUnknown { cancel: false },
-            None
+            Some(R08Reason::AcknowledgedWorkerLost)
         )
     );
     let after = store.attempt(&id)?.ok_or("row")?;
@@ -842,5 +927,144 @@ fn redispatch_opens_generation_two() -> R {
     assert_eq!(rows[1].dispatch_seq, last_seq(&store, &t)?);
     assert_eq!(store.latest_attempt(&t)?.as_ref(), Some(&rows[1]));
     assert_eq!(store.open_attempts()?, vec![rows[1].clone()]);
+    Ok(())
+}
+
+/// The closed row a terminal-making event leaves: unknown, effect unknown, cleanup pending,
+/// `outcome`, `closed_seq` = the event's seq.
+fn assert_closed(store: &Store, t: &TaskId, outcome: AttemptOutcome) -> R {
+    let row = store.attempt(&AttemptId::new(t, 1))?.ok_or("row")?;
+    assert_eq!(
+        (
+            row.state,
+            row.effect,
+            row.cleanup,
+            row.outcome,
+            row.closed_seq
+        ),
+        (
+            AttemptState::Unknown,
+            Effect::Unknown,
+            Cleanup::Pending,
+            Some(outcome),
+            Some(last_seq(store, t)?)
+        ),
+        "{t}"
+    );
+    Ok(())
+}
+
+#[test]
+fn stop_and_abandon_close_the_row_quarantine_does_not() -> R {
+    let (store, _) = ready("stop-abandon")?;
+    let abandon = Event::Resolve(Resolution::Abandon(AbandonReason::AttemptFailed));
+    let quarantine = Event::Resolve(Resolution::Quarantine(
+        QuarantineReason::EffectUnknownPermanent {
+            rule: RecoveryRule::R08WorkerAbsent,
+        },
+    ));
+
+    // Cancel + Stop over a running attempt: Cancelled, the row closed `stopped`.
+    let stopped = dispatched(&store, "stopped")?;
+    store.apply(&stopped, Event::Cancel)?;
+    assert_eq!(store.apply(&stopped, Event::Stop)?, Phase::Cancelled);
+    assert_closed(&store, &stopped, AttemptOutcome::Stopped)?;
+    store.attempt_cleanup_settled(&AttemptId::new(&stopped, 1))?;
+
+    // Resolve(Abandon) from Running and from CancellationRequested.
+    let abandoned = dispatched(&store, "abandoned")?;
+    assert_eq!(store.apply(&abandoned, abandon)?, Phase::Abandoned);
+    assert_closed(&store, &abandoned, AttemptOutcome::Abandoned)?;
+    let cancelled = dispatched(&store, "cancelled")?;
+    store.apply(&cancelled, Event::Cancel)?;
+    assert_eq!(store.apply(&cancelled, abandon)?, Phase::Cancelled);
+    assert_closed(&store, &cancelled, AttemptOutcome::Abandoned)?;
+
+    // Quarantine keeps the attempt running (it may still settle); Abandon then closes it.
+    let held = dispatched(&store, "held")?;
+    assert_eq!(
+        store.apply(&held, quarantine)?,
+        Phase::Blocked { cancel: false }
+    );
+    assert_eq!(
+        store
+            .attempt(&AttemptId::new(&held, 1))?
+            .ok_or("row")?
+            .state,
+        AttemptState::Running
+    );
+    assert_eq!(store.apply(&held, abandon)?, Phase::Abandoned);
+    assert_closed(&store, &held, AttemptOutcome::Abandoned)?;
+    let settled = dispatched(&store, "settled")?;
+    store.apply(&settled, quarantine)?;
+    store.apply(&settled, Event::Settle(Settlement::Ready))?;
+    let row = store.attempt(&AttemptId::new(&settled, 1))?.ok_or("row")?;
+    assert_eq!(
+        (row.state, row.outcome),
+        (AttemptState::Settled, Some(AttemptOutcome::Ready))
+    );
+    let still = dispatched(&store, "still-blocked")?;
+    store.apply(&still, quarantine)?;
+
+    // Stop / Abandon with no attempt in flight close nothing and are not refused.
+    let never = tid("never")?;
+    store.apply(&never, Event::Admit)?;
+    assert_eq!(store.apply(&never, Event::Stop)?, Phase::Failed);
+    assert_eq!(store.attempts(&never)?, Vec::new());
+
+    let open: Vec<String> = store
+        .open_attempts()?
+        .iter()
+        .map(|r| r.id.to_string())
+        .collect();
+    assert_eq!(
+        open,
+        ["a-still-blocked-1"],
+        "only the quarantined attempt is open"
+    );
+    let report = reconcile(&store, &Observations::worker_absent())?;
+    assert!(report.findings.is_empty(), "{:?}", report.findings);
+    assert_eq!((report.applied, report.complete), (0, true));
+    Ok(())
+}
+
+#[test]
+fn running_row_under_a_terminal_phase_is_r03() -> R {
+    let running = attempt_facts(true, None)?;
+    for phase in [
+        Phase::Cancelled,
+        Phase::Abandoned,
+        Phase::Failed,
+        Phase::Accepted,
+    ] {
+        let d = decide(
+            "e",
+            &facts(phase, false),
+            Some(&running),
+            ProcessCustody::Absent,
+            WorkspaceReadback::Unobserved,
+            None,
+            None,
+        );
+        assert_eq!(
+            (d.rule, d.event, d.contradiction),
+            (Some(RecoveryRule::R03CommitOrdering), None, true),
+            "{phase:?}"
+        );
+    }
+    let d = decide(
+        "e",
+        &facts(Phase::Blocked { cancel: false }, true),
+        Some(&running),
+        ProcessCustody::Absent,
+        WorkspaceReadback::Unobserved,
+        None,
+        None,
+    );
+    assert_eq!(
+        (d.rule, d.contradiction),
+        (None, false),
+        "blocked + running is legal"
+    );
     Ok(())
 }

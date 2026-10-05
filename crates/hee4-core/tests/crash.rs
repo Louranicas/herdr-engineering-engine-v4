@@ -7,6 +7,9 @@
 //! `attempt_started` + `attempt_pid`, so R08 is `AcknowledgedWorkerLost` and the writable
 //! workspace attaches R09) and `HEE4_CRASH_AFTER_DISPATCH=1` (killed before the
 //! acknowledgement: `DispatchUnacknowledged`). The parent reads custody with `probe::observe`.
+//! In `HEE4_CRASH_AFTER_DISPATCH` mode no pid was recorded, so the probe reads `Unobserved` (R07, with the
+//! same `DispatchUnacknowledged` class, proven probe-only); the R08 row there uses custody the
+//! parent supplies from its own reap of the child (hand-supplied, not probed).
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -15,7 +18,10 @@ use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
 
 use hee4_contracts::{Event, Phase, RecoveryRule, TaskId};
-use hee4_core::recovery::{ProcessCustody, R08Reason, WorkspaceReadback, WorkspaceReuseRefused};
+use hee4_core::recovery::{
+    AttemptFacts, Facts, ProcessCustody, R08Reason, WorkspaceReadback, WorkspaceReuseRefused,
+    decide,
+};
 use hee4_core::{
     AttemptId, AttemptOutcome, AttemptRow, AttemptStart, AttemptState, Cleanup, Effect,
     Observations, Store, probe, reconcile,
@@ -183,6 +189,39 @@ fn sigkill_after_admit_before_dispatch() -> Result<(), Box<dyn Error>> {
 
 /// Shared parent half of the two attempt modes: kill after the ACK, reopen, probe, reconcile
 /// twice, check the reason class, the attachment and the attempt row.
+/// What the probe's observation alone decides for an attempt killed before `attempt_started`
+/// (no pid recorded, so custody is `Unobserved`): R07 with `DispatchUnacknowledged`.
+fn probe_only_is_r07_unacknowledged(
+    store: &Store,
+    task: &TaskId,
+    row: &AttemptRow,
+    observed: &Observations,
+    mode: &str,
+) -> Result<(), Box<dyn Error>> {
+    // Probe-only: what the observation alone decides, before the parent adds anything.
+    let probe_only = decide(
+        &store.epoch()?,
+        &Facts::from_history(Phase::Running, &store.history_with_seq(task)?),
+        Some(&AttemptFacts::from_row(row)),
+        ProcessCustody::Unobserved,
+        WorkspaceReadback::Unobserved,
+        observed.clock.as_ref(),
+        None,
+    );
+    assert_eq!(
+        (probe_only.rule, probe_only.reason),
+        (
+            Some(RecoveryRule::R07ProcessNotOurs),
+            Some(R08Reason::DispatchUnacknowledged)
+        )
+    );
+    println!(
+        "crash: mode={mode} probe_only rule={:?} reason={:?} (custody below is hand-supplied)",
+        probe_only.rule, probe_only.reason
+    );
+    Ok(())
+}
+
 fn attempt_crash(
     db_name: &str,
     mode_env: &str,
@@ -233,6 +272,7 @@ fn attempt_crash(
             observed.process.get(&task),
             Some(&ProcessCustody::Unobserved)
         );
+        probe_only_is_r07_unacknowledged(&store, &task, &open[0], &observed, mode)?;
         observed
             .process
             .insert(task.clone(), ProcessCustody::Absent);
