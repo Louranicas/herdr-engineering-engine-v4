@@ -2,19 +2,48 @@
 //! admits and dispatches tasks through the real store in a loop, printing `ACK <task> <phase>`
 //! after each `apply` returns; the parent `SIGKILL`s it by pid mid-loop, reopens the file, runs
 //! `reconcile` with every worker absent, and checks "acked ⇒ present" plus R08's target.
+//!
+//! Two more child modes hold one attempt open: `HEE4_CRASH_ATTEMPT=1` (acknowledged with
+//! `attempt_started` + `attempt_pid`, so R08 is `AcknowledgedWorkerLost` and the writable
+//! workspace attaches R09) and `HEE4_CRASH_AFTER_DISPATCH=1` (killed before the
+//! acknowledgement: `DispatchUnacknowledged`). The parent reads custody with `probe::observe`.
 
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 
 use hee4_contracts::{Event, Phase, RecoveryRule, TaskId};
-use hee4_core::{Observations, Store, reconcile};
+use hee4_core::recovery::{ProcessCustody, R08Reason, WorkspaceReadback, WorkspaceReuseRefused};
+use hee4_core::{
+    AttemptId, AttemptOutcome, AttemptRow, AttemptStart, AttemptState, Cleanup, Effect,
+    Observations, Store, probe, reconcile,
+};
 
 const CHILD_ENV: &str = "HEE4_CRASH_CHILD";
 const AFTER_ADMIT_ENV: &str = "HEE4_CRASH_AFTER_ADMIT";
+const ATTEMPT_ENV: &str = "HEE4_CRASH_ATTEMPT";
+const AFTER_DISPATCH_ENV: &str = "HEE4_CRASH_AFTER_DISPATCH";
 const KILL_AFTER_ACKS: usize = 60;
+
+fn crash_dir() -> Result<PathBuf, Box<dyn Error>> {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("hee4-core-crash");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+fn fresh_db(name: &str) -> Result<PathBuf, Box<dyn Error>> {
+    let path = crash_dir()?.join(name);
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+    Ok(path)
+}
+
+fn flag(env: &str) -> bool {
+    std::env::var_os(env).is_some_and(|v| v == "1")
+}
 
 /// The child half. A no-op unless `HEE4_CRASH_CHILD` names a database.
 #[test]
@@ -25,7 +54,43 @@ fn crash_child() -> Result<(), Box<dyn Error>> {
     let store = Store::open(&PathBuf::from(path))?;
     reconcile(&store, &Observations::default())?;
     let mut out = std::io::stdout().lock();
-    let after_admit = std::env::var_os(AFTER_ADMIT_ENV).is_some_and(|v| v == "1");
+    let after_admit = flag(AFTER_ADMIT_ENV);
+    let attempt_mode = flag(ATTEMPT_ENV);
+    if attempt_mode || flag(AFTER_DISPATCH_ENV) {
+        let task: TaskId = "task-000000".parse()?;
+        store.apply(&task, Event::Admit)?;
+        store.apply(&task, Event::Dispatch)?;
+        if attempt_mode {
+            let workspace = crash_dir()?.join("ws-task-000000");
+            let _ = std::fs::remove_dir_all(&workspace);
+            std::fs::create_dir_all(&workspace)?;
+            std::fs::write(workspace.join("note"), b"crash")?;
+            let id = AttemptId::new(&task, 1);
+            store.attempt_started(
+                &id,
+                &AttemptStart {
+                    receipt_id: "r-task-000000-crash".parse()?,
+                    permit_id: 1,
+                    model: "none".into(),
+                    head_sha: "a".repeat(40).parse()?,
+                    workspace,
+                    lease: None,
+                },
+            )?;
+            let (pid, start_ticks) = probe::self_identity().ok_or("no self identity")?;
+            store.attempt_pid(&id, pid, start_ticks)?;
+        }
+        writeln!(
+            out,
+            "ACK {task} {}",
+            if attempt_mode { "attempt" } else { "running" }
+        )?;
+        out.flush()?;
+        // Hold until the parent kills us.
+        let mut hold = String::new();
+        std::io::stdin().read_line(&mut hold)?;
+        return Ok(());
+    }
     for i in 0..100_000u32 {
         let task: TaskId = format!("task-{i:06}").parse()?;
         for event in [Event::Admit, Event::Dispatch] {
@@ -43,23 +108,24 @@ fn crash_child() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// The `admitted` landing: killed right after the first Admit ack, before any Dispatch.
-#[test]
-fn sigkill_after_admit_before_dispatch() -> Result<(), Box<dyn Error>> {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("hee4-core-crash");
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join("crash-admit.sqlite");
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
-    }
-    let mut child = Command::new(std::env::current_exe()?)
+fn spawn_child(path: &PathBuf, mode_env: &str) -> Result<Child, Box<dyn Error>> {
+    Ok(Command::new(std::env::current_exe()?)
         .args(["crash_child", "--exact", "--nocapture", "--test-threads=1"])
-        .env(CHILD_ENV, &path)
-        .env(AFTER_ADMIT_ENV, "1")
+        .env(CHILD_ENV, path)
+        .env(mode_env, "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .spawn()?;
+        .spawn()?)
+}
+
+/// Spawn the child in `mode_env`, SIGKILL it (by pid only, AP-38) right after its first ACK,
+/// reap it, and return the ACK text and the exit status.
+fn kill_after_first_ack(
+    path: &PathBuf,
+    mode_env: &str,
+) -> Result<(u32, String, ExitStatus), Box<dyn Error>> {
+    let mut child = spawn_child(path, mode_env)?;
     let pid = child.id();
     let stdout = child.stdout.take().ok_or("no child stdout")?;
     let mut acked = None;
@@ -73,8 +139,16 @@ fn sigkill_after_admit_before_dispatch() -> Result<(), Box<dyn Error>> {
     }
     let status = child.wait()?;
     let acked = acked.ok_or("child never acked")?;
-    println!("crash: mode=after_admit child pid={pid} acked={acked:?} status={status}");
     assert!(!status.success(), "the child must die by signal");
+    Ok((pid, acked, status))
+}
+
+/// The `admitted` landing: killed right after the first Admit ack, before any Dispatch.
+#[test]
+fn sigkill_after_admit_before_dispatch() -> Result<(), Box<dyn Error>> {
+    let path = fresh_db("crash-admit.sqlite")?;
+    let (pid, acked, status) = kill_after_first_ack(&path, AFTER_ADMIT_ENV)?;
+    println!("crash: mode=after_admit child pid={pid} acked={acked:?} status={status}");
     assert_eq!(acked, "task-000000 admitted");
 
     let store = Store::open(&path)?;
@@ -86,6 +160,11 @@ fn sigkill_after_admit_before_dispatch() -> Result<(), Box<dyn Error>> {
         "no Dispatch, no attempt"
     );
     assert_eq!(store.phase(&id)?, Some(Phase::Admitted));
+    assert_eq!(
+        store.attempts(&id)?,
+        vec![],
+        "no attempt row without a Dispatch"
+    );
     let report = reconcile(&store, &Observations::worker_absent())?;
     assert_eq!(report.rows.len(), 1);
     let row = &report.rows[0];
@@ -102,14 +181,167 @@ fn sigkill_after_admit_before_dispatch() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Shared parent half of the two attempt modes: kill after the ACK, reopen, probe, reconcile
+/// twice, check the reason class, the attachment and the attempt row.
+fn attempt_crash(
+    db_name: &str,
+    mode_env: &str,
+    mode: &str,
+    expected_ack: &str,
+    reason: R08Reason,
+    workspace: Option<WorkspaceReuseRefused>,
+) -> Result<(), Box<dyn Error>> {
+    let path = fresh_db(db_name)?;
+    let (pid, acked, status) = kill_after_first_ack(&path, mode_env)?;
+    println!("crash: mode={mode} child pid={pid} acked={acked:?} status={status}");
+    assert_eq!(acked, expected_ack);
+
+    let store = Store::open(&path)?;
+    let task: TaskId = "task-000000".parse()?;
+    let id = AttemptId::new(&task, 1);
+    assert_eq!(
+        store.task_ids()?,
+        std::slice::from_ref(&task),
+        "acked => present"
+    );
+    assert_eq!(store.phase(&task)?, Some(Phase::Running));
+    let open = store.open_attempts()?;
+    assert_eq!(open.len(), 1, "{open:?}");
+    assert_eq!(open[0].id, id);
+    assert_eq!(open[0].acknowledged(), mode_env == ATTEMPT_ENV);
+    let acknowledged = open[0].acknowledged();
+    let mut observed = probe::observe(&open, 1 << 20);
+    if acknowledged {
+        assert_eq!(
+            open[0].pid.map(|(p, _)| p),
+            Some(pid),
+            "the child recorded itself"
+        );
+        assert_eq!(
+            observed.process.get(&task),
+            Some(&ProcessCustody::Absent),
+            "the probe read ENOENT for the reaped child"
+        );
+        assert_eq!(
+            observed.workspace.get(&id),
+            Some(&WorkspaceReadback::Writable { bytes: 5 })
+        );
+    } else {
+        // No pid was recorded before the kill, so the probe cannot know; the parent, which
+        // reaped the child above, supplies the custody it measured.
+        assert_eq!(
+            observed.process.get(&task),
+            Some(&ProcessCustody::Unobserved)
+        );
+        observed
+            .process
+            .insert(task.clone(), ProcessCustody::Absent);
+        assert_eq!(
+            observed.workspace.get(&id),
+            Some(&WorkspaceReadback::Unobserved)
+        );
+    }
+    let report = reconcile(&store, &observed)?;
+    assert_eq!(report.rows.len(), 1);
+    let row = &report.rows[0];
+    assert_eq!(row.rule, Some(RecoveryRule::R08WorkerAbsent));
+    assert_eq!(row.reason, Some(reason));
+    assert_eq!(row.workspace, workspace);
+    assert_eq!(row.after, Phase::EffectUnknown { cancel: false });
+    assert_eq!(
+        (report.applied, report.complete),
+        (1, true),
+        "{:?}",
+        report.findings
+    );
+    let (closing_seq, closing) = *store.history_with_seq(&task)?.last().ok_or("history")?;
+    assert_eq!(closing, Event::Recover(RecoveryRule::R08WorkerAbsent));
+    let after = store.attempt(&id)?.ok_or("attempt row")?;
+    assert_eq!(
+        (
+            after.state,
+            after.effect,
+            after.outcome,
+            after.cleanup,
+            after.closed_seq
+        ),
+        (
+            AttemptState::Unknown,
+            Effect::Unknown,
+            Some(AttemptOutcome::R08),
+            Cleanup::Pending,
+            Some(closing_seq)
+        )
+    );
+    assert_eq!(store.open_attempts()?, Vec::<AttemptRow>::new());
+
+    let second = reconcile(&store, &probe::observe(&store.open_attempts()?, 1 << 20))?;
+    assert_eq!(
+        (second.applied, second.complete),
+        (0, true),
+        "second pass converges"
+    );
+    assert_eq!(
+        store.attempt(&id)?.as_ref(),
+        Some(&after),
+        "identical row after the second pass"
+    );
+    let integrity = store.integrity_check()?;
+    println!(
+        "crash: mode={mode} reason={:?} workspace={:?} closed_seq={:?} applied={} integrity_check={integrity}",
+        row.reason, row.workspace, after.closed_seq, report.applied
+    );
+    assert_eq!(integrity, "ok");
+    Ok(())
+}
+
+/// Killed after `attempt_started` + `attempt_pid`: an acknowledged attempt whose worker is
+/// gone, with a writable, unleased workspace.
+#[test]
+fn sigkill_after_attempt_started() -> Result<(), Box<dyn Error>> {
+    attempt_crash(
+        "crash-attempt.sqlite",
+        ATTEMPT_ENV,
+        "attempt",
+        "task-000000 attempt",
+        R08Reason::AcknowledgedWorkerLost,
+        Some(WorkspaceReuseRefused::NotLeasedWritable),
+    )
+}
+
+/// Killed after the Dispatch ack, before any acknowledgement facts were written.
+#[test]
+fn sigkill_after_dispatch_before_attempt_started() -> Result<(), Box<dyn Error>> {
+    attempt_crash(
+        "crash-after-dispatch.sqlite",
+        AFTER_DISPATCH_ENV,
+        "after_dispatch",
+        "task-000000 running",
+        R08Reason::DispatchUnacknowledged,
+        None,
+    )
+}
+
+/// The task's attempt rows are exactly one, in `state` with `outcome`.
+fn one_attempt(
+    store: &Store,
+    task: &TaskId,
+    state: AttemptState,
+    outcome: Option<AttemptOutcome>,
+) -> Result<(), Box<dyn Error>> {
+    let rows = store.attempts(task)?;
+    assert_eq!(rows.len(), 1, "{task:?} has one attempt row: {rows:?}");
+    assert_eq!(
+        (rows[0].state, rows[0].outcome),
+        (state, outcome),
+        "{task:?}"
+    );
+    Ok(())
+}
+
 #[test]
 fn sigkill_mid_loop_then_reconcile() -> Result<(), Box<dyn Error>> {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("hee4-core-crash");
-    std::fs::create_dir_all(&dir)?;
-    let path = dir.join("crash.sqlite");
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
-    }
+    let path = fresh_db("crash.sqlite")?;
     let mut child = Command::new(std::env::current_exe()?)
         .args(["crash_child", "--exact", "--nocapture", "--test-threads=1"])
         .env(CHILD_ENV, &path)
@@ -157,6 +389,7 @@ fn sigkill_mid_loop_then_reconcile() -> Result<(), Box<dyn Error>> {
                 store.history(&id)?.contains(&Event::Dispatch),
                 "acked dispatch of {task} lost"
             );
+            one_attempt(&store, &id, AttemptState::Running, None)?;
         }
     }
     let report = reconcile(&store, &Observations::worker_absent())?;
@@ -168,6 +401,9 @@ fn sigkill_mid_loop_then_reconcile() -> Result<(), Box<dyn Error>> {
             Phase::Running => {
                 assert_eq!(row.rule, Some(RecoveryRule::R08WorkerAbsent));
                 assert_eq!(row.after, Phase::EffectUnknown { cancel: false });
+                assert_eq!(row.reason, Some(R08Reason::DispatchUnacknowledged));
+                let r08 = Some(AttemptOutcome::R08);
+                one_attempt(&store, &row.task_id, AttemptState::Unknown, r08)?;
             }
             Phase::Admitted => assert!(!dispatched && row.rule.is_none(), "{row:?}"),
             other => return Err(format!("unexpected pre-reconcile phase {other:?}").into()),
@@ -203,5 +439,7 @@ fn sigkill_mid_loop_then_reconcile() -> Result<(), Box<dyn Error>> {
         0,
         "second pass converges"
     );
+    let open = store.open_attempts()?.len();
+    assert_eq!(open, 0, "no running row survives two passes");
     Ok(())
 }

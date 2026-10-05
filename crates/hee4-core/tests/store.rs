@@ -8,7 +8,9 @@ use hee4_contracts::{
     Decision, Event, GitSha, Observation, ObservationId, Outcome, Phase, Receipt, ReceiptBody,
     RecoveryRule, Refusal, Settlement, Sha256Hex, TaskId, ToolId, Verdict,
 };
-use hee4_core::{Observations, OperationKey, Store, StoreError, reconcile};
+use hee4_core::{
+    AttemptOutcome, AttemptState, Cleanup, Observations, OperationKey, Store, StoreError, reconcile,
+};
 use serde_json::json;
 
 type R = Result<(), Box<dyn Error>>;
@@ -88,6 +90,13 @@ fn apply_writes_event_and_cache_together() -> R {
         ("running", false, 1)
     );
     assert_eq!(store.phase(&t)?, Some(Phase::Running));
+    let attempts = store.attempts(&t)?;
+    assert_eq!(attempts.len(), 1, "one attempts row per Dispatch");
+    assert_eq!(attempts[0].id.to_string(), "a-t1-1");
+    assert_eq!(
+        (attempts[0].state, attempts[0].dispatch_seq),
+        (AttemptState::Running, 2)
+    );
     Ok(())
 }
 
@@ -277,6 +286,23 @@ fn reconcile_applies_r08_through_apply_and_is_idempotent() -> R {
         store.history(&tid("a-running")?)?.last(),
         Some(&Event::Recover(RecoveryRule::R08WorkerAbsent))
     );
+    for (name, state, outcome) in [
+        ("a-running", AttemptState::Unknown, AttemptOutcome::R08),
+        ("c-verifying", AttemptState::Settled, AttemptOutcome::Ready),
+        ("e-accepted", AttemptState::Settled, AttemptOutcome::Ready),
+    ] {
+        let row = store.latest_attempt(&tid(name)?)?.ok_or("attempt row")?;
+        assert_eq!(
+            (
+                row.state,
+                row.outcome,
+                row.cleanup,
+                row.closed_seq.is_some()
+            ),
+            (state, Some(outcome), Cleanup::Pending, true),
+            "{name}"
+        );
+    }
     let second = reconcile(&store, &Observations::worker_absent())?;
     assert_eq!((second.applied, second.complete), (0, true));
     assert_eq!(store.event_count()?, before + 2);

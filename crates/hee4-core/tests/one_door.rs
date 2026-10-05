@@ -176,6 +176,28 @@ fn the_census_catches_the_crate_name_and_the_methods_calls_does_not_list() {
     assert_eq!(hits("conn.query_one(\"x\", [], f)"), Vec::<&str>::new());
 }
 
+/// `src/probe.rs` (the only IO recovery consults) is walked by the census and holds no call
+/// token and no crate name; the same matcher still names a planted `conn.query_row(`.
+#[test]
+fn probe_rs_is_walked_and_holds_no_sql_token() -> Result<(), Box<dyn Error>> {
+    let src = Path::new(&manifest_dir()?).join("src");
+    let mut files = Vec::new();
+    rust_files(&src, &mut files)?;
+    let probe = src.join("probe.rs");
+    assert!(files.contains(&probe), "probe.rs is walked: {files:?}");
+    assert_eq!(
+        hits(&std::fs::read_to_string(&probe)?),
+        Vec::<&str>::new(),
+        "probe.rs spells no census token as a call"
+    );
+    assert_eq!(
+        hits("fn planted(conn: &Door) { conn.query_row(\"SELECT 1\", [], |r| r.get(0)) }"),
+        ["query_row"],
+        "the census still catches a planted query_row in a non-store file"
+    );
+    Ok(())
+}
+
 fn copy_tree(from: &Path, to: &Path) -> Result<(), Box<dyn Error>> {
     std::fs::create_dir_all(to)?;
     for entry in std::fs::read_dir(from)? {
