@@ -13,7 +13,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use hee4_app::{doctor, socket, wire};
-use hee4_contracts::{Budgets, Receipt, Verdict};
+use hee4_contracts::{Budgets, Event, Receipt, Sha256Hex, Verdict};
 use serde_json::{Value, json};
 
 type R<T> = Result<T, Box<dyn Error>>;
@@ -49,6 +49,7 @@ fn start_with(dir: &Path, log: &str, live: bool, env: &[(&str, &Path)]) -> R<Ser
         cmd.env_remove("HEE4_LIVE_MODEL");
     }
     cmd.env_remove("HEE4_BUDGETS");
+    cmd.env_remove("HEE4_REQUIRE_BACKUPS");
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -1099,4 +1100,436 @@ fn observed_model_requests(ledger: &Path, task: &str) -> R<usize> {
         n += row?.matches("\"model_request\"").count();
     }
     Ok(n)
+}
+
+// ---- DC-22 backups and the deep-diff-forge observation (dispatcher-backups-ddf) ----
+
+/// A backup root on another device than `dir` (the ledger's): `serve` passes
+/// `SameDisk::Refuse`, so the e2e needs no same-device escape. `dir` is on `/dev/shm`
+/// (`fsync_cheap_dir`); the root is under `CARGO_TARGET_TMPDIR`. Removed when the guard drops.
+fn backup_root(dir: &Path, name: &str) -> R<(RunDir, PathBuf)> {
+    use std::os::unix::fs::MetadataExt as _;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("hee4-bk-{name}-{}-{nanos}", std::process::id()));
+    fs::create_dir_all(&root)?;
+    let (ledger_dev, root_dev) = (fs::metadata(dir)?.dev(), fs::metadata(&root)?.dev());
+    println!("MEASURED st_dev ledger_dir={ledger_dev} backup_root={root_dev}");
+    if ledger_dev == root_dev {
+        return Err(format!(
+            "{} and {} share st_dev {ledger_dev}: no cross-device root for this test",
+            dir.display(),
+            root.display()
+        )
+        .into());
+    }
+    let bk = root.join("bk");
+    Ok((RunDir(root), bk))
+}
+
+/// `hee4 serve --backups backups` over `dir`, with `env` set; polls health like `start_with`.
+fn start_backed(dir: &Path, log: &str, backups: &Path, env: &[(&str, &str)]) -> R<Server> {
+    let sock = dir.join("rt/control.sock");
+    let mut cmd = Command::new(BIN);
+    cmd.env_remove("HEE4_LIVE_MODEL")
+        .env_remove("HEE4_BUDGETS")
+        .env_remove("HEE4_REQUIRE_BACKUPS");
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let child = cmd
+        .args(["serve", "--socket"])
+        .arg(&sock)
+        .arg("--ledger")
+        .arg(dir.join("ledger.sqlite3"))
+        .arg("--work")
+        .arg(dir.join("work"))
+        .arg("--backups")
+        .arg(backups)
+        .stdout(Stdio::null())
+        .stderr(fs::File::create(dir.join(log))?)
+        .spawn()?;
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(20) {
+        if let Ok(v) = call(&sock, "health", None, json!({}))
+            && v["body"]["ok"] == true
+        {
+            return Ok(Server { child, sock });
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Err("backed server did not become healthy".into())
+}
+
+fn lines_of(path: &Path) -> R<Vec<String>> {
+    Ok(fs::read_to_string(path)?
+        .lines()
+        .map(str::to_owned)
+        .collect())
+}
+
+/// The `id=` word of a `backup ...` line.
+fn backup_id(line: &str) -> R<String> {
+    line.split(' ')
+        .find_map(|w| w.strip_prefix("id="))
+        .map(str::to_owned)
+        .ok_or_else(|| format!("no id= in {line}").into())
+}
+
+/// Submit `verify` under `key` and poll it to a terminal phase.
+fn run_task(sock: &Path, key: &str, verify: &str) -> R<(String, Value)> {
+    let got = call(
+        sock,
+        "task.submit",
+        Some(key),
+        json!({ "brief": brief(verify) }),
+    )?;
+    assert_eq!(got["kind"], "result", "{got}");
+    let id = got["body"]["task_id"].clone();
+    let done = poll(sock, &id, |p| TERMINAL.contains(&p), &mut Vec::new())?;
+    Ok((id.as_str().ok_or("id")?.to_owned(), done))
+}
+
+/// `hee4 restore --into into id --backups bk` as a subprocess: `(exit code, stdout)`.
+fn restore(into: &Path, id: &str, bk: &Path) -> R<(Option<i32>, String)> {
+    let out = Command::new(BIN)
+        .arg("restore")
+        .arg("--into")
+        .arg(into)
+        .arg(id)
+        .arg("--backups")
+        .arg(bk)
+        .output()?;
+    println!(
+        "restore stderr: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    Ok((
+        out.status.code(),
+        String::from_utf8(out.stdout)?.trim().to_owned(),
+    ))
+}
+
+#[test]
+fn backup_at_start_then_restore_into_round_trip() -> R<()> {
+    let (_run, dir) = fsync_cheap_dir("e2e-backup")?;
+    let (_bk_run, bk) = backup_root(&dir, "round-trip")?;
+    let mut server = start_backed(&dir, "serve.log", &bk, &[])?;
+    // Health answered, so the start backup is already on disk.
+    let log = lines_of(&bk.join("backup.log"))?;
+    println!("backup.log: {log:?}");
+    assert_eq!(log.len(), 1, "{log:?}");
+    let first = &log[0];
+    assert!(
+        first.starts_with("backup id=")
+            && first.contains(" trigger=start ")
+            && first.ends_with(" verdict=PASS"),
+        "{first}"
+    );
+    let id = backup_id(first)?;
+    assert!(bk.join(&id).join("manifest.json").is_file());
+    let serve_log = fs::read_to_string(dir.join("serve.log"))?;
+    assert!(
+        serve_log.contains(&format!(" backups={}", bk.display())),
+        "{serve_log}"
+    );
+
+    let (task, done) = run_task(&server.sock, "key-bk", FIXTURE)?;
+    assert_eq!(done["body"]["phase"], "accepted", "{done}");
+    let serve_log = fs::read_to_string(dir.join("serve.log"))?;
+    let skip = format!("dispatch task={task} ddf=skipped reason=no_worktree");
+    println!("serve.log has `{skip}`: {}", serve_log.contains(&skip));
+    assert!(serve_log.contains(&skip), "{serve_log}");
+    server.child.kill()?;
+    server.child.wait()?;
+
+    let into = dir.join("restored");
+    let (code, line) = restore(&into, &id, &bk)?;
+    println!("{line}");
+    assert_eq!(code, Some(0), "{line}");
+    assert!(
+        line.starts_with(&format!("restore backup={id} ledger="))
+            && line.ends_with(" verdict=PASS"),
+        "{line}"
+    );
+    assert_eq!(lines_of(&bk.join("restore.log"))?, vec![line]);
+    assert!(into.join("ledger.sqlite3").is_file());
+    Ok(())
+}
+
+/// `serve.log` contains every needle, within `within`.
+fn wait_log(log: &Path, needles: &[&str], within: Duration) -> R<String> {
+    let t0 = Instant::now();
+    loop {
+        let text = fs::read_to_string(log).unwrap_or_default();
+        if needles.iter().all(|n| text.lines().any(|l| l.contains(n))) {
+            return Ok(text);
+        }
+        if t0.elapsed() > within {
+            return Err(format!("{needles:?} not in {}: {text}", log.display()).into());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn batch_backup_fires_before_the_ninth_dispatch_and_a_failed_backup_blocks_dispatch_by_name()
+-> R<()> {
+    let (_run, dir) = fsync_cheap_dir("e2e-batch")?;
+    let (_bk_run, bk) = backup_root(&dir, "batch")?;
+    let mut server = start_backed(&dir, "serve.log", &bk, &[])?;
+    let sock = server.sock.clone();
+    for i in 1..=8 {
+        let (_, done) = run_task(&sock, &format!("key-batch-{i}"), FIXTURE)?;
+        assert_eq!(done["body"]["phase"], "accepted", "{done}");
+    }
+    assert_eq!(
+        lines_of(&bk.join("backup.log"))?.len(),
+        1,
+        "no batch backup before the ninth"
+    );
+    fs::set_permissions(&bk, fs::Permissions::from_mode(0o000))?;
+    let ninth = call(
+        &sock,
+        "task.submit",
+        Some("key-batch-9"),
+        json!({ "brief": brief(FIXTURE) }),
+    )?;
+    let ninth_id = ninth["body"]["task_id"].clone();
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(2) {
+        let got = call(&sock, "task.get", None, json!({ "task_id": ninth_id }))?;
+        if got["body"]["phase"] != "admitted" {
+            fs::set_permissions(&bk, fs::Permissions::from_mode(0o700))?;
+            return Err(format!("dispatched while the backup failed: {got}").into());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let blocked = wait_log(
+        &dir.join("serve.log"),
+        &["trigger=batch", "verdict=FAIL", "dispatch error: backup:"],
+        Duration::from_secs(5),
+    );
+    fs::set_permissions(&bk, fs::Permissions::from_mode(0o700))?;
+    let blocked = blocked?;
+    for l in blocked
+        .lines()
+        .filter(|l| l.starts_with("backup ") || l.starts_with("dispatch error:"))
+    {
+        println!("serve.log: {l}");
+    }
+    assert!(
+        blocked.lines().any(|l| l.starts_with("backup ")
+            && l.contains(" trigger=batch ")
+            && l.contains(" verdict=FAIL ")),
+        "{blocked}"
+    );
+    let done = poll(&sock, &ninth_id, |p| TERMINAL.contains(&p), &mut Vec::new())?;
+    assert_eq!(done["body"]["phase"], "accepted", "{done}");
+    let log = lines_of(&bk.join("backup.log"))?;
+    println!("backup.log: {log:#?}");
+    assert_eq!(log.len(), 3, "{log:?}");
+    assert!(
+        log[0].contains(" trigger=start ") && log[0].ends_with(" verdict=PASS"),
+        "{log:?}"
+    );
+    assert!(
+        log[1].contains(" trigger=batch ") && log[1].contains(" verdict=FAIL reason="),
+        "{log:?}"
+    );
+    assert!(
+        log[2].contains(" trigger=batch ") && log[2].ends_with(" verdict=PASS"),
+        "{log:?}"
+    );
+    let dispatch = serde_json::to_string(&Event::Dispatch)?;
+    let conn = rusqlite::Connection::open_with_flags(
+        dir.join("ledger.sqlite3"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let dispatches: i64 = conn.query_row(
+        "SELECT count(*) FROM events WHERE task_id = ?1 AND event_json = ?2",
+        [ninth_id.as_str().ok_or("id")?, dispatch.as_str()],
+        |r| r.get(0),
+    )?;
+    assert_eq!(dispatches, 1, "one Dispatch for the ninth task");
+    server.child.kill()?;
+    server.child.wait()?;
+    Ok(())
+}
+
+#[test]
+fn serve_without_backups_is_refused_by_name_when_required() -> R<()> {
+    let (_run, dir) = fsync_cheap_dir("e2e-require")?;
+    let sock = dir.join("rt/control.sock");
+    let mut child = Command::new(BIN)
+        .env("HEE4_REQUIRE_BACKUPS", "1")
+        .args(["serve", "--socket"])
+        .arg(&sock)
+        .arg("--ledger")
+        .arg(dir.join("ledger.sqlite3"))
+        .arg("--work")
+        .arg(dir.join("work"))
+        .stdout(Stdio::null())
+        .stderr(fs::File::create(dir.join("serve.log"))?)
+        .spawn()?;
+    let t0 = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if t0.elapsed() > Duration::from_secs(5) {
+            child.kill()?;
+            child.wait()?;
+            return Err("serve still running 5 s after the refusal was due".into());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let log = fs::read_to_string(dir.join("serve.log"))?;
+    println!("exit={status} log={}", log.trim());
+    assert!(!status.success());
+    assert!(
+        log.contains("hee4 serve refused: backups: --backups is required (HEE4_REQUIRE_BACKUPS=1)"),
+        "{log}"
+    );
+    assert!(!sock.exists(), "no socket file");
+    assert!(
+        !dir.join("ledger.sqlite3").exists(),
+        "refused before Store::open"
+    );
+    Ok(())
+}
+
+#[test]
+fn restore_refuses_an_unknown_id_and_an_occupied_target_by_name() -> R<()> {
+    let (_run, dir) = fsync_cheap_dir("e2e-restore-refuse")?;
+    let (_bk_run, bk) = backup_root(&dir, "refuse")?;
+    let mut server = start_backed(&dir, "serve.log", &bk, &[])?;
+    server.child.kill()?;
+    server.child.wait()?;
+    let id = backup_id(
+        lines_of(&bk.join("backup.log"))?
+            .first()
+            .ok_or("no backup line")?,
+    )?;
+
+    let (code, unknown) = restore(&dir.join("x"), "nosuch", &bk)?;
+    println!("{unknown}");
+    assert_eq!(code, Some(1), "{unknown}");
+    assert!(
+        unknown.starts_with("restore backup=nosuch ")
+            && unknown.ends_with(" verdict=FAIL reason=not_found"),
+        "{unknown}"
+    );
+
+    let occupied = dir.join("occupied");
+    fs::create_dir_all(&occupied)?;
+    fs::write(occupied.join("ledger.sqlite3"), b"not a ledger")?;
+    let (code, refused) = restore(&occupied, &id, &bk)?;
+    println!("{refused}");
+    assert_eq!(code, Some(1), "{refused}");
+    assert!(
+        refused.starts_with(&format!("restore backup={id} "))
+            && refused.ends_with(" verdict=FAIL reason=target_occupied"),
+        "{refused}"
+    );
+    assert_eq!(fs::read(occupied.join("ledger.sqlite3"))?, b"not a ledger");
+    assert_eq!(lines_of(&bk.join("restore.log"))?, vec![unknown, refused]);
+    Ok(())
+}
+
+/// Whether `deep-diff-forge` is on this process's `PATH` (the serve child inherits it).
+fn ddf_present() -> bool {
+    std::env::var_os("PATH")
+        .is_some_and(|p| std::env::split_paths(&p).any(|d| d.join("deep-diff-forge").is_file()))
+}
+
+/// `git -C ws args..` on the host, which must succeed.
+fn git(ws: &Path, args: &[&str]) -> R<()> {
+    let status = Command::new("git").arg("-C").arg(ws).args(args).status()?;
+    if !status.success() {
+        return Err(format!("git {args:?} in {}: {status}", ws.display()).into());
+    }
+    Ok(())
+}
+
+/// The brief's VERIFY `sh: git init -q . && echo x > f && git add f` cannot run in the landed
+/// sandbox: `bwrap` mounts no `/dev`, and git exits 128 `could not open '/dev/null'` (MEASURED,
+/// hee4-host `spawn::plan` argv). So the test seeds generation 1's workspace on the host
+/// (`<work>/<task>/1/<task>`, the task id derived as `task.submit` derives it) with a HEAD-less
+/// repo holding one staged file, and the VERIFY checks that file from inside the sandbox.
+#[test]
+fn sealed_diff_observation_reaches_the_receipt() -> R<()> {
+    const VERIFY: &str = "/usr/bin/test -s f";
+    const KEY: &str = "key-ddf";
+    let (_run, dir) = fsync_cheap_dir("e2e-ddf")?;
+    let uid = hee4_app::process_uid().ok_or("uid")?;
+    let digest = Sha256Hex::digest(format!("uid:{uid}\n{KEY}").as_bytes()).to_string();
+    let expected_task = format!("t-{}", &digest[..24]);
+    let ws = dir
+        .join("work")
+        .join(&expected_task)
+        .join("1")
+        .join(&expected_task);
+    fs::create_dir_all(&ws)?;
+    git(&ws, &["init", "-q", "."])?;
+    fs::write(ws.join("f"), "x\n")?;
+    git(&ws, &["add", "f"])?;
+    let mut server = start(&dir, "serve.log")?;
+    let (task, done) = run_task(&server.sock, KEY, VERIFY)?;
+    assert_eq!(task, expected_task, "the seeded workspace is the task's");
+    server.child.kill()?;
+    server.child.wait()?;
+    let log = fs::read_to_string(dir.join("serve.log"))?;
+    for l in log.lines().filter(|l| l.contains("ddf")) {
+        println!("serve.log: {l}");
+    }
+    assert_eq!(done["body"]["phase"], "accepted", "{done} {log}");
+    if !ddf_present() {
+        println!("UNMEASURED: deep-diff-forge not on PATH");
+        assert!(
+            log.contains(&format!(
+                "dispatch task={task} ddf=skipped reason=tool_absent"
+            )),
+            "{log}"
+        );
+        return Ok(());
+    }
+    assert!(
+        log.contains(&format!(
+            "dispatch task={task} ddf=observed tool=deep-diff-forge "
+        )),
+        "{log}"
+    );
+    let ledger = dir.join("ledger.sqlite3");
+    let conn =
+        rusqlite::Connection::open_with_flags(&ledger, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut q = conn.prepare("SELECT id, json FROM observations WHERE task_id = ?1")?;
+    let mut ddf_rows = Vec::new();
+    for row in q.query_map([&task], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })? {
+        let (id, json) = row?;
+        let obs: Value = serde_json::from_str(&json)?;
+        if obs["tool"]["name"] == "deep-diff-forge" {
+            ddf_rows.push((id, obs));
+        }
+    }
+    assert_eq!(ddf_rows.len(), 1, "{ddf_rows:?}");
+    let (obs_id, obs) = &ddf_rows[0];
+    println!("MEASURED ddf observation {obs_id} {obs}");
+    assert_eq!(
+        obs["input_sha256"],
+        Sha256Hex::digest(VERIFY.as_bytes()).to_string(),
+        "bound to the VERIFY digest"
+    );
+    let chain = receipts(&ledger, &task)?;
+    let receipt = chain.last().ok_or("no receipt")?;
+    assert!(
+        receipt.observed().iter().any(|o| o.to_string() == *obs_id),
+        "{receipt:?}"
+    );
+    assert_eq!(receipt.decision().verdict, Verdict::Pass, "{receipt:?}");
+    Ok(())
 }

@@ -4,7 +4,9 @@
 //! Every state change is `Store::apply`; the only verdict is `hee4_evidence::decide_and_seal`'s.
 
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hee4_contracts::bounds::MAX_VIEW_ITEMS;
@@ -12,9 +14,12 @@ use hee4_contracts::{
     AbandonReason, Brief, BriefField, Event, GitSha, Observation, Phase, ReceiptId, Resolution,
     Settlement, Sha256Hex, SourceId, TaskId, Verdict, VerifyLine,
 };
+use hee4_core::backup::{BackupError, SameDisk, backup_to};
 use hee4_core::roster::RosterDefinition;
 use hee4_core::{AttemptId, AttemptStart, StoreError};
+use hee4_evidence::ddf::{self, AdapterError, Diff, TaskObservation};
 use hee4_evidence::{Identities, Identity, Source, Subject, Why, decide_and_seal, observation_id};
+use hee4_host::clock::{Clock, SystemClock};
 use hee4_host::model::OllamaClient;
 use hee4_host::model_door::Upstream;
 use hee4_host::spawn::{self, Permit, SpawnScope};
@@ -62,6 +67,9 @@ pub enum DispatchError {
     /// An id did not parse.
     #[error("contract: {0}")]
     Contract(#[from] hee4_contracts::Refusal),
+    /// The due DC-22 backup failed; no `Dispatch` was applied and the task stays `admitted`.
+    #[error("backup: {0}")]
+    Backup(#[from] BackupFault),
 }
 
 /// The playbook named by the brief's VERIFY field: one step per line of
@@ -123,6 +131,333 @@ pub fn timebox(text: &str, default: Duration, ceiling: Duration) -> Duration {
         (n, _) => Duration::from_secs(n),
     };
     asked.min(ceiling)
+}
+
+/// DC-22 freshness: a backup older than this is stale, so the next dispatch takes one first
+/// (plan/DECISIONS.md:199-204). Pending K0 field `backup.freshness_ms`; the one copy.
+pub const DC22_FRESHNESS: Duration = Duration::from_mins(15);
+
+/// DC-22 batch boundary: after this many dispatches since the last backup, the next dispatch
+/// takes one first (plan/DECISIONS.md:199-204). Pending K0 field `backup.batch_tasks`; the one copy.
+pub const DC22_BATCH_TASKS: u64 = 8;
+
+/// The file under the backup root that gets one line per backup run (K6's, not K1's).
+pub const BACKUP_LOG: &str = "backup.log";
+
+/// Why a DC-22 backup is due: one variant per DC-22 bullet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackupTrigger {
+    /// No backup has been taken into this root.
+    Start,
+    /// The last backup was taken by another build (`head` moved): before an upgrade serves.
+    Upgrade,
+    /// The last backup is older than [`DC22_FRESHNESS`].
+    Stale,
+    /// [`DC22_BATCH_TASKS`] dispatches since the last backup.
+    Batch,
+}
+
+impl BackupTrigger {
+    /// The `trigger=` word in `backup.log`.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Upgrade => "upgrade",
+            Self::Stale => "stale",
+            Self::Batch => "batch",
+        }
+    }
+}
+
+/// The first 12 hex digits of a build commit, as `backup.log` records it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Head12([u8; 12]);
+
+impl Head12 {
+    /// The first 12 digits of `head`.
+    #[must_use]
+    pub fn of(head: &GitSha) -> Option<Self> {
+        Self::parse(head.as_str().get(..12)?)
+    }
+
+    /// Exactly 12 lowercase hex digits, else `None`.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        let bytes: [u8; 12] = text.as_bytes().try_into().ok()?;
+        bytes
+            .iter()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+            .then_some(Self(bytes))
+    }
+
+    /// Byte equality, usable in a `const fn`.
+    #[must_use]
+    pub const fn same(&self, other: &Self) -> bool {
+        let mut i = 0;
+        while i < 12 {
+            if self.0[i] != other.0[i] {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+
+    /// The 12 digits.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.0).unwrap_or("unknown")
+    }
+}
+
+/// The last successful backup in the root, as its `backup.log` line records it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LastBackup {
+    /// When it started, since the Unix epoch (from the K1 id `b-<ts_ms hex>-<boot hex>`).
+    pub ts: Duration,
+    /// The build that took it.
+    pub head: Head12,
+}
+
+/// Everything [`backup_due`] reads; time comes in as a value, never from a clock here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackupFacts {
+    /// The last successful backup, if any.
+    pub last: Option<LastBackup>,
+    /// Successful `Dispatch` events since it.
+    pub dispatched_since: u64,
+    /// Now, since the Unix epoch.
+    pub now: Duration,
+    /// This build.
+    pub head: Head12,
+}
+
+/// The DC-22 rule, pure and total: no backup → `Start`; another build's → `Upgrade`; older
+/// than [`DC22_FRESHNESS`] (strictly) → `Stale`; at least [`DC22_BATCH_TASKS`] dispatches since
+/// → `Batch`; else none.
+#[must_use]
+pub const fn backup_due(facts: &BackupFacts) -> Option<BackupTrigger> {
+    let Some(last) = &facts.last else {
+        return Some(BackupTrigger::Start);
+    };
+    if !last.head.same(&facts.head) {
+        return Some(BackupTrigger::Upgrade);
+    }
+    if facts.now.saturating_sub(last.ts).as_millis() > DC22_FRESHNESS.as_millis() {
+        return Some(BackupTrigger::Stale);
+    }
+    if facts.dispatched_since >= DC22_BATCH_TASKS {
+        return Some(BackupTrigger::Batch);
+    }
+    None
+}
+
+/// Why a backup run failed or the backup root could not be opened.
+#[derive(Debug, thiserror::Error)]
+pub enum BackupFault {
+    /// K1's `backup_to` refused.
+    #[error("{0}")]
+    Take(#[from] BackupError),
+    /// The root or `backup.log` could not be created, read or appended.
+    #[error("{BACKUP_LOG} at {path}: {source}")]
+    Log {
+        /// The path.
+        path: PathBuf,
+        /// The OS's answer.
+        #[source]
+        source: std::io::Error,
+    },
+    /// The build commit is `unknown`, so no backup can name its head.
+    #[error("head unknown: the build has no commit")]
+    HeadUnknown,
+}
+
+/// The `reason=` word for a K1 backup or restore refusal.
+#[must_use]
+pub const fn backup_error_name(e: &BackupError) -> &'static str {
+    match e {
+        BackupError::Store(_) => "store",
+        BackupError::Io { .. } => "io",
+        BackupError::Json(_) => "manifest_json",
+        BackupError::Manifest { .. } => "manifest",
+        BackupError::ObjectsOverBound { .. } => "objects_over_bound",
+        BackupError::SameDevice { .. } => "same_device",
+        BackupError::Incomplete { .. } => "incomplete",
+        BackupError::TargetOccupied { .. } => "target_occupied",
+        BackupError::DigestMismatch { .. } => "digest_mismatch",
+        BackupError::ObjectsMissing { .. } => "objects_missing",
+        _ => "backup_error",
+    }
+}
+
+/// The DC-22 backup state the dispatcher thread owns: the root, its open `backup.log` (held
+/// open so a FAIL line still lands when the root itself refuses), the last good backup and the
+/// dispatches since. No thread, timer or daemon (V4-6): it runs only when `serve` or `step`
+/// calls it.
+#[derive(Debug)]
+pub struct Backups {
+    root: PathBuf,
+    log: fs::File,
+    last: Option<LastBackup>,
+    dispatched_since: u64,
+    head: Head12,
+    failing: bool,
+}
+
+/// `(ts, head)` from a `backup id=b-<ts_ms hex>-.. ... head=<12> verdict=PASS` line.
+fn parse_pass_line(line: &str) -> Option<LastBackup> {
+    if !line.starts_with("backup ") || !line.contains(" verdict=PASS") {
+        return None;
+    }
+    let word = |key: &str| {
+        line.split(' ')
+            .find_map(|w| w.strip_prefix(key))
+            .map(str::to_owned)
+    };
+    let id = word("id=")?;
+    let ts_hex = id.strip_prefix("b-")?.split('-').next()?;
+    let ts_ms = u64::from_str_radix(ts_hex, 16).ok()?;
+    Some(LastBackup {
+        ts: Duration::from_millis(ts_ms),
+        head: Head12::parse(&word("head=")?)?,
+    })
+}
+
+impl Backups {
+    /// Create `root` if absent, open `<root>/backup.log` for append, and read its last PASS
+    /// line as the last backup (so `Upgrade` needs no manifest field).
+    ///
+    /// # Errors
+    /// [`BackupFault::Log`] when the root or the log cannot be created or read.
+    pub fn open(root: &Path, head: Head12) -> Result<Self, BackupFault> {
+        let at = |path: &Path| {
+            let path = path.to_path_buf();
+            move |source| BackupFault::Log { path, source }
+        };
+        fs::create_dir_all(root).map_err(at(root))?;
+        let path = root.join(BACKUP_LOG);
+        let log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(at(&path))?;
+        let text = fs::read_to_string(&path).map_err(at(&path))?;
+        let last = text.lines().rev().find_map(parse_pass_line);
+        Ok(Self {
+            root: root.to_path_buf(),
+            log,
+            last,
+            dispatched_since: 0,
+            head,
+            failing: false,
+        })
+    }
+
+    /// The root.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// The facts [`backup_due`] reads, at `now`.
+    #[must_use]
+    pub const fn facts(&self, now: Duration) -> BackupFacts {
+        BackupFacts {
+            last: self.last,
+            dispatched_since: self.dispatched_since,
+            now,
+            head: self.head,
+        }
+    }
+
+    /// Count one applied `Dispatch`.
+    pub const fn dispatched(&mut self) {
+        self.dispatched_since = self.dispatched_since.saturating_add(1);
+    }
+
+    /// Run K1's `backup_to` into the root (the ledger's device refused) and append one line to
+    /// `backup.log`; on PASS reset the last backup and the dispatch count. A FAIL line is
+    /// written once per failing streak (each retry still prints it to the serve log), then the
+    /// error is returned.
+    ///
+    /// # Errors
+    /// [`BackupFault::Take`] when K1 refused; [`BackupFault::Log`] when the line could not be
+    /// appended.
+    pub fn take(
+        &mut self,
+        engine: &Engine,
+        trigger: BackupTrigger,
+        clock: &impl Clock,
+    ) -> Result<(), BackupFault> {
+        let now = clock.now();
+        let age = self.last.map_or_else(
+            || "none".to_owned(),
+            |l| now.saturating_sub(l.ts).as_secs().to_string(),
+        );
+        let taken = backup_to(&engine.store(), engine.work(), &self.root, SameDisk::Refuse);
+        let head = self.head.as_str().to_owned();
+        let trigger = trigger.name();
+        let (line, result) = match taken {
+            Ok(report) => (
+                format!(
+                    "backup id={} objects={} age_s={age} trigger={trigger} head={head} verdict=PASS",
+                    report.id, report.objects_n
+                ),
+                Ok(report),
+            ),
+            Err(e) => (
+                format!(
+                    "backup id=none objects=none age_s={age} trigger={trigger} head={head} verdict=FAIL reason={}",
+                    backup_error_name(&e)
+                ),
+                Err(e),
+            ),
+        };
+        eprintln!("{line}");
+        let first_failure = result.is_err() && !self.failing;
+        if result.is_ok() || first_failure {
+            writeln!(self.log, "{line}").map_err(|source| BackupFault::Log {
+                path: self.root.join(BACKUP_LOG),
+                source,
+            })?;
+        }
+        match result {
+            Ok(report) => {
+                self.failing = false;
+                self.dispatched_since = 0;
+                self.last = Some(LastBackup {
+                    ts: u64::try_from(report.ts_ms).map_or(now, Duration::from_millis),
+                    head: self.head,
+                });
+                Ok(())
+            }
+            Err(e) => {
+                self.failing = true;
+                Err(BackupFault::Take(e))
+            }
+        }
+    }
+
+    /// Take the backup [`backup_due`] names now, if any.
+    ///
+    /// # Errors
+    /// As [`Backups::take`].
+    pub fn take_if_due(&mut self, engine: &Engine, clock: &impl Clock) -> Result<(), BackupFault> {
+        match backup_due(&self.facts(clock.now())) {
+            Some(trigger) => self.take(engine, trigger, clock),
+            None => Ok(()),
+        }
+    }
+}
+
+/// The brief's TIMEBOX under `budgets.attempt` ([`timebox`]): the attempt's and deep-diff-forge's.
+fn brief_timebox(brief: &Brief, budgets: &hee4_contracts::Budgets) -> Duration {
+    timebox(
+        brief.get(BriefField::Timebox),
+        budgets.attempt.timebox_default(),
+        budgets.attempt.deadline(),
+    )
 }
 
 /// The first `admitted` task, oldest id first.
@@ -301,11 +636,18 @@ fn route_with(
 }
 
 /// Dispatch one `admitted` task to a terminal or parked phase. `Ok(None)`: nothing to do.
+/// With `backups`, the DC-22 backup [`backup_due`] names is taken immediately before
+/// `apply(Dispatch)`.
 ///
 /// # Errors
 /// [`DispatchError`] when the ledger fails; the task stays where the last `apply` left it, and
-/// startup reconcile owns it after a restart.
-pub fn step(engine: &Engine, cfg: &Config) -> Result<Option<(TaskId, Phase)>, DispatchError> {
+/// startup reconcile owns it after a restart. [`DispatchError::Backup`] when the due backup
+/// failed: no `Dispatch` was applied, the task stays `admitted` and the next step retries.
+pub fn step(
+    engine: &Engine,
+    cfg: &Config,
+    backups: Option<&mut Backups>,
+) -> Result<Option<(TaskId, Phase)>, DispatchError> {
     let Some(task) = next_admitted(engine)? else {
         return Ok(None);
     };
@@ -344,16 +686,8 @@ pub fn step(engine: &Engine, cfg: &Config) -> Result<Option<(TaskId, Phase)>, Di
             )));
         }
     };
-    let (ns, generation) = match workspace(
-        engine,
-        &task,
-        needs_model,
-        timebox(
-            brief.get(BriefField::Timebox),
-            budgets.attempt.timebox_default(),
-            budgets.attempt.deadline(),
-        ),
-    )? {
+    let budget = brief_timebox(&brief, &budgets);
+    let (ns, generation) = match workspace(engine, &task, needs_model, budget)? {
         Ok(built) => built,
         Err(abandoned) => return Ok(Some((task.clone(), abandoned))),
     };
@@ -381,7 +715,7 @@ pub fn step(engine: &Engine, cfg: &Config) -> Result<Option<(TaskId, Phase)>, Di
         }
     };
 
-    apply(engine, &task, Event::Dispatch)?;
+    dispatch(engine, &task, backups)?;
     let start = AttemptStart {
         receipt_id: receipt_id.clone(),
         permit_id: permit.id().0,
@@ -407,7 +741,41 @@ pub fn step(engine: &Engine, cfg: &Config) -> Result<Option<(TaskId, Phase)>, Di
             return Ok(Some((task.clone(), apply(engine, &task, Event::Stop)?)));
         }
     };
-    settle_and_decide(engine, &task, receipt_id, &permit, &brief, head, &outcome)
+    let sealing = Sealing {
+        receipt_id,
+        permit: &permit,
+        subject: &subject_of(&task, head, &brief),
+        work_dir: ns.work_dir(),
+        budget,
+    };
+    settle_and_decide(engine, &sealing, &outcome)
+}
+
+/// The DC-22 backup [`backup_due`] names, then `apply(Dispatch)`, then count it. A failed
+/// backup returns before `Dispatch`: the task stays `admitted`.
+fn dispatch(
+    engine: &Engine,
+    task: &TaskId,
+    mut backups: Option<&mut Backups>,
+) -> Result<(), DispatchError> {
+    if let Some(b) = backups.as_deref_mut() {
+        b.take_if_due(engine, &SystemClock)?;
+    }
+    apply(engine, task, Event::Dispatch)?;
+    if let Some(b) = backups {
+        b.dispatched();
+    }
+    Ok(())
+}
+
+/// The one subject: every observation and the receipt are bound to it. Its input is the
+/// VERIFY text's digest, which every observation carries.
+fn subject_of(task: &TaskId, head: GitSha, brief: &Brief) -> Subject {
+    Subject {
+        task_id: task.clone(),
+        head_sha: head,
+        input_sha256: Sha256Hex::digest(brief.get(BriefField::Verify).as_bytes()),
+    }
 }
 
 /// The attempt's permit: receipt `receipt_id`, scope = the `Run` steps' programs.
@@ -547,17 +915,25 @@ fn opened_attempt(engine: &Engine, task: &TaskId, expected: u64) -> Result<Attem
     }
 }
 
-/// After the attempt: settle, ledger each observation, `decide_and_seal`, append, decide.
-#[allow(clippy::too_many_arguments)]
+/// What `settle_and_decide` seals against: one subject for every observation and the receipt.
+struct Sealing<'a> {
+    receipt_id: ReceiptId,
+    permit: &'a Permit,
+    subject: &'a Subject,
+    /// The per-generation workspace (`ns.work_dir()`), diffed for deep-diff-forge.
+    work_dir: &'a Path,
+    /// The attempt's timebox, deep-diff-forge's budget too.
+    budget: Duration,
+}
+
+/// After the attempt: settle, ask deep-diff-forge over the workspace diff, ledger each
+/// observation, `decide_and_seal`, append, decide.
 fn settle_and_decide(
     engine: &Engine,
-    task: &TaskId,
-    receipt_id: ReceiptId,
-    permit: &Permit,
-    brief: &Brief,
-    head: GitSha,
+    sealing: &Sealing<'_>,
     outcome: &AttemptOutcome,
 ) -> Result<Option<(TaskId, Phase)>, DispatchError> {
+    let task = &sealing.subject.task_id;
     for s in &outcome.steps {
         eprintln!("dispatch task={task} step={} status={:?}", s.name, s.status);
     }
@@ -570,20 +946,14 @@ fn settle_and_decide(
         return Ok(Some((task.clone(), apply(engine, task, Event::Stop)?)));
     }
     apply(engine, task, Event::Settle(Settlement::Ready))?;
-    for obs in &outcome.observations {
+    let mut observations = outcome.observations.clone();
+    observations.extend(ddf_observation(sealing));
+    for obs in &observations {
         let id = observation_id(task, obs)?;
         engine.store().record_observation(task, &id, obs)?;
         apply(engine, task, Event::Observe)?;
     }
-    let receipt = seal(
-        engine,
-        task,
-        receipt_id,
-        permit,
-        brief,
-        head,
-        &outcome.observations,
-    )?;
+    let receipt = seal(engine, sealing, &observations)?;
     let verdict = receipt.decision().verdict;
     eprintln!(
         "dispatch task={task} verdict={verdict:?} receipt={}",
@@ -596,14 +966,102 @@ fn settle_and_decide(
     Ok(Some((task.clone(), phase)))
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Why the workspace could not be diffed.
+#[derive(Debug, thiserror::Error)]
+pub enum DiffFault {
+    /// `git` could not be run.
+    #[error("git: {0}")]
+    Spawn(#[from] std::io::Error),
+    /// `git diff` exited non-zero.
+    #[error("git diff exited {code:?}")]
+    Exit {
+        /// The exit code, if any.
+        code: Option<i32>,
+    },
+}
+
+/// The workspace's diff: `None` when `<ws>/.git` is absent (no worktree); else
+/// `git diff --cached` (a fresh `git init` has no HEAD, so staged files show only here)
+/// followed by `git diff`. Empty bytes mean a clean worktree.
+///
+/// # Errors
+/// [`DiffFault`] when git cannot run or exits non-zero.
+pub fn workspace_diff(ws: &Path) -> Result<Option<Vec<u8>>, DiffFault> {
+    if !ws.join(".git").exists() {
+        return Ok(None);
+    }
+    let mut bytes = Vec::new();
+    for cached in [true, false] {
+        let mut cmd = Command::new("git");
+        cmd.arg("-C")
+            .arg(ws)
+            .args(["diff", "--no-color", "--no-ext-diff"]);
+        if cached {
+            cmd.arg("--cached");
+        }
+        let out = cmd.output()?;
+        if !out.status.success() {
+            return Err(DiffFault::Exit {
+                code: out.status.code(),
+            });
+        }
+        bytes.extend_from_slice(&out.stdout);
+    }
+    Ok(Some(bytes))
+}
+
+/// The `AdapterError` variant name for the skip line.
+const fn adapter_error_name(e: &AdapterError) -> &'static str {
+    match e {
+        AdapterError::Spawn(_) => "spawn",
+        AdapterError::Exit { .. } => "exit",
+        AdapterError::Malformed(_) => "malformed",
+        AdapterError::SealMismatch { .. } => "seal_mismatch",
+        AdapterError::Timeout { .. } => "timeout",
+        AdapterError::LookedAtNothing => "looked_at_nothing",
+    }
+}
+
+/// K4's `ddf::for_task` over the workspace diff, bound to the one subject. An observation of any
+/// outcome is returned for recording (the lattice reads it; this function never does); every
+/// skip is a log line and nothing else: never a refusal, never an abandon.
+fn ddf_observation(sealing: &Sealing<'_>) -> Option<Observation> {
+    let task = &sealing.subject.task_id;
+    let skipped = |reason: &str| {
+        eprintln!("dispatch task={task} ddf=skipped reason={reason}");
+        None
+    };
+    let bytes = match workspace_diff(sealing.work_dir) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("dispatch task={task} ddf git_error={e}");
+            let kind = match e {
+                DiffFault::Spawn(_) => "spawn",
+                DiffFault::Exit { .. } => "exit",
+            };
+            return skipped(&format!("git_error:{kind}"));
+        }
+    };
+    let diff = bytes.as_deref().map_or(Diff::NoWorktree, Diff::Bytes);
+    match ddf::for_task(diff, sealing.subject, &SystemClock, sealing.budget) {
+        Ok(TaskObservation::Observed(obs)) => {
+            eprintln!(
+                "dispatch task={task} ddf=observed tool={} {}",
+                obs.tool.name, obs.tool.version
+            );
+            Some(obs)
+        }
+        Ok(TaskObservation::Skipped(skip)) => skipped(skip.name()),
+        Err(e) => {
+            eprintln!("dispatch task={task} ddf adapter_error={e}");
+            skipped(&format!("adapter_error:{}", adapter_error_name(&e)))
+        }
+    }
+}
+
 fn seal(
     engine: &Engine,
-    task: &TaskId,
-    id: ReceiptId,
-    permit: &Permit,
-    brief: &Brief,
-    head: GitSha,
+    sealing: &Sealing<'_>,
     obs: &[Observation],
 ) -> Result<hee4_contracts::Receipt, DispatchError> {
     let store = engine.store();
@@ -621,17 +1079,17 @@ fn seal(
     };
     let ids = Identities {
         collector,
-        locks: source("hee4-permit", format!("{permit:?}").as_bytes())?,
+        locks: source("hee4-permit", format!("{:?}", sealing.permit).as_bytes())?,
         standards: source("gate.toml", crate::GATE_TOML)?,
     };
-    // The subject's input is the VERIFY text; every observation carries its digest.
-    let input = brief.get(BriefField::Verify);
-    let subject = Subject {
-        task_id: task.clone(),
-        head_sha: head,
-        input_sha256: Sha256Hex::digest(input.as_bytes()),
-    };
-    let receipt = decide_and_seal(store.chain_head(task)?, id, &ids, obs, &subject)?;
+    let task = &sealing.subject.task_id;
+    let receipt = decide_and_seal(
+        store.chain_head(task)?,
+        sealing.receipt_id.clone(),
+        &ids,
+        obs,
+        sealing.subject,
+    )?;
     store.append_receipt(&receipt)?;
     Ok(receipt)
 }
@@ -639,6 +1097,158 @@ fn seal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn head(c: u8) -> Head12 {
+        Head12([c; 12])
+    }
+
+    fn facts(last: Option<(u64, u8)>, dispatched_since: u64, now_s: u64) -> BackupFacts {
+        BackupFacts {
+            last: last.map(|(ts, c)| LastBackup {
+                ts: Duration::from_secs(ts),
+                head: head(c),
+            }),
+            dispatched_since,
+            now: Duration::from_secs(now_s),
+            head: head(b'a'),
+        }
+    }
+
+    #[test]
+    fn backup_due_start_when_no_backup() {
+        assert_eq!(backup_due(&facts(None, 0, 0)), Some(BackupTrigger::Start));
+        assert_eq!(backup_due(&facts(None, 99, 5)), Some(BackupTrigger::Start));
+    }
+
+    #[test]
+    fn backup_due_upgrade_when_head_moved() {
+        assert_eq!(
+            backup_due(&facts(Some((100, b'b')), 0, 100)),
+            Some(BackupTrigger::Upgrade)
+        );
+        // A moved head outranks a stale or batched backup.
+        assert_eq!(
+            backup_due(&facts(Some((0, b'b')), 8, 10_000)),
+            Some(BackupTrigger::Upgrade)
+        );
+    }
+
+    #[test]
+    fn backup_due_stale_after_fifteen_minutes() {
+        assert_eq!(DC22_FRESHNESS, Duration::from_mins(15));
+        // Exactly 15 minutes old is still fresh; one millisecond more is stale.
+        assert_eq!(backup_due(&facts(Some((1000, b'a')), 0, 1900)), None);
+        let mut f = facts(Some((1000, b'a')), 0, 1900);
+        f.now += Duration::from_millis(1);
+        assert_eq!(backup_due(&f), Some(BackupTrigger::Stale));
+        // Stale outranks batch.
+        assert_eq!(
+            backup_due(&facts(Some((1000, b'a')), 8, 1901)),
+            Some(BackupTrigger::Stale)
+        );
+    }
+
+    #[test]
+    fn backup_due_batch_at_eight_dispatches() {
+        assert_eq!(DC22_BATCH_TASKS, 8);
+        assert_eq!(backup_due(&facts(Some((1000, b'a')), 7, 1000)), None);
+        assert_eq!(
+            backup_due(&facts(Some((1000, b'a')), 8, 1000)),
+            Some(BackupTrigger::Batch)
+        );
+        assert_eq!(
+            backup_due(&facts(Some((1000, b'a')), 9, 1000)),
+            Some(BackupTrigger::Batch)
+        );
+    }
+
+    #[test]
+    fn backup_due_none_when_fresh() {
+        assert_eq!(backup_due(&facts(Some((1000, b'a')), 0, 1000)), None);
+        // A clock behind the backup saturates to zero age: fresh, never a wrap.
+        assert_eq!(backup_due(&facts(Some((1000, b'a')), 0, 10)), None);
+    }
+
+    #[test]
+    fn a_pass_line_round_trips_its_ts_and_head() {
+        let line = "backup id=b-0000000003e8-0000000a objects=2 age_s=none trigger=start head=aaaaaaaaaaaa verdict=PASS";
+        assert_eq!(
+            parse_pass_line(line),
+            Some(LastBackup {
+                ts: Duration::from_millis(1000),
+                head: head(b'a')
+            })
+        );
+        assert_eq!(parse_pass_line(&line.replace("PASS", "FAIL")), None);
+    }
+
+    type R<T> = Result<T, Box<dyn std::error::Error>>;
+
+    fn scratch(name: &str) -> R<PathBuf> {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir =
+            std::env::temp_dir().join(format!("hee4-app-{name}-{}-{nanos}", std::process::id()));
+        fs::create_dir_all(&dir)?;
+        Ok(dir)
+    }
+
+    fn subject() -> R<Subject> {
+        Ok(Subject {
+            task_id: "t-000000000000000000000000".parse()?,
+            head_sha: "0123456789abcdef0123456789abcdef01234567".parse()?,
+            input_sha256: Sha256Hex::digest(b"sh: true"),
+        })
+    }
+
+    #[test]
+    fn workspace_diff_without_git_dir_is_no_worktree() -> R<()> {
+        let ws = scratch("no-worktree")?;
+        fs::write(ws.join("f"), "x")?;
+        assert_eq!(workspace_diff(&ws)?, None);
+        let skip = ddf::for_task(
+            Diff::NoWorktree,
+            &subject()?,
+            &SystemClock,
+            Duration::from_secs(5),
+        )?;
+        assert_eq!(skip, TaskObservation::Skipped(ddf::Skip::NoWorktree));
+        let _ = fs::remove_dir_all(&ws);
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_diff_of_a_clean_worktree_is_no_diff() -> R<()> {
+        let ws = scratch("clean")?;
+        let init = Command::new("git")
+            .arg("-C")
+            .arg(&ws)
+            .args(["init", "-q", "."])
+            .status()?;
+        assert!(init.success());
+        let bytes = workspace_diff(&ws)?.ok_or("no worktree")?;
+        assert!(bytes.is_empty(), "{}", String::from_utf8_lossy(&bytes));
+        let skip = ddf::for_task(
+            Diff::Bytes(&bytes),
+            &subject()?,
+            &SystemClock,
+            Duration::from_secs(5),
+        )?;
+        assert_eq!(skip, TaskObservation::Skipped(ddf::Skip::NoDiff));
+        // A staged file in the same HEAD-less worktree is in the diff.
+        fs::write(ws.join("f"), "x\n")?;
+        let add = Command::new("git")
+            .arg("-C")
+            .arg(&ws)
+            .args(["add", "f"])
+            .status()?;
+        assert!(add.success());
+        let staged = workspace_diff(&ws)?.ok_or("no worktree")?;
+        assert!(String::from_utf8_lossy(&staged).contains("+x"));
+        let _ = fs::remove_dir_all(&ws);
+        Ok(())
+    }
 
     #[test]
     fn sh_line_becomes_a_shell_run_step() {

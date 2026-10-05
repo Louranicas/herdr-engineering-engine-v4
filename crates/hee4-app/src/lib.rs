@@ -3,7 +3,7 @@
 //!
 //! Startup: the budgets file (`--budgets`/`HEE4_BUDGETS`, else the default) →
 //! `Store::open` → `probe::observe(open_attempts)` → `recovery::reconcile` → `Engine::new` (composes the registry) →
-//! the families' `on_serve_start` → dispatcher thread → bind → serve. A
+//! the families' `on_serve_start` → the DC-22 start/upgrade backup (`--backups`) → dispatcher thread → bind → serve. A
 //! mutating action is refused `not_ready` while the ledger's `recovery_complete` is false.
 
 pub mod actions;
@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use hee4_contracts::{BudgetParseError, Budgets};
 use hee4_core::{Store, probe, reconcile};
+use hee4_host::clock::{Clock as _, SystemClock};
 
 /// The build commit (`git rev-parse HEAD` at build time, or `unknown`).
 pub const HEAD: &str = env!("HEE4_HEAD");
@@ -70,6 +71,10 @@ pub struct ServeArgs {
     pub work: PathBuf,
     /// The budgets file (`--budgets P`, else `HEE4_BUDGETS`); `None` is [`Budgets::DEFAULT`].
     pub budgets: Option<PathBuf>,
+    /// The DC-22 backup root (`--backups DIR`); `None` takes no backups.
+    pub backups: Option<PathBuf>,
+    /// `HEE4_REQUIRE_BACKUPS=1`: refuse to serve without `backups`.
+    pub require_backups: bool,
 }
 
 /// Why `serve` stopped.
@@ -116,6 +121,12 @@ pub enum ServeError {
     /// A family's startup hook refused; the engine does not listen.
     #[error("start: {0}")]
     Start(#[from] actions::StartFault),
+    /// `HEE4_REQUIRE_BACKUPS=1` and no `--backups`; the engine does not open the ledger.
+    #[error("backups: --backups is required (HEE4_REQUIRE_BACKUPS=1)")]
+    BackupsRequired,
+    /// The start/upgrade backup failed; the store does not go into service.
+    #[error("backups: {0}")]
+    Backup(#[from] dispatcher::BackupFault),
 }
 
 /// Recovery adopts at most `limit` (`recovery.open_attempt_limit`) open attempts; more is a
@@ -130,11 +141,38 @@ fn adoptable(open: usize, limit: u64) -> Result<(), ServeError> {
     Ok(())
 }
 
+/// The DC-22 start/upgrade backup into `root`: the store goes into service only after it.
+/// The trigger is what [`dispatcher::backup_due`] names, else `Start` (a restart inside the
+/// freshness window still backs up). No thread or timer (V4-6).
+///
+/// # Errors
+/// [`dispatcher::BackupFault`]: the head is unknown, the root or log refused, or K1 refused.
+fn start_backup(
+    root: &std::path::Path,
+    engine: &actions::Engine,
+) -> Result<dispatcher::Backups, dispatcher::BackupFault> {
+    let head = HEAD
+        .parse::<hee4_contracts::GitSha>()
+        .ok()
+        .as_ref()
+        .and_then(dispatcher::Head12::of)
+        .ok_or(dispatcher::BackupFault::HeadUnknown)?;
+    let mut backups = dispatcher::Backups::open(root, head)?;
+    let clock = SystemClock;
+    let trigger = dispatcher::backup_due(&backups.facts(clock.now()))
+        .unwrap_or(dispatcher::BackupTrigger::Start);
+    backups.take(engine, trigger, &clock)?;
+    Ok(backups)
+}
+
 /// Open, reconcile, start the dispatcher, then listen. Does not return while serving.
 ///
 /// # Errors
 /// [`ServeError`].
 pub fn serve(args: &ServeArgs, cfg: &dispatcher::Config) -> Result<(), ServeError> {
+    if args.require_backups && args.backups.is_none() {
+        return Err(ServeError::BackupsRequired);
+    }
     let budgets = match &args.budgets {
         None => Budgets::DEFAULT,
         Some(path) => Budgets::parse(&std::fs::read_to_string(path).map_err(|source| {
@@ -200,11 +238,16 @@ pub fn serve(args: &ServeArgs, cfg: &dispatcher::Config) -> Result<(), ServeErro
         .with_budgets(budgets),
     );
     engine.registry().on_serve_start(&engine)?;
+    let mut backups = args
+        .backups
+        .as_deref()
+        .map(|root| start_backup(root, &engine))
+        .transpose()?;
     let worker = Arc::clone(&engine);
     let cfg = cfg.clone();
     std::thread::spawn(move || {
         loop {
-            match dispatcher::step(&worker, &cfg) {
+            match dispatcher::step(&worker, &cfg, backups.as_mut()) {
                 Ok(Some(_)) => {}
                 Ok(None) => std::thread::sleep(budgets.dispatcher.idle()),
                 Err(e) => {
@@ -216,12 +259,15 @@ pub fn serve(args: &ServeArgs, cfg: &dispatcher::Config) -> Result<(), ServeErro
     });
     let listener = socket::bind(&args.socket)?;
     eprintln!(
-        "hee4 {VERSION} {} serving socket={} peer_check={:?} recovery_applied={} catalogue={} budgets={budgets_from}",
+        "hee4 {VERSION} {} serving socket={} peer_check={:?} recovery_applied={} catalogue={} budgets={budgets_from} backups={}",
         head12(),
         args.socket.display(),
         socket::PEER_CHECK,
         report.applied,
-        catalogue12()
+        catalogue12(),
+        args.backups
+            .as_deref()
+            .map_or_else(|| "none".into(), |p| p.display().to_string())
     );
     socket::serve(&listener, &engine);
     Ok(())

@@ -6,7 +6,9 @@ scope), the synchronous dispatcher, `doctor`. Defines no contract type; every st
 `Store::admit` or `Store::apply`, and the only verdict is `hee4_evidence::decide_and_seal`'s.
 
 ```
-hee4 serve --socket S --ledger L --work W [--budgets F]
+hee4 serve --socket S --ledger L --work W [--budgets F] [--backups B]
+  HEE4_REQUIRE_BACKUPS=1, no --backups  `hee4 serve refused: backups: --backups is required (HEE4_REQUIRE_BACKUPS=1)`,
+                                      exit 1, before the budgets file and the ledger; no socket
   Budgets::parse(read F)              F = --budgets, else env HEE4_BUDGETS, else Budgets::DEFAULT; read once, before
                                       the ledger; a refusal is `hee4 serve refused: budgets: <field> ...`, exit 1, never listens
   Store::open(L)                      (resets recovery_complete=0)
@@ -20,10 +22,15 @@ hee4 serve --socket S --ledger L --work W [--budgets F]
   Engine::new                         composed(): Registry::new over the families below (a RegistryFault is ServeError::Compose, never listens)
   registry.on_serve_start(engine)     every family's hook in registration order; the first Err is ServeError::Start, never listens
   Engine::with_budgets(budgets)       the one Budgets every app limit reads (`Engine::budgets`)
+  backup (when --backups B)           `Backups::open(B, head12)` (creates B, opens B/backup.log for append, its last PASS
+                                      line is the last backup), then K1 `backup::backup_to(store, W, B, SameDisk::Refuse)`
+                                      with trigger `backup_due(..)` else `start`; one `backup.log` line; an Err is
+                                      `hee4 serve refused: backups: <k1 error>`, never listens (the store goes into service
+                                      only after a backup, DC-22). No backup thread, timer or daemon (V4-6)
   dispatcher thread                   loop { step(); sleep dispatcher.idle_ms when idle, dispatcher.error_backoff_ms after an error }
   socket::bind(S)                     dir 0700 (owner = our uid), stale socket removed only if nothing answers, socket 0600
   socket::serve                       one thread per connection, at most socket.max_connections open (the next is refused
-                                      too_many_connections, no thread); startup line ends `budgets=default|file:<F>`; SO_PEERCRED uid ≠ ours → one `forbidden` frame, close;
+                                      too_many_connections, no thread); startup line ends `budgets=default|file:<F> backups=<B>|none`; SO_PEERCRED uid ≠ ours → one `forbidden` frame, close;
                                       one JSON frame per LF line each way
 ```
 
@@ -134,14 +141,16 @@ DC proposal below.
 | route | `route::select` over a one-row roster (`HEE4_MODEL`, default `qwen2.5-coder:7b`), floor local-only, baseline = that model; availability probed (`tags`) only when a model step will run | `Resolve(Abandon(RouteRefused{floor_unmet}))` |
 | namespace | per-generation work root: generation = latest attempt's + 1; `NamespaceTask::with_door_root(task, <W>/<task>/<generation>, <control socket dir>, needs_model, min(TIMEBOX else attempt.timebox_default_ms, attempt.deadline_ms))` (`dispatcher::timebox`: minutes saturate, never wrap or panic; every step's kill deadline is at most `attempt.deadline_ms`) → `plan_for` (unaltered), so the work dir is `<W>/<task>/<generation>/<task>` (the trailing `/<task>` is the namespace's; DC ask: a generation-aware constructor). An old generation's dir is never removed (R11 readback only); `needs_model` = a `sh:` step (`dispatcher::wants_model`, shared with `task.preview`) and `HEE4_LIVE_MODEL=1` | `Resolve(Abandon(NamespaceRefused))`; work dir → `WorkDirUnavailable`; unknown head → `HeadUnknown`; door upstream unparsable → `NoPermit` |
 | permit | `Permit::mint(ReceiptId "r-<task>-<ns>", scope = the Run programs)` | — |
+| backup | with `--backups`: `backup_due(BackupFacts{last, dispatched_since, now, head})` (pure: no backup → `start`; another head → `upgrade`; older than `DC22_FRESHNESS` 15 min, strictly → `stale`; `dispatched_since >= DC22_BATCH_TASKS` 8 → `batch`; else none; `now` from `SystemClock`), then `Backups::take` → K1 `backup_to`; one line `backup id= objects= age_s= trigger= head=<sha12> verdict=PASS\|FAIL [reason=<k1 refusal name>]` on stderr and in `B/backup.log` (a FAIL line once per failing streak; the log fd is held open, so it lands even when B refuses) | `DispatchError::Backup`: no `Dispatch` is applied, the task stays `admitted`, the loop prints `dispatch error: backup: ..`, backs off `dispatcher.error_backoff_ms` and retries |
 | dispatch | `Store::apply(Dispatch)` → running and K1 opens the row `a-<task>-<generation>` in the same transaction (refused before reconcile by K1) | — |
 | attempt_started | the open row read back (`Store::open_attempts`, never formatted here; its generation must equal the work dir's), then `Store::attempt_started(id, AttemptStart{receipt_id, permit_id, model, head_sha, workspace = ns.work_dir(), lease: None})`; prints `dispatch task= attempt= started workspace=`. No lease is issued (a lease is what R09 compares before reuse), so `attempt.deadline_ms` is not recorded | `StoreError::WorkspaceLeased` → `Resolve(Abandon(WorkDirUnavailable))`, the store's text printed; any other error or a missing/mismatched row → `dispatch task= attempt_started error=`, `Settle(NotReady)` → `Stop`; never a silent run |
 | attempt | `Attempt::with_budget(model, head, budgets.door).run(.., on_start)` (bwrap for Run steps; `sh:` steps run without a door when not live, `UNMEASURED` printed) | error or a `Failed` step: `Settle(NotReady)` → `Stop` → failed, no receipt |
 | attempt_pid | `on_start(pid, start_ticks)` from `spawn::start` before the wait, per Run step: `Store::attempt_pid(id, pid, start_ticks)`, prints `dispatch task= attempt= pid= start_ticks=`; the worker calls no store | a store error is printed `attempt_pid error=` (the child is already running) |
 | repair | D6: `Settle(NotReady)` or `Decide(Fail)` → `repair_pending` → redispatch under `attempt.max_generations`, else `Stop`. `attempt.max_generations` is absent from K0's `AttemptBudget`, so today's parking stands (`Settle(NotReady)` → `Stop` → failed) and `next_admitted` ignores `repair_pending`; the two repair e2e tests print `UNMEASURED: attempt.max_generations absent` and fail once the field lands | — |
 | settle | `Settle(Ready)` → verifying | — |
-| observe | per observation: `observation_id`, `Store::record_observation`, `apply(Observe)` | — |
-| decide + seal | `decide_and_seal(chain_head, receipt_id, ids, obs, subject)`; ids: collector = digest(ledger epoch), locks = digest(permit), standards = digest(`gate.toml` baked at build); subject input = VERIFY text | — |
+| ddf | `workspace_diff(ns.work_dir())`: no `<ws>/.git` → `Diff::NoWorktree`; else `git -C <ws> diff --cached` then `git -C <ws> diff` (`--no-color --no-ext-diff`) on the host; then K4 `ddf::for_task(diff, &subject, &SystemClock, timebox)` (the attempt's TIMEBOX). `Observed(o)` of any outcome (Pass, exit-7 advisory `Refused`, timeout `Error`) joins the observations; prints `dispatch task= ddf=observed tool=<name> <version>` | a log line and nothing else: `dispatch task= ddf=skipped reason=no_worktree\|no_diff\|tool_absent\|adapter_error:<variant>\|git_error:<spawn\|exit>`; never a refusal, never an abandon, never `Settle(NotReady)`; the dispatcher never reads the outcome, the lattice does |
+| observe | per observation (the attempt's, then the ddf one): `observation_id`, `Store::record_observation`, `apply(Observe)` | — |
+| decide + seal | `decide_and_seal(chain_head, receipt_id, ids, obs, subject)`; ids: collector = digest(ledger epoch), locks = digest(permit), standards = digest(`gate.toml` baked at build); the one subject (built once in `step`, `subject_of`) has input = digest(VERIFY text), the same subject ddf bound its observation to | — |
 | receipt | `Store::append_receipt` (K1 re-runs `verify_chain`) | — |
 | verdict | `apply(Decide(verdict))`; `Pass` → `apply(Accept)` | — |
 
@@ -155,6 +164,16 @@ exits 0 and reaches the model also adds the door observation (one `model_request
 request): `Pass` → `accepted`. A `/usr/bin/true` brief now ends `accepted` (exit evidence);
 the `live_model_attempt_through_the_door` e2e test (`HEE4_LIVE_MODEL=1`, model on 11434, else an
 `UNMEASURED` line) drives a `curl --unix-socket "$HEE4_MODEL_SOCKET"` line to `accepted`.
+
+## Restore
+
+`hee4 restore --into D ID [--backups B]` (B default `/mnt/storage-10tb/hee4-backups`, the unit's
+`--backups`): K1 `backup::restore(B/ID, D)`; prints and appends to `B/restore.log` one line
+`restore backup=<id> ledger=<sha12> objects=<n>/<total> rto_s=<t> verdict=PASS`, or
+`... verdict=FAIL reason=<name>`: `not_found` when `B/ID` is not a directory (or ID is not one
+path component), else K1's refusal (`target_occupied`, `incomplete`, `digest_mismatch`,
+`objects_missing`, `manifest`, `io`, ...; `dispatcher::backup_error_name`). Exit 0 only on PASS.
+No socket, no engine; the ledger is never opened or copied here.
 
 ## Peer credentials
 
@@ -175,6 +194,16 @@ frame and shuts the socket. A watcher thread reads the socket to EOF so a closed
 three threads. Resume with `since_seq` = the last `seq` received: exactly-once by `seq`.
 
 ## Gaps
+
+- DC-22 numbers are consts in `dispatcher.rs` (`DC22_FRESHNESS` 15 min, `DC22_BATCH_TASKS` 8,
+  plan/DECISIONS.md:199-204) until K0 adds `backup.freshness_ms` / `backup.batch_tasks` to
+  `Budgets` (hee4-contracts-architect follow-up); they are the only copy.
+- ddf has no per-attempt budget field: it runs under the attempt's TIMEBOX (`dispatcher::timebox`).
+  Its timeout observation is tier-0, so a hung deep-diff-forge gates the task (K4 DC, evidence FLOW).
+- The sandbox mounts no `/dev`, so `git` cannot run inside a VERIFY (exit 128, `/dev/null`;
+  MEASURED); a candidate's `.git` must come from elsewhere. The e2e seeds it on the host.
+- deep-diff-forge is found on `PATH`; the unit's `PATH` is the user manager's, which may not hold
+  `~/.local/bin` (then `ddf=skipped reason=tool_absent`; UNMEASURED under the unit).
 
 - The brief lives in a file, not the ledger (no `Store` brief column or reader). A crash between
   `admit` and the write leaves an admitted task the dispatcher abandons by name.
