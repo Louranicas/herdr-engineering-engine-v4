@@ -137,6 +137,40 @@ fn absent_tool_is_a_named_skip() {
     );
 }
 
+#[test]
+fn a_bare_name_not_on_path_is_a_named_skip() {
+    let got = ddf::for_task_with(
+        Path::new("hee4-no-such-tool"),
+        Diff::Bytes(FIXTURE),
+        &subject(),
+        &TestClock::new(0),
+        BUDGET,
+    );
+    assert!(
+        matches!(got, Ok(TaskObservation::Skipped(Skip::ToolAbsent))),
+        "{got:?}"
+    );
+}
+
+/// `execve` of a present script whose `#!` interpreter is missing fails `ENOENT`, the same
+/// kind as an absent binary. The adapter looks on disk: a present file is never `tool_absent`.
+#[test]
+fn a_present_tool_with_a_missing_interpreter_is_spawn_not_a_skip() {
+    let bin = stub("ddf-badshebang.sh");
+    assert!(bin.is_file(), "{}", bin.display());
+    let got = ddf::for_task_with(
+        &bin,
+        Diff::Bytes(FIXTURE),
+        &subject(),
+        &TestClock::new(0),
+        BUDGET,
+    );
+    let Err(AdapterError::Spawn(e)) = got else {
+        panic!("expected Err(Spawn), got {got:?}");
+    };
+    assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "{e}");
+}
+
 /// A VERIFY-digest subject: the diff digest and the subject's input differ, as in the
 /// dispatcher (`Subject.input_sha256 = digest(brief VERIFY)`, V4-94).
 fn verify_subject() -> Subject {

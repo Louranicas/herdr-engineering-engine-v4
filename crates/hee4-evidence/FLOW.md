@@ -49,8 +49,11 @@ git) and `TaskObservation::Observed(Observation) | Skipped(Skip)`:
 - three skips, by wire word, none of which spawns or is a refusal: `no_worktree` when the task
   has no worktree (`Diff::NoWorktree`); `no_diff` when the bytes are empty (an empty diff must
   never reach `--require-files`, whose exit 7 would fail a task that merely changed nothing);
-  `tool_absent` when the binary is not found at spawn (`io::ErrorKind::NotFound` only: a
-  present-but-broken tool stays `AdapterError::Spawn`);
+  `tool_absent` when the binary is not found on `PATH` (a bare name) or at the given path; a
+  present file that fails to exec (a missing `#!` interpreter or ELF loader, which `execve`
+  also reports as `NotFound`; permissions, `PermissionDenied`) stays `AdapterError::Spawn`.
+  The adapter checks the disk (`execvp`'s rule: a name with a `/` as given, else each `PATH`
+  entry) before it calls a `NotFound` absent; `tests/fixtures/ddf-badshebang.sh` pins it;
 - otherwise runs `deep-diff-forge --stdin-patch --rank --json --require-files --require-hunks`
   as a local process (no network, no shell);
 - exit 7 → `Observed` with `Outcome::Refused{reason}` (first stderr line; a fixed sentence when

@@ -82,8 +82,9 @@ pub enum Skip {
     NoWorktree,
     /// [`Diff::Bytes`] was empty: an empty diff never reaches `--require-files`.
     NoDiff,
-    /// The binary was not found (`io::ErrorKind::NotFound` at spawn). A present-but-broken
-    /// tool is not absent: every other spawn error stays [`AdapterError::Spawn`].
+    /// The binary is not on `PATH` (a bare name) or not at the given path. A present file that
+    /// fails to exec (a missing `#!` interpreter or ELF loader is also `NotFound`; permissions
+    /// are `PermissionDenied`) is not absent: it stays [`AdapterError::Spawn`].
     ToolAbsent,
 }
 
@@ -119,7 +120,8 @@ pub enum TaskObservation {
 ///
 /// - [`Diff::NoWorktree`] → `Skipped(NoWorktree)`, empty bytes → `Skipped(NoDiff)`; neither
 ///   spawns;
-/// - a binary not found → `Skipped(ToolAbsent)`;
+/// - a binary that is not on `PATH` → `Skipped(ToolAbsent)`; a present file that fails to exec
+///   is `Err(Spawn)`;
 /// - a run past `budget` → `Observed` with [`timeout_observation`] (`Refused(timeout)` in
 ///   `decide`);
 /// - exit 7 → `Observed` with [`Outcome::Refused`]; a pass → `Observed`, bound to
@@ -153,7 +155,12 @@ pub fn for_task_with(
         Diff::Bytes([]) => Ok(TaskObservation::Skipped(Skip::NoDiff)),
         Diff::Bytes(b) => match observe_with(bin, b, subject, clock, budget) {
             Ok(o) => Ok(TaskObservation::Observed(o)),
-            Err(AdapterError::Spawn(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            // `execve` reports a missing `#!` interpreter or ELF loader as `NotFound` too, so the
+            // kind alone cannot tell an absent tool from a present, broken one: look on disk.
+            Err(AdapterError::Spawn(e))
+                if e.kind() == std::io::ErrorKind::NotFound
+                    && !on_disk(bin, std::env::var_os("PATH").as_deref()) =>
+            {
                 Ok(TaskObservation::Skipped(Skip::ToolAbsent))
             }
             Err(AdapterError::Timeout { budget }) => Ok(TaskObservation::Observed(
@@ -162,6 +169,15 @@ pub fn for_task_with(
             Err(e) => Err(e),
         },
     }
+}
+
+/// Whether `bin` names a file that exists, by `execvp`'s rule: a name with a `/` is taken as
+/// given; a bare name is looked up in each entry of `path`. No `PATH` means no lookup.
+fn on_disk(bin: &Path, path: Option<&std::ffi::OsStr>) -> bool {
+    if bin.as_os_str().as_encoded_bytes().contains(&b'/') {
+        return bin.is_file();
+    }
+    path.is_some_and(|p| std::env::split_paths(p).any(|dir| dir.join(bin).is_file()))
 }
 
 /// Run deep-diff-forge from `PATH` over `diff` and turn its ranking into an observation of
@@ -390,4 +406,26 @@ fn pass_observation(
         elapsed_ms,
         budget_ms: u64::try_from(budget.as_millis()).unwrap_or(u64::MAX),
     })
+}
+
+#[cfg(test)]
+mod on_disk_tests {
+    use super::on_disk;
+    use std::ffi::OsStr;
+    use std::path::Path;
+
+    #[test]
+    fn a_bare_name_is_looked_up_on_the_given_path_only() {
+        assert!(on_disk(
+            Path::new("sh"),
+            Some(OsStr::new("/nonexistent:/bin"))
+        ));
+        assert!(!on_disk(Path::new("sh"), Some(OsStr::new("/nonexistent"))));
+        assert!(!on_disk(Path::new("sh"), None));
+        assert!(on_disk(Path::new("/bin/sh"), None));
+        assert!(!on_disk(
+            Path::new("/nonexistent/sh"),
+            Some(OsStr::new("/bin"))
+        ));
+    }
 }
