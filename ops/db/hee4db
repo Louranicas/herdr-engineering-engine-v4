@@ -2031,14 +2031,16 @@ def scan_timers() -> tuple[str, list[tuple[Path, bytes, Path, bytes | None]], st
     """(status, [(timer, timer_bytes, service, service_bytes)], sha256, detail): the bytes of every top-level
     *.timer in TIMERS_DIR (sorted, no recursion) and of its paired .service in the same directory (None when
     absent), without parsing. The sha256 is over the concatenated bytes in that order, so `stale` compares one
-    number. absent: no directory; unreadable: a listing or read failed."""
+    number. absent: no directory; unreadable: a listing or read failed (the listing is os.listdir, which raises on an
+    unreadable directory; Path.glob swallows PermissionError and would print a zero from a source it never read)."""
     d = TIMERS_DIR
     if not d.is_dir():
         return "absent", [], None, "directory absent"
     units: list[tuple[Path, bytes, Path, bytes | None]] = []
     h = hashlib.sha256()
     try:
-        timers = sorted(p for p in d.glob("*.timer") if p.is_file())
+        names = sorted(os.listdir(d))
+        timers = [d / n for n in names if n.endswith(".timer") and (d / n).is_file()]
         for t in timers:
             tb = reg_read(t, CRONTAB_CAP)
             unit = next((v for _, k, v in parse_unit(reg_text(t, tb)).get("Timer", []) if k == "Unit" and v), f"{t.stem}.service")

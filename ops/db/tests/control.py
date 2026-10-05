@@ -213,27 +213,31 @@ def main() -> int:
         frozen = {k: bw.root / k for k in WORLD}
         n = 0
 
-        def case(name: str, kind: str, setup, args: list[str], want_rc: int, needles: list[str], post=None) -> None:
+        def case(name: str, kind: str, setup, args: list[str], want_rc: int, needles: list[str], post=None, cleanup=None) -> None:
             nonlocal n
             n += 1
             w = World(base, f"c{n:02d}", frozen)
             w.copy_db_from(snap)
             try:
-                pre = setup(w) if setup else None
-            except Exception as e:  # a setup failure is a recorded miss, never a crash of the control
-                results.append((kind, name, False, f"setup_error {type(e).__name__}: {str(e)[:200]}"))
-                return
-            rc, out = w.run(*args)
-            ok = rc == want_rc and all(x in out for x in needles)
-            why = f"rc={rc} want={want_rc}"
-            missing = [x for x in needles if x not in out]
-            if missing:
-                why += f" missing={missing}"
-            if ok and post:
-                pok, pwhy = post(w, pre)
-                ok = ok and pok
-                why += " " + pwhy
-            results.append((kind, name, ok, why if not ok else why + " needles=" + ",".join(needles)))
+                try:
+                    pre = setup(w) if setup else None
+                except Exception as e:  # a setup failure is a recorded miss, never a crash of the control
+                    results.append((kind, name, False, f"setup_error {type(e).__name__}: {str(e)[:200]}"))
+                    return
+                rc, out = w.run(*args)
+                ok = rc == want_rc and all(x in out for x in needles)
+                why = f"rc={rc} want={want_rc}"
+                missing = [x for x in needles if x not in out]
+                if missing:
+                    why += f" missing={missing}"
+                if ok and post:
+                    pok, pwhy = post(w, pre)
+                    ok = ok and pok
+                    why += " " + pwhy
+                results.append((kind, name, ok, why if not ok else why + " needles=" + ",".join(needles)))
+            finally:
+                if cleanup:   # undoes a plant that would block the temp dir's removal (a chmod 000), pass or fail
+                    cleanup(w)
 
         # ── quiet cases (clean copy) ──
         case("quiet-stale", "quiet", None, ["stale"], 0, ["stale_sources=0", "habitat_stale=0"])
@@ -464,6 +468,12 @@ def main() -> int:
                 _rc, out = w.run(*args)
                 return needle not in out, f"absent={needle!r}:{needle not in out}"
             return post
+
+        def present_in(args: list[str], needle: str):
+            def post(w, _pre):
+                _rc, out = w.run(*args)
+                return needle in out, f"present={needle!r}:{needle in out}"
+            return post
         case("quiet-recipe-skills", "quiet", None, ["recipe", "skills"], 0,
              ['"name": "hee-v4-corpus", "scope": "user", "v4_reason": "rule:v4"', '"name": "claim-discipline", "scope": "user", "v4_reason": "curated:',
               "rule v4_relevant ="], absent_from(["recipe", "skills"], '"name": "hee-v3-corpus"'))
@@ -531,6 +541,19 @@ def main() -> int:
              ["stale_registry path=", "/timers state=changed"])
         case("timers-daily-kind", "quiet", None, ["q", "SELECT kind, agent FROM agent_schedules WHERE kind='daily'"], 0,
              ['"rows": [{"kind": "daily", "agent": null}]'])
+
+        # a timers directory that exists but cannot be listed is unreadable, never `ok entries=0` (AP-29/F138: no zero
+        # from a source that was not read); the mode is restored in cleanup so the temp dir can be removed
+        def timers_unlistable(w):
+            (w.root / "timers").chmod(0)
+
+        def timers_listable(w):
+            (w.root / "timers").chmod(0o755)
+        case("timers-dir-unreadable", "fault", timers_unlistable, ["ingest"], 10,
+             ["registry_timers_unmeasured PermissionError", "registry_unreadable=1"],
+             present_in(["q", "SELECT status, entries FROM registry_sources WHERE kind='timers'"], '"status": "unreadable"'), cleanup=timers_listable)
+        case("timers-dir-unreadable-check", "fault", then_ingest(unlink("crontab.txt"), timers_unlistable), ["check"], 30,
+             ["check=registry_agents verdict=UNMEASURED", "registry_schedule_unmeasured", "timers=unreadable"], cleanup=timers_listable)
 
         def sources_present_no_roster(w):   # an empty present source is a measured zero, never UNMEASURED
             shutil.rmtree(w.root / "repo/ops/roster" / PLANTED)
@@ -676,6 +699,8 @@ NEUTERS += [  # rev 2026-10-01 registry (V4-70): one per refusal site and per ru
     ("timers-roster-kind", '        at = [j for j, x in enumerate(toks) if Path(x).name == "run-agent.sh"]\n', "        at = []\n"),
     ("timers-section", '        if "Timer" not in sections:\n', "        if False:\n"),
     ("timers-stale-changed", '        elif tstatus == "ok" and tsha != row[0]:\n', "        elif False:\n"),
+    # a listing that swallows PermissionError (Path.glob's behaviour) reads an unlistable dir as ok entries=0
+    ("timers-dir-unreadable", "        names = sorted(os.listdir(d))\n", "        names = sorted(os.listdir(d)) if os.access(d, os.R_OK) else []\n"),
     ("crontab-absent-word", '        return "absent", None, f"HEE4DB_CRONTAB_FILE={p} absent"\n', '        return "unreadable", None, f"HEE4DB_CRONTAB_FILE={p} absent"\n'),
     ("world-measured-empty", "            if ok_kinds:\n", "            if True:\n"),
     ("registry-stale-changed", '        elif sha256_bytes(reg_read(fp)) != sha:\n', "        elif False:\n"),
