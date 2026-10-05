@@ -1820,7 +1820,7 @@ def record_failed_receipt(db: Path, verb: str, started: str, r: Refusal, seen: i
 # read only, through `flatpak-spawn --host crontab -l` (or HEE4DB_CRONTAB_FILE, which the control uses).
 # (rev 2026-10-05 schedule) The SCHEDULE-SOURCE RULE, stated here and only here: a schedule source is the host
 # crontab or the systemd user timer directory (TIMERS_DIR, read from its *.timer/*.service files only, never through
-# systemctl). A source's status is ok | absent | unreadable: absent is a measured fact (no binary, no file, no
+# the systemd CLI). A source's status is ok | absent | unreadable: absent is a measured fact (no binary, no file, no
 # directory), unreadable is a source that exists and failed; only unreadable is a gap (ingest exit 10). A schedule's
 # kind is roster (the command runs run-agent.sh <agent> <mode>), daily (it runs ops/db/daily.sh) or other.
 
@@ -2055,7 +2055,7 @@ def scan_timers() -> tuple[str, list[tuple[Path, bytes, Path, bytes | None]], st
 
 def read_timers() -> tuple[str, list[dict], str | None, str]:
     """(status, rows, sha256, detail). systemd user timers as a schedule source, read from files only (never
-    `systemctl`). One agent_schedules row per schedule line of each .timer: schedule = the line's value verbatim,
+    the systemd CLI). One agent_schedules row per schedule line of each .timer: schedule = the line's value verbatim,
     command = the paired .service's first ExecStart= verbatim (`unit_absent:<name>.service` when the service is
     missing), kind by the schedule-source rule. A .timer with no [Timer] section or no schedule line refuses the
     ingest by name. detail on ok: `timers=T jobs=N roster=R daily=D enabled=E` (enabled = a timers.target.wants link)."""
