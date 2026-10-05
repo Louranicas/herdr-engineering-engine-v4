@@ -184,5 +184,16 @@ class DrillTests(unittest.TestCase):
         rec = json.load(open(os.path.join(root, head_of(TOOLS), "rehearsal.json")))
         self.assertEqual(rec["acked_present"], "2/3"); self.assertEqual(len(rec["task_ids"]), 3)
 
+    def test_fire_mainpid_zero_is_refused_and_nothing_is_killed(self):
+        import subprocess
+        w = World(); self.addCleanup(w.close)
+        open(w.pidfile, "w").write("0")
+        r = subprocess.run([DRILL, "--socket", w.sockpath, "--repo", TOOLS, "--drill-root", tempfile.mkdtemp(prefix="dr-")],
+                           env={**os.environ, **w.env}, capture_output=True, text=True, start_new_session=True, timeout=60)
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("drill_step=unit_active status=FAIL", r.stdout); self.assertIn("MainPID=0: active unit without a main process", r.stdout)
+        self.assertEqual(r.stdout.count("drill_step="), 5); self.assertNotIn("drill_step=kill9 status=MEASURED", r.stdout)
+        self.assertIsNone(w.proc.poll(), "the fake main was killed")
+
 if __name__ == "__main__":
     unittest.main()

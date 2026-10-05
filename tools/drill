@@ -11,6 +11,9 @@ detail acked=N/N ids=...), and after health_ready one task.list that must list e
 `acked_present`, detail k/N missing=...). The rehearsal record
   <drill-root>/<sha12>/rehearsal.json      (default ~/.cache/hee4-drill; written on every run)
 holds {tree, unit, submitted, acked_present, task_ids, steps, ts}: D7 reads it, D9 excludes its ids.
+task_ids is the union with the record already there (a second run at the same tree loses no id, so no
+drill task ever counts as use) and the record is written right after the submit step, before the kill.
+unit_active refuses MainPID=0 by name (an active unit without a main process): nothing is killed.
 unit_restarted waits for Restart=on-failure; if no new MainPID by half the budget it runs
 `systemctl --user start <unit>` once and records explicit_start=yes (V4-37).
 Last line
@@ -131,6 +134,10 @@ def main():
         run.not_reached("unit_active", "unit_active was not measured")
         run.finish()
     old = int(p.get("MainPID", "0") or 0)
+    if old <= 0:  # os.kill(0, ...) would signal this drill's own process group: refused by name, nothing is killed
+        emit("unit_active", "FAIL", 5, t0, f"MainPID={old}: active unit without a main process; nothing to kill")
+        run.not_reached("unit_active", "no MainPID to kill")
+        run.finish()
     emit("unit_active", "MEASURED", 5, t0, f"MainPID={old}")
 
     if a.submit > 0:
