@@ -12,6 +12,7 @@ No agent acts on a chat sentence. The coordinator writes the brief (I1, eleven f
 - Every spawn is a fresh agent with consolidated scope; resuming is allowed only to answer a refuter's question about the agent's own prior output.
 - `planned_agents=N` is written to the ledger **before** any fan-out; a fan-out beyond N is a STOP.
 - Each brief carries a command budget and a TIMEBOX; an agent at 70% of either stops spawning and reports what remains UNMEASURED.
+- Build output (every `CARGO_TARGET_DIR`, export or work tree) goes under `~/.cache/hee4-*`, never /tmp or a session scratchpad: /tmp is a RAM tmpfs (`tools/doctor` row `tmp_usage`, brain `tmp-is-ram-keep-builds-in-cache`).
 - Nested fan-out (an agent spawning agents) requires the coordinator's line in the ledger; each nested layer re-pays orientation, so the default is flat.
 
 ## 4 · One writer per artefact

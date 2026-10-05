@@ -20,6 +20,13 @@ def hee4_stub(dirpath, head):
          'doctor) echo "doctor row=budgets present door.pool=8 socket.max_connections=256";; '
          "*) echo 'ready=true recovery=complete database=ready socket=owned'; echo '" + health + "';; esac\n")
 
+def df_stub(dirpath, space, inodes, rc=0):
+    """A fake `df --output=pcent,ipcent`: the planted reading."""
+    stub(dirpath, "df", f'echo "Use% IUse%"; echo " {space}%  {inodes}%"; exit {rc}\n')
+
+def tmp_row(out):
+    return [l for l in out.splitlines() if l.startswith("check=tmp_usage ")][0]
+
 def ps_handler(models):
     class H(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
@@ -48,6 +55,7 @@ class World:
         self.start_main()
         stub(self.bin, "systemctl", f'echo LoadState=loaded; echo ActiveState=active; echo MainPID=$(cat {self.pidfile})\n')
         hee4_stub(self.bin, "HEADSHA")
+        df_stub(self.bin, 10, 10)  # the host's own /tmp never decides a test
         self.env = {"PATH": self.bin + ":" + os.environ["PATH"]}
     def serve(self):
         while True:
@@ -160,6 +168,51 @@ class DoctorTests(unittest.TestCase):
         os.chmod(w.sockpath, 0o666)
         rc, out, _ = run(DOCTOR, "--socket", w.sockpath, "--model-url", w.url, "--repo", TOOLS, env=w.env)
         self.assertEqual(rc, 1); self.assertIn("check=socket status=FAIL", out)
+
+    def test_quiet_tmp_below_threshold_is_not_advisory(self):
+        w = World(); self.addCleanup(w.close)
+        rc, out, _ = healthy_doctor(w, "--model", "m")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("status=MEASURED detail=path=", tmp_row(out))
+        self.assertIn(" space=10% inodes=10% threshold=70% over=none ", tmp_row(out))
+        self.assertRegex(out.strip().splitlines()[-1], r"^doctor verdict=PASS .* advisory=0 ")
+
+    def test_fire_tmp_planted_full_is_advisory_never_fail(self):
+        # 2026-10-05: /tmp (a RAM tmpfs) filled twice, by space then by inodes. The doctor says so,
+        # but a full /tmp is the operator's to clear, never a reason to fail readiness.
+        for space, inodes, over in ((90, 12, "space"), (12, 90, "inodes"), (90, 90, "space,inodes")):
+            with self.subTest(space=space, inodes=inodes):
+                w = World(); self.addCleanup(w.close)
+                df_stub(w.bin, space, inodes)
+                rc, out, _ = healthy_doctor(w, "--model", "m")
+                self.assertEqual(rc, 0, out)
+                row = tmp_row(out)
+                self.assertIn(f"check=tmp_usage status=MEASURED detail=path=", row)
+                self.assertIn(f" space={space}% inodes={inodes}% threshold=70% over={over} ", row)
+                self.assertTrue(row.endswith(" scope=advisory"), row)
+                self.assertRegex(out.strip().splitlines()[-1], r"^doctor verdict=PASS .* fail=0 advisory=1 ")
+
+    def test_fire_tmp_df_unreadable_is_advisory_unmeasured(self):
+        w = World(); self.addCleanup(w.close)
+        df_stub(w.bin, 0, 0, rc=1)
+        rc, out, _ = healthy_doctor(w, "--model", "m")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("check=tmp_usage status=UNMEASURED detail=path=", tmp_row(out))
+        self.assertIn("df unreadable: rc=1", tmp_row(out))
+        self.assertRegex(out.strip().splitlines()[-1], r"^doctor verdict=PASS .* advisory=1 ")
+
+    def test_tmp_top_names_the_three_largest_own_entries_largest_first(self):
+        w = World(); self.addCleanup(w.close)
+        tmp = tempfile.mkdtemp(prefix="tt-")
+        for name, kib in (("big", 400), ("mid", 200), ("small", 100), ("tiny", 8)):
+            os.mkdir(os.path.join(tmp, name))
+            with open(os.path.join(tmp, name, "f"), "wb") as f:
+                f.write(os.urandom(kib * 1024))
+        rc, out, _ = healthy_doctor(w, "--model", "m", "--tmp-dir", tmp)
+        self.assertEqual(rc, 0, out)
+        row = tmp_row(out)
+        self.assertIn(f"path={tmp} ", row)
+        self.assertRegex(row, r" top=big:\d+k,mid:\d+k,small:\d+k scope=advisory$")
 
 def restarter(tc, w):
     """When the old main dies, a new one appears (the unit's Restart=)."""
