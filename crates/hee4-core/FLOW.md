@@ -98,12 +98,14 @@ transaction; `Store::cache_heals()` reads them.
 sha256}`); `id` is `b-<ts_ms 12 hex>-<boot 8 hex>`, lexically sortable. A dir without a
 manifest is incomplete by construction and `restore` refuses it (`Incomplete`). `SameDisk::Refuse`
 (serve's default) refuses a `dest_root` on the ledger's device (`SameDevice`).
-`restore(backup_dir, into)` refuses `TargetOccupied` when `<into>/ledger.sqlite3` exists,
+`restore(backup_dir, into)` first refuses any manifest `files` key other than `ledger.sqlite3`
+or `objects/<one normal component>.brief` (`Manifest{field: "files"}`: a `..`, absolute or nested
+key is never joined, stat'ed or read), refuses `TargetOccupied` when `<into>/ledger.sqlite3` exists,
 verifies every sha256 before copying anything (`DigestMismatch{file}`, `ObjectsMissing{n,
 total}`), then stages the ledger and `work/briefs/*.brief` under `<into>/.restore-<id>.tmp/`,
 opens the staged ledger, records `restored_from` (the manifest's epoch), mints a fresh epoch and
 runs `reconcile` with unobserved custody there, and only then renames the briefs and, LAST, the
-ledger into place. A failure after the copy (`BackupError::Store`: a snapshot newer than the
+ledger into place; `RestoreReport.objects_n` counts the briefs actually staged. A failure after the copy (`BackupError::Store`: a snapshot newer than the
 binary answers `UnknownMigration`) removes the staging dir, so `<into>` holds no ledger and the
 retry is not `TargetOccupied`; a `<into>/ledger.sqlite3` therefore means a completed restore.
 

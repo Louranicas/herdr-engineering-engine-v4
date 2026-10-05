@@ -344,3 +344,115 @@ fn a_restore_whose_open_fails_leaves_nothing_behind_and_the_retry_is_not_occupie
     );
     Ok(())
 }
+
+/// A copy of a good backup whose manifest also lists `key` with the sha256 of `outside`, a
+/// file outside the backup dir that is then made unreadable (mode 000): a restore that read
+/// it would answer `Io`, one that copied it would succeed.
+fn backup_with_foreign_key(
+    base: &Path,
+    key: &str,
+    outside: &Path,
+) -> Result<PathBuf, Box<dyn Error>> {
+    use std::os::unix::fs::PermissionsExt;
+    let (ledger, work) = seed(base, 2)?;
+    let store = Store::open(&ledger)?;
+    store.apply(&"t-000".parse()?, Event::Admit)?;
+    let backup = backup_to(&store, &work, &base.join("backups"), SameDisk::Allow)?;
+    let tampered = base.join("tampered");
+    copy_tree(&backup.dir, &tampered)?;
+    std::fs::write(outside, b"outside the backup\n")?;
+    let mut m = manifest(&tampered)?;
+    m["files"][key] = Value::from(Sha256Hex::digest(&std::fs::read(outside)?).to_string());
+    std::fs::write(
+        tampered.join("manifest.json"),
+        serde_json::to_vec_pretty(&m)?,
+    )?;
+    std::fs::set_permissions(outside, std::fs::Permissions::from_mode(0o000))?;
+    Ok(tampered)
+}
+
+/// `into` holds no ledger, no brief and no `.restore-*.tmp`.
+fn nothing_staged(into: &Path) -> R {
+    let mut left = Vec::new();
+    if into.exists() {
+        walk(into, into, &mut left)?;
+        for entry in std::fs::read_dir(into)? {
+            left.push(entry?.file_name().to_string_lossy().into_owned());
+        }
+    }
+    assert!(left.is_empty(), "nothing is read or staged: {left:?}");
+    Ok(())
+}
+
+#[test]
+fn restore_refuses_a_dotdot_key() -> R {
+    let base = scratch("dotdot-key")?;
+    let outside = base.join("x");
+    let tampered = backup_with_foreign_key(&base, "../x", &outside)?;
+    let into = base.join("into");
+    let err = restore(&tampered, &into);
+    assert!(
+        matches!(&err, Err(BackupError::Manifest { field: "files" })),
+        "{err:?}"
+    );
+    nothing_staged(&into)
+}
+
+#[test]
+fn restore_refuses_an_absolute_key() -> R {
+    let base = scratch("absolute-key")?;
+    let outside = base.join("hostname");
+    let key = outside.display().to_string();
+    assert!(key.starts_with('/'), "an absolute key: {key}");
+    let tampered = backup_with_foreign_key(&base, &key, &outside)?;
+    let into = base.join("into");
+    let err = restore(&tampered, &into);
+    assert!(
+        matches!(&err, Err(BackupError::Manifest { field: "files" })),
+        "{err:?}"
+    );
+    nothing_staged(&into)?;
+    // A nested key under objects/ is refused the same way.
+    let mut m = manifest(&tampered)?;
+    let files = m["files"].as_object_mut().ok_or("files")?;
+    files.retain(|k, _| !k.starts_with('/'));
+    let sha = files.get("objects/t-000.brief").cloned().ok_or("t-000")?;
+    files.insert("objects/sub/t-000.brief".into(), sha);
+    std::fs::write(
+        tampered.join("manifest.json"),
+        serde_json::to_vec_pretty(&m)?,
+    )?;
+    let err = restore(&tampered, &into);
+    assert!(
+        matches!(&err, Err(BackupError::Manifest { field: "files" })),
+        "{err:?}"
+    );
+    nothing_staged(&into)
+}
+
+/// `objects_n` is the number of briefs staged and moved into place, checked against a
+/// manifest that lists N of them.
+#[test]
+fn restore_objects_n_counts_the_staged_briefs() -> R {
+    let base = scratch("objects-n")?;
+    let n = 4;
+    let (ledger, work) = seed(&base, n)?;
+    let store = Store::open(&ledger)?;
+    store.apply(&"t-000".parse()?, Event::Admit)?;
+    let backup = backup_to(&store, &work, &base.join("backups"), SameDisk::Allow)?;
+    let listed = manifest(&backup.dir)?["files"]
+        .as_object()
+        .ok_or("files")?
+        .keys()
+        .filter(|k| k.starts_with("objects/"))
+        .count();
+    assert_eq!(listed, n);
+    let into = base.join("into");
+    let report = restore(&backup.dir, &into)?;
+    let mut restored = Vec::new();
+    let briefs = into.join("work").join("briefs");
+    walk(&briefs, &briefs, &mut restored)?;
+    assert_eq!((report.objects_n, report.objects_total), (n, n));
+    assert_eq!(restored.len(), report.objects_n);
+    Ok(())
+}

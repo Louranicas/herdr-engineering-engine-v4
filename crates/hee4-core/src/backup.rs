@@ -285,6 +285,25 @@ fn write_manifest_last(dir: &Path, manifest: &Value) -> Result<(), BackupError> 
     Ok(())
 }
 
+/// A manifest `files` key this writer produces: `ledger.sqlite3`, or `objects/<name>.brief`
+/// where `<name>.brief` is one normal path component (no `/`, not `.` or `..`).
+fn is_manifest_key(key: &str) -> bool {
+    if key == LEDGER_FILE {
+        return true;
+    }
+    let Some(name) = key
+        .strip_prefix(OBJECTS_DIR)
+        .and_then(|rest| rest.strip_prefix('/'))
+    else {
+        return false;
+    };
+    let mut parts = Path::new(name).components();
+    matches!(
+        (parts.next(), parts.next()),
+        (Some(std::path::Component::Normal(one)), None) if one == name
+    ) && Path::new(name).extension().is_some_and(|e| e == BRIEF_EXT)
+}
+
 fn field<'a>(manifest: &'a Value, name: &'static str) -> Result<&'a Value, BackupError> {
     manifest
         .get(name)
@@ -300,6 +319,8 @@ fn field<'a>(manifest: &'a Value, name: &'static str) -> Result<&'a Value, Backu
 /// retry is not `TargetOccupied`; the failure is the restore's only output.
 ///
 /// # Errors
+/// [`BackupError::Manifest`] (`files`) for a key other than `ledger.sqlite3` or
+/// `objects/<name>.brief`, before any file is read;
 /// [`BackupError::Incomplete`] (no manifest, or no ledger), [`BackupError::TargetOccupied`],
 /// [`BackupError::ObjectsMissing`], [`BackupError::DigestMismatch`]; [`BackupError::Store`]
 /// when the staged ledger cannot be opened or reconciled (a snapshot newer than this binary
@@ -326,6 +347,11 @@ pub fn restore(backup_dir: &Path, into: &Path) -> Result<RestoreReport, BackupEr
     let files = field(&manifest, "files")?
         .as_object()
         .ok_or(BackupError::Manifest { field: "files" })?;
+    // Every key is a path inside the backup dir that this writer could have written; anything
+    // else ('..', an absolute path, a nested dir) is refused before any file is read.
+    if !files.keys().all(|key| is_manifest_key(key)) {
+        return Err(BackupError::Manifest { field: "files" });
+    }
     let ledger_sha256 = files
         .get(LEDGER_FILE)
         .and_then(Value::as_str)
@@ -369,9 +395,9 @@ pub fn restore(backup_dir: &Path, into: &Path) -> Result<RestoreReport, BackupEr
         std::fs::remove_dir_all(&staging).map_err(|e| io_at(&staging, e))?;
     }
     let staged = stage(backup_dir, &staging, &objects, &old_epoch)
-        .and_then(|complete| move_into_place(&staging, into, &objects).map(|()| complete));
-    let recovery_complete = match staged {
-        Ok(complete) => complete,
+        .and_then(|done| move_into_place(&staging, into, &objects).map(|()| done));
+    let (recovery_complete, objects_n) = match staged {
+        Ok(done) => done,
         Err(e) => {
             if staging.exists() {
                 std::fs::remove_dir_all(&staging).map_err(|e| io_at(&staging, e))?;
@@ -382,7 +408,7 @@ pub fn restore(backup_dir: &Path, into: &Path) -> Result<RestoreReport, BackupEr
     Ok(RestoreReport {
         backup_id,
         ledger_sha256,
-        objects_n: objects_total,
+        objects_n,
         objects_total,
         recovery_complete,
         rto_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -390,7 +416,8 @@ pub fn restore(backup_dir: &Path, into: &Path) -> Result<RestoreReport, BackupEr
 }
 
 /// Copy the verified ledger and objects into `staging`, open the staged ledger, mark
-/// `restored_from`, renew the epoch and reconcile there. Returns `reconcile`'s `complete`. The
+/// `restored_from`, renew the epoch and reconcile there. Returns `reconcile`'s `complete` and
+/// the number of objects actually staged (the report's `objects_n`). The
 /// `Store` is dropped before returning, so the staged ledger has no open connection (and, under
 /// WAL, no live `-wal`/`-shm`) when it is renamed.
 fn stage(
@@ -398,20 +425,22 @@ fn stage(
     staging: &Path,
     objects: &[&String],
     old_epoch: &str,
-) -> Result<bool, BackupError> {
+) -> Result<(bool, usize), BackupError> {
     let briefs_dir = staging.join("work").join(BRIEFS_DIR);
     std::fs::create_dir_all(&briefs_dir).map_err(|e| io_at(&briefs_dir, e))?;
     copy(&backup_dir.join(LEDGER_FILE), &staging.join(LEDGER_FILE))?;
+    let mut staged = 0_usize;
     for rel in objects {
         let src = backup_dir.join(rel);
         copy(&src, &briefs_dir.join(file_name(&src)?))?;
+        staged += 1;
     }
     let store = Store::open(&staging.join(LEDGER_FILE))?;
     store.mark_restored_from(old_epoch)?;
     store.renew_epoch()?;
     let report = reconcile(&store, &Observations::default())?;
     drop(store);
-    Ok(report.complete)
+    Ok((report.complete, staged))
 }
 
 /// Rename the staged briefs into `<into>/work/briefs/`, then the ledger's `-wal`/`-shm` when
