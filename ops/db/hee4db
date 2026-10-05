@@ -1818,10 +1818,22 @@ def record_failed_receipt(db: Path, verb: str, started: str, r: Refusal, seen: i
 # Each source file stays the home of its facts; these rows are derived and rebuilt by `ingest` in the same
 # transaction as the planning tables. ~/.claude is READ only (another owner writes it); the host crontab is
 # read only, through `flatpak-spawn --host crontab -l` (or HEE4DB_CRONTAB_FILE, which the control uses).
+# (rev 2026-10-05 schedule) The SCHEDULE-SOURCE RULE, stated here and only here: a schedule source is the host
+# crontab or the systemd user timer directory (TIMERS_DIR, read from its *.timer/*.service files only, never through
+# systemctl). A source's status is ok | absent | unreadable: absent is a measured fact (no binary, no file, no
+# directory), unreadable is a source that exists and failed; only unreadable is a gap (ingest exit 10). A schedule's
+# kind is roster (the command runs run-agent.sh <agent> <mode>), daily (it runs ops/db/daily.sh) or other.
 
 CLAUDE_HOME = Path(os.environ.get("HEE4DB_CLAUDE_HOME", HOME / ".claude"))
 CRONTAB_FILE = os.environ.get("HEE4DB_CRONTAB_FILE")            # unset: the live host crontab
 CRONTAB_LABEL = "crontab:host"
+TIMERS_DIR = Path(os.environ.get("HEE4DB_TIMERS_DIR", HOME / ".config/systemd/user"))   # the control's seam, like HEE4DB_CRONTAB_FILE
+TIMER_SCHEDULE_KEYS = ("OnCalendar",)                            # the schedule lines of a [Timer]; monotonic keys only when none
+TIMER_MONOTONIC_KEYS = ("OnBootSec", "OnUnitActiveSec")
+REGISTRY_SOURCE_KINDS = {  # a registry table and the registry_sources kinds that feed it (check=world's measured-zero rule)
+    "skills": ("skills_dir",), "agents": ("agents_dir",), "agent_modes": ("roster_dir", "modes"),
+    "agent_schedules": ("crontab", "timers"), "reflexes": ("hooks_dir", "settings"),
+}
 VERIFY_LOGS = Path(os.environ.get("HEE4DB_VERIFY_LOGS", HOME / ".cache/hee4-just"))
 HANDOFFS = Path(os.environ.get("HEE4DB_HANDOFFS", os.environ.get("HEE4_HANDOFFS", HOME / "handoffs")))
 REGISTRY_TABLES = ["registry_sources", "skills", "agents", "agent_modes", "agent_schedules", "reflexes"]
@@ -1941,18 +1953,23 @@ def reg_text(p: Path, data: bytes) -> str:
 
 
 def read_crontab() -> tuple[str, str | None, str]:
-    """(status, text, detail). The crontab is read, never written: `crontab -l` only."""
+    """(status, text, detail). The crontab is read, never written: `crontab -l` only. Status absent is a
+    measured fact (no binary on PATH, or the seam file does not exist); unreadable is a binary or file that
+    exists and fails (rc!=0, a bounded-run refusal, a permission error)."""
     if CRONTAB_FILE is not None:
         p = Path(CRONTAB_FILE)
         if not p.exists():
-            return "unreadable", None, f"HEE4DB_CRONTAB_FILE={p} absent"
-        return "ok", reg_text(p, reg_read(p, CRONTAB_CAP)), f"file={p}"
+            return "absent", None, f"HEE4DB_CRONTAB_FILE={p} absent"
+        try:
+            return "ok", reg_text(p, reg_read(p, CRONTAB_CAP)), f"file={p}"
+        except OSError as e:
+            return "unreadable", None, f"HEE4DB_CRONTAB_FILE={p} {type(e).__name__}: {e}"[:200]
     if shutil.which("flatpak-spawn"):
         argv = ["flatpak-spawn", "--host", "crontab", "-l"]
     elif shutil.which("crontab"):
         argv = ["crontab", "-l"]
     else:
-        return "unreadable", None, "neither flatpak-spawn nor crontab on PATH"
+        return "absent", None, "neither flatpak-spawn nor crontab on PATH"
     try:
         rc, out, err = run_bounded(argv, CRONTAB_CAP, timeout=20)
     except Refusal as r:
@@ -1989,6 +2006,99 @@ def parse_crontab(text: str, label: str) -> list[dict]:
         else:
             rows.append({"kind": "other", "schedule": sched, "agent": None, "mode": None, "command": cmd, "line": i})
     return rows
+
+
+def parse_unit(text: str) -> dict[str, list[tuple[int, str, str]]]:
+    """A systemd unit file as {section: [(line, key, value)]}. Comments (# ;) and blank lines are skipped; a
+    key line before any section goes under ''. Structure only: no value is interpreted here."""
+    sections: dict[str, list[tuple[int, str, str]]] = {}
+    cur = ""
+    for i, raw in enumerate(text.splitlines(), start=1):
+        ln = raw.strip()
+        if not ln or ln.startswith(("#", ";")):
+            continue
+        if ln.startswith("[") and ln.endswith("]"):
+            cur = ln[1:-1].strip()
+            sections.setdefault(cur, [])
+            continue
+        key, sep, val = ln.partition("=")
+        if sep:
+            sections.setdefault(cur, []).append((i, key.strip(), val.strip()))
+    return sections
+
+
+def scan_timers() -> tuple[str, list[tuple[Path, bytes, Path, bytes | None]], str | None, str]:
+    """(status, [(timer, timer_bytes, service, service_bytes)], sha256, detail): the bytes of every top-level
+    *.timer in TIMERS_DIR (sorted, no recursion) and of its paired .service in the same directory (None when
+    absent), without parsing. The sha256 is over the concatenated bytes in that order, so `stale` compares one
+    number. absent: no directory; unreadable: a listing or read failed."""
+    d = TIMERS_DIR
+    if not d.is_dir():
+        return "absent", [], None, "directory absent"
+    units: list[tuple[Path, bytes, Path, bytes | None]] = []
+    h = hashlib.sha256()
+    try:
+        timers = sorted(p for p in d.glob("*.timer") if p.is_file())
+        for t in timers:
+            tb = reg_read(t, CRONTAB_CAP)
+            unit = next((v for _, k, v in parse_unit(reg_text(t, tb)).get("Timer", []) if k == "Unit" and v), f"{t.stem}.service")
+            s = d / unit
+            sb = reg_read(s, CRONTAB_CAP) if s.is_file() else None
+            h.update(tb)
+            if sb is not None:
+                h.update(sb)
+            units.append((t, tb, s, sb))
+    except OSError as e:
+        return "unreadable", [], None, f"{type(e).__name__}: {e}"[:200]
+    return "ok", units, h.hexdigest(), f"timers={len(units)}"
+
+
+def read_timers() -> tuple[str, list[dict], str | None, str]:
+    """(status, rows, sha256, detail). systemd user timers as a schedule source, read from files only (never
+    `systemctl`). One agent_schedules row per schedule line of each .timer: schedule = the line's value verbatim,
+    command = the paired .service's first ExecStart= verbatim (`unit_absent:<name>.service` when the service is
+    missing), kind by the schedule-source rule. A .timer with no [Timer] section or no schedule line refuses the
+    ingest by name. detail on ok: `timers=T jobs=N roster=R daily=D enabled=E` (enabled = a timers.target.wants link)."""
+    status, units, sha, detail = scan_timers()
+    if status != "ok":
+        return status, [], sha, detail
+    rows: list[dict] = []
+    enabled = 0
+    for t, tb, s, sb in units:
+        sections = parse_unit(reg_text(t, tb))
+        if "Timer" not in sections:
+            raise Refusal("ingest_malformed", f"source={t} no [Timer] section")
+        timer = sections["Timer"]
+        scheds = [(i, v) for i, k, v in timer if k in TIMER_SCHEDULE_KEYS and v]
+        if not scheds:
+            scheds = [(i, v) for i, k, v in timer if k in TIMER_MONOTONIC_KEYS and v]
+        if not scheds:
+            raise Refusal("ingest_malformed", f"source={t} no schedule line ({'/'.join(TIMER_SCHEDULE_KEYS + TIMER_MONOTONIC_KEYS)}=) in [Timer]")
+        if sb is None:
+            cmd = f"unit_absent:{s.name}"
+        else:
+            cmd = next((v for _, k, v in parse_unit(reg_text(s, sb)).get("Service", []) if k == "ExecStart" and v), f"execstart_absent:{s.name}")
+        try:
+            toks = shlex.split(cmd)
+        except ValueError as e:
+            raise Refusal("ingest_malformed", f"source={s} ExecStart does not tokenize: {e}") from e
+        kind, agent, mode = "other", None, None
+        at = [j for j, x in enumerate(toks) if Path(x).name == "run-agent.sh"]
+        if at:
+            j = at[0]
+            if len(toks) <= j + 2:
+                raise Refusal("ingest_malformed", f"source={s} ExecStart runs run-agent.sh without <agent> <mode>")
+            kind, agent, mode = "roster", toks[j + 1], toks[j + 2]
+        elif any(Path(x).name == "daily.sh" and Path(x).parent.parts[-2:] == ("ops", "db") for x in toks):
+            kind = "daily"
+        enabled += os.path.lexists(t.parent / "timers.target.wants" / t.name)
+        tsha = sha256_bytes(tb)
+        for i, v in scheds:
+            rows.append({"kind": kind, "schedule": v, "agent": agent, "mode": mode, "command": cmd, "line": i,
+                         "source_path": str(t), "source_sha256": tsha})
+    detail = (f"timers={len(units)} jobs={len(rows)} roster={sum(r['kind'] == 'roster' for r in rows)} "
+              f"daily={sum(r['kind'] == 'daily' for r in rows)} enabled={enabled}")
+    return "ok", rows, sha, detail
 
 
 def parse_modes(text: str, agent: str, src: Path) -> list[dict]:
@@ -2124,13 +2234,20 @@ def collect_registry(ts: str) -> tuple[dict[str, list[dict]], list[str]]:
     label = CRONTAB_FILE or CRONTAB_LABEL
     if status != "ok" or text is None:
         src("crontab", "host", label, status, None, 0, detail)
-        lines.append(f"registry_crontab_unmeasured {detail}")
+        lines.append(f"registry_crontab_{'absent' if status == 'absent' else 'unmeasured'} {detail}")
     else:
         sha = sha256_bytes(text.encode())
         rows = parse_crontab(text, label)
         for r in rows:
             res["agent_schedules"].append({**r, "source_path": label, "source_sha256": sha, "source_line": r["line"], "ingested_at": ts})
         src("crontab", "host", label, "ok", sha, len(rows), f"{detail} jobs={len(rows)} roster={sum(r['kind'] == 'roster' for r in rows)}")
+    # systemd user timers (rev 2026-10-05 schedule): files only, through the TIMERS_DIR seam ----------------
+    tstatus, trows, tsha, tdetail = read_timers()
+    for r in trows:
+        res["agent_schedules"].append({**r, "source_line": r["line"], "ingested_at": ts})
+    src("timers", "user", str(TIMERS_DIR), tstatus, tsha, len(trows), tdetail)
+    if tstatus != "ok":
+        lines.append(f"registry_timers_{'absent' if tstatus == 'absent' else 'unmeasured'} {tdetail}")
     # reflexes --------------------------------------------------------------
     for scope, settings_p, hooks_dir in (("user", CLAUDE_HOME / "settings.json", CLAUDE_HOME / "hooks"),
                                          ("project", ROOTS["repo"] / ".claude" / "settings.json", ROOTS["repo"] / ".claude" / "hooks")):
@@ -2261,12 +2378,21 @@ def registry_stale(con: sqlite3.Connection) -> list[dict]:
         status, text, _ = read_crontab()
         if status == "ok" and text is not None and sha256_bytes(text.encode()) != row[0]:
             out.append({"path": CRONTAB_FILE or CRONTAB_LABEL, "state": "changed"})
+    row = con.execute("SELECT sha256 FROM registry_sources WHERE kind='timers' AND status='ok'").fetchone()
+    if row:
+        tstatus, _units, tsha, _detail = scan_timers()
+        if tstatus == "absent":
+            out.append({"path": str(TIMERS_DIR), "state": "absent"})
+        elif tstatus == "ok" and tsha != row[0]:
+            out.append({"path": str(TIMERS_DIR), "state": "changed"})
     return out
 
 
 def registry_checks(db: Path, add) -> None:
     """registry_skills: every v4_relevant skill file exists and parses, and every curated name is a skill.
-    registry_agents: every agent the crontab runs has a clean definition, a modes.conf, and the mode it is run in."""
+    registry_agents: every agent a schedule source (crontab or timers) runs has a clean definition, a modes.conf, and
+    the mode it is run in. UNMEASURED when no schedule source is readable; PASS over the readable sources (never
+    measured=0/0, F138/AP-29) when they hold no roster job."""
     try:
         con = ro_connect(db)
         try:
@@ -2296,32 +2422,46 @@ def registry_checks(db: Path, add) -> None:
     try:
         con = ro_connect(db)
         try:
-            cron = con.execute("SELECT status, detail FROM registry_sources WHERE kind='crontab'").fetchone()
-            sched = con.execute("SELECT agent, mode, source_line FROM agent_schedules WHERE kind='roster' ORDER BY source_line").fetchall()
+            srcrows = con.execute("SELECT kind, status, detail, entries FROM registry_sources WHERE kind IN ('crontab','timers')").fetchall()
+            roster_dir = con.execute("SELECT entries FROM registry_sources WHERE kind='roster_dir' AND status='ok'").fetchone()
+            sched = con.execute("SELECT agent, mode, source_line, source_path FROM agent_schedules WHERE kind='roster' "
+                                "ORDER BY source_path, source_line").fetchall()
             defs = {r[0]: r[1] for r in con.execute("SELECT name, parse_error FROM agents")}
             modes: dict[str, set[str]] = {}
             for ag, md in con.execute("SELECT agent, mode FROM agent_modes"):
                 modes.setdefault(ag, set()).add(md)
         finally:
             con.close()
-        if not cron or cron[0] != "ok":
-            add("registry_agents", EXIT_UNMEASURED, "measured=0/0 registry_crontab_unmeasured " + (cron[1][:200] if cron else "no crontab row (run `hee4db ingest`)"))
+        by_kind = {k: (st, det, ent) for k, st, det, ent in srcrows}
+        sources_ok = sorted(k for k, (st, _, _) in by_kind.items() if st == "ok")
+        cstat = by_kind.get("crontab", ("no_row",))[0]
+        tstat = by_kind.get("timers", ("no_row",))[0]
+        if not sources_ok:
+            add("registry_agents", EXIT_UNMEASURED, f"measured=0/0 registry_schedule_unmeasured crontab={cstat} timers={tstat}"
+                + ("" if srcrows else " (no schedule rows: run `hee4db ingest`)"))
         elif not sched:
-            add("registry_agents", EXIT_UNMEASURED, "measured=0/0 unmeasured_empty_world roster_jobs=0")
+            n = len(sources_ok)      # the subjects measured are the readable schedule sources, never 0/0
+            add("registry_agents", EXIT_OK, f"measured={n}/{n} roster_jobs=0 roster_dirs={roster_dir[0] if roster_dir else 0} "
+                f"timers={by_kind.get('timers', (None, None, 0))[2]} crontab={cstat} sources=present")
         else:
-            bad = []
-            for ag, md, ln in sched:
+            bad, failed = [], set()
+            for ag, md, ln, sp in sched:
+                loc = f"source={sp} line={ln}"
                 if ag not in defs:
-                    bad.append(f"registry_agent_undefined agent={ag} crontab_line={ln}")
+                    bad.append(f"registry_agent_undefined agent={ag} {loc}")
+                    failed.add((sp, ln))
                 elif defs[ag]:
                     bad.append(f"registry_agent_definition_unparsed agent={ag} error={defs[ag]}")
+                    failed.add((sp, ln))
                 if ag not in modes:
-                    bad.append(f"registry_agent_no_modes agent={ag} crontab_line={ln}")
+                    bad.append(f"registry_agent_no_modes agent={ag} {loc}")
+                    failed.add((sp, ln))
                 elif md not in modes[ag]:
-                    bad.append(f"registry_agent_mode_unknown agent={ag} mode={md} crontab_line={ln}")
-            okn = len(sched) - len({b.split(" crontab_line=")[-1] for b in bad if "crontab_line=" in b} | {b for b in bad if "crontab_line=" not in b})
+                    bad.append(f"registry_agent_mode_unknown agent={ag} mode={md} {loc}")
+                    failed.add((sp, ln))
             add("registry_agents", EXIT_OK if not bad else EXIT_REFUSED,
-                f"measured={max(okn, 0)}/{len(sched)} roster_jobs={len(sched)} agents={len({s[0] for s in sched})}" + "".join(" " + b for b in bad))
+                f"measured={len(sched) - len(failed)}/{len(sched)} roster_jobs={len(sched)} agents={len({s[0] for s in sched})} "
+                f"sources={','.join(sources_ok)}" + "".join(" " + b for b in bad))
     except (sqlite3.DatabaseError, Refusal) as e:
         add("registry_agents", EXIT_REFUSED, f"error={e}")
 
@@ -3251,12 +3391,29 @@ def verb_check(a, o: Out) -> int:
         add("migrations", EXIT_OK if not bad else EXIT_REFUSED, f"measured={len(files) - len(bad)}/{len(files)}" + (f" migration_drift={bad}" if bad else ""))
     except sqlite3.DatabaseError as e:
         add("migrations", EXIT_REFUSED, f"error={e}")
-    # 4. world: an empty derived world is UNMEASURED, never PASS
+    # 4. world: an empty derived world is UNMEASURED, never PASS. (rev 2026-10-05 schedule) An empty REGISTRY table
+    #    whose registry_sources kind was read with status ok is a measured zero (an empty present source), printed
+    #    as measured_empty=<table>:<kind>=ok; one whose sources are all absent/unreadable stays unmeasured.
     try:
         cnt = py_counts(a.db, DERIVED_TABLES + ["sources"] + REGISTRY_TABLES)
-        empty = [t for t, n in cnt.items() if n == 0]
+        con = ro_connect(a.db)
+        try:
+            kinds_ok = {r[0] for r in con.execute("SELECT DISTINCT kind FROM registry_sources WHERE status='ok'")}
+        finally:
+            con.close()
+        empty, measured_empty = [], []
+        for t, n in cnt.items():
+            if n:
+                continue
+            ok_kinds = [k for k in REGISTRY_SOURCE_KINDS.get(t, ()) if k in kinds_ok]
+            if ok_kinds:
+                measured_empty.append(f"{t}:" + ",".join(f"{k}=ok" for k in ok_kinds))
+            else:
+                empty.append(t)
         add("world", EXIT_OK if not empty else EXIT_UNMEASURED,
-            f"measured={len(cnt) - len(empty)}/{len(cnt)} derived_rows={sum(cnt.values())}" + (f" unmeasured_empty_world empty={','.join(empty)}" if empty else ""))
+            f"measured={len(cnt) - len(empty)}/{len(cnt)} derived_rows={sum(cnt.values())}"
+            + "".join(f" measured_empty={m}" for m in measured_empty)
+            + (f" unmeasured_empty_world empty={','.join(empty)}" if empty else ""))
     except (sqlite3.DatabaseError, Refusal) as e:
         add("world", EXIT_REFUSED, f"error={e}")
     # 5. stale derived rows
@@ -4119,7 +4276,7 @@ VERBS = [
     ("get", "one entity by id: " + "|".join(ENTITIES), "hee4db get module store"),
     ("search", "ranked full-text search over decisions, APs, EXs, drift, notes, held items, loops, learnings", "hee4db search verdict authority"),
     ("migrate", "apply schema/NNN_*.sql not yet applied (idempotent; refuses a changed applied file)", "hee4db migrate"),
-    ("ingest", "rebuild every derived table from its file home (incl. the skills/agents/reflexes registry), then the FTS sidecar", "hee4db ingest"),
+    ("ingest", "rebuild every derived table from its file home (incl. the skills/agents/reflexes registry and the crontab/timers schedule sources), then the FTS sidecar", "hee4db ingest"),
     ("record run", "one roster run (--log <run-*.log>, as run-agent.sh does), or --from-logs to backfill roster/*/run-*.log", "hee4db record run --from-logs"),
     ("record measurement", "one measurement, --file <measure-*.txt> (as run-agent.sh does), or --from-measure-files", "hee4db record measurement --name v3_refs --value 0 --denominator 204"),
     ("record jev-daily", "Jev egress counts for a day (counts only, never text)", "hee4db record jev-daily --day 2026-10-01"),
