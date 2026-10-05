@@ -54,7 +54,7 @@ and a family that leaves one of its owner's catalogued ids without a handler
 | `actions/tools.rs` | `FAMILY` | `Actions` | v4.0 | `tools.list`, `tools.inspect` | none |
 | `actions/service.rs` | `FAMILY` | `Service` | v4.2 | `service.inspect`, `service.probe`, `service.action` (busctl only through `service_runner.rs` → `spawn::plan/run`; commits through `Store::service_*`) | seed `service_facts` (`self`, `model`, `drive`), pin the busctl digest (`HEE4_BUSCTL_SHA256` or measured), print `busctl_sha256=` |
 
-Unregistered owners (`Roster` v4.1; `Service`, `Cohort`, `Numerical` v4.2; `Judge` held) have no
+Unregistered owners (`Roster` v4.1; `Cohort`, `Numerical` v4.2; `Judge` held) have no
 module: their ids are catalogued, listed by `tools.list`, inspected by `tools.inspect`, and refused
 `unavailable` on invocation. Wave-2 families add one line to `composed()` and nothing in `lib.rs`.
 
@@ -87,23 +87,23 @@ The brief text is written to `<W>/briefs/<task>.brief` under the same ledger loc
 
 | Name | Retry | When | Field |
 |---|---|---|---|
-| `invalid_argument` | never | line not a JSON object; `request_id`/`action`/`action_version`/`body` missing or mistyped; `precondition` of another shape than null or `{resource, id, generation}`; a `Required(resource)` action without one; mutating action without `idempotency_key`; `tools.list` `query` over 256 bytes or not a string, `page` not an object, `page.limit` outside 1..100, a malformed `page.cursor`; `tools.inspect` `action`/`version` missing or mistyped; brief missing a field, duplicate field, empty RESTATEMENT; bad `task_id`; `resolution` not quarantine/abandon; `reason` not in that resolution's table; `since_seq` not a u64 | the member's pointer (`/`, `/precondition`, `/body/brief`, `/body/page/limit`, …) |
+| `invalid_argument` | never | line not a JSON object; `request_id`/`action`/`action_version`/`body` missing or mistyped; `precondition` of another shape than null or `{resource, id, generation}`; a `Required(resource)` action without one; mutating action without `idempotency_key`; `tools.list` `query` over 256 bytes or not a string, `page` not an object, `page.limit` outside 1..100, a malformed `page.cursor`; `tools.inspect` `action`/`version` missing or mistyped; brief missing a field, duplicate field, empty RESTATEMENT; bad `task_id`; `resolution` not quarantine/abandon; `reason` not in that resolution's table; `since_seq` not a u64; `service.*` body fields (`probe_id`, `max_cost_microunits` ≠ 0, `unit_id` not the service's, `action`, a malformed `expected_owner_sha256`, `operation`) and a `service.action` precondition naming another resource | the member's pointer (`/`, `/precondition`, `/body/brief`, `/body/page/limit`, `/body/unit_id`, …) |
 | `unknown_action` | never | action not in `catalogue::CATALOGUE` (`/action`); `tools.inspect` of an uncatalogued id (`/body/action`) | `/action`, `/body/action` |
-| `unsupported_action_version` | never | `action_version` ≠ 1 | `/action_version` |
+| `unsupported_action_version` | never | `action_version` ≠ 1; `service.probe` `probe_version` ≠ 1 | `/action_version`, `/body/probe_version` |
 | `not_ready` | after_condition | mutating action while the ledger's `recovery_complete` is false | `/action` |
-| `conflict` | after_readback | same idempotency key, other body bytes; `transition` refused the cancel or the resolve | `/idempotency_key`, `/body/task_id` |
-| `not_found` | never | `task.get`/`task.cancel`/`task.resolve` of a task never admitted | `/body/task_id` |
-| `forbidden` | never | `SO_PEERCRED` uid ≠ the process uid (or unreadable); sent before any request is read, then close | `/` |
+| `conflict` | after_readback | same idempotency key, other body bytes; `transition` refused the cancel or the resolve; `service.action` `expected_owner_sha256` ≠ the row's | `/idempotency_key`, `/body/task_id`, `/body/expected_owner_sha256` |
+| `not_found` | never | `task.get`/`task.cancel`/`task.resolve` of a task never admitted; `service.*` of an unseeded `service_id`; `service.inspect` of an operation key not on this service; `service.action` answered `Unit X not found.`/`not loaded.` by the manager | `/body/task_id`, `/body/service_id`, `/body/operation`, `/body/unit_id` |
+| `forbidden` | never | `SO_PEERCRED` uid ≠ the process uid (or unreadable); sent before any request is read, then close; `service.probe` `network_scope` ≠ `none`; `service.action` on a service seeded not actable (`because` "service not actable") | `/`, `/body/network_scope`, `/body/service_id` |
 | `internal` | same_exact_request | the ledger failed under the request | `/` |
 | `no_route` | after_condition | `task.preview`: `route::select` refused the brief (result body `refusal`, not an error frame) | — |
 | `slow_consumer` | after_condition | `events.subscribe`: the subscriber is 256 frames behind; `{"kind":"close",…}` frame, then close. Best effort: written with a 200 ms write deadline; if the peer's socket buffer is full the frame is not delivered, the server logs `slow_consumer close frame not delivered`, and the client sees EOF | — |
 | `frame_too_large` | never | a request line over 1,048,576 bytes; error frame, then close | `/` |
 | `too_many_connections` | after_condition | 256 connections already open; error frame written from the accept loop before any thread is spawned, then close | `/` |
-| `unavailable` | after_condition | the registry miss in `dispatch`: the action is catalogued but its owner is not registered in this release; `because` is the scope's text (v4.0 "owner not composed", v4.1 the roster family, v4.2 the service/cohort/numerical families, held "H-8") | `/action` |
-| `stale_generation` | never | no emitter in this release; reserved for the roster/service/task families (`precondition.generation` behind the resource's; `current_generation` set) | `/precondition` |
+| `unavailable` | after_condition | the registry miss in `dispatch`: the action is catalogued but its owner is not registered in this release; `because` is the scope's text (v4.0 "owner not composed", v4.1 the roster family, v4.2 the cohort/numerical families, held "H-8"); `service.probe`/`service.action` before the call: `because` "busctl digest", "head unknown", "user bus absent", "service runner not started", or "manager refused" (a manager error reply, at `/body/unit_id`) | `/action`, `/`, `/body/unit_id` |
+| `stale_generation` | never | `service.action`: `precondition.generation` ≠ the service's (`current_generation` set); reserved for the roster/task families | `/precondition/generation` |
 | `resync_required` | never | `tools.list`: a page cursor from another `Engine::boot` (`because` "epoch moved") or another query digest ("filter moved"); reserved for the roster/service/task families' listings | `/body/page/cursor` |
-| `resource_exhausted` | same_exact_request | no emitter in this release; reserved for the roster/service/task families (a bound on work or storage reached) | `/` |
-| `effect_unknown` | after_readback | no emitter in this release; reserved for the roster/service/task families (`readback` names the read that settles it; frame carries `effect: "unknown"`) | `/` |
+| `resource_exhausted` | same_exact_request | `service.probe`: busctl stdout over the 4096 B bound (the message names both numbers); reserved for the roster/task families | `/` |
+| `effect_unknown` | after_readback | `service.action`: the call was sent but its read-back did not settle or faulted; no operations row (`readback` `service.inspect`; frame carries `effect: "unknown"`); reserved for the roster/task families | `/` |
 
 `wire::tests::every_emittable_refusal_has_one_row_in_flow` parses this table and asserts its names
 equal `wire::Code::ALL`, each once. The API Map names the queue overflow `queue_limit` (A-10);
