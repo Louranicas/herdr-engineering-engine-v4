@@ -1,10 +1,13 @@
 //! Rung-2 census behind a rung-1 door: a spawn plan is built only by `spawn::plan` under a
-//! `Permit`. The plan's fields are private (rung 1, held by the `compile_fail` doctest on the
-//! type), so a struct literal outside `crates/hee4-host/src/spawn.rs` cannot compile; this
-//! census names one anyway, in every `.rs` file under `crates/`, so the privacy cannot be
-//! quietly undone. The match is a token census (no regex): the type name as a whole identifier
-//! followed by optional whitespace and `{`. The needle is assembled at run time, so this file
-//! holds no literal of its own.
+//! `Permit`. The plan's fields are private (rung 1), so a struct literal outside
+//! `crates/hee4-host/src/spawn.rs` cannot compile. The privacy itself is held by the
+//! `compile_fail` doctests on the type: one `E0451` literal, plus one `E0616` write per field,
+//! so making any single field `pub` fails its own doctest. This census only counts literals:
+//! it names one in any `.rs` file under `crates/` outside the door, which catches a literal
+//! even when every field is re-exposed, but it does not see a field write. The match is a
+//! token census (no regex): the type name as a whole identifier followed by optional
+//! whitespace and `{`. The needle is assembled at run time, so this file holds no literal of
+//! its own.
 
 use std::error::Error;
 use std::fmt::Write as _;

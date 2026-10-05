@@ -169,6 +169,40 @@ pub const MODEL_SOCKET_ENV: &str = "HEE4_MODEL_SOCKET";
 ///     timeout: Duration::from_secs(1),
 /// };
 /// ```
+///
+/// Nor can a permitted plan be rewritten after [`plan`] built it. Each field has its own
+/// check, so making any one field `pub` fails its doctest even while the literal above still
+/// fails on the other four:
+///
+/// ```compile_fail,E0616
+/// fn rewrite(p: &mut hee4_host::spawn::SpawnPlan) {
+///     p.permit = hee4_host::spawn::PermitId(0);
+/// }
+/// ```
+///
+/// ```compile_fail,E0616
+/// fn rewrite(p: &mut hee4_host::spawn::SpawnPlan) {
+///     p.receipt = hee4_host::spawn::ReceiptId(String::new());
+/// }
+/// ```
+///
+/// ```compile_fail,E0616
+/// fn rewrite(p: &mut hee4_host::spawn::SpawnPlan) {
+///     p.program = std::path::PathBuf::from("/bin/sh");
+/// }
+/// ```
+///
+/// ```compile_fail,E0616
+/// fn rewrite(p: &mut hee4_host::spawn::SpawnPlan) {
+///     p.argv.push("--share-net".to_owned());
+/// }
+/// ```
+///
+/// ```compile_fail,E0616
+/// fn rewrite(p: &mut hee4_host::spawn::SpawnPlan) {
+///     p.timeout = std::time::Duration::MAX;
+/// }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpawnPlan {
     /// Permit this plan was built under.
