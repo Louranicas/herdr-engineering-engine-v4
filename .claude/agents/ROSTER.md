@@ -25,14 +25,14 @@ Drafted 2026-10-05. Every agent is a Claude Code agent file in this directory (`
 
 ## Watchers (read-only, continuous or scheduled; each ends with a typed verdict and may raise STOP)
 
-| Agent | Watches for | Rung it reports on | Draws from |
-|---|---|---|---|
-| `hee4-watch-drift` | apparatus_ratio, count literals in prose, generated blocks, second homes, cards longer than their code budget (AP-28, AP-44–48, D-01…D-16) | things sitting at rung 4 that have a rung-2 detector | the DRIFT doc's printed numbers; SRE golden signals (measure, don't narrate) |
-| `hee4-watch-contradiction` | maps vs cards vs register vs feature files disagreeing (today's §8 class); dangling cites (V4-77); stale pins | rung 2 door "one name / one phase / one home" | `cite_pins`, `module_funnel`, `funnel_trace`; the feature map |
-| `hee4-watch-evidence` | claims without MEASURED/INFERRED/UNMEASURED; gates that looked at nothing; observations without `input_sha256`/`head_sha`; a PASS from a tier-1 source | rung 2 | pstack reply rule ("every claim carries its evidence or its label"); AP-29, AP-33, AP-34 |
-| `hee4-watch-recovery` | non-terminal tasks after a drill; `effect_unknown` rows; missing `Restart=`; observations not ledgered before a verdict | rung 5 → 2 | Jepsen; D7; the crash-restart feature file |
-| `hee4-watch-fence` | writes outside the v4 homes; v3 paths; unsandboxed agent runs (`bypassPermissions`, `disableAllHooks`); secrets in the tree; **any v4 text headed for Jev** | rung 2 | `hee4-v3-guard`, `.claude/settings.json` deny rules, `hee4db jev-entry`, secret-scan preflight (V4-76) |
-| `hee4-watch-budget` | fan-outs over `planned_agents=`, spend past 70% of budget, briefs over their command budget, agents resumed instead of fresh | rung 2 | REQUIREMENTS rank 3 (fan-out kernel); pstack orchestrate's measured lessons ("each nested layer re-pays orientation"; "stop at ~70%") |
+| Agent | Watches for | Rung it reports on | Draws from | Detector (tools/watch) |
+|---|---|---|---|---|
+| `hee4-watch-drift` | apparatus_ratio, count literals in prose, generated blocks, second homes, cards longer than their code budget (AP-28, AP-44–48, D-01…D-16) | things sitting at rung 4 that have a rung-2 detector | the DRIFT doc's printed numbers; SRE golden signals (measure, don't narrate) | `tools/layers` (verdict, `apparatus_ratio=`, `largest_file=`) |
+| `hee4-watch-contradiction` | maps vs cards vs register vs feature files disagreeing (today's §8 class); dangling cites (V4-77); stale pins | rung 2 door "one name / one phase / one home" | `cite_pins`, `module_funnel`, `funnel_trace`; the feature map | `python3 ops/checks/cite_pins.py status`; `python3 ops/checks/module_funnel.py`; `tools/features-check` |
+| `hee4-watch-evidence` | claims without MEASURED/INFERRED/UNMEASURED; gates that looked at nothing; observations without `input_sha256`/`head_sha`; a PASS from a tier-1 source | rung 2 | pstack reply rule ("every claim carries its evidence or its label"); AP-29, AP-33, AP-34 | newest `~/.cache/hee4-gate/*/summary.json` (`ok=false` or `looked_at_nothing`); `unmeasured` frames in `~/.cache/hee4-drive/<head12>/*.jsonl` |
+| `hee4-watch-recovery` | non-terminal tasks after a drill; `effect_unknown` rows; missing `Restart=`; observations not ledgered before a verdict | rung 5 → 2 | Jepsen; D7; the crash-restart feature file | `~/.cache/hee4-drill/<head12>/rehearsal.json` (`acked_present=N/N`, every step MEASURED); `hee4 task.list` (`effect_unknown=0`) |
+| `hee4-watch-fence` | writes outside the v4 homes; v3 paths; unsandboxed agent runs (`bypassPermissions`, `disableAllHooks`); secrets in the tree; **any v4 text headed for Jev** | rung 2 | `hee4-v3-guard`, `.claude/settings.json` deny rules, `hee4db jev-entry`, secret-scan preflight (V4-76) | `tools/push-scan` (default range; `commits=0` is UNMEASURED) |
+| `hee4-watch-budget` | fan-outs over `planned_agents=`, spend past 70% of budget, briefs over their command budget, agents resumed instead of fresh | rung 2 | REQUIREMENTS rank 3 (fan-out kernel); pstack orchestrate's measured lessons ("each nested layer re-pays orientation"; "stop at ~70%") | `fm-db status` (`spawned <= planned_agents`, `open_andon=0` per open unit) |
 
 ## Collaboration roles (never code; the brief and the ledger are their product)
 
