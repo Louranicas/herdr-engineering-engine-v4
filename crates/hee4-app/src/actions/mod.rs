@@ -196,9 +196,9 @@ fn dispatch(engine: &Engine, req: &Request) -> Result<Answer, Fault> {
 ///
 /// # Errors
 /// `unknown_action` (not catalogued), `unsupported_action_version`, `unavailable` (owner not
-/// registered: the one site), `invalid_argument` (missing key or precondition), `not_ready`,
-/// `internal` (a registered id with no handler, unreachable after `Registry::new`), or the
-/// handler's own refusal.
+/// registered: the one site; `Registry::serve` misses exactly then, since `Registry::new`
+/// refused any family missing one of its owner's ids), `invalid_argument` (missing key or
+/// precondition), `not_ready`, or the handler's own refusal.
 pub fn dispatch_with(engine: &Engine, registry: &Registry, req: &Request) -> Result<Answer, Fault> {
     let Some(entry) = catalogue::find(&req.action) else {
         return Err(Fault::new(
@@ -214,14 +214,14 @@ pub fn dispatch_with(engine: &Engine, registry: &Registry, req: &Request) -> Res
             "only 1",
         ));
     }
-    if registry.get(entry.owner).is_none() {
+    let Some(handler) = registry.serve(entry) else {
         return Err(Fault::new(
             Code::Unavailable,
             "/action",
             "owner not registered in this release",
         )
         .with_because(entry.scope.because()));
-    }
+    };
     if entry.effect.mutates() {
         if req.idempotency_key.is_none() {
             return Err(Fault::new(
@@ -251,13 +251,6 @@ pub fn dispatch_with(engine: &Engine, registry: &Registry, req: &Request) -> Res
             format!("required: {{resource: \"{resource}\", id, generation}}"),
         ));
     }
-    let Some(handler) = registry.handler(&req.action) else {
-        return Err(Fault::new(
-            Code::Internal,
-            "/",
-            "catalogued and registered, no handler",
-        ));
-    };
     handler(engine, req)
 }
 

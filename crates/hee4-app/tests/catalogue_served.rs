@@ -41,8 +41,20 @@ fn stub(_: &Engine, _: &Request) -> Result<Answer, Fault> {
     Ok(Answer::Frame(false, json!({})))
 }
 
-/// A test-only roster family over the one roster id whose catalogue rule is `Required`.
-static ROSTER_STUB: [(&str, Handler); 1] = [("roster.disable", stub)];
+/// A test-only family that stubs every catalogued id of `owner` (read from `CATALOGUE`, never a
+/// second id list); the handler table is leaked once because `Family` holds `&'static`.
+fn stub_family(owner: Owner) -> Family {
+    let handlers: Vec<(&'static str, Handler)> = CATALOGUE
+        .iter()
+        .filter(|e| e.owner == owner)
+        .map(|e| (e.id, stub as Handler))
+        .collect();
+    Family {
+        owner,
+        handlers: Box::leak(handlers.into_boxed_slice()),
+        on_serve_start: None,
+    }
+}
 
 #[test]
 fn every_catalogued_id_is_served_or_unavailable_by_scope() -> R<()> {
@@ -111,37 +123,51 @@ fn registry_refuses_held_owners_unknown_ids_and_mismatches_by_name() {
         ),
         "{mismatch:?}"
     );
-    let twice = Registry::new(&[
-        Family {
-            owner: Owner::App,
-            handlers: &[],
-            on_serve_start: None,
-        },
-        Family {
-            owner: Owner::App,
-            handlers: &[],
-            on_serve_start: None,
-        },
-    ]);
+    let twice = Registry::new(&[stub_family(Owner::App), stub_family(Owner::App)]);
     assert!(
         matches!(twice, Err(RegistryFault::DuplicateOwner(Owner::App))),
         "{twice:?}"
     );
 }
 
+/// A family that registers an owner with only some of that owner's catalogued ids is refused at
+/// compose time, so a registered owner's id can never reach dispatch without a handler.
+#[test]
+fn registry_refuses_a_family_that_leaves_one_of_its_owners_ids_unserved() {
+    let served = "task.get";
+    assert_eq!(find(served).map(|e| e.owner), Some(Owner::Task));
+    let first_unserved = CATALOGUE
+        .iter()
+        .find(|e| e.owner == Owner::Task && e.id != served)
+        .map(|e| e.id)
+        .expect("Task owns more than one id");
+    let partial = Registry::new(&[Family {
+        owner: Owner::Task,
+        handlers: &[("task.get", stub)],
+        on_serve_start: None,
+    }]);
+    assert!(
+        matches!(
+            &partial,
+            Err(RegistryFault::MissingHandler { owner: Owner::Task, id }) if id == first_unserved
+        ),
+        "{partial:?}"
+    );
+    let full = composed().expect("composed");
+    for entry in CATALOGUE.iter().filter(|e| full.get(e.owner).is_some()) {
+        assert!(full.serve(entry).is_some(), "{}", entry.id);
+    }
+}
+
 #[test]
 fn a_required_precondition_action_without_one_is_refused_at_precondition() -> R<()> {
     let e = engine("precondition")?;
-    let required = find(ROSTER_STUB[0].0).expect("catalogued");
+    let required = find("roster.disable").expect("catalogued");
     assert_eq!(required.owner, Owner::Roster);
     let PreconditionRule::Required(resource) = required.precondition else {
         panic!("{} is not Required", required.id);
     };
-    let registry = Registry::new(&[Family {
-        owner: Owner::Roster,
-        handlers: &ROSTER_STUB,
-        on_serve_start: None,
-    }])?;
+    let registry = Registry::new(&[stub_family(Owner::Roster)])?;
     let line = wire::request("r", required.id, Some("k"), json!({})).to_string();
     let req = wire::parse(&line).map_err(|(_, f)| f.message)?;
     let refused = dispatch_with(&e, &registry, &req);

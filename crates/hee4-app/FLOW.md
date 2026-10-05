@@ -41,8 +41,10 @@ The catalogue is `hee4_contracts::catalogue`; dispatch is `catalogue::find` then
 `not_ready` while `recovery_complete` is false → `PreconditionRule::Required(resource)` with no
 `precondition` (`invalid_argument` at `/precondition` naming the resource) → the handler.
 `Registry::new` (built once in `Engine::new`, `actions::composed()`) refuses a held owner
-(`Judge`, `Deploy`), a duplicate owner, an id the catalogue does not carry, and an owner mismatch,
-by typed name; so a registered id always has a handler.
+(`Judge`, `Deploy`), a duplicate owner, an id the catalogue does not carry, an owner mismatch,
+and a family that leaves one of its owner's catalogued ids without a handler
+(`RegistryFault::MissingHandler`), by typed name; so `Registry::serve(entry)` misses exactly when
+`Registry::get(entry.owner)` does, and dispatch has no "registered, no handler" arm.
 
 | Module | Family | Owner | Scope | Ids | Hook |
 |---|---|---|---|---|---|
