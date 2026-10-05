@@ -25,7 +25,7 @@ hee4-sh analysis.get 'selector:={"source_action":"analysis.request","idempotency
 
 Socket: request `body` `{selector: AnalysisSelectorV1}` (FACT required); result `body` `{analysis_id, …, state, dataset_sha256, report, error_code}` (API Map A-21). `UNWRITTEN: the AnalysisSelectorV1 field names, the decoded-output field's shape (decoded by K4 julia-decoders from one schema), the error_code domain, and the generated wrapper spelling.`
 
-- v4.0 path: the `unavailable` refusal.
+- v4.0 path: the `unavailable` refusal. Driven by `tools/drive` through `tools/drive.d/scoped.py`: the scope is read from `tools.inspect` (path `catalogued`), and the action, sent with a placeholder for each `Socket:` request member, must be refused `unavailable` at `/action` with exactly that scope's `because` from `Scope::because` (path `refused_by_scope`); the line is `verdict=PASS paths=2/2 scope=v4.2 (refused by release scope, as catalogued)`. Until `tools.inspect` carries `scope`, the line stays UNMEASURED `scope=unserved` naming the missing member.
 - v4.2 success: a validated analysis returns its decoded output and `error_code=null`; a failed one returns `error_code` from the closed decoder set.
 - Error: unknown id → `not_found`.
 - Empty: a running analysis returns a null output field; still a `result`.

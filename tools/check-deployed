@@ -195,13 +195,17 @@ def drive_task_ids(evidence_root):
 
 def feature_counts(feats):
     """(l2, reasoned, unexplained) over `drive feature=` lines; every line lands in exactly one bucket.
-    PASS is l2; UNMEASURED with `scope=unserved` or `reason=` is reasoned; everything else (a FAIL, with
-    or without a reason, an UNMEASURED with neither, an unknown verdict) is unexplained."""
+    PASS is l2, except a PASS naming a release scope (`scope=v4.2`: refused by release scope, as
+    catalogued), which is a reasoned out-of-release flow; UNMEASURED with `scope=unserved` or `reason=`
+    is reasoned; everything else (a FAIL, with or without a reason or scope, an UNMEASURED with
+    neither, an unknown verdict) is unexplained."""
     l2 = reasoned = unexplained = 0
     for line in feats:
         keys = {t.split("=", 1)[0]: t.split("=", 1)[1] for t in line.split() if "=" in t}
         v = keys.get("verdict")
-        if v == "PASS":
+        if v == "PASS" and keys.get("scope", "unserved") != "unserved":
+            reasoned += 1
+        elif v == "PASS":
             l2 += 1
         elif v == "UNMEASURED" and (keys.get("scope") == "unserved" or "reason" in keys):
             reasoned += 1
