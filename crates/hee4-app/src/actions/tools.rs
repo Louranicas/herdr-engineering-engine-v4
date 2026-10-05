@@ -352,7 +352,7 @@ mod tests {
         assert_eq!(thread["body"]["scope"], "v42");
         // `served` is the registry's own answer for every entry, and an unserved one invoked is
         // `unavailable` at `/action` with its scope's `because` (served handlers are not run here).
-        for a in CATALOGUE.iter() {
+        for a in &CATALOGUE {
             let inspected = call(&e, "tools.inspect", json!({"action": a.id, "version": 1}));
             let served = inspected["body"]["served"].as_bool();
             assert_eq!(
