@@ -1,5 +1,7 @@
 # Herdr Engineering Engine v4
 
+Local context framework: [Poteto Weave](</mnt/storage-10tb/hee4-evidence/prototypes/turso-tool-context/assimilation-20261005/README.md>) links back here and to pstack, DDF, LoomLattice and the [Firstmate adapter](ops/firstmate/README.md). It is an isolated retrieval and tool-chain candidate; HEE retains engine state and verdict authority.
+
 HEE v4 is a local engineering engine. It admits a task over a Unix control socket, dispatches it to a local model inside an isolated namespace, verifies it with one verdict authority, settles it durably with a hash-chained receipt, and survives a crash, a restart and a restore. It runs on this machine as a systemd user unit.
 
 The repository holds the engine (`crates/`), its gate (`tools/`, `gate.toml`), the behaviour-level feature map it is verified against (`gates/features/`), the planning corpus it was built from (`plan/`, `modules/`, `docs/`), the agent roster that builds it (`.claude/agents/`, `.claude/skills/`), and the orchestration glue for Firstmate (`ops/firstmate/`).

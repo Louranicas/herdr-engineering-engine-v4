@@ -1,5 +1,7 @@
 # pstack for HEE v4 (Claude Code port)
 
+Local integration: [Poteto Weave](</mnt/storage-10tb/hee4-evidence/prototypes/turso-tool-context/assimilation-20261005/README.md>) is the Herdr context and tool-chain framework inspired by Lauren Tan's pstack. Its project map links back here. This local reference does not change upstream attribution or skill behavior. Active skill directories are siblings of this provenance directory under `.claude/skills/`.
+
 Lauren Tan's [pstack](https://github.com/cursor/plugins/tree/main/pstack) 0.15.9 (MIT) plus the brain
 loop from [brainmaxxing](https://github.com/poteto/brainmaxxing) (MIT), ported to Claude Code skills for
 **building HEE v4**. Sources, hashes and every porting change: `PROVENANCE.md`. Licenses: `LICENSE`.
