@@ -4,14 +4,16 @@
 //! [--body JSON | --body-file F] [--precondition JSON]`. An action the catalogue does not carry
 //! is exit 2 with the catalogue's ids.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use hee4_app::{ServeArgs, catalogue12, dispatcher, doctor, head12, socket, wire};
 use hee4_contracts::catalogue::{self, CATALOGUE};
+use hee4_core::Store;
+use hee4_core::receipts::VerifyError;
 use serde_json::{Value, json};
 
-const USAGE: &str = "usage: hee4 --version | serve --socket P --ledger P --work D | doctor [--unit U] [--socket P] [--repo D]
+const USAGE: &str = "usage: hee4 --version | serve --socket P --ledger P --work D | doctor [--unit U] [--socket P] [--repo D] | verify-ledger --ledger P
        | health | task.list | task.get ID | task.cancel ID --key K | task.submit --brief-file F --key K   [--socket P]
        | <action> [--key K] [--body JSON | --body-file F] [--precondition JSON] [--socket P]   (any catalogued action)";
 
@@ -83,7 +85,56 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         }
+        "verify-ledger" => {
+            let Some(ledger) = flag(&args, "--ledger") else {
+                return fail("verify-ledger needs --ledger");
+            };
+            verify_ledger(Path::new(&ledger))
+        }
         _ => client(verb, &args, &sock),
+    }
+}
+
+/// The offline verifier (no socket, no engine): open the ledger file read-only and re-derive
+/// every link, seal and checkpoint root. One line on stdout; exit 0 on PASS, 1 on a break, 2
+/// when the file cannot be opened or read.
+fn verify_ledger(ledger: &Path) -> ExitCode {
+    let store = match Store::open_read_only(ledger) {
+        Ok(store) => store,
+        Err(e) => {
+            return fail(&format!(
+                "verify-ledger cannot open {}: {e}",
+                ledger.display()
+            ));
+        }
+    };
+    match store.verify_ledger() {
+        Ok(r) => {
+            let root = r.root.to_string();
+            println!(
+                "verify-ledger receipts={} tasks={} checkpoints={} root={} verdict=PASS",
+                r.receipts,
+                r.tasks,
+                r.checkpoints,
+                root.get(..12).unwrap_or(&root)
+            );
+            ExitCode::SUCCESS
+        }
+        Err(VerifyError::Fault(f)) => {
+            println!(
+                "verify-ledger receipts=unmeasured checkpoints=unmeasured break receipt={} seq={} cause={} verdict=FAIL",
+                f.receipt
+                    .as_ref()
+                    .map_or_else(|| "none".to_owned(), ToString::to_string),
+                f.seq,
+                f.cause
+            );
+            ExitCode::from(1)
+        }
+        Err(VerifyError::Store(e)) => fail(&format!(
+            "verify-ledger cannot read {}: {e}",
+            ledger.display()
+        )),
     }
 }
 

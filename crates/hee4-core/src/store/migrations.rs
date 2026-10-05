@@ -128,6 +128,7 @@ pub const MIGRATIONS: &[Migration] = &[
         apply: m004_serve_cgroup,
     },
     super::attempts::MIGRATION,
+    super::receipts::m005_checkpoints(),
 ];
 
 /// The migrations a legacy file (no `migration:` rows) has already applied, by its

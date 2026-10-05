@@ -120,7 +120,7 @@ fn backup_under_a_concurrent_writer_is_a_consistent_snapshot_with_the_manifest_l
         in_snapshot >= before && in_snapshot <= applied,
         "snapshot holds a prefix of the writer's acks"
     );
-    assert_eq!(snapshot.schema_version()?, 4);
+    assert_eq!(snapshot.schema_version()?, 5);
     assert_eq!(report.objects_n, 3);
     assert_eq!(report.epoch, store.epoch()?);
 

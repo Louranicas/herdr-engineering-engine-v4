@@ -15,6 +15,7 @@
 pub(crate) mod attempts;
 mod backup;
 pub(crate) mod migrations;
+pub mod receipts;
 
 pub use attempts::{
     AttemptId, AttemptIdFault, AttemptOutcome, AttemptRow, AttemptStart, AttemptState, Cleanup,
