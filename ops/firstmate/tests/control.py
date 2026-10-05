@@ -50,11 +50,17 @@ def standing_body() -> list[str]:
     return [ln for ln in lines[1:] if ln.strip()]
 
 
-def brief_text(standing: list[str] | None = None, drop: str | None = None, indent: str | None = None) -> str:
+def brief_text(standing: list[str] | None = None, drop: str | None = None, indent: str | None = None,
+               verify: list[str] | None = None) -> str:
+    """The drive brief; `verify` replaces the VERIFY field with `VERIFY:` followed by these lines, one per line."""
     out = []
     for ln in DRIVE_LINES:
         label = ln.split(":")[0]
         if label == drop:
+            continue
+        if label == "VERIFY" and verify is not None:
+            out.append("VERIFY:")
+            out.extend(verify)
             continue
         out.append(("  " + ln) if label == indent else ln)
         if label == "STANDING":
@@ -186,6 +192,26 @@ def main() -> int:
             p = w.brief_file(brief_text(standing=["Standing orders apply as in agents/standing-orders.md"]))
             rc, j = w.fm("record", "brief", "--unit", "U1", "--path", str(p), "--head-sha", HEAD)
             case("brief-standing-sentence", "fault", rc, j, 20, "standing_not_verbatim")
+
+            # A VERIFY line that cannot fail is refused naming its file line and shape; the line sits after a can-fail
+            # line so the number is the offender's own. The fixture's line is found, never pinned.
+            for name, bad, shape in (("tail", "cargo test --offline | tail -1", "shape=pipe_into_tail_head"),
+                                     ("echo-rc", "cargo test --offline; echo rc=$?", "shape=echo_rc"),
+                                     ("or-true", "cargo test --offline || true", "shape=or_true")):
+                text = brief_text(verify=["python3 ops/firstmate/tests/control.py", bad])
+                n = text.splitlines().index(bad) + 1
+                p = w.brief_file(text)
+                rc, j = w.fm("record", "brief", "--unit", "U1", "--path", str(p), "--head-sha", HEAD)
+                case(f"brief-verify-{name}", "fault", rc, j, 20, f"verify_line_cannot_fail line={n} {shape}")
+            # Lines that can fail pass: a pipe into `grep -q`, a stated pipefail, a plain command, and a parenthesised
+            # description (not a command: fm-db verify_cannot_fail documents the rule).
+            for name, good in (("grep-q", "cargo test --offline | grep -q PASS"),
+                               ("pipefail", "set -o pipefail; cargo test --offline | tail -1"),
+                               ("plain", "cargo fmt --all --check"),
+                               ("described", "(from the worktree root; each line judged by its own exit code, never | tail)")):
+                p = w.brief_file(brief_text(verify=[good]))
+                rc, j = w.fm("record", "brief", "--unit", "U1", "--path", str(p), "--head-sha", HEAD)
+                case(f"brief-verify-{name}", "quiet", rc, j, 0, None)
 
             p = w.brief_file(brief_text())
             rc, j = w.fm("record", "brief", "--unit", "U1", "--path", str(p))     # no git under the temp HEE4_ROOT

@@ -6,7 +6,9 @@ Verbs (each one transaction, BEGIN IMMEDIATE, under the writer flock; stdlib onl
                                          transaction with its schema_migrations row; refuses a changed or half-applied file)
   record unit|brief|spawn|claim|verify|receipt|exit|andon  --k v ...   one row; refusals are typed (exit 20)
   record brief --unit U --path P [--head-sha S]   brief_sha, standing_sha (and head_sha from git) are computed, never typed;
-                                         refuses a missing `LABEL:` field or summarised standing orders (PROTOCOL §2)
+                                         refuses a missing `LABEL:` field or summarised standing orders (PROTOCOL §2), and
+                                         a VERIFY line that cannot fail (verify_line_cannot_fail line=N shape=S); the door
+                                         judges each new `record brief`, never a row already recorded
   record spawn ... [--brief-sha X]       refuses a unit with no recorded brief, a closed unit, a brief of another unit
   clear-andon --id N --by WHO
   close-unit --id U --by WHO             refuses an open andon or a spawn without an exit; reports unverified MEASURED claims
@@ -23,6 +25,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import signal
 import sqlite3
 import subprocess
@@ -154,6 +157,72 @@ def collapsed(text: str) -> list[str]:
     return [" ".join(ln.split()) for ln in text.splitlines()]
 
 
+# A VERIFY line whose exit status is not its check's: the shape names why (the workflow curator's detector, bin/workflow-curator
+# cannot_fail, mirrored for the door; `informational` is not refused here).
+VERIFY_SINKS = {"tail": "pipe_into_tail_head", "head": "pipe_into_tail_head", "wc": "pipe_into_sink", "cat": "pipe_into_sink",
+                "sort": "pipe_into_sink", "uniq": "pipe_into_sink", "tee": "pipe_into_sink"}
+
+
+def _first_word(seg: str) -> str:
+    w = seg.split()
+    while w and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", w[0]):          # leading VAR=value assignments
+        w = w[1:]
+    return os.path.basename(w[0]) if w else ""
+
+
+def verify_cannot_fail(line: str) -> list[str]:
+    """The shapes that keep one VERIFY line from failing; [] when its exit status is its check's.
+
+    Rule for what is a command: a markdown bullet (`- `, `* `, `1. `) and a backtick wrapper are stripped; a line that then
+    opens with `(` and closes with `)` is a description (`(from the worktree root; ...)`), never a command, so it is not
+    judged. `a; b` exits with b, so only the last `;` command counts; in it every `&&`/`||` part must carry its status to
+    the end: a pipeline is judged by its LAST stage (`x | tail -1` cannot fail, `x | grep -q PASS` can) unless the line
+    states `set -o pipefail` or reads `${PIPESTATUS[..]}`; `|| true`, `; true` and a trailing `echo rc=$?` swallow the
+    status; `grep -v` succeeds whenever any line differs."""
+    s = line.strip()
+    s = re.sub(r"^(-|\*|\d+[.)])\s+", "", s)
+    if s.startswith("`") and s.count("`") >= 2:
+        s = s[1:s.index("`", 1)].strip()
+    if not s or (s.startswith("(") and s.endswith(")")):
+        return []
+    bare = re.sub(r"'[^']*'|\"[^\"]*\"|\$\([^)]*\)", "Q", s)            # quoted text and $(..) cannot split the line
+    status_read = "pipefail" in bare or "PIPESTATUS" in s                 # a quoted "pipefail" is a mention, not a setting
+    chunks = [c.strip() for c in bare.split(";") if c.strip()]
+    if not chunks:
+        return []
+    last = chunks[-1]
+    shapes: set[str] = set()
+    if len(chunks) > 1 and _first_word(last) in ("echo", "printf", "true", ":"):
+        shapes.add("echo_rc" if "$?" in last else "trailing_true")
+    if re.search(r"\|\|\s*(true|:|exit 0)\s*$", last):
+        shapes.add("or_true")
+    for part in re.split(r"&&|\|\|", last):
+        segs = [x.strip() for x in part.split("|") if x.strip()]
+        if not segs:
+            continue
+        sink = _first_word(segs[-1])
+        if len(segs) > 1 and not status_read and sink in VERIFY_SINKS:
+            shapes.add(VERIFY_SINKS[sink])
+        if sink in ("grep", "egrep", "rg") and any(re.match(r"^-[A-Za-z]*v", o) for o in segs[-1].split()[1:]):
+            shapes.add("inverted_grep")
+    return sorted(shapes)
+
+
+def verify_refusal(text: str) -> str | None:
+    """The first VERIFY line (file line number) that cannot fail, as the typed refusal; None when every line can fail."""
+    in_verify = False
+    for n, ln in enumerate(text.splitlines(), start=1):
+        label = next((f for f in BRIEF_FIELDS if ln.startswith(f + ":")), None)   # column 0, `LABEL:` — brief.rs:63-64
+        if label is not None:
+            in_verify = label == "VERIFY"
+            ln = ln[len(label) + 1:]
+        if in_verify:
+            shapes = verify_cannot_fail(ln)
+            if shapes:
+                return f"verify_line_cannot_fail line={n} shape={','.join(shapes)}: {ln.strip()}"
+    return None
+
+
 def brief_row(d: dict[str, str]) -> str | None:
     """Fill the computed brief columns in place; return the typed refusal detail, or None when the brief is admissible."""
     path = Path(d.get("path") or "")
@@ -181,6 +250,9 @@ def brief_row(d: dict[str, str]) -> str | None:
     for n, ln in enumerate(standing_lines, start=1):
         if n > first_body and ln.strip() and " ".join(ln.split()) not in present:
             return f"standing_not_verbatim line={n}: standing orders are pasted verbatim, never summarised (PROTOCOL §2)"
+    refusal = verify_refusal(text)
+    if refusal:
+        return refusal
     d["brief_sha"] = hashlib.sha256(body).hexdigest()
     d["standing_sha"] = hashlib.sha256(standing).hexdigest()
     return None
