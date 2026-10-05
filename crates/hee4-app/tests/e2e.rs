@@ -860,7 +860,9 @@ fn a_repair_that_never_passes_stops_after_max_generations() -> R<()> {
 ///
 /// `/dev/shm` is machine-global, so the root is unique per run (package, pid, nanosecond
 /// stamp): concurrent slices or cargo invocations never share, delete or `pkill -f` each
-/// other's directories. The guard removes the root when the test ends, pass or panic.
+/// other's directories. The guard removes the root when the test ends, pass or panic; a test
+/// binary killed outright (SIGKILL) runs no guard, so each new run first sweeps the roots of
+/// this package's dead runs ([`sweep_dead_runs`]).
 struct RunDir(PathBuf);
 
 impl Drop for RunDir {
@@ -869,7 +871,45 @@ impl Drop for RunDir {
     }
 }
 
+/// Remove each `<parent>/hee4-e2e-<package>-<pid>-<stamp>` directory whose `<pid>` has no
+/// `/proc` entry and whose owner is this process's uid: the leftovers of a killed run of this
+/// package. A live pid's directory, another package's, another user's, a symlink or a name
+/// that does not parse is never touched. Returns the directories removed.
+fn sweep_dead_runs(parent: &Path, package: &str) -> R<Vec<PathBuf>> {
+    use std::os::unix::fs::MetadataExt as _;
+    let uid = fs::metadata("/proc/self")?.uid();
+    let prefix = format!("hee4-e2e-{package}-");
+    let mut removed = Vec::new();
+    let Ok(entries) = fs::read_dir(parent) else {
+        return Ok(removed);
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(rest) = name.to_str().and_then(|n| n.strip_prefix(&prefix)) else {
+            continue;
+        };
+        let Some((pid, stamp)) = rest.split_once('-') else {
+            continue;
+        };
+        let digits = |t: &str| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit());
+        if !digits(pid) || !digits(stamp) || Path::new("/proc").join(pid).exists() {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_dir() && meta.uid() == uid && fs::remove_dir_all(&path).is_ok() {
+            removed.push(path);
+        }
+    }
+    Ok(removed)
+}
+
 fn fsync_cheap_dir(name: &str) -> R<(RunDir, PathBuf)> {
+    for gone in sweep_dead_runs(Path::new("/dev/shm"), env!("CARGO_PKG_NAME"))? {
+        println!("removed a dead run's directory: {}", gone.display());
+    }
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_nanos();
@@ -889,6 +929,41 @@ fn fsync_cheap_dir(name: &str) -> R<(RunDir, PathBuf)> {
     let dir = root.join(name);
     fs::create_dir_all(&dir)?;
     Ok((RunDir(root), dir))
+}
+
+/// A killed run's `/dev/shm` root is removed by the next run's fresh-directory helper; a live
+/// pid's root (this test's own pid) and another package's root are kept.
+#[test]
+fn the_fresh_dir_helper_removes_only_this_packages_dead_runs() -> R<()> {
+    let shm = Path::new("/dev/shm");
+    if !shm.is_dir() {
+        println!("UNMEASURED: no /dev/shm");
+        return Ok(());
+    }
+    // A pid that was ours and is now reaped: no `/proc` entry.
+    let mut child = Command::new("/usr/bin/true").spawn()?;
+    let dead = child.id();
+    child.wait()?;
+    if Path::new("/proc").join(dead.to_string()).exists() {
+        return Err(format!("pid {dead} was reused before the test could plant it").into());
+    }
+    let pkg = env!("CARGO_PKG_NAME");
+    let dead_run = shm.join(format!("hee4-e2e-{pkg}-{dead}-1"));
+    let live_run = shm.join(format!("hee4-e2e-{pkg}-{}-1", std::process::id()));
+    let other_run = shm.join(format!("hee4-e2e-other-{dead}-1"));
+    for d in [&dead_run, &live_run, &other_run] {
+        fs::create_dir_all(d.join("inner"))?;
+    }
+    let made = fsync_cheap_dir("sweep");
+    let kept = (live_run.is_dir(), other_run.is_dir());
+    let swept = !dead_run.exists();
+    for d in [&dead_run, &live_run, &other_run] {
+        let _ = fs::remove_dir_all(d);
+    }
+    drop(made?);
+    assert!(swept, "{} was left behind", dead_run.display());
+    assert_eq!(kept, (true, true), "a live or foreign run root was removed");
+    Ok(())
 }
 
 /// The server's `slow_consumer` log line: the reader dropped the subscriber, or the close frame
