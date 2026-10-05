@@ -607,22 +607,6 @@ pub(crate) fn route(
     })
 }
 
-/// The model the dispatcher would select now with no upstream call: every row `Up` when the
-/// engine is live (the dispatcher's view whenever the upstream holds every eligible model),
-/// `Unknown` otherwise. `roster.disable` reads it to find the attempts on a record; it is an
-/// approximation until attempts record their model (K1-attempts-ledger).
-pub(crate) fn route_as_dispatched(
-    cfg: &Config,
-    roster: &Roster,
-) -> Result<Selection, RouteRefusal> {
-    let availability = if cfg.live {
-        Availability::Up
-    } else {
-        Availability::Unknown
-    };
-    route_with(cfg, roster, |_| availability)
-}
-
 /// `select` over `roster` with each row's availability from `availability(name)`.
 fn route_with(
     cfg: &Config,
