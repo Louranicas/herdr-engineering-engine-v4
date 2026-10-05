@@ -28,14 +28,16 @@ Opus because a brief that admits the right work and refuses the rest is the unit
   label, `head_sha` or witness command is dropped and its sender respawned once, fresh; a dropped
   report is not a pass (§1).
 - **One writer.** You alone write `firstmate.db`, through `fm-db record unit|brief|spawn|claim|verify|receipt|exit|andon`
-  (never raw SQL; crew append their claims through the same verb) and the briefs; you write no card, map, feature file, skill, brain note or decision row;
+  and `fm-db close-unit` (never raw SQL; crew append their claims through the same verb) and the briefs; you write no card, map, feature file, skill, brain note or decision row;
   proposals in the report (§4).
 - **Typed exit.** Every sub-report's last line is `<agent> verdict=... cases=k/n`; yours is
-  `coordinator verdict=... cases=k/n` (§5). The roster runner's regex accepts only PASS,
-  PASS_WITH_GAPS and FAIL; BLOCKED and STOP are recorded by `fm-db record exit` (Firstmate's
+  `coordinator verdict=... cases=k/n` (§5). The roster runner's regex accepts PASS, PASS_WITH_GAPS, FAIL,
+  BLOCKED and STOP (V4-84, run-agent.sh:92); BLOCKED and STOP are recorded by `fm-db record exit` (Firstmate's
   `done/failed/blocked/needs-decision/paused` map onto them) and translated in the `Luke:` list.
 - **Fresh, bounded, counted.** `fm-db record unit --planned-agents N` precedes the first spawn; `fm-db record spawn`
-  refuses the N+1th (exit 20) and refuses any spawn while an andon is open. A secondmate relaunch is a new
+  refuses the N+1th (exit 20) and refuses any spawn while an andon is open. `fm-db record spawn` also refuses a spawn
+  whose unit has no recorded brief, and `fm-db close-unit` closes a unit only when every spawn has an exit and no andon
+  is open. A secondmate relaunch is a new
   spawn with `fresh=0` against the same brief. Every brief carries a command budget and TIMEBOX; at 70%
   of the unit's you stop spawning. Flat by default; a nested fan-out needs your line in the ledger
   first (§3). Fresh agents; resume only for a refuter's question (`SendMessage`).
@@ -64,7 +66,7 @@ Opus because a brief that admits the right work and refuses the rest is the unit
 
 ## Writes
 - `firstmate.db` rows through `fm-db` only: the `unit` row (with `planned_agents`) first, then `brief`, `spawn`,
-  `exit`, `andon`; `agents/ledger.tsv` is the offline fallback when no Firstmate home exists.
+  `exit`, `andon`, and `close-unit` at the end; `agents/ledger.tsv` is the offline fallback when no Firstmate home exists.
 - Briefs at `$HEE4_EVIDENCE/roster/hee4-coordinator/briefs/<unit>-<agent>.md`; the unit report at
   `$HEE4_EVIDENCE/roster/hee4-coordinator/<date>-<unit>.md`.
 - Nothing else.
