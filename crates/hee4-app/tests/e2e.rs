@@ -1,4 +1,7 @@
 //! One task end to end through `hee4 serve`, then `kill -9` mid-dispatch and a restart.
+//!
+//! The fixture VERIFY is `/usr/bin/test -d /usr`: real, silent, inside the sandbox's `RO_BINDS`,
+//! and the live proof of the named gap (admission reads the text, not the effect).
 
 use std::error::Error;
 use std::fs;
@@ -10,13 +13,15 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use hee4_app::{socket, wire};
-use hee4_contracts::Receipt;
+use hee4_contracts::{Receipt, Verdict};
 use serde_json::{Value, json};
 
 type R<T> = Result<T, Box<dyn Error>>;
 
 const BIN: &str = env!("CARGO_BIN_EXE_hee4");
 const TERMINAL: [&str; 4] = ["accepted", "failed", "cancelled", "abandoned"];
+/// The admitted fixture: real, silent, in the sandbox's read-only binds.
+const FIXTURE: &str = "/usr/bin/test -d /usr";
 
 fn brief(verify: &str) -> String {
     format!(
@@ -105,6 +110,30 @@ fn receipts(ledger: &Path, task: &str) -> R<Vec<Receipt>> {
     Ok(out)
 }
 
+/// The health body carries K1's two readers beside the four skeleton fields: `schema_version`
+/// (the migration count, an integer >= 2) and `serve_cgroup` (a non-empty string).
+fn assert_health_fields(sock: &Path) -> R<()> {
+    let health = call(sock, "health", None, json!({}))?;
+    let body = &health["body"];
+    assert_eq!(body["ok"], true, "{health}");
+    assert_eq!(body["recovery_complete"], true, "{health}");
+    assert!(body["head_sha"].is_string(), "{health}");
+    assert!(body["uptime_s"].is_u64(), "{health}");
+    assert!(
+        body["schema_version"].as_i64().is_some_and(|v| v >= 2),
+        "{health}"
+    );
+    assert!(
+        body["serve_cgroup"].as_str().is_some_and(|s| !s.is_empty()),
+        "{health}"
+    );
+    println!(
+        "MEASURED health schema_version={} serve_cgroup={}",
+        body["schema_version"], body["serve_cgroup"]
+    );
+    Ok(())
+}
+
 #[test]
 fn one_task_end_to_end_then_kill9_mid_dispatch() -> R<()> {
     let version = Command::new(BIN).arg("--version").output()?;
@@ -124,12 +153,14 @@ fn one_task_end_to_end_then_kill9_mid_dispatch() -> R<()> {
     println!("perms dir={dir_mode:o} sock={sock_mode:o}");
     assert_eq!((dir_mode, sock_mode), (0o700, 0o600));
 
-    // Task A: VERIFY /usr/bin/true, no live model.
+    assert_health_fields(&sock)?;
+
+    // Task A: the silent fixture VERIFY, no live model.
     let a = call(
         &sock,
         "task.submit",
         Some("key-a"),
-        json!({ "brief": brief("/usr/bin/true") }),
+        json!({ "brief": brief(FIXTURE) }),
     )?;
     assert_eq!(a["kind"], "result", "{a}");
     let a_id = a["body"]["task_id"].clone();
@@ -148,6 +179,7 @@ fn one_task_end_to_end_then_kill9_mid_dispatch() -> R<()> {
         done["body"]["last_receipt_hash"],
         last.hash_self().to_string()
     );
+    assert_eq!(last.decision().verdict, Verdict::Pass, "{last:?}");
     println!(
         "task A receipt verdict={:?} hash_self={} verify_chain=ok",
         last.decision().verdict,
@@ -157,7 +189,7 @@ fn one_task_end_to_end_then_kill9_mid_dispatch() -> R<()> {
         &sock,
         "task.submit",
         Some("key-a"),
-        json!({ "brief": brief("/usr/bin/true") }),
+        json!({ "brief": brief(FIXTURE) }),
     )?;
     assert_eq!(replay["replayed"], true);
 
@@ -204,22 +236,43 @@ fn one_task_end_to_end_then_kill9_mid_dispatch() -> R<()> {
     Ok(())
 }
 
-/// Open an `events.subscribe` stream after `since`, returning the reader past the ack.
-fn subscribe(sock: &Path, since: i64) -> R<BufReader<UnixStream>> {
+/// Send an `events.subscribe {since_seq, epoch}` and return its first frame (ack or refusal)
+/// with the reader positioned after it.
+fn subscribe_frame(
+    sock: &Path,
+    since: i64,
+    epoch: Option<&str>,
+) -> R<(Value, BufReader<UnixStream>)> {
     let mut s = UnixStream::connect(sock)?;
     let frame = wire::request(
         "sub",
         "events.subscribe",
         None,
-        json!({ "since_seq": since }),
+        json!({ "since_seq": since, "epoch": epoch }),
     );
     s.write_all(format!("{frame}\n").as_bytes())?;
     s.set_read_timeout(Some(Duration::from_secs(30)))?;
     let mut r = BufReader::new(s);
-    let mut ack = String::new();
-    r.read_line(&mut ack)?;
-    let ack: Value = serde_json::from_str(&ack)?;
+    let mut first = String::new();
+    r.read_line(&mut first)?;
+    Ok((serde_json::from_str(&first)?, r))
+}
+
+/// Open an `events.subscribe` stream after `since`, returning the reader past the ack, which
+/// must carry `since_seq`, the ledger `epoch` (string) and `high_water` (u64).
+fn subscribe(sock: &Path, since: i64, epoch: Option<&str>) -> R<BufReader<UnixStream>> {
+    let (ack, r) = subscribe_frame(sock, since, epoch)?;
+    assert_eq!(ack["kind"], "result", "{ack}");
     assert_eq!(ack["body"]["since_seq"], since, "{ack}");
+    assert_eq!(ack["body"]["stream"], "events", "{ack}");
+    assert!(
+        ack["body"]["epoch"].as_str().is_some_and(|e| !e.is_empty()),
+        "{ack}"
+    );
+    assert!(ack["body"]["high_water"].is_u64(), "{ack}");
+    if let Some(epoch) = epoch {
+        assert_eq!(ack["body"]["epoch"], epoch, "{ack}");
+    }
     Ok(r)
 }
 
@@ -249,12 +302,12 @@ fn events_subscribe_streams_in_seq_order_and_resumes_exactly_once() -> R<()> {
     fs::create_dir_all(&dir)?;
     let mut server = start(&dir, "serve.log")?;
     let sock = server.sock.clone();
-    let mut live = subscribe(&sock, 0)?;
+    let mut live = subscribe(&sock, 0, None)?;
     let a = call(
         &sock,
         "task.submit",
         Some("key-s"),
-        json!({ "brief": brief("/usr/bin/true") }),
+        json!({ "brief": brief(FIXTURE) }),
     )?;
     let id = a["body"]["task_id"].clone();
     let first = until_terminal(&mut live, &id)?;
@@ -269,7 +322,7 @@ fn events_subscribe_streams_in_seq_order_and_resumes_exactly_once() -> R<()> {
     assert!(first.len() >= 3, "{first:?}");
 
     // Resume after the second event: exactly the rest, once each, then nothing.
-    let mut resumed = subscribe(&sock, seqs[1])?;
+    let mut resumed = subscribe(&sock, seqs[1], None)?;
     let rest = until_terminal(&mut resumed, &id)?;
     assert_eq!(rest, first[2..].to_vec());
     resumed
@@ -358,51 +411,274 @@ fn the_connection_after_the_cap_is_refused_by_name_and_health_still_answers() ->
     Ok(())
 }
 
-#[test]
-fn a_subscriber_that_never_reads_gets_the_close_frame_or_the_log_line() -> R<()> {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("e2e-slow");
+/// A fresh test directory on tmpfs when `/dev/shm` is writable, else under
+/// `CARGO_TARGET_TMPDIR`. The slow-consumer proof needs ~300 admitted tasks (every submit and
+/// every dispatcher step is one `synchronous=FULL` transaction plus a brief `fsync`): measured
+/// 33 ms per submit on this machine's `/home` (dm-crypt) and 0.3 ms on tmpfs, with or without a
+/// subscriber, so the disk is the test's clock and not what it proves.
+fn fsync_cheap_dir(name: &str) -> R<PathBuf> {
+    let shm = PathBuf::from("/dev/shm").join(format!(
+        "hee4-e2e-{}",
+        std::env::var("CARGO_PKG_NAME").unwrap_or_default()
+    ));
+    let root = if fs::create_dir_all(&shm).is_ok() {
+        shm
+    } else {
+        PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+    };
+    let dir = root.join(name);
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// The server's `slow_consumer` log line: the reader dropped the subscriber, or the close frame
+/// missed its deadline (`log_line` below is the second, the FLOW's "not delivered").
+fn log_says(log: &Path, needle: &str) -> bool {
+    fs::read_to_string(log).is_ok_and(|s| s.contains(needle))
+}
+
+fn is_close_frame(line: &str) -> bool {
+    line.contains("\"kind\":\"close\"") && line.contains("slow_consumer")
+}
+
+/// A subscriber that reads one line per 64 submits is a slow consumer against a real
+/// `hee4 serve`: the submit loop stops at the first signal (the server's log line, a close frame
+/// or EOF on the subscriber) or at 3000 submits, and the wait after it is bounded by the same
+/// signals, so the test finishes in seconds without weakening `delivered || logged`.
+#[test]
+fn a_subscriber_that_never_reads_gets_the_close_frame_or_the_log_line() -> R<()> {
+    let dir = fsync_cheap_dir("e2e-slow")?;
     let mut server = start(&dir, "serve.log")?;
-    let mut sub = subscribe(&server.sock, 0)?;
+    let log = dir.join("serve.log");
+    let mut sub = subscribe(&server.sock, 0, None)?;
+    sub.get_ref()
+        .set_read_timeout(Some(Duration::from_secs(1)))?;
     // One connection, many submits: enough events to fill the queue and the socket buffer.
     let mut c = UnixStream::connect(&server.sock)?;
     c.set_read_timeout(Some(Duration::from_secs(30)))?;
     let mut cr = BufReader::new(c.try_clone()?);
-    for i in 0..3000 {
-        let f = wire::request(
-            "slow",
-            "task.submit",
-            Some(&format!("slow-{i}")),
-            json!({ "brief": brief("/usr/bin/true") }),
-        );
-        c.write_all(format!("{f}\n").as_bytes())?;
-        let mut l = String::new();
-        cr.read_line(&mut l)?;
-    }
-    let log = dir.join("serve.log");
-    let t0 = Instant::now();
-    let mut logged = false;
-    while t0.elapsed() < Duration::from_secs(20) && !logged {
-        logged = fs::read_to_string(&log)?.contains("slow_consumer close frame not delivered");
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    // Now read what the subscriber was sent: a close frame, or EOF.
+    let t_submit = Instant::now();
+    let mut submits = 0;
     let mut delivered = false;
-    loop {
-        let mut l = String::new();
-        if sub.read_line(&mut l).unwrap_or(0) == 0 {
-            break;
+    let mut signal = None;
+    while signal.is_none() && submits < 3000 {
+        for _ in 0..64 {
+            let f = wire::request(
+                "slow",
+                "task.submit",
+                Some(&format!("slow-{submits}")),
+                json!({ "brief": brief(FIXTURE) }),
+            );
+            c.write_all(format!("{f}\n").as_bytes())?;
+            let mut l = String::new();
+            cr.read_line(&mut l)?;
+            submits += 1;
         }
-        delivered |= l.contains("\"kind\":\"close\"") && l.contains("slow_consumer");
+        if log_says(&log, "slow_consumer") {
+            signal = Some("log");
+        }
+        let mut l = String::new();
+        match sub.read_line(&mut l) {
+            Ok(0) => signal = Some("eof"),
+            Ok(_) if is_close_frame(&l) => {
+                delivered = true;
+                signal = Some("close_frame");
+            }
+            Ok(_) | Err(_) => {}
+        }
     }
-    println!("MEASURED close_frame_delivered={delivered} log_line={logged}");
+    // Bounded wait: drain the subscriber to the close frame or EOF, re-reading the log.
+    let t0 = Instant::now();
+    let mut logged = log_says(&log, "slow_consumer close frame not delivered");
+    while t0.elapsed() < Duration::from_secs(10) && !(delivered || logged) {
+        let mut l = String::new();
+        match sub.read_line(&mut l) {
+            Ok(0) => {
+                logged = log_says(&log, "slow_consumer close frame not delivered");
+                break;
+            }
+            Ok(_) => delivered |= is_close_frame(&l),
+            Err(_) => logged = log_says(&log, "slow_consumer close frame not delivered"),
+        }
+    }
+    println!(
+        "MEASURED close_frame_delivered={delivered} log_line={logged} submits={submits} signal={} submit_ms={} drain_ms={}",
+        signal.unwrap_or("none"),
+        t_submit.elapsed().as_millis(),
+        t0.elapsed().as_millis()
+    );
     assert!(
         delivered || logged,
         "neither the close frame nor the log line"
     );
     server.child.kill()?;
     server.child.wait()?;
+    let work = dir.join("work").to_string_lossy().into_owned();
+    let _ = Command::new("pkill").args(["-KILL", "-f", &work]).status();
+    let _ = fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+/// Over the real socket: a vacuous VERIFY is refused at admission by name (`invalid_argument`
+/// at `/body/brief`, message naming VERIFY), nothing is admitted, and the silent fixture then
+/// runs to `accepted` with a `Pass` receipt.
+#[test]
+fn vacuous_verify_is_refused_at_admission() -> R<()> {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("e2e-vacuous");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir)?;
+    let mut server = start(&dir, "serve.log")?;
+    let sock = server.sock.clone();
+    for (i, verify) in ["sh: true", "/usr/bin/true", "model: hi"]
+        .iter()
+        .enumerate()
+    {
+        let refused = call(
+            &sock,
+            "task.submit",
+            Some(&format!("vacuous-{i}")),
+            json!({ "brief": brief(verify) }),
+        )?;
+        println!("MEASURED vacuous_verify submit {verify:?} -> {refused}");
+        assert_eq!(refused["kind"], "error", "{refused}");
+        assert_eq!(refused["code"], "invalid_argument", "{refused}");
+        assert_eq!(refused["retry"], "never", "{refused}");
+        assert_eq!(refused["field"], "/body/brief", "{refused}");
+        assert!(
+            refused["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("VERIFY")),
+            "{refused}"
+        );
+        let preview = call(
+            &sock,
+            "task.preview",
+            None,
+            json!({ "brief": brief(verify) }),
+        )?;
+        println!("MEASURED vacuous_verify preview {verify:?} -> {preview}");
+        assert_eq!(preview["body"]["eligible"], false, "{preview}");
+        assert_eq!(preview["body"]["refusal"], "invalid_argument", "{preview}");
+        assert!(
+            preview["body"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("VERIFY")),
+            "{preview}"
+        );
+    }
+    let listed = call(&sock, "task.list", None, json!({}))?;
+    assert_eq!(listed["body"]["tasks"], json!([]), "{listed}");
+
+    let ok = call(
+        &sock,
+        "task.submit",
+        Some("key-real"),
+        json!({ "brief": brief(FIXTURE) }),
+    )?;
+    assert_eq!(ok["kind"], "result", "{ok}");
+    let id = ok["body"]["task_id"].clone();
+    let mut trace = vec!["admitted".to_owned()];
+    let done = poll(&sock, &id, |p| TERMINAL.contains(&p), &mut trace)?;
+    assert_eq!(done["body"]["phase"], "accepted", "{done}; trace {trace:?}");
+    let chain = receipts(&dir.join("ledger.sqlite3"), id.as_str().ok_or("id")?)?;
+    assert_eq!(chain.len(), 1);
+    Receipt::verify_chain(&chain).map_err(|b| format!("{b:?}"))?;
+    let last = chain.last().ok_or("empty chain")?;
+    assert_eq!(last.decision().verdict, Verdict::Pass, "{last:?}");
+    println!(
+        "task receipt verdict={:?} hash_self={} verify_chain=ok",
+        last.decision().verdict,
+        last.hash_self()
+    );
+    server.child.kill()?;
+    server.child.wait()?;
+    Ok(())
+}
+
+/// R13 over the real socket: each stale cursor is `resync_required` named by its verdict, the
+/// boundary cursor is a snapshot, a restored-from epoch is refused after a restart, and a valid
+/// epoch cursor streams exactly what the legacy cursor streams.
+#[test]
+fn events_subscribe_epoch_cursor_refuses_resync_by_name() -> R<()> {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("e2e-cursor");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir)?;
+    let mut server = start(&dir, "serve.log")?;
+    let sock = server.sock.clone();
+    let a = call(
+        &sock,
+        "task.submit",
+        Some("key-c"),
+        json!({ "brief": brief(FIXTURE) }),
+    )?;
+    let id = a["body"]["task_id"].clone();
+    let mut trace = vec!["admitted".to_owned()];
+    poll(&sock, &id, |p| TERMINAL.contains(&p), &mut trace)?;
+
+    // The ledger's own cursor, from a legacy (epoch null) ack.
+    let (ack, _r) = subscribe_frame(&sock, 0, None)?;
+    assert_eq!(ack["kind"], "result", "{ack}");
+    let epoch = ack["body"]["epoch"].as_str().ok_or("ack epoch")?.to_owned();
+    let high_water = ack["body"]["high_water"].as_u64().ok_or("ack high_water")?;
+    assert!(high_water >= 3, "{ack}");
+
+    // (a) a foreign epoch.
+    let (foreign, _r) = subscribe_frame(&sock, 0, Some("not-this-ledger"))?;
+    println!("MEASURED resync case=epoch_changed -> {foreign}");
+    assert_eq!(foreign["kind"], "error", "{foreign}");
+    assert_eq!(foreign["code"], "resync_required", "{foreign}");
+    assert_eq!(foreign["field"], "/body/epoch", "{foreign}");
+    assert_eq!(foreign["because"], "epoch_changed", "{foreign}");
+    assert_eq!(foreign["retry"], "never", "{foreign}");
+
+    // (b) the right epoch, a sequence past the high water.
+    let future_seq = i64::try_from(high_water + 1000)?;
+    let (future, _r) = subscribe_frame(&sock, future_seq, Some(&epoch))?;
+    println!("MEASURED resync case=future_sequence -> {future}");
+    assert_eq!(future["code"], "resync_required", "{future}");
+    assert_eq!(future["field"], "/body/since_seq", "{future}");
+    assert_eq!(future["because"], "future_sequence", "{future}");
+
+    // (c) the boundary: since_seq == high_water with the right epoch is a snapshot (ack).
+    let boundary_seq = i64::try_from(high_water)?;
+    let (boundary, _r) = subscribe_frame(&sock, boundary_seq, Some(&epoch))?;
+    println!("MEASURED resync case=snapshot_only -> {boundary}");
+    assert_eq!(boundary["kind"], "result", "{boundary}");
+    assert_eq!(boundary["body"]["epoch"], epoch, "{boundary}");
+    assert_eq!(boundary["body"]["high_water"], high_water, "{boundary}");
+
+    // (e) a valid epoch cursor streams exactly the frames the legacy cursor streams.
+    let mut by_epoch = subscribe(&sock, 0, Some(&epoch))?;
+    let with_epoch = until_terminal(&mut by_epoch, &id)?;
+    let mut legacy = subscribe(&sock, 0, None)?;
+    let without = until_terminal(&mut legacy, &id)?;
+    assert_eq!(with_epoch, without);
+    assert!(with_epoch.len() >= 3, "{with_epoch:?}");
+    println!(
+        "MEASURED resync case=valid_cursor_streams -> {} frames, same as the legacy cursor",
+        with_epoch.len()
+    );
+    drop(by_epoch);
+    drop(legacy);
+
+    // (d) restart over a ledger that records this epoch as the one it was restored from.
+    server.child.kill()?;
+    server.child.wait()?;
+    {
+        let store = hee4_core::Store::open(&dir.join("ledger.sqlite3"))?;
+        store.mark_restored_from(&epoch)?;
+    }
+    let mut server = start(&dir, "serve-2.log")?;
+    let (prior, _r) = subscribe_frame(&server.sock, 0, Some(&epoch))?;
+    println!("MEASURED resync case=prior_epoch_of_restore -> {prior}");
+    assert_eq!(prior["code"], "resync_required", "{prior}");
+    assert_eq!(prior["field"], "/body/epoch", "{prior}");
+    assert_eq!(prior["because"], "prior_epoch_of_restore", "{prior}");
+    server.child.kill()?;
+    server.child.wait()?;
+    let work = dir.join("work").to_string_lossy().into_owned();
+    let _ = Command::new("pkill").args(["-KILL", "-f", &work]).status();
     Ok(())
 }
 

@@ -42,6 +42,19 @@ Socket: request `body` `{cursor: EventCursorV1|null, topics[], resource_ids[], b
 - Persistence: `delivered` survives restart; resuming with the final cursor after an idle close replays nothing already acknowledged; after a restore (new epoch) every old cursor is `resync_required`.
 - Side effects to read: `outbox.delivered`, connection count, `task.get.delivery`.
 
+Concrete, deployed frame (`crates/hee4-app/FLOW.md` Stream; `crates/hee4-app/tests/e2e.rs`; no drive procedure yet, so no drive marker):
+
+```bash
+printf '%s\n' '{"request_id":"s1","action":"events.subscribe","action_version":1,"idempotency_key":null,"body":{"since_seq":0,"epoch":null}}' | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/hee4/control.sock
+```
+
+- Request `body` `{since_seq: u64|null, epoch: string|null}`: `since_seq` absent or null is 0 (`invalid_argument` at `/body/since_seq` otherwise); `epoch` absent or null is a legacy cursor; any other type is `invalid_argument` at `/body/epoch` ("string or null"). The six-field `EventCursorV1` above is not adopted: `{since_seq, epoch}` is the minimal cursor (DC proposal).
+- Ack: `kind=result`, `replayed=false`, body `{since_seq, epoch, high_water, stream:"events"}`; `epoch` is the ledger's (`Store::epoch`), `high_water` the highest `events.seq` or 0 (`Store::event_high_water`). Then one event frame per ledger row with `seq > since_seq`, in `seq` order: `{"kind":"event","seq","task_id","event","phase_after","ts"}`; `event` is the contracts' `Serialize` spelling, `phase_after` the replayed phase after that row. Resume with `since_seq` = the last `seq` received: exactly once by `seq`.
+- `resync_required` (R13, `Store::cursor_check`, retry `never`, before the ack, never a replay authorisation), only when `epoch` is a string, in this order: `because="prior_epoch_of_restore"` at `/body/epoch` (the epoch is the one this ledger was restored from, `meta.restored_from`); `because="epoch_changed"` at `/body/epoch` (any other epoch than the ledger's; the message names the ledger epoch); `because="future_sequence"` at `/body/since_seq` (`since_seq > high_water`; the message names the high water). `since_seq == high_water` with the right epoch is the snapshot boundary: an ack, then only new rows.
+- Epoch-null rule: a null epoch is unchecked (the skeleton's legacy cursor) and streams as before; the ack still returns `epoch` and `high_water` so the next subscribe can carry them. Proposal (DC): a later release refuses a null epoch with `invalid_argument` once every client sends one.
+- `slow_consumer`: a subscriber 256 frames behind is dropped: `{"kind":"close","code":"slow_consumer","retry":"after_condition",...}` then close, written with a 200 ms deadline; when the peer's buffer is full the frame is not delivered, the server logs `slow_consumer close frame not delivered` and the client sees EOF. Resubscribe with the last `seq` and the ack's `epoch`.
+- Restart: the epoch survives a restart of the same ledger; only a restore mints a new one, so a pre-restart cursor with its epoch resumes, and a pre-restore cursor is `prior_epoch_of_restore`.
+
 ## Gotchas
 
 - It is `ReadStream`: not an operation, so no `operations` row and no idempotency key — but it **does** write (`delivered`). "Read-only" is wrong for it.

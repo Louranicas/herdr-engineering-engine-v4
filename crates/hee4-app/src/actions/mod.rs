@@ -19,7 +19,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use hee4_contracts::TaskId;
 use hee4_contracts::catalogue::{self, PreconditionRule};
 use hee4_core::{Store, StoreError};
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::dispatcher::Config;
 use crate::wire::{self, Code, Fault, Request};
@@ -155,12 +155,8 @@ pub fn answer(engine: &Engine, line: &str) -> Outcome {
             Ok(Answer::Frame(replayed, body)) => {
                 Outcome::Frame(wire::result(&req.request_id, replayed, body))
             }
-            Ok(Answer::Subscribe(since_seq)) => Outcome::Subscribe {
-                ack: wire::result(
-                    &req.request_id,
-                    false,
-                    json!({ "since_seq": since_seq, "stream": "events" }),
-                ),
+            Ok(Answer::Subscribe(ack, since_seq)) => Outcome::Subscribe {
+                ack: wire::result(&req.request_id, false, ack),
                 since_seq,
             },
             Err(fault) => Outcome::Frame(wire::error(&req.request_id, &fault)),
@@ -184,8 +180,8 @@ pub(crate) type Reply = Result<(bool, Value), Fault>;
 pub enum Answer {
     /// One result frame: `(replayed, body)`.
     Frame(bool, Value),
-    /// Turn the connection into the event stream after `since_seq`.
-    Subscribe(i64),
+    /// Turn the connection into the event stream after `since_seq`; the handler built the ack body.
+    Subscribe(Value, i64),
 }
 
 fn dispatch(engine: &Engine, req: &Request) -> Result<Answer, Fault> {
@@ -263,8 +259,8 @@ pub(crate) fn internal(e: &StoreError) -> Fault {
 pub(crate) mod testing {
     use super::{Config, Engine, PathBuf, Store};
 
-    /// An eleven-field brief whose VERIFY is `/usr/bin/true`.
-    pub(crate) const BRIEF: &str = "GOAL: g\nSCOPE: s\nCONTEXT: c\nACCEPTANCE: a\nVERIFY: /usr/bin/true\nTIMEBOX: 10s\nFORBIDDEN: f\nREPORT: r\nSTANDING: s\nRECON: r\nRESTATEMENT: run true\n";
+    /// An eleven-field brief whose VERIFY is `/usr/bin/test -d /usr` (real, silent, admitted).
+    pub(crate) const BRIEF: &str = "GOAL: g\nSCOPE: s\nCONTEXT: c\nACCEPTANCE: a\nVERIFY: /usr/bin/test -d /usr\nTIMEBOX: 10s\nFORBIDDEN: f\nREPORT: r\nSTANDING: s\nRECON: r\nRESTATEMENT: run test in the namespace\n";
 
     /// A fresh engine over a store under `OUT_DIR/actions-<name>`.
     pub(crate) fn engine(name: &str) -> Result<Engine, Box<dyn std::error::Error>> {
