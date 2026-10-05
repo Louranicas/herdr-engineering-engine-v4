@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+"""layers [--repo DIR] [--tree REV] [--config layers.toml] [--reason TEXT]
+
+The layer denominators of one tree (DRIFT D-05, REQUIREMENTS rank 10): every tracked path of
+`git ls-tree -r <tree>` is classified by <repo>/layers.toml, the one home of that mapping, and
+its lines are counted from the blob (never the dirty worktree). Prints one line per layer
+  layer=<name> lines=<n> ratio=<x>            (ratio to product, 2 decimals)
+and last
+  apparatus_ratio=<x> bound=<b> largest_file=<path> lines=<n> trigger=<t> over=yes|no tree=<sha12> verdict=PASS|FAIL
+Exit 0 PASS; 1 FAIL (apparatus_ratio above the bound and no --reason; with --reason an extra
+`reason=<text>` line and PASS); 3 UNMEASURED (product has no lines, so no ratio exists);
+2 refused: an unclassified tracked path (`unclassified=<n>` and one `unclassified path=<p>` per
+path, printed before any ratio), an [[exclude]] row without a reason, an empty --reason, a
+config that does not declare exactly the five layers.
+"""
+import argparse, os, re, subprocess, sys, tomllib
+
+LAYERS = ("product", "tests", "apparatus", "governance", "planning")
+
+def die(msg, code=2):
+    print(f"layers: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+def glob_re(pat):
+    """`**` crosses segments, `*` and `?` stay inside one, a trailing `/` means anything under."""
+    if pat.endswith("/"):
+        pat += "**"
+    out = ""
+    i = 0
+    while i < len(pat):
+        c = pat[i]
+        if pat.startswith("**", i):
+            out += ".*"; i += 2
+        elif c == "*":
+            out += "[^/]*"; i += 1
+        elif c == "?":
+            out += "[^/]"; i += 1
+        else:
+            out += re.escape(c); i += 1
+    return re.compile(out + r"\Z")
+
+def load_config(path):
+    try:
+        with open(path, "rb") as f:
+            cfg = tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        die(f"cannot read {path}: {e}")
+    layers = cfg.get("layer", {})
+    if tuple(layers) != LAYERS:
+        die(f"{path} must declare exactly the layers {', '.join(LAYERS)} in that order; found {', '.join(layers) or 'none'}")
+    table = [(name, [glob_re(g) for g in layers[name].get("paths", [])]) for name in LAYERS]
+    excludes = []
+    for row in cfg.get("exclude", []):
+        if not row.get("path") or not str(row.get("reason", "")).strip():
+            die(f"[[exclude]] row {row.get('path')!r} has no reason: it excludes nothing (refused)")
+        excludes.append(glob_re(row["path"]))
+    bounds = cfg.get("bounds", {})
+    for key in ("apparatus_ratio_max", "largest_file_trigger"):
+        if not isinstance(bounds.get(key), (int, float)):
+            die(f"[bounds] {key} is not declared in {path}")
+    return table, excludes, float(bounds["apparatus_ratio_max"]), int(bounds["largest_file_trigger"])
+
+def classify(path, table):
+    for name, globs in table:
+        if any(g.match(path) for g in globs):
+            return name
+    return None
+
+def git(repo, *args, **kw):
+    r = subprocess.run(["git", "-C", repo, *args], capture_output=True, **kw)
+    if r.returncode:
+        die(f"git {' '.join(args)} failed: {r.stderr.decode('utf-8', 'replace').strip()}")
+    return r.stdout
+
+def line_counts(repo, tree, paths):
+    """Lines per path from the blobs of <tree>, one `git cat-file --batch` for all of them."""
+    query = "".join(f"{tree}:{p}\n" for p in paths).encode()
+    out = git(repo, "cat-file", "--batch", input=query)
+    counts, pos = {}, 0
+    for p in paths:
+        nl = out.index(b"\n", pos)
+        header = out[pos:nl].decode("utf-8", "replace").split()
+        if len(header) != 3 or header[1] == "missing":
+            die(f"{tree}:{p} is not a readable blob ({' '.join(header)})")
+        size = int(header[2])
+        body = out[nl + 1:nl + 1 + size]
+        counts[p] = body.count(b"\n")
+        pos = nl + 1 + size + 1
+    return counts
+
+def main():
+    ap = argparse.ArgumentParser(prog="layers", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--repo", default=os.getcwd())
+    ap.add_argument("--tree", default="HEAD", help="rev whose tracked blobs are counted (default HEAD)")
+    ap.add_argument("--config", help="layers.toml path (default <repo>/layers.toml)")
+    ap.add_argument("--reason", help="why a ratio above the bound is accepted this once (printed as reason=)")
+    a = ap.parse_args()
+    if a.reason is not None and not a.reason.strip():
+        die("--reason is empty (refused)")
+    table, excludes, bound, trigger = load_config(a.config or os.path.join(a.repo, "layers.toml"))
+    tree = git(a.repo, "rev-parse", "--verify", "--quiet", a.tree + "^{commit}").decode().strip()
+    if not tree:
+        die(f"tree {a.tree!r} does not resolve in {a.repo}")
+    listed = git(a.repo, "ls-tree", "-r", "-z", "--name-only", tree).decode("utf-8", "replace")
+    paths = [p for p in listed.split("\0") if p and not any(g.match(p) for g in excludes)]
+    by_layer, unclassified = {name: [] for name in LAYERS}, []
+    for p in paths:
+        layer = classify(p, table)
+        (by_layer[layer] if layer else unclassified).append(p)
+    if unclassified:
+        print(f"unclassified={len(unclassified)}")
+        for p in unclassified:
+            print(f"unclassified path={p}")
+        die(f"{len(unclassified)} tracked path(s) match no layer in layers.toml")
+    counts = line_counts(a.repo, tree, paths)
+    totals = {name: sum(counts[p] for p in ps) for name, ps in by_layer.items()}
+    if totals["product"] == 0:
+        print(f"apparatus_ratio=UNMEASURED(product has no lines in {tree[:12]}) tree={tree[:12]} verdict=UNMEASURED")
+        sys.exit(3)
+    for name in LAYERS:
+        print(f"layer={name} lines={totals[name]} ratio={totals[name] / totals['product']:.2f}")
+    ratio = totals["apparatus"] / totals["product"]
+    largest = max(paths, key=lambda p: (counts[p], p)) if paths else ""
+    over = "yes" if counts.get(largest, 0) > trigger else "no"
+    if a.reason:
+        print(f"reason={a.reason.strip()}")
+    verdict = "FAIL" if ratio > bound and not a.reason else "PASS"
+    print(f"apparatus_ratio={ratio:.2f} bound={bound} largest_file={largest} lines={counts.get(largest, 0)} "
+          f"trigger={trigger} over={over} tree={tree[:12]} verdict={verdict}")
+    sys.exit(0 if verdict == "PASS" else 1)
+
+if __name__ == "__main__":
+    main()
