@@ -138,7 +138,7 @@ def restarter(tc, w):
 
 class DrillTests(unittest.TestCase):
     def test_fire_absent_unit_every_step_unmeasured(self):
-        rc, out, _ = run(DRILL, "--unit", "nope-xyz.service", "--repo", TOOLS)
+        rc, out, _ = run(DRILL, "--unit", "nope-xyz.service", "--repo", TOOLS, "--drill-root", tempfile.mkdtemp(prefix="dr-"))
         self.assertEqual(rc, 3)
         self.assertEqual(out.count("status=UNMEASURED"), out.count("drill_step="))
         self.assertNotIn("status=MEASURED", out)
@@ -147,15 +147,42 @@ class DrillTests(unittest.TestCase):
     def test_quiet_kill9_and_restart(self):
         w = World(); self.addCleanup(w.close)
         old = restarter(self, w)
-        rc, out, _ = run(DRILL, "--socket", w.sockpath, "--restart-budget", "10", "--repo", TOOLS, env=w.env)
+        rc, out, _ = run(DRILL, "--socket", w.sockpath, "--restart-budget", "10", "--repo", TOOLS, "--drill-root", tempfile.mkdtemp(prefix="dr-"), env=w.env)
         self.assertEqual(rc, 0, out)
         self.assertRegex(out.strip().splitlines()[-1], r"^drill verdict=PASS steps=(\d+)/\1 ")
         self.assertIn(f"old={old}", out)
 
     def test_fire_unit_never_restarts(self):
         w = World(); self.addCleanup(w.close)
-        rc, out, _ = run(DRILL, "--socket", w.sockpath, "--restart-budget", "1", "--repo", TOOLS, env=w.env)
+        rc, out, _ = run(DRILL, "--socket", w.sockpath, "--restart-budget", "1", "--repo", TOOLS, "--drill-root", tempfile.mkdtemp(prefix="dr-"), env=w.env)
         self.assertEqual(rc, 1); self.assertIn("drill_step=unit_restarted status=FAIL", out)
+
+    def test_quiet_submit3_acked_present_and_rehearsal(self):
+        w = World(); self.addCleanup(w.close)
+        restarter(self, w)
+        root = tempfile.mkdtemp(prefix="dr-")
+        rc, out, _ = run(DRILL, "--socket", w.sockpath, "--restart-budget", "10", "--repo", TOOLS, "--submit", "3", "--drill-root", root, env=w.env)
+        self.assertEqual(rc, 0, out)
+        steps = [l.split()[0] for l in out.splitlines() if l.startswith("drill_step=")]
+        self.assertEqual(steps, ["drill_step=unit_active", "drill_step=submit", "drill_step=kill9", "drill_step=unit_restarted",
+                                 "drill_step=socket_perms", "drill_step=health_ready", "drill_step=acked_present"])
+        self.assertRegex(out, r"drill_step=submit status=MEASURED .* detail=acked=3/3 ids=t-[0-9a-f]{24},t-")
+        self.assertRegex(out, r"drill_step=acked_present status=MEASURED .* detail=3/3 missing=none")
+        self.assertRegex(out.strip().splitlines()[-1], r"^drill verdict=PASS steps=(\d+)/\1 unit=hee4.service head=\S+ submitted=3 acked_present=3/3$")
+        rec = json.load(open(os.path.join(root, head_of(TOOLS), "rehearsal.json")))
+        self.assertEqual(sorted(rec["task_ids"]), sorted(w.submitted)); self.assertEqual(rec["acked_present"], "3/3")
+        self.assertEqual([s["status"] for s in rec["steps"]], ["MEASURED"] * len(steps))
+
+    def test_fire_missing_ack_is_fail_and_rehearsal_still_written(self):
+        w = World(missing=1); self.addCleanup(w.close)
+        restarter(self, w)
+        root = tempfile.mkdtemp(prefix="dr-")
+        rc, out, _ = run(DRILL, "--socket", w.sockpath, "--restart-budget", "10", "--repo", TOOLS, "--submit", "3", "--drill-root", root, env=w.env)
+        self.assertEqual(rc, 1, out)
+        self.assertRegex(out, r"drill_step=acked_present status=FAIL .* detail=2/3 missing=t-[0-9a-f]{24}")
+        self.assertRegex(out.strip().splitlines()[-1], r"^drill verdict=FAIL .* submitted=3 acked_present=2/3$")
+        rec = json.load(open(os.path.join(root, head_of(TOOLS), "rehearsal.json")))
+        self.assertEqual(rec["acked_present"], "2/3"); self.assertEqual(len(rec["task_ids"]), 3)
 
 if __name__ == "__main__":
     unittest.main()
