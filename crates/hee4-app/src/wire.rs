@@ -567,15 +567,25 @@ mod tests {
         !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
     }
 
-    /// The helper (`let NAME = |params|` or `fn NAME(params)`) defined last before `at`:
-    /// `(name, parameter names)`.
+    /// The helper (`let NAME = |params|`, any whitespace around `=` including a line break, or
+    /// `fn NAME(params)`) defined last before `at`: `(name, parameter names)`.
     fn helper_before(src: &str, at: usize) -> Option<(String, Vec<String>)> {
         let head = &src[..at];
-        let closure = head.rfind(" = |").and_then(|eq| {
-            let name = head[..eq].rsplit("let ").next()?.trim();
-            let params = head[eq + 4..].split('|').next()?;
-            Some((eq, name.to_owned(), params.to_owned()))
-        });
+        let closure = head
+            .match_indices("let ")
+            .filter_map(|(l, _)| {
+                let rest = head[l + 4..].trim_start_matches("mut ");
+                let end = rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))?;
+                let params = rest[end..]
+                    .trim_start()
+                    .strip_prefix('=')?
+                    .trim_start()
+                    .strip_prefix('|')?
+                    .split('|')
+                    .next()?;
+                Some((l, rest[..end].to_owned(), params.to_owned()))
+            })
+            .last();
         let func = head.rfind("fn ").and_then(|f| {
             let rest = &head[f + 3..];
             let paren = rest.find('(')?;
@@ -629,11 +639,25 @@ mod tests {
         out
     }
 
+    /// What [`emissions`] read: every triple, and each `because` expression it could not
+    /// resolve to a literal (`file: expression`).
+    struct Scan {
+        found: BTreeSet<Emission>,
+        unresolved: BTreeSet<String>,
+    }
+
+    /// `because` expressions the scan cannot resolve, each with where its texts are checked.
+    const BECAUSE_ALLOW: &[(&str, &str)] = &[(
+        "entry.scope.because()",
+        "Scope::because(): every variant checked verbatim by scope_becauses_appear_in_the_unavailable_row",
+    )];
+
     /// Every refusal the crate's live source emits through `Fault::new`, with its field and
     /// `because` resolved to literals where the site or one helper level holds them.
-    fn emissions() -> std::collections::BTreeSet<Emission> {
-        let mut out = std::collections::BTreeSet::new();
-        for (_, src) in crate_sources() {
+    fn emissions() -> Scan {
+        let mut out = BTreeSet::new();
+        let mut unresolved = BTreeSet::new();
+        for (file, src) in crate_sources() {
             for (at, _) in src.match_indices("Fault::new(") {
                 let open = at + "Fault::new".len();
                 let Some(close) = close_of(&src, open) else {
@@ -680,6 +704,9 @@ mod tests {
                 .flatten();
                 let name = variant.name().to_owned();
                 let Some((helper, params)) = helper else {
+                    if let Some(b) = because.as_deref().filter(|_| because_lit.is_none()) {
+                        unresolved.insert(format!("{file}: {b}"));
+                    }
                     out.insert(Emission {
                         code: name,
                         field: field_lit,
@@ -695,15 +722,23 @@ mod tests {
                             .and_then(|a| literal(a))
                             .or_else(|| own.clone())
                     };
+                    let resolved = from(bi, &because_lit);
+                    if let Some(b) = because.as_deref().filter(|_| resolved.is_none()) {
+                        let arg = bi.and_then(|i| call.get(i)).map_or(b, String::as_str);
+                        unresolved.insert(format!("{file}: {helper}({arg})"));
+                    }
                     out.insert(Emission {
                         code: name.clone(),
                         field: from(fi, &field_lit),
-                        because: from(bi, &because_lit),
+                        because: resolved,
                     });
                 }
             }
         }
-        out
+        Scan {
+            found: out,
+            unresolved,
+        }
     }
 
     /// The FLOW.md "Refusal names" row of `code`, whole.
@@ -716,11 +751,39 @@ mod tests {
 
     /// Triple parity: every `(code, field, because)` the source emits (literal at the site or
     /// one helper level up) appears in that code's FLOW.md row: the field as `` `field` ``, the
-    /// `because` text verbatim. A field or `because` the scan cannot resolve to a literal is
-    /// not checked; the resync triple below proves the helper resolution runs.
+    /// `because` text verbatim. A `because` the scan cannot resolve to a literal fails the test
+    /// unless [`BECAUSE_ALLOW`] lists it with where its texts are checked; an unresolved field
+    /// is not checked. The resync and `user bus absent` triples prove the helper resolution runs
+    /// (a closure whose `= |` spans two lines included).
     #[test]
     fn every_emitted_triple_appears_in_its_flow_row() {
-        let found = emissions();
+        let Scan { found, unresolved } = emissions();
+        let unlisted: Vec<&String> = unresolved
+            .iter()
+            .filter(|u| {
+                !BECAUSE_ALLOW
+                    .iter()
+                    .any(|(expr, _)| u.ends_with(&format!(": {expr}")))
+            })
+            .collect();
+        assert!(
+            unlisted.is_empty(),
+            "a `because` the scan cannot resolve and BECAUSE_ALLOW does not list: {unlisted:#?}"
+        );
+        for (expr, _) in BECAUSE_ALLOW {
+            assert!(
+                unresolved.iter().any(|u| u.ends_with(&format!(": {expr}"))),
+                "BECAUSE_ALLOW lists {expr}, which no site emits any more"
+            );
+        }
+        assert!(
+            found.contains(&Emission {
+                code: "unavailable".into(),
+                field: Some("/".into()),
+                because: Some("user bus absent".into()),
+            }),
+            "the scan no longer resolves a closure whose `= |` spans two lines: {found:?}"
+        );
         assert!(
             found.contains(&Emission {
                 code: "resync_required".into(),
@@ -747,6 +810,24 @@ mod tests {
             }
         }
         assert!(missing.is_empty(), "FLOW.md rows miss: {missing:#?}");
+    }
+
+    /// Every [`Scope::because`] text (the `unavailable` registry miss) appears verbatim in the
+    /// `unavailable` row. The match is exhaustive, so a new scope must be listed here.
+    #[test]
+    fn scope_becauses_appear_in_the_unavailable_row() {
+        use hee4_contracts::catalogue::Scope;
+        let listed = |s: Scope| match s {
+            Scope::V40 | Scope::V41 | Scope::V42 | Scope::Held => s,
+        };
+        let row = flow_row("unavailable").unwrap_or_default();
+        for scope in [Scope::V40, Scope::V41, Scope::V42, Scope::Held].map(listed) {
+            assert!(
+                row.contains(&format!("\"{}\"", scope.because())),
+                "{scope:?}: {:?} not in the unavailable row",
+                scope.because()
+            );
+        }
     }
 
     #[test]
