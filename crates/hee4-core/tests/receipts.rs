@@ -507,6 +507,99 @@ fn deleting_a_checkpointed_receipt_is_a_root_mismatch() -> R {
     Ok(())
 }
 
+/// Six receipts over two tasks with a checkpoint at three and at six; foreign keys and the
+/// append-only triggers off on the returned test-side connection.
+fn two_checkpoint_ledger(
+    name: &str,
+) -> Result<(Store, Connection, TaskId, TaskId), Box<dyn Error>> {
+    let (store, path) = ready(name)?;
+    let a = seed_task(&store, "t-a")?;
+    let b = seed_task(&store, "t-b")?;
+    for n in 1..=3 {
+        append(&store, &a, n)?;
+    }
+    store.checkpoint_if_due(EVERY_THREE)?.ok_or("first")?;
+    for n in 1..=3 {
+        append(&store, &b, n)?;
+    }
+    store.checkpoint_if_due(EVERY_THREE)?.ok_or("second")?;
+    assert_eq!(store.verify_ledger()?.checkpoints, 2);
+    let conn = Connection::open(&path)?;
+    conn.pragma_update(None, "foreign_keys", "OFF")?;
+    conn.execute_batch("DROP TRIGGER receipts_no_delete; DROP TRIGGER checkpoints_no_delete")?;
+    Ok((store, conn, a, b))
+}
+
+/// Case 6b: the tail receipts deleted together with the checkpoint that covered them: every
+/// surviving chain and checkpoint re-derives, the missing seq names the truncation.
+#[test]
+fn tail_and_its_checkpoint_deleted_is_a_missing_receipt() -> R {
+    let (store, conn, _, b) = two_checkpoint_ledger("tail-cut")?;
+    conn.execute("DELETE FROM receipts WHERE seq > 4", [])?;
+    conn.execute("DELETE FROM checkpoints WHERE seq = 2", [])?;
+    assert_eq!(store.verify_chain(&b)?.receipts, 1);
+    let f = fault(store.verify_ledger().err().ok_or("refused")?);
+    assert_eq!(
+        f,
+        ChainFault {
+            receipt: None,
+            seq: 5,
+            cause: ChainCause::MissingReceipt
+        }
+    );
+    // The documented limit: rewriting `sqlite_sequence` too evades the in-file tell. Only a
+    // root kept outside the file (the wave-3 `--expect-root` handoff) catches this.
+    conn.execute(
+        "UPDATE sqlite_sequence SET seq = 4 WHERE name = 'receipts'",
+        [],
+    )?;
+    conn.execute(
+        "UPDATE sqlite_sequence SET seq = 1 WHERE name = 'checkpoints'",
+        [],
+    )?;
+    assert_eq!(store.verify_ledger()?.receipts, 4);
+    Ok(())
+}
+
+/// Case 6c: every checkpoint deleted, receipts intact: `checkpoints=0` is not a pass.
+#[test]
+fn all_checkpoints_deleted_is_a_missing_checkpoint() -> R {
+    let (store, conn, _, _) = two_checkpoint_ledger("no-checkpoints")?;
+    assert_eq!(conn.execute("DELETE FROM checkpoints", [])?, 2);
+    let f = fault(store.verify_ledger().err().ok_or("refused")?);
+    assert_eq!(
+        f,
+        ChainFault {
+            receipt: None,
+            seq: 1,
+            cause: ChainCause::MissingCheckpoint
+        }
+    );
+    Ok(())
+}
+
+/// Case 6d: a whole task's receipts deleted together with every checkpoint: the hole in the
+/// receipt seqs names it.
+#[test]
+fn whole_task_and_checkpoints_deleted_is_a_missing_receipt() -> R {
+    let (store, conn, a, _) = two_checkpoint_ledger("task-cut")?;
+    conn.execute("DELETE FROM checkpoints", [])?;
+    assert_eq!(
+        conn.execute("DELETE FROM receipts WHERE task_id = ?1", [a.as_str()])?,
+        3
+    );
+    let f = fault(store.verify_ledger().err().ok_or("refused")?);
+    assert_eq!(
+        f,
+        ChainFault {
+            receipt: None,
+            seq: 1,
+            cause: ChainCause::MissingReceipt
+        }
+    );
+    Ok(())
+}
+
 /// Case 7: `open_read_only` verifies, writes nothing (`recovery_complete`, `user_version`
 /// unchanged; a write through it is refused by SQLite), and refuses a pre-checkpoint file by
 /// name.

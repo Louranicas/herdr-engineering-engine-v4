@@ -76,6 +76,12 @@ pub enum ChainCause {
     Unparsable,
     /// A checkpoint's `root` or `count` is not what the receipts it covers re-derive to.
     RootMismatch,
+    /// A `receipts.seq` that SQLite issued (`AUTOINCREMENT`, so a gap-free run from 1 up to
+    /// `sqlite_sequence`) has no row: a receipt was deleted. `seq` is the first missing one.
+    MissingReceipt,
+    /// The same for `checkpoints.seq`: a checkpoint was deleted, perhaps with the receipts it
+    /// covered. `seq` is the first missing one.
+    MissingCheckpoint,
 }
 
 impl ChainCause {
@@ -88,6 +94,8 @@ impl ChainCause {
             Self::ColumnMismatch => "ColumnMismatch",
             Self::Unparsable => "Unparsable",
             Self::RootMismatch => "RootMismatch",
+            Self::MissingReceipt => "MissingReceipt",
+            Self::MissingCheckpoint => "MissingCheckpoint",
         }
     }
 }
@@ -111,9 +119,11 @@ fn receipt_or_none(receipt: Option<&ReceiptId>) -> String {
     receipt.map_or_else(|| "none".to_owned(), ToString::to_string)
 }
 
-/// The first row at which the ledger fails to re-derive. `receipt` is `None` only for a
+/// The first row at which the ledger fails to re-derive. `receipt` is `None` for a
 /// checkpoint row's fault ([`ChainCause::RootMismatch`], or [`ChainCause::Unparsable`] for its
-/// `root`), where `seq` is the checkpoint's; otherwise `seq` is the receipt row's.
+/// `root`), where `seq` is the checkpoint's, and for a missing row
+/// ([`ChainCause::MissingReceipt`], [`ChainCause::MissingCheckpoint`]), where `seq` is the
+/// first missing one; otherwise `seq` is the receipt row's.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("ledger breaks at receipt={} seq={seq} cause={cause}", receipt_or_none(.receipt.as_ref()))]
 pub struct ChainFault {
@@ -247,6 +257,42 @@ fn tasks_with_receipts(conn: &Connection) -> Result<Vec<TaskRow>, StoreError> {
         })
     })?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+/// The first `seq` SQLite issued for `table` that has no row, or `None` when the table holds
+/// exactly `1..=sqlite_sequence`. Both tables are `AUTOINCREMENT` and append-only, and a failed
+/// or rolled-back insert rolls `sqlite_sequence` back with it, so the run is gap-free unless a
+/// row was deleted. A tamperer who also rewrites `sqlite_sequence` passes this tell; only a
+/// root kept outside the file catches that.
+fn first_missing_seq(conn: &Connection, table: SeqTable) -> Result<Option<i64>, StoreError> {
+    let (rows_sql, name) = match table {
+        SeqTable::Receipts => ("SELECT seq FROM receipts ORDER BY seq", "receipts"),
+        SeqTable::Checkpoints => ("SELECT seq FROM checkpoints ORDER BY seq", "checkpoints"),
+    };
+    let issued: i64 = conn
+        .query_row(
+            "SELECT seq FROM sqlite_sequence WHERE name = ?1",
+            [name],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    let mut stmt = conn.prepare(rows_sql)?;
+    let seqs = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+    let mut want = 1_i64;
+    for seq in seqs {
+        if seq? != want {
+            return Ok(Some(want));
+        }
+        want = want.saturating_add(1);
+    }
+    Ok((want <= issued).then_some(want))
+}
+
+#[derive(Clone, Copy)]
+enum SeqTable {
+    Receipts,
+    Checkpoints,
 }
 
 /// SQLite refused a read because it needed to create or write a sidecar (`-shm`) file.
@@ -447,13 +493,18 @@ impl Store {
 
     /// Re-derive the whole ledger: [`Store::verify_chain`] for every task that holds receipts
     /// (in first-receipt order), then every checkpoint row's `count` and `root` against the
-    /// `hash_self` columns with `seq <= upto_receipt_seq`.
+    /// `hash_self` columns with `seq <= upto_receipt_seq`, then that neither table is missing
+    /// a `seq` SQLite issued. Everything is checked against the file itself: a tamperer who
+    /// rewrites the tail, its checkpoints and `sqlite_sequence` together needs a root kept
+    /// outside the file to be caught.
     ///
     /// # Errors
     /// [`VerifyError::Fault`]: a chain fault as `verify_chain` reports it, or
     /// [`ChainCause::RootMismatch`] (or [`ChainCause::Unparsable`] for a non-hex `root`) with
     /// `receipt: None` and the checkpoint's `seq`, or [`ChainCause::Unparsable`] for a
     /// `task_id` column that is not a task id, named by that task's first receipt;
+    /// [`ChainCause::MissingReceipt`] or [`ChainCause::MissingCheckpoint`] with the first
+    /// issued `seq` that has no row;
     /// [`VerifyError::Store`] when SQLite cannot hand the rows over.
     pub fn verify_ledger(&self) -> Result<LedgerReport, VerifyError> {
         let tasks = tasks_with_receipts(&self.conn)?;
@@ -480,6 +531,19 @@ impl Store {
             root = Receipt::checkpoint(&hashes);
             if count != cp.count || root != stored {
                 return Err(fault(ChainCause::RootMismatch).into());
+            }
+        }
+        for (table, cause) in [
+            (SeqTable::Receipts, ChainCause::MissingReceipt),
+            (SeqTable::Checkpoints, ChainCause::MissingCheckpoint),
+        ] {
+            if let Some(seq) = first_missing_seq(&self.conn, table)? {
+                return Err(ChainFault {
+                    receipt: None,
+                    seq,
+                    cause,
+                }
+                .into());
             }
         }
         Ok(LedgerReport {
