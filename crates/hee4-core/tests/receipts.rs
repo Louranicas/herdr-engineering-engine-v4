@@ -413,6 +413,60 @@ fn unparsable_task_id_column_is_unparsable_by_receipt_id() -> R {
     Ok(())
 }
 
+/// Case 7b: a WAL-mode ledger copied into a read-only directory (a backup on read-only
+/// media) verifies from the file alone, and a non-empty `-wal` beside it is refused by name
+/// rather than silently ignored.
+#[test]
+fn ledger_in_a_read_only_directory_verifies() -> R {
+    use std::os::unix::fs::PermissionsExt;
+    let (store, path) = ready("rodir-src")?;
+    let t = seed_task(&store, "t1")?;
+    for n in 1..=3 {
+        append(&store, &t, n)?;
+    }
+    store.checkpoint_if_due(EVERY_THREE)?.ok_or("checkpoint")?;
+    drop(store);
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("hee4-core-receipts-rodir");
+    if dir.exists() {
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))?;
+        std::fs::remove_dir_all(&dir)?;
+    }
+    std::fs::create_dir_all(&dir)?;
+    let copy = dir.join("ledger.sqlite");
+    std::fs::copy(&path, &copy)?;
+    let wal = dir.join("stale.sqlite-wal");
+    std::fs::copy(&path, dir.join("stale.sqlite"))?;
+    std::fs::write(&wal, b"not empty")?;
+    std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o444))?;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555))?;
+
+    let verified = Store::open_read_only(&copy).and_then(|ro| {
+        ro.verify_ledger().map_err(|e| match e {
+            VerifyError::Store(e) => e,
+            VerifyError::Fault(f) => panic!("clean copy must not fault: {f}"),
+        })
+    });
+    let stale =
+        Store::open_read_only(&dir.join("stale.sqlite")).map(|ro| ro.verify_ledger().is_ok());
+    let listed: Vec<_> = std::fs::read_dir(&dir)?
+        .map(|e| e.map(|e| e.file_name()))
+        .collect::<Result<_, _>>()?;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))?;
+
+    let report = verified?;
+    assert_eq!((report.receipts, report.checkpoints), (3, 1));
+    assert_eq!(
+        listed.len(),
+        3,
+        "nothing written beside the copy: {listed:?}"
+    );
+    match stale {
+        Err(StoreError::Corrupt { detail, .. }) => assert!(detail.contains("-wal"), "{detail}"),
+        other => panic!("a non-empty -wal in a read-only directory must be refused: {other:?}"),
+    }
+    Ok(())
+}
+
 /// Case 6: deleting the last receipt after a checkpoint: every per-task chain still passes
 /// (a shorter prefix is a valid chain), the checkpoint names the truncation.
 #[test]

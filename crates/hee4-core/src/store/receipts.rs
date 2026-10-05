@@ -249,22 +249,78 @@ fn tasks_with_receipts(conn: &Connection) -> Result<Vec<TaskRow>, StoreError> {
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 
+/// SQLite refused a read because it needed to create or write a sidecar (`-shm`) file.
+fn needs_write_access(e: &rusqlite::Error) -> bool {
+    matches!(
+        e.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::ReadOnly | rusqlite::ErrorCode::CannotOpen)
+    )
+}
+
+fn wal_path(path: &Path) -> std::path::PathBuf {
+    let mut wal = path.as_os_str().to_owned();
+    wal.push("-wal");
+    wal.into()
+}
+
+/// `file:<path>?immutable=1`, with every byte outside the URI unreserved set (and `/`)
+/// percent-encoded so `?`, `#` and `%` in the path stay part of it.
+fn immutable_uri(path: &Path) -> String {
+    use std::fmt::Write as _;
+    use std::os::unix::ffi::OsStrExt as _;
+    let mut uri = String::from("file:");
+    for &b in path.as_os_str().as_bytes() {
+        if b.is_ascii_alphanumeric() || b"-._~/".contains(&b) {
+            uri.push(char::from(b));
+        } else {
+            let _ = write!(uri, "%{b:02X}");
+        }
+    }
+    uri.push_str("?immutable=1");
+    uri
+}
+
 impl Store {
     /// Open an existing ledger for verification only: `SQLITE_OPEN_READ_ONLY`, no pragma
     /// write, no migration, no `meta` write (unlike [`Store::open`], which migrates, bumps
-    /// `boot` and resets `recovery_complete`). The file must already carry the checkpoints
-    /// migration. `serve_cgroup()` is empty on such a store.
+    /// `boot` and resets `recovery_complete`). A WAL ledger whose directory is not writable
+    /// (no `-shm` can be made) is reopened `immutable=1` when no `-wal` content sits beside
+    /// it. The file must already carry the checkpoints migration. `serve_cgroup()` is empty
+    /// on such a store.
     ///
     /// # Errors
     /// SQLite errors (a missing file among them); [`StoreError::Corrupt`] with detail
-    /// `ledger not migrated to checkpoints` for a file without `migration:m005_checkpoints`.
+    /// `ledger not migrated to checkpoints` for a file without `migration:m005_checkpoints`,
+    /// or naming the `-wal` file when a WAL ledger whose directory cannot be written still
+    /// holds WAL frames (read without them would verify a stale file).
     pub fn open_read_only(path: &Path) -> Result<Self, StoreError> {
-        let conn = Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let key = format!("migration:{MIGRATION_NAME}");
+        let mut conn = Connection::open_with_flags(path, flags)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        if meta_get(&conn, &format!("migration:{MIGRATION_NAME}"))?.is_none() {
+        let migrated = match meta_get(&conn, &key) {
+            Err(e) if needs_write_access(&e) => {
+                // A WAL ledger on read-only media: SQLite cannot create `-shm`. With no WAL
+                // content to miss, `immutable=1` reads the main file as it stands.
+                let wal = wal_path(path);
+                if std::fs::metadata(&wal).is_ok_and(|m| m.len() > 0) {
+                    return Err(StoreError::Corrupt {
+                        task: String::new(),
+                        detail: format!(
+                            "{} holds frames that need write access to its directory to read",
+                            wal.display()
+                        ),
+                    });
+                }
+                conn = Connection::open_with_flags(
+                    immutable_uri(path),
+                    flags | OpenFlags::SQLITE_OPEN_URI,
+                )?;
+                meta_get(&conn, &key)?
+            }
+            other => other?,
+        };
+        if migrated.is_none() {
             return Err(StoreError::Corrupt {
                 task: String::new(),
                 detail: "ledger not migrated to checkpoints".into(),
