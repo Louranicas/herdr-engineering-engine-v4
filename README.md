@@ -16,11 +16,11 @@ Every claim here is labelled. MEASURED means a command ran on this machine and i
 | Binary | `hee4 4.0.0-skeleton <sha12>`, the sha baked at build | `hee4 --version` |
 | Health | `recovery_complete=true` after reconcile | `hee4 health` |
 | Crash drill | SIGKILL → systemd restart → recovery complete, socket perms intact; `--submit 3` acks survive the kill and the drill settles its own rehearsal tasks (step `rehearsal_settled`) | `tools/drill --submit 3` |
-| Feature drive | 21 served features driven against the live unit (mutating paths only on a disposable serve), restart included; the drive settles the tasks it submitted; 4 features UNMEASURED by scope (`thread.*`, `analysis.*`) | `tools/drive --doctor-first --allow-restart` |
-| Gate | cut tier 10/11 at `7193129` (features, lints, deps, fmt, clippy, 333 tests, sealed diff, drill, drive, doctor, advisories): every step green but `drive`, UNMEASURED only for the unserved actions; tools suite 228/228 | `just gate commit`, `just gate cut` |
+| Feature drive | 24/24 features: `tools/drive-cut` drives the live unit (read-only with the ledger, plus the restart path) and a disposable serve from the installed binary (crash, mutating roster paths, the service unit), merged path by path; thread/analysis PASS by their scope refusal (v4.2, served=false) | `tools/drive-cut` |
+| Gate | cut tier **11/11** at `da3bc8f` (features, lints, deps, fmt, clippy, 354 tests, sealed diff, drill, drive, doctor, advisories); tools suite 247/247 | `just gate commit`, `just gate cut` |
 | Model | user-space ollama 0.35.1 on `127.0.0.1:11434`, `qwen2.5:0.5b`, GPU via Vulkan; the engine reaches it only through the door | `systemctl --user is-active ollama.service`, `hee4 doctor --repo .` |
 | First live Pass | one task through the deployed unit: `admitted -> accepted` in 0.2 s, receipt `71a15c2b…`, `command` and `model-door` observations, one `model_request` row | `plan/DECISIONS.md` V4-94 |
-| Version cut | `just cut-check` at `7193129`: `deployed=9/9` (ATLAS D1–D9), cold-clone 6/6, push-scan hits=0 over 278 commits, watchers 5/6; refused only because thread.get/list and analysis.get/request are unserved (a design decision, plus the GitHub credential for the push). No `v4.0.0` tag is claimed. | `just cut-check` |
+| Version cut | **`just cut-check` PASS** at `da3bc8f`: `deployed=9/9`, cold-clone 6/6, push-scan hits=0 over 313 commits, watchers 6/6, `dirty=0`. The tag is not laid: a human names the first cut (ATLAS D10, S01). | `just cut-check`, then `just tag <NAME> confirm` |
 | Backups | ledger: online at serve start and every 8 dispatches to `/mnt/storage-10tb/hee4-backups`, restore drill PASS; habitat: `hee4-backup.timer` daily, codebase bundle + evidence + handoffs to the home disk | `hee4 restore`, `systemctl --user list-timers` |
 | Tags | `skeleton-deployed-2026-10-05`, `hardened-deployed-2026-10-05`, `live-model-deployed-2026-10-05` | `git tag -n` |
 
@@ -157,10 +157,11 @@ Recorded because each is now an instance a future door must fail on:
 
 ## Not yet
 
-- **The version cut.** `just cut-check` refuses it for one named reason: `thread.get`, `thread.list`, `analysis.get` and `analysis.request` are catalogued but unserved, so the drive reports them UNMEASURED by scope. Serving them is a design decision (what a thread is; the grants file format, PT-06, that gates `analysis.request`) that the plan does not settle. The tag is then pushed on the owner's word; GitHub needs a credential on this host.
-- **Named gaps carried in the unit evidence** (`hee4-evidence/roster/U-stack-04/`): `SpawnPlan` fields are public (a plan literal can bypass the permit door); `service.action`'s effect lock is per process; Quarantine leaves an attempt row open; the brief door does not yet refuse a VERIFY line that cannot fail (the workflow curator counts 95 of 378).
-- **Firstmate live crew in herdr:** captain-supervised on this harness (V4-93); zero-touch work runs through the Agent-tool roster recorded in `firstmate.db`.
-- **The Jev advisory port:** no sender is installed. After incident H-10a (V4-102) the two user-level senders are off; any return is the owner's decision, with a per-session opt-in.
+- **Naming the first cut.** `just cut-check` passes; the plan proposes `v4.0.0` and leaves the name to the owner. At the tagged sha: `just deploy && just cut-check && just tag v4.0.0` (prints the message), then `just tag v4.0.0 confirm` (local only, never pushed). GitHub needs a credential on this host before the push.
+- **v4.2 families.** `thread.*` (cohort) and `analysis.*` (numerical) are catalogued for v4.2 and refused by scope today; serving them needs their design (and the grants file format, PT-06, for `analysis.request`).
+- **Named gaps carried in the unit evidence** (`hee4-evidence/roster/U-stack-04/`), each with its fix proposed.
+- **Poteto Weave** (the habitat's context layer) refuses until its owner re-qualifies it against the current catalogue; briefs record it UNMEASURED meanwhile.
+- **The Jev advisory port:** no sender is installed; after incident H-10a (V4-102) the user-level senders are off, and any return is the owner's decision with a per-session opt-in.
 
 ## Layout
 
