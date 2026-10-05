@@ -30,9 +30,30 @@ fn brief(verify: &str) -> String {
     )
 }
 
+/// A running `hee4 serve`. Dropping it kills and reaps the child, so a test that returns early
+/// or panics never leaves a serve behind; a test killed outright is covered by
+/// [`serve_command`]'s parent-death signal.
 struct Server {
     child: Child,
     sock: PathBuf,
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        // Already reaped by the test, or already gone: both errors mean nothing is left to stop.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// `hee4` started through util-linux `setpriv --pdeathsig KILL`, which sets
+/// `PR_SET_PDEATHSIG=SIGKILL` and then execs `hee4` in place (same pid): when the test thread
+/// that spawned it dies (the harness killed, `timeout -s KILL`), the kernel kills the serve.
+/// `pre_exec` would need `unsafe`, which the workspace forbids.
+fn serve_command() -> Command {
+    let mut cmd = Command::new("setpriv");
+    cmd.args(["--pdeathsig", "KILL", "--", BIN]);
+    cmd
 }
 
 fn start(dir: &Path, log: &str) -> R<Server> {
@@ -42,7 +63,7 @@ fn start(dir: &Path, log: &str) -> R<Server> {
 /// `hee4 serve` over `dir` with `env` set (and `HEE4_BUDGETS` removed unless `env` names it).
 fn start_with(dir: &Path, log: &str, live: bool, env: &[(&str, &Path)]) -> R<Server> {
     let sock = dir.join("rt/control.sock");
-    let mut cmd = Command::new(BIN);
+    let mut cmd = serve_command();
     if live {
         cmd.env("HEE4_LIVE_MODEL", "1");
     } else {
@@ -626,7 +647,7 @@ fn a_budgets_refusal_names_the_field_and_serve_does_not_listen() -> R<()> {
     let file = dir.join("b.json");
     fs::write(&file, r#"{"door":{"max_body_bytes":0}}"#)?;
     for by_flag in [false, true] {
-        let mut cmd = Command::new(BIN);
+        let mut cmd = serve_command();
         cmd.env_remove("HEE4_BUDGETS")
             .args(["serve", "--socket"])
             .arg(dir.join("rt/control.sock"))
@@ -1298,7 +1319,7 @@ fn backup_root(dir: &Path, name: &str) -> R<(RunDir, PathBuf)> {
 /// `hee4 serve --backups backups` over `dir`, with `env` set; polls health like `start_with`.
 fn start_backed(dir: &Path, log: &str, backups: &Path, env: &[(&str, &str)]) -> R<Server> {
     let sock = dir.join("rt/control.sock");
-    let mut cmd = Command::new(BIN);
+    let mut cmd = serve_command();
     cmd.env_remove("HEE4_LIVE_MODEL")
         .env_remove("HEE4_BUDGETS")
         .env_remove("HEE4_REQUIRE_BACKUPS");
@@ -1448,7 +1469,7 @@ fn batch_backup_fires_before_the_ninth_dispatch_and_a_failed_backup_blocks_dispa
     let (_bk_run, bk) = backup_root(&dir, "batch")?;
     let mut server = start_backed(&dir, "serve.log", &bk, &[])?;
     let sock = server.sock.clone();
-    for i in 1..=8 {
+    for i in 1..=hee4_app::dispatcher::DC22_BATCH_TASKS {
         let (_, done) = run_task(&sock, &format!("key-batch-{i}"), FIXTURE)?;
         assert_eq!(done["body"]["phase"], "accepted", "{done}");
     }
@@ -1530,7 +1551,7 @@ fn batch_backup_fires_before_the_ninth_dispatch_and_a_failed_backup_blocks_dispa
 fn serve_without_backups_is_refused_by_name_when_required() -> R<()> {
     let (_run, dir) = fsync_cheap_dir("e2e-require")?;
     let sock = dir.join("rt/control.sock");
-    let mut child = Command::new(BIN)
+    let mut child = serve_command()
         .env("HEE4_REQUIRE_BACKUPS", "1")
         .args(["serve", "--socket"])
         .arg(&sock)
@@ -1847,7 +1868,7 @@ fn checkpoints_are_written_every_n_receipts() -> R<()> {
 /// `hee4 serve` with `extra` after the base argv over `dir` and `env` set: `(exit code,
 /// stderr)`. A serve still running after 5 s is killed and is an error (the refusal was due).
 fn serve_refusal(dir: &Path, extra: &[&str], env: &[(&str, &str)]) -> R<(Option<i32>, String)> {
-    let mut cmd = Command::new(BIN);
+    let mut cmd = serve_command();
     cmd.env_remove("HEE4_BUDGETS")
         .env_remove("HEE4_REQUIRE_BACKUPS");
     for (k, v) in env {
@@ -1880,6 +1901,9 @@ fn serve_refusal(dir: &Path, extra: &[&str], env: &[(&str, &str)]) -> R<(Option<
     Ok((status.code(), fs::read_to_string(&log)?))
 }
 
+/// One refused serve: extra argv, extra env, and the text stderr must carry.
+type FlagCase<'a> = (&'a [&'a str], &'a [(&'a str, &'a str)], &'a str);
+
 /// Serve's flags and `HEE4_REQUIRE_BACKUPS` are parsed at the boundary: a flag with no value
 /// (last, or followed by a flag), a repeated flag, a relative `--backups` and a
 /// `HEE4_REQUIRE_BACKUPS` other than 1/0 each exit 2 naming the flag or variable, before the
@@ -1887,7 +1911,7 @@ fn serve_refusal(dir: &Path, extra: &[&str], env: &[(&str, &str)]) -> R<(Option<
 #[test]
 fn serve_flags_are_refused_by_name_at_the_boundary() -> R<()> {
     let (_run, dir) = fsync_cheap_dir("e2e-serve-flags")?;
-    let cases: [(&[&str], &[(&str, &str)], &str); 5] = [
+    let cases: &[FlagCase] = &[
         (&["--budgets"], &[], "--budgets needs a value"),
         (
             &["--budgets", "--backups", "/x"],
@@ -1910,7 +1934,7 @@ fn serve_flags_are_refused_by_name_at_the_boundary() -> R<()> {
             "HEE4_REQUIRE_BACKUPS must be 1 or 0",
         ),
     ];
-    for (extra, env, named) in cases {
+    for &(extra, env, named) in cases {
         let (code, stderr) = serve_refusal(&dir, extra, env)?;
         println!(
             "{extra:?} {env:?} -> exit={code:?} {}",
@@ -1954,7 +1978,7 @@ fn the_unit_exec_start_argv_serves() -> R<()> {
         .ok_or("the unit names no --backups")?;
     *words.get_mut(at + 1).ok_or("--backups has no value")? = bk.to_string_lossy().into_owned();
     fs::create_dir_all(home.join(".local/share/hee4"))?;
-    let child = Command::new(BIN)
+    let child = serve_command()
         .env_remove("HEE4_LIVE_MODEL")
         .env_remove("HEE4_BUDGETS")
         .env("HEE4_REQUIRE_BACKUPS", "1")
