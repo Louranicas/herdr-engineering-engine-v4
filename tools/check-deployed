@@ -417,6 +417,35 @@ def d4(a, ctx):
     return r
 
 
+def manifest_objects(m):
+    """(objects_n, objects_bound) from a ledger backup manifest (hee4-core backup.rs writes both); None where absent."""
+    n, bound = m.get("objects_n"), m.get("objects_bound")
+    ok = lambda v: isinstance(v, int) and not isinstance(v, bool) and v >= 0
+    return (n if ok(n) else None), (bound if ok(bound) else None)
+
+
+HABITAT_EXIT = {"PASS": 0, "PASS_WITH_GAPS": 10, "FAIL": 20}  # the roster contract; no verdict line -> 30
+
+
+def last_habitat_verdict(log):
+    """The verdict of the last `habitat-backup verdict=` line of the tool's own log; None when absent."""
+    try:
+        lines = open(log).read().splitlines()
+    except OSError:
+        return None
+    for l in reversed(lines):
+        if l.startswith("habitat-backup verdict="):
+            return l.split()[1].split("=", 1)[1]
+    return None
+
+
+def habitat_agrees(verdict, result, status):
+    """The unit's last ExecMainStatus is the code its last verdict line maps to, and Result says success
+    exactly when that code is 0 or 10 (SuccessExitStatus=10). A disagreement is refused, never reconciled."""
+    want = HABITAT_EXIT.get(verdict, 30)
+    return status == str(want) and (result == "success") == (want in (0, 10))
+
+
 def d5(a, ctx):
     r = Row("D5")
     b = a.backups
@@ -431,9 +460,10 @@ def d5(a, ctx):
         mp = os.path.join(b, newest, "manifest.json")
         try:
             m = json.load(open(mp))
-            objs = m.get("objects")
             r.val("newest", newest)
-            r.val("objects", len(objs) if isinstance(objs, list) else objs)
+            n, bound = manifest_objects(m)
+            r.check("objects", "absent" if n is None else n, n is not None and bound is not None and n <= bound)
+            r.val("objects_bound", "absent" if bound is None else bound)
             r.val("age_s", int(time.time() - os.stat(mp).st_mtime))
         except (OSError, ValueError) as e:
             r.check("manifest", f"unparseable({e})", False)
@@ -447,6 +477,10 @@ def d5(a, ctx):
     r.check("timer", out or f"rc={rc}", out == "enabled")
     rc, p, _ = show("hee4-backup.service", "Result", "ExecMainStatus")
     r.val("last_run", f"{p.get('Result', '?')}/{p.get('ExecMainStatus', '?')}")
+    hv = last_habitat_verdict(a.habitat_log)
+    r.check("habitat_verdict", hv or "absent", hv == "PASS")
+    agree = habitat_agrees(hv, p.get("Result"), p.get("ExecMainStatus"))
+    r.check("habitat_agree", "yes" if agree else f"no(verdict={hv or 'absent'},status={p.get('ExecMainStatus', '?')})", agree)
     try:
         same = os.stat(b).st_dev == os.stat(os.path.expanduser("~")).st_dev
         r.check("other_device", "no" if same else "yes", not same)
@@ -912,6 +946,7 @@ def main():
     ap.add_argument("--evidence-root", default=os.path.expanduser("~/.cache/hee4-drive"))
     ap.add_argument("--drill-root", default=os.path.expanduser("~/.cache/hee4-drill"))
     ap.add_argument("--backups", default="/mnt/storage-10tb/hee4-backups")
+    ap.add_argument("--habitat-log", default=os.path.expanduser("~/.local/state/hee4/habitat-backup.log"))
     ap.add_argument("--model", default="", help="default: HEE4_MODEL env, else the unit's Environment")
     ap.add_argument("--model-url", default="http://127.0.0.1:11434")
     ap.add_argument("--drive-cmd", default=f"{HERE}/drive --doctor-first --allow-restart")
