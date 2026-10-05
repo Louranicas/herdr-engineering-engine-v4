@@ -108,6 +108,15 @@ class PushScanTests(unittest.TestCase):
         self.assertEqual(rc, 1, out); self.assertIn("hit class=secret file=p.rs line=2 rule=aws_akia\n", out)
         self.assertRegex(out.strip().splitlines()[-1], r" files=1 hits=1 verdict=FAIL$")
 
+    def test_fire_empty_range_is_unmeasured(self):
+        d = planted({"p.rs": "fn main() {}\n"})
+        rc, out, _ = run(SCAN, "HEAD..HEAD", "--repo", d, cwd=d)
+        self.assertEqual(rc, 3, out); self.assertNotIn("hits=0", out)
+        self.assertEqual(out.strip().splitlines()[-1], "push-scan range=HEAD..HEAD commits=0 files=0 hits=UNMEASURED(empty range) verdict=UNMEASURED")
+        rc, out, _ = run(SCAN, "HEAD..HEAD~1", "--repo", d, cwd=d)  # reversed: the removals would read as additions
+        self.assertEqual(rc, 3, out); self.assertNotIn("hits=0", out)
+        self.assertRegex(out.strip().splitlines()[-1], r"^push-scan range=HEAD\.\.HEAD~1 commits=0 files=1 hits=UNMEASURED\(reversed range.*\) verdict=UNMEASURED$")
+
     def test_fire_unknown_range_refused(self):
         d = planted({"p.rs": "fn main() {}\n"})
         rc, out, err = run(SCAN, "nosuch..HEAD", "--repo", d)

@@ -7,7 +7,8 @@ and its commit messages for three classes: secret (V4-76), v3_path (the fence) a
   hit class=<secret|v3_path|outward_name> file=<path|commit:<sha12>> line=<n> rule=<name>
 and last
   push-scan range=<a>..<b> commits=N files=N hits=N verdict=PASS|FAIL
-Exit 0 only when hits=0; 1 otherwise; 2 refused (no range, unknown rev, unreadable exclusions).
+Exit 0 only when hits=0; 1 otherwise; 2 refused (no range, unknown rev, unreadable exclusions);
+3 with hits=UNMEASURED(empty range|reversed range: ...) when the range holds no commit.
 Paths ending .md are scanned for secret and outward_name only (CLAUDE.md names v3 paths to forbid
 them). Exclusions come from ops/v3-independence-exclusions.txt (`repo:<path or glob> | reason`;
 a row without a reason excludes nothing) plus one built-in: this script, whose RULES table holds
@@ -235,8 +236,15 @@ def main():
     print(" ".join(f"{k}={v}" for k, v in notes.items()))
     for h in hits:
         print("hit class=%s file=%s line=%d rule=%s" % h)
+    head_line = f"push-scan range={base_rev}..{head_rev} commits={commits} files={files}"
+    if commits == 0:
+        # Nothing in base..head: an empty range looked at nothing, a reversed one (head behind base) would
+        # scan the removals as additions. Neither is a green (STANDING 4, AP-29).
+        why = "empty range" if files == 0 else "reversed range: head is behind base"
+        print(f"{head_line} hits=UNMEASURED({why}) verdict=UNMEASURED")
+        sys.exit(3)
     v = "PASS" if not hits else "FAIL"
-    print(f"push-scan range={base_rev}..{head_rev} commits={commits} files={files} hits={len(hits)} verdict={v}")
+    print(f"{head_line} hits={len(hits)} verdict={v}")
     sys.exit(0 if v == "PASS" else 1)
 
 if __name__ == "__main__":
