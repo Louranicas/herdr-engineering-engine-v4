@@ -78,8 +78,9 @@ def main():
         rc, _, err = git(tmp, "checkout", "-q", sha)
         if rc:
             die(f"checkout {sha[:12]} failed: {err}")
+        env = dict(os.environ, PYTHONUNBUFFERED="1")  # relay the gate's lines as they happen
         p = subprocess.Popen([a.gate, a.tier, "--repo", tmp, "--subject", sha, "--target-dir", target],
-                             cwd=tmp, stdout=subprocess.PIPE, text=True)
+                             cwd=tmp, env=env, stdout=subprocess.PIPE, text=True)
         summary_path = None
         for line in p.stdout:
             sys.stdout.write(line)
