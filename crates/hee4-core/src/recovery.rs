@@ -16,7 +16,9 @@
 //! | running, attempt open, row with pid | `LiveSameIdentity` (probe: the process start ticks equal the row's) | R06 | — (observe-only, no reaper) | unchanged |
 //! | running, attempt open | `Absent` | R08 + reason: row unacknowledged → `DispatchUnacknowledged`; acknowledged → `AcknowledgedWorkerLost`; no row (pre-migration history) → `AcknowledgementUnrecorded` | `Recover(R08)` | effect_unknown |
 //! | running, attempt open | `PidReused` / `Unreadable` / `Unobserved` (a row with no pid probes `Unobserved`) | R07 + the same acknowledgement class | `Recover(R07)` | effect_unknown |
-//! | verifying, nothing sealed: no `Decide` after the latest `Dispatch`, receipts ≤ `Decide`s | any | R12 (no verdict exists to re-issue; the dispatcher never revisits `verifying`) | `Resolve(Quarantine(EffectUnknownPermanent{R12}))` | blocked |
+//! | verifying, nothing sealed: no `Decide` after the latest `Dispatch`, receipts ≤ `Decide`s | any | R12 (no verdict exists to copy) | `Resolve(Quarantine(EffectUnknownPermanent{R12}))` | blocked |
+//! | verifying, receipts > `Decide`s (a legacy settle sealed, then stopped) | any | R12 + [`SealedStep::DecideFromSeal`] ([`Row::sealed`]) | `Decide(<the latest sealed receipt's verdict, copied>)`, then `Accept` on a `Pass`, one transaction ([`Store::finish_sealed`]) | the phase the verdict names: accepted / repair_pending / failed / effect_unknown |
+//! | verifying, a `Decide(Pass)` after the latest `Dispatch`, no `Accept` | any | R12 + [`SealedStep::AcceptAfterPass`] | `Accept` | accepted |
 //! | terminal phase | latest row still `running` | R03 (a `Stop` or `Resolve(Abandon)` closes the row `stopped` / `abandoned`; a running row under a terminal phase contradicts) | — | unchanged; `complete=false` |
 //! | R07/R08 over an open row, or R11 over a closed row with cleanup pending | `Writable{bytes}` workspace | R09 attached beside the rule: no lease → `NotLeasedWritable`; lease, no clock → `ClockUnavailable`; other clock epoch → `LeaseClockNotComparable`; same epoch, past deadline → `LeaseExpiredWritable`; same epoch, live → nothing | none for the attachment | unchanged; cleanup stays pending |
 //! | ledger `epoch`, `event_high_water`, `restored_from` · a cursor | — | R13 ([`cursor`], not a task rule) | — | `PriorEpochOfRestore` / `EpochChanged` / `FutureSequence` carry `R13CursorEpoch`; `SnapshotOnly` carries none; never a replay authorisation |
@@ -32,6 +34,7 @@ use crate::store::{
     AttemptId, AttemptOutcome, AttemptRow, AttemptState, Cleanup, CursorVerdict, Lease, Store,
     StoreError,
 };
+pub use crate::store::{SealedFinish, SealedStep, sealed_step};
 
 /// A worker's physical custody as the caller observed it (v3 `ProcessCustody`, `:520-532`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -378,8 +381,8 @@ pub fn decide(
         // v3 `history` returns None for these; the settled attempt goes to cleanup (`:1147`).
         Phase::Failed | Phase::Abandoned | Phase::RepairPending => keep(R::R11CleanupReadback),
         // R12 with nothing sealed: no receipt and no `Decide` for the latest attempt, so no
-        // verdict exists to re-issue and the dispatcher never revisits `verifying`. The task is
-        // quarantined by name; the operator's `Resolve(Abandon)` is the exit from `blocked`.
+        // verdict exists to copy. The task is quarantined by name; the operator's
+        // `Resolve(Abandon)` is the exit from `blocked`.
         Phase::Verifying if facts.verdict_unsealed => Decision {
             event: Some(Event::Resolve(Resolution::Quarantine(
                 QuarantineReason::EffectUnknownPermanent {
@@ -388,6 +391,8 @@ pub fn decide(
             ))),
             ..keep(R::R12VerificationBoundary)
         },
+        // R12 with a seal: `reconcile` finishes it through `Store::finish_sealed`, which copies
+        // the sealed verdict (never a judgement here); the policy itself applies nothing.
         Phase::Verifying => keep(R::R12VerificationBoundary),
         Phase::EffectUnknown { .. } => keep(R::R10EffectAmbiguity),
         Phase::Running | Phase::CancellationRequested if facts.attempt_open => {
@@ -469,6 +474,9 @@ pub struct Row {
     pub reason: Option<R08Reason>,
     /// R09's attachment.
     pub workspace: Option<WorkspaceReuseRefused>,
+    /// R12's convergence, when this pass finished a sealed `verifying` task
+    /// ([`SealedStep::DecideFromSeal`] or [`SealedStep::AcceptAfterPass`]).
+    pub sealed: Option<SealedStep>,
 }
 
 /// A reason `complete` is withheld.
@@ -530,6 +538,54 @@ fn cache_matches(store: &Store, task: &TaskId, facts: &Facts) -> Result<bool, St
             && c.cancel == facts.phase.cancel_requested()
             && c.generation == facts.generation
     }))
+}
+
+/// Write `decision` for `task` through the store's doors: its event via [`Store::apply`], or,
+/// for R12 over a sealed verification, [`Store::finish_sealed`] (the sealed verdict copied, and
+/// `Accept` on a `Pass`, in one transaction). A refusal or an unreadable row is a [`Finding`];
+/// returns the phase after and R12's convergence step, if one fired.
+fn carry_out(
+    store: &Store,
+    task: &TaskId,
+    phase: Phase,
+    decision: Decision,
+    report: &mut RecoveryReport,
+) -> Result<(Phase, Option<SealedStep>), StoreError> {
+    let result = match decision.event {
+        Some(event) => store.apply(task, event).map(|after| {
+            report.applied += 1;
+            (after, None)
+        }),
+        None if decision.rule == Some(RecoveryRule::R12VerificationBoundary)
+            && !decision.contradiction =>
+        {
+            store.finish_sealed(task).map(|finish| {
+                finish.map_or((phase, None), |f| {
+                    report.applied += f.events;
+                    (f.phase, Some(f.step))
+                })
+            })
+        }
+        None => Ok((phase, None)),
+    };
+    match result {
+        Ok(done) => Ok(done),
+        Err(StoreError::Refused(r)) => {
+            report.findings.push(Finding::Refused {
+                task_id: task.clone(),
+                detail: r.to_string(),
+            });
+            Ok((phase, None))
+        }
+        Err(StoreError::Corrupt { task, detail }) if decision.event.is_none() => {
+            report.findings.push(Finding::Unreadable {
+                task_id: task,
+                detail,
+            });
+            Ok((phase, None))
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Apply R01–R14 to every task through [`Store::apply`], then set `recovery_complete` to
@@ -607,23 +663,7 @@ pub fn reconcile(store: &Store, observed: &Observations) -> Result<RecoveryRepor
                 rule,
             });
         }
-        let after = match decision.event {
-            None => phase,
-            Some(event) => match store.apply(&task, event) {
-                Ok(after) => {
-                    report.applied += 1;
-                    after
-                }
-                Err(StoreError::Refused(r)) => {
-                    report.findings.push(Finding::Refused {
-                        task_id: task.clone(),
-                        detail: r.to_string(),
-                    });
-                    phase
-                }
-                Err(e) => return Err(e),
-            },
-        };
+        let (after, sealed) = carry_out(store, &task, phase, decision, &mut report)?;
         report.rows.push(Row {
             task_id: task,
             rule: decision.rule,
@@ -631,6 +671,7 @@ pub fn reconcile(store: &Store, observed: &Observations) -> Result<RecoveryRepor
             after,
             reason: decision.reason,
             workspace: decision.workspace,
+            sealed,
         });
     }
     report.complete = report.findings.is_empty();
