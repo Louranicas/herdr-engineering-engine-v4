@@ -224,11 +224,25 @@ deploy:
     install -Dm755 "$CARGO_TARGET_DIR/release/hee4" "$HOME/.local/bin/hee4" || { echo "deploy verdict=FAIL step=install"; exit 1; }
     install -Dm644 systemd/hee4.service "$HOME/.config/systemd/user/hee4.service"
     systemctl --user daemon-reload && systemctl --user restart hee4.service || { echo "deploy verdict=FAIL step=restart"; exit 1; }
-    sleep 2
-    v=$(hee4 --version); h=$(hee4 health 2>&1 | head -1)
+    # Serve start takes a backup before it listens (V4-99), so a fixed sleep raced it once and the
+    # recipe printed PASS over "connection refused". Poll until ready, bounded; PASS only on a
+    # measured ready=true recovery=complete at the installed head, and a doctor that passes.
+    v=$(hee4 --version); h=""; t0=$SECONDS
+    until [ $((SECONDS - t0)) -ge 60 ]; do
+      h=$(hee4 health 2>&1 | head -1)
+      case "$h" in *ready=true*recovery=complete*) break ;; esac
+      sleep 1
+    done
+    head=$(git rev-parse --short=12 HEAD)
+    case "$h" in
+      *ready=true*recovery=complete*"head=$head"*) ;;
+      *) echo "deploy verdict=FAIL step=health binary=\"$v\" health=\"$h\" waited_s=$((SECONDS - t0))"; exit 1 ;;
+    esac
     d=$(hee4 doctor --repo . 2>&1 | tail -1)
-    echo "deploy verdict=PASS binary=\"$v\" health=\"$h\""
-    echo "$d"
+    case "$d" in
+      *"verdict=PASS"*) echo "deploy verdict=PASS binary=\"$v\" health=\"$h\" waited_s=$((SECONDS - t0))"; echo "$d" ;;
+      *) echo "deploy verdict=FAIL step=doctor binary=\"$v\" health=\"$h\""; echo "$d"; exit 1 ;;
+    esac
 
 # Install and enable the user timers (ops/db/daily.sh and tools/habitat-backup; never a roster agent). One verdict line.
 install-timers:
