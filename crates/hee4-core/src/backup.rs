@@ -22,6 +22,13 @@ use crate::store::{Store, StoreError};
 /// writing a backup it would not verify in bounded time.
 pub const MAX_BACKUP_OBJECTS: usize = 1024;
 
+/// How many complete backups [`backup_to`] keeps under its root, the one it just wrote
+/// included. UNMEASURED: INFERRED from the habitat backup's `--keep 14`; a K0 field
+/// `backup.keep` is a `hee4-scribe` proposal (DC-05: retention is a pure fn in K1).
+pub const BACKUP_KEEP: usize = 14;
+
+const BACKUP_PREFIX: &str = "b-";
+const PRUNING_PREFIX: &str = ".pruning-";
 const LEDGER_FILE: &str = "ledger.sqlite3";
 const MANIFEST_FILE: &str = "manifest.json";
 const OBJECTS_DIR: &str = "objects";
@@ -97,6 +104,15 @@ pub enum BackupError {
         /// The manifest-relative path.
         file: String,
     },
+    /// A file the restore would read from the backup dir is not a regular file of that dir: a
+    /// symlink (to anywhere), a directory or a device, or the file changed identity between
+    /// its check and its open. Refused before anything outside the backup dir is read.
+    #[error("{file} in the backup is not a regular file")]
+    NotRegular {
+        /// The backup-relative path (`manifest.json`, `ledger.sqlite3`, `objects`,
+        /// `objects/<name>.brief`).
+        file: String,
+    },
     /// The objects dir is short of the manifest.
     #[error("objects dir holds {n} of the manifest's {total} objects")]
     ObjectsMissing {
@@ -126,6 +142,44 @@ pub struct BackupReport {
     pub objects_n: usize,
     /// sha256 of the snapshot.
     pub ledger_sha256: String,
+    /// Ids of the complete backups retention removed after this one's manifest landed
+    /// ([`retain`] with [`BACKUP_KEEP`]).
+    pub pruned: Vec<String>,
+    /// Removals that failed. The backup itself is complete either way; a failed removal never
+    /// fails the backup.
+    pub prune_failed: Vec<PruneFailure>,
+}
+
+/// A retention removal the file system refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PruneFailure {
+    /// The path it tried to remove (or list).
+    pub path: PathBuf,
+    /// The OS's answer.
+    pub kind: std::io::ErrorKind,
+}
+
+/// One complete backup under a root, as its manifest names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupMeta {
+    /// The manifest's `id` (equal to the directory name).
+    pub id: String,
+    /// The manifest's `ts_ms`: retention orders by it, never by name.
+    pub ts_ms: i64,
+}
+
+/// Retention, pure: the ids in `metas` to remove so that `keep` backups remain, newest by
+/// `ts_ms` first (ties by id). `just_written` is never returned and counts toward `keep`.
+#[must_use]
+pub fn retain(metas: &[BackupMeta], keep: usize, just_written: &str) -> Vec<String> {
+    let mut others: Vec<&BackupMeta> = metas.iter().filter(|m| m.id != just_written).collect();
+    others.sort_by(|a, b| b.ts_ms.cmp(&a.ts_ms).then_with(|| b.id.cmp(&a.id)));
+    let held = usize::from(metas.iter().any(|m| m.id == just_written));
+    others
+        .into_iter()
+        .skip(keep.saturating_sub(held))
+        .map(|m| m.id.clone())
+        .collect()
 }
 
 /// What [`restore`] did.
@@ -162,6 +216,68 @@ fn copy(from: &Path, to: &Path) -> Result<(), BackupError> {
     Ok(())
 }
 
+/// Open `<backup_dir>/<rel>` only if it is a regular file of its own: `symlink_metadata`
+/// must say regular (a symlink is refused, never followed), and the opened file's
+/// `(dev, ino)` must equal that `lstat`'s, so a swap between the check and the open is
+/// refused too. `None` when nothing is there.
+fn open_regular(backup_dir: &Path, rel: &str) -> Result<Option<std::fs::File>, BackupError> {
+    let path = backup_dir.join(rel);
+    let not_regular = || BackupError::NotRegular {
+        file: rel.to_owned(),
+    };
+    let checked = match std::fs::symlink_metadata(&path) {
+        Ok(meta) if meta.file_type().is_file() => meta,
+        Ok(_) => return Err(not_regular()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(io_at(&path, e)),
+    };
+    let file = std::fs::File::open(&path).map_err(|e| io_at(&path, e))?;
+    let opened = file.metadata().map_err(|e| io_at(&path, e))?;
+    if !opened.file_type().is_file()
+        || (opened.dev(), opened.ino()) != (checked.dev(), checked.ino())
+    {
+        return Err(not_regular());
+    }
+    Ok(Some(file))
+}
+
+/// The checked descriptor of `<backup_dir>/<rel>` and its bytes; `NotFound` as `Io` when it
+/// is gone.
+fn read_regular(backup_dir: &Path, rel: &str) -> Result<(std::fs::File, Vec<u8>), BackupError> {
+    let path = backup_dir.join(rel);
+    let mut file = open_regular(backup_dir, rel)?
+        .ok_or_else(|| io_at(&path, std::io::Error::from(std::io::ErrorKind::NotFound)))?;
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut bytes).map_err(|e| io_at(&path, e))?;
+    Ok((file, bytes))
+}
+
+/// Copy `<backup_dir>/<rel>` to `to` from the descriptor [`open_regular`] checked, keeping the
+/// source's permission bits as `fs::copy` would.
+fn copy_regular(backup_dir: &Path, rel: &str, to: &Path) -> Result<(), BackupError> {
+    let (file, bytes) = read_regular(backup_dir, rel)?;
+    let mode = file
+        .metadata()
+        .map_err(|e| io_at(&backup_dir.join(rel), e))?
+        .permissions();
+    std::fs::write(to, bytes).map_err(|e| io_at(to, e))?;
+    std::fs::set_permissions(to, mode).map_err(|e| io_at(to, e))
+}
+
+/// A backup id this writer produces (`b-{ts_ms:012x}-{boot:08x}`): `b-`, at least 12 lowercase
+/// hex digits, `-`, at least 8 lowercase hex digits. Nothing else can name a path component.
+fn is_backup_id(id: &str) -> bool {
+    let hex = |part: &str, min: usize| {
+        part.len() >= min
+            && part
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    };
+    id.strip_prefix(BACKUP_PREFIX)
+        .and_then(|rest| rest.split_once('-'))
+        .is_some_and(|(ts, boot)| hex(ts, 12) && hex(boot, 8))
+}
+
 /// Every `*.brief` under `<work>/briefs`, by file name; none when the dir is absent.
 fn briefs(work: &Path) -> Result<Vec<PathBuf>, BackupError> {
     let dir = work.join(BRIEFS_DIR);
@@ -194,8 +310,10 @@ fn file_name(path: &Path) -> Result<String, BackupError> {
 }
 
 /// Snapshot `store` and copy every brief under `<work_briefs>/briefs/` into
-/// `<dest_root>/<id>/`, then write `manifest.json` last (renamed into place). Returns the
-/// report; the backup dir is `report.dir`.
+/// `<dest_root>/<id>/`, then write `manifest.json` last (renamed into place). Only after that
+/// rename succeeds, retention ([`retain`], [`BACKUP_KEEP`]) removes the older complete `b-*`
+/// backups under `dest_root`, never the one just written; the removed ids are
+/// `report.pruned`. Returns the report; the backup dir is `report.dir`.
 ///
 /// # Errors
 /// [`BackupError::SameDevice`] under [`SameDisk::Refuse`] when `dest_root` is on the
@@ -258,6 +376,7 @@ pub fn backup_to(
         "files": files,
     });
     write_manifest_last(&dir, &manifest)?;
+    let (pruned, prune_failed) = prune(dest_root, &id, BACKUP_KEEP);
     Ok(BackupReport {
         id,
         dir,
@@ -267,7 +386,93 @@ pub fn backup_to(
         task_count,
         objects_n: objects.len(),
         ledger_sha256,
+        pruned,
+        prune_failed,
     })
+}
+
+/// Every complete backup directly under `root`: a real directory (not a symlink) named
+/// `b-*` whose `manifest.json` parses with an `id` equal to the name and an integer `ts_ms`.
+/// An incomplete, foreign or unreadable entry is not listed, so retention never touches it.
+fn complete_backups(root: &Path) -> Result<Vec<BackupMeta>, std::io::Error> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !name.starts_with(BACKUP_PREFIX) || !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(entry.path().join(MANIFEST_FILE)) else {
+            continue;
+        };
+        let Ok(manifest) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        let id = manifest.get("id").and_then(Value::as_str);
+        let ts_ms = manifest.get("ts_ms").and_then(Value::as_i64);
+        if let (Some(id), Some(ts_ms)) = (id, ts_ms)
+            && id == name
+        {
+            out.push(BackupMeta { id: name, ts_ms });
+        }
+    }
+    Ok(out)
+}
+
+/// Remove what [`retain`] names under `root`: each is renamed to `.pruning-<id>` first (so a
+/// half-removed backup is never mistaken for a complete one), then removed; a `.pruning-*`
+/// left by an interrupted earlier prune is removed too. A backup another writer already
+/// removed (`NotFound`) is neither pruned nor failed here.
+fn prune(root: &Path, just_written: &str, keep: usize) -> (Vec<String>, Vec<PruneFailure>) {
+    let mut pruned = Vec::new();
+    let mut failed = Vec::new();
+    let metas = match complete_backups(root) {
+        Ok(metas) => metas,
+        Err(e) => {
+            failed.push(PruneFailure {
+                path: root.to_path_buf(),
+                kind: e.kind(),
+            });
+            return (pruned, failed);
+        }
+    };
+    let mut doomed: Vec<(Option<String>, PathBuf)> = Vec::new();
+    for id in retain(&metas, keep, just_written) {
+        let from = root.join(&id);
+        let to = root.join(format!("{PRUNING_PREFIX}{id}"));
+        match std::fs::rename(&from, &to) {
+            Ok(()) => doomed.push((Some(id), to)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => failed.push(PruneFailure {
+                path: from,
+                kind: e.kind(),
+            }),
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let stale = entry.file_name().to_str().is_some_and(|n| {
+                n.strip_prefix(PRUNING_PREFIX)
+                    .is_some_and(|id| id.starts_with(BACKUP_PREFIX))
+            });
+            if stale && !doomed.iter().any(|(_, p)| *p == entry.path()) {
+                doomed.push((None, entry.path()));
+            }
+        }
+    }
+    for (id, path) in doomed {
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => pruned.extend(id),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => failed.push(PruneFailure {
+                path,
+                kind: e.kind(),
+            }),
+        }
+    }
+    (pruned, failed)
 }
 
 /// Write `manifest.json.tmp`, fsync it, rename it to `manifest.json`: the manifest exists only
@@ -285,6 +490,25 @@ fn write_manifest_last(dir: &Path, manifest: &Value) -> Result<(), BackupError> 
     Ok(())
 }
 
+/// A manifest `files` key this writer produces: `ledger.sqlite3`, or `objects/<name>.brief`
+/// where `<name>.brief` is one normal path component (no `/`, not `.` or `..`).
+fn is_manifest_key(key: &str) -> bool {
+    if key == LEDGER_FILE {
+        return true;
+    }
+    let Some(name) = key
+        .strip_prefix(OBJECTS_DIR)
+        .and_then(|rest| rest.strip_prefix('/'))
+    else {
+        return false;
+    };
+    let mut parts = Path::new(name).components();
+    matches!(
+        (parts.next(), parts.next()),
+        (Some(std::path::Component::Normal(one)), None) if one == name
+    ) && Path::new(name).extension().is_some_and(|e| e == BRIEF_EXT)
+}
+
 fn field<'a>(manifest: &'a Value, name: &'static str) -> Result<&'a Value, BackupError> {
     manifest
         .get(name)
@@ -300,23 +524,28 @@ fn field<'a>(manifest: &'a Value, name: &'static str) -> Result<&'a Value, Backu
 /// retry is not `TargetOccupied`; the failure is the restore's only output.
 ///
 /// # Errors
+/// [`BackupError::Manifest`] (`files`) for a key other than `ledger.sqlite3` or
+/// `objects/<name>.brief`, and (`id`) for an id not of the writer's `b-<hex12>-<hex8>` shape,
+/// both before any backup file other than the manifest is read;
+/// [`BackupError::NotRegular`] when the manifest, the ledger, `objects/` or an object is a
+/// symlink or not a regular file (nothing is followed out of the backup dir);
 /// [`BackupError::Incomplete`] (no manifest, or no ledger), [`BackupError::TargetOccupied`],
 /// [`BackupError::ObjectsMissing`], [`BackupError::DigestMismatch`]; [`BackupError::Store`]
 /// when the staged ledger cannot be opened or reconciled (a snapshot newer than this binary
 /// answers `UnknownMigration`); IO errors.
 pub fn restore(backup_dir: &Path, into: &Path) -> Result<RestoreReport, BackupError> {
     let started = Instant::now();
-    let manifest_path = backup_dir.join(MANIFEST_FILE);
-    if !manifest_path.is_file() {
-        return Err(BackupError::Incomplete {
-            dir: backup_dir.to_path_buf(),
-        });
+    let incomplete = || BackupError::Incomplete {
+        dir: backup_dir.to_path_buf(),
+    };
+    if open_regular(backup_dir, MANIFEST_FILE)?.is_none() {
+        return Err(incomplete());
     }
-    let manifest: Value = serde_json::from_slice(
-        &std::fs::read(&manifest_path).map_err(|e| io_at(&manifest_path, e))?,
-    )?;
+    let manifest: Value = serde_json::from_slice(&read_regular(backup_dir, MANIFEST_FILE)?.1)?;
+    // The id names the staging dir under `into`; only the writer's own shape is joined.
     let backup_id = field(&manifest, "id")?
         .as_str()
+        .filter(|id| is_backup_id(id))
         .ok_or(BackupError::Manifest { field: "id" })?
         .to_owned();
     let old_epoch = field(&manifest, "epoch")?
@@ -326,6 +555,11 @@ pub fn restore(backup_dir: &Path, into: &Path) -> Result<RestoreReport, BackupEr
     let files = field(&manifest, "files")?
         .as_object()
         .ok_or(BackupError::Manifest { field: "files" })?;
+    // Every key is a path inside the backup dir that this writer could have written; anything
+    // else ('..', an absolute path, a nested dir) is refused before any file is read.
+    if !files.keys().all(|key| is_manifest_key(key)) {
+        return Err(BackupError::Manifest { field: "files" });
+    }
     let ledger_sha256 = files
         .get(LEDGER_FILE)
         .and_then(Value::as_str)
@@ -338,17 +572,26 @@ pub fn restore(backup_dir: &Path, into: &Path) -> Result<RestoreReport, BackupEr
             path: target_ledger,
         });
     }
-    if !backup_dir.join(LEDGER_FILE).is_file() {
-        return Err(BackupError::Incomplete {
-            dir: backup_dir.to_path_buf(),
-        });
+    if open_regular(backup_dir, LEDGER_FILE)?.is_none() {
+        return Err(incomplete());
     }
     let objects: Vec<&String> = files.keys().filter(|k| *k != LEDGER_FILE).collect();
     let objects_total = objects.len();
-    let present = objects
-        .iter()
-        .filter(|rel| backup_dir.join(rel).is_file())
-        .count();
+    // `objects/` itself must be a real dir: a symlinked one would lead every object outside.
+    if objects_total > 0
+        && !std::fs::symlink_metadata(backup_dir.join(OBJECTS_DIR))
+            .is_ok_and(|m| m.file_type().is_dir())
+    {
+        return Err(BackupError::NotRegular {
+            file: OBJECTS_DIR.to_owned(),
+        });
+    }
+    let mut present = 0_usize;
+    for rel in &objects {
+        if open_regular(backup_dir, rel)?.is_some() {
+            present += 1;
+        }
+    }
     if present != objects_total {
         return Err(BackupError::ObjectsMissing {
             n: present,
@@ -359,7 +602,7 @@ pub fn restore(backup_dir: &Path, into: &Path) -> Result<RestoreReport, BackupEr
         let expected = expected
             .as_str()
             .ok_or(BackupError::Manifest { field: "files" })?;
-        if sha256_of(&backup_dir.join(rel))? != expected {
+        if Sha256Hex::digest(&read_regular(backup_dir, rel)?.1).to_string() != expected {
             return Err(BackupError::DigestMismatch { file: rel.clone() });
         }
     }
@@ -369,9 +612,9 @@ pub fn restore(backup_dir: &Path, into: &Path) -> Result<RestoreReport, BackupEr
         std::fs::remove_dir_all(&staging).map_err(|e| io_at(&staging, e))?;
     }
     let staged = stage(backup_dir, &staging, &objects, &old_epoch)
-        .and_then(|complete| move_into_place(&staging, into, &objects).map(|()| complete));
-    let recovery_complete = match staged {
-        Ok(complete) => complete,
+        .and_then(|done| move_into_place(&staging, into, &objects).map(|()| done));
+    let (recovery_complete, objects_n) = match staged {
+        Ok(done) => done,
         Err(e) => {
             if staging.exists() {
                 std::fs::remove_dir_all(&staging).map_err(|e| io_at(&staging, e))?;
@@ -382,7 +625,7 @@ pub fn restore(backup_dir: &Path, into: &Path) -> Result<RestoreReport, BackupEr
     Ok(RestoreReport {
         backup_id,
         ledger_sha256,
-        objects_n: objects_total,
+        objects_n,
         objects_total,
         recovery_complete,
         rto_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -390,7 +633,8 @@ pub fn restore(backup_dir: &Path, into: &Path) -> Result<RestoreReport, BackupEr
 }
 
 /// Copy the verified ledger and objects into `staging`, open the staged ledger, mark
-/// `restored_from`, renew the epoch and reconcile there. Returns `reconcile`'s `complete`. The
+/// `restored_from`, renew the epoch and reconcile there. Returns `reconcile`'s `complete` and
+/// the number of objects actually staged (the report's `objects_n`). The
 /// `Store` is dropped before returning, so the staged ledger has no open connection (and, under
 /// WAL, no live `-wal`/`-shm`) when it is renamed.
 fn stage(
@@ -398,20 +642,25 @@ fn stage(
     staging: &Path,
     objects: &[&String],
     old_epoch: &str,
-) -> Result<bool, BackupError> {
+) -> Result<(bool, usize), BackupError> {
     let briefs_dir = staging.join("work").join(BRIEFS_DIR);
     std::fs::create_dir_all(&briefs_dir).map_err(|e| io_at(&briefs_dir, e))?;
-    copy(&backup_dir.join(LEDGER_FILE), &staging.join(LEDGER_FILE))?;
+    copy_regular(backup_dir, LEDGER_FILE, &staging.join(LEDGER_FILE))?;
+    let mut staged = 0_usize;
     for rel in objects {
-        let src = backup_dir.join(rel);
-        copy(&src, &briefs_dir.join(file_name(&src)?))?;
+        copy_regular(
+            backup_dir,
+            rel,
+            &briefs_dir.join(file_name(Path::new(rel))?),
+        )?;
+        staged += 1;
     }
     let store = Store::open(&staging.join(LEDGER_FILE))?;
     store.mark_restored_from(old_epoch)?;
     store.renew_epoch()?;
     let report = reconcile(&store, &Observations::default())?;
     drop(store);
-    Ok(report.complete)
+    Ok((report.complete, staged))
 }
 
 /// Rename the staged briefs into `<into>/work/briefs/`, then the ledger's `-wal`/`-shm` when

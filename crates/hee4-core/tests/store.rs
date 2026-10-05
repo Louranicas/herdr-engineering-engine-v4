@@ -5,9 +5,10 @@ use std::error::Error;
 use std::path::PathBuf;
 
 use hee4_contracts::{
-    Decision, Event, GitSha, Observation, ObservationId, Outcome, Phase, Receipt, ReceiptBody,
-    RecoveryRule, Refusal, Settlement, Sha256Hex, TaskId, ToolId, Verdict,
+    Decision, Event, GitSha, Observation, ObservationId, Outcome, Phase, Reason, Receipt,
+    ReceiptBody, RecoveryRule, Refusal, Settlement, Sha256Hex, TaskId, ToolId, Verdict,
 };
+use hee4_core::recovery::SealedStep;
 use hee4_core::{
     AttemptOutcome, AttemptState, Cleanup, Observations, OperationKey, Store, StoreError, reconcile,
 };
@@ -433,5 +434,187 @@ fn operation_readbacks_by_key_and_by_subject() -> R {
     );
     assert_eq!(store.last_operation_for("nobody")?, None);
     assert_eq!(store.operation_by_key(&op("k-none"))?, None);
+    Ok(())
+}
+
+/// `task` taken to `verifying` the way the dispatcher does it, with one ledgered observation
+/// (`o-<task>`) and its `Observe`; returns that observation's id.
+fn to_verifying(store: &Store, task: &TaskId) -> Result<ObservationId, Box<dyn Error>> {
+    store.apply(task, Event::Admit)?;
+    store.apply(task, Event::Dispatch)?;
+    store.apply(task, Event::Settle(Settlement::Ready))?;
+    let obs: ObservationId = format!("o-{task}").parse()?;
+    store.record_observation(task, &obs, &observation()?)?;
+    store.apply(task, Event::Observe)?;
+    Ok(obs)
+}
+
+fn sealed(
+    task: &TaskId,
+    id: &str,
+    prev: Sha256Hex,
+    verdict: Verdict,
+    observed: Vec<ObservationId>,
+) -> Result<Receipt, Box<dyn Error>> {
+    Ok(Receipt::seal(
+        prev,
+        ReceiptBody {
+            id: id.parse()?,
+            task_id: task.clone(),
+            decision: Decision { verdict },
+            observed,
+        },
+    ))
+}
+
+/// The one-transaction door: when the `Decide` inside `seal_and_decide` is refused, the receipt
+/// it would have sealed is not written either (and a chain break writes no event).
+#[test]
+fn seal_and_decide_is_one_transaction() -> R {
+    let store = ready("seal-one-tx")?;
+    let t = tid("t1")?;
+    store.apply(&t, Event::Admit)?;
+    let obs: ObservationId = "o1".parse()?;
+    store.record_observation(&t, &obs, &observation()?)?;
+    let events = store.history(&t)?;
+    let receipt = sealed(&t, "r1", Sha256Hex::GENESIS, Verdict::Pass, vec![obs])?;
+    let err = store.seal_and_decide(&receipt);
+    assert!(
+        matches!(err, Err(StoreError::Refused(Refusal::Illegal { .. }))),
+        "admitted refuses Decide: {err:?}"
+    );
+    assert_eq!(
+        store.receipt_count(&t)?,
+        0,
+        "the refused Decide took the seal with it"
+    );
+    assert_eq!(store.history(&t)?, events, "no event either");
+    assert_eq!(store.chain_head(&t)?, Sha256Hex::GENESIS);
+
+    // The other order: a receipt that breaks the chain writes no `Decide`.
+    let v = tid("t2")?;
+    let obs = to_verifying(&store, &v)?;
+    let events = store.history(&v)?;
+    let fork = sealed(
+        &v,
+        "r2",
+        Sha256Hex::digest(b"not-genesis"),
+        Verdict::Pass,
+        vec![obs],
+    )?;
+    assert!(matches!(
+        store.seal_and_decide(&fork),
+        Err(StoreError::Chain(_))
+    ));
+    assert_eq!(store.receipt_count(&v)?, 0);
+    assert_eq!(store.history(&v)?, events);
+    assert_eq!(store.phase(&v)?, Some(Phase::Verifying));
+    Ok(())
+}
+
+/// One call per verdict ends the task where `transition` sends that verdict, with the seal
+/// and every event in one commit: Pass → accepted (`decide`, `accept`), Fail → `repair_pending`
+/// (the transition table's landing for a failed verification), Refused(Error) → failed.
+#[test]
+fn seal_and_decide_pass_ends_accepted_fail_ends_failed() -> R {
+    let store = ready("seal-verdicts")?;
+    let ready_settle = Event::Settle(Settlement::Ready);
+    for (name, verdict, phase, tail) in [
+        (
+            "pass",
+            Verdict::Pass,
+            Phase::Accepted,
+            vec![Event::Decide(Verdict::Pass), Event::Accept],
+        ),
+        (
+            "fail",
+            Verdict::Fail,
+            Phase::RepairPending,
+            vec![Event::Decide(Verdict::Fail)],
+        ),
+        (
+            "refused",
+            Verdict::Refused(Reason::Error),
+            Phase::Failed,
+            vec![Event::Decide(Verdict::Refused(Reason::Error))],
+        ),
+    ] {
+        let t = tid(name)?;
+        let obs = to_verifying(&store, &t)?;
+        let before = store.event_count()?;
+        let receipt = sealed(
+            &t,
+            &format!("r-{name}"),
+            Sha256Hex::GENESIS,
+            verdict,
+            vec![obs],
+        )?;
+        assert_eq!(store.seal_and_decide(&receipt)?, phase, "{name}");
+        assert_eq!(store.phase(&t)?, Some(phase));
+        assert_eq!(store.chain_head(&t)?, receipt.hash_self());
+        assert_eq!(store.receipt_count(&t)?, 1);
+        let mut expected = vec![Event::Admit, Event::Dispatch, ready_settle, Event::Observe];
+        expected.extend(tail.iter().copied());
+        assert_eq!(store.history(&t)?, expected, "{name}");
+        assert_eq!(store.event_count()? - before, tail.len() as u64, "{name}");
+        assert_eq!(store.cached(&t)?.ok_or("row")?.phase, phase.as_str());
+        assert_eq!(
+            store.finish_sealed(&t)?,
+            None,
+            "nothing left to finish: {name}"
+        );
+    }
+    Ok(())
+}
+
+/// Two writers on one file race to finish the same legacy sealed-but-undecided task: the
+/// check runs inside each writer's `BEGIN IMMEDIATE`, so exactly one `Decide` and one
+/// `Accept` are written and the loser answers `None`.
+#[test]
+fn finish_sealed_two_writers_finish_once() -> R {
+    let path = db("finish-two-writers")?;
+    let store = Store::open(&path)?;
+    assert!(reconcile(&store, &Observations::default())?.complete);
+    let t = tid("t1")?;
+    let obs = to_verifying(&store, &t)?;
+    store.append_receipt(&sealed(
+        &t,
+        "r1",
+        Sha256Hex::GENESIS,
+        Verdict::Pass,
+        vec![obs],
+    )?)?;
+    drop(store);
+    let barrier = std::sync::Barrier::new(2);
+    let outcomes = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                scope.spawn(|| -> Result<_, String> {
+                    let writer = Store::open(&path).map_err(|e| e.to_string())?;
+                    barrier.wait();
+                    writer.finish_sealed(&t).map_err(|e| e.to_string())
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().map_err(|_| "writer panicked".to_owned())?)
+            .collect::<Result<Vec<_>, String>>()
+    })?;
+    let finished: Vec<_> = outcomes.iter().flatten().collect();
+    assert_eq!(finished.len(), 1, "{outcomes:?}");
+    assert_eq!(finished[0].step, SealedStep::DecideFromSeal);
+    assert_eq!(finished[0].phase, Phase::Accepted);
+    let store = Store::open(&path)?;
+    let history = store.history(&t)?;
+    assert_eq!(
+        history
+            .iter()
+            .filter(|e| matches!(e, Event::Decide(_)))
+            .count(),
+        1,
+        "{history:?}"
+    );
+    assert_eq!(history.last(), Some(&Event::Accept));
     Ok(())
 }

@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use hee4_contracts::{Event, Sha256Hex};
-use hee4_core::backup::{backup_to, restore};
+use hee4_core::backup::{BACKUP_KEEP, BackupMeta, backup_to, restore, retain};
 use hee4_core::{BackupError, CursorVerdict, Observations, SameDisk, Store, StoreError, reconcile};
 use serde_json::Value;
 
@@ -343,4 +343,352 @@ fn a_restore_whose_open_fails_leaves_nothing_behind_and_the_retry_is_not_occupie
         CursorVerdict::PriorEpochOfRestore
     );
     Ok(())
+}
+
+/// A copy of a good backup whose manifest also lists `key` with the sha256 of `outside`, a
+/// file outside the backup dir that is then made unreadable (mode 000): a restore that read
+/// it would answer `Io`, one that copied it would succeed.
+fn backup_with_foreign_key(
+    base: &Path,
+    key: &str,
+    outside: &Path,
+) -> Result<PathBuf, Box<dyn Error>> {
+    use std::os::unix::fs::PermissionsExt;
+    let (ledger, work) = seed(base, 2)?;
+    let store = Store::open(&ledger)?;
+    store.apply(&"t-000".parse()?, Event::Admit)?;
+    let backup = backup_to(&store, &work, &base.join("backups"), SameDisk::Allow)?;
+    let tampered = base.join("tampered");
+    copy_tree(&backup.dir, &tampered)?;
+    std::fs::write(outside, b"outside the backup\n")?;
+    let mut m = manifest(&tampered)?;
+    m["files"][key] = Value::from(Sha256Hex::digest(&std::fs::read(outside)?).to_string());
+    std::fs::write(
+        tampered.join("manifest.json"),
+        serde_json::to_vec_pretty(&m)?,
+    )?;
+    std::fs::set_permissions(outside, std::fs::Permissions::from_mode(0o000))?;
+    Ok(tampered)
+}
+
+/// `into` holds no ledger, no brief and no `.restore-*.tmp`.
+fn nothing_staged(into: &Path) -> R {
+    let mut left = Vec::new();
+    if into.exists() {
+        walk(into, into, &mut left)?;
+        for entry in std::fs::read_dir(into)? {
+            left.push(entry?.file_name().to_string_lossy().into_owned());
+        }
+    }
+    assert!(left.is_empty(), "nothing is read or staged: {left:?}");
+    Ok(())
+}
+
+#[test]
+fn restore_refuses_a_dotdot_key() -> R {
+    let base = scratch("dotdot-key")?;
+    let outside = base.join("x");
+    let tampered = backup_with_foreign_key(&base, "../x", &outside)?;
+    let into = base.join("into");
+    let err = restore(&tampered, &into);
+    assert!(
+        matches!(&err, Err(BackupError::Manifest { field: "files" })),
+        "{err:?}"
+    );
+    nothing_staged(&into)
+}
+
+#[test]
+fn restore_refuses_an_absolute_key() -> R {
+    let base = scratch("absolute-key")?;
+    let outside = base.join("hostname");
+    let key = outside.display().to_string();
+    assert!(key.starts_with('/'), "an absolute key: {key}");
+    let tampered = backup_with_foreign_key(&base, &key, &outside)?;
+    let into = base.join("into");
+    let err = restore(&tampered, &into);
+    assert!(
+        matches!(&err, Err(BackupError::Manifest { field: "files" })),
+        "{err:?}"
+    );
+    nothing_staged(&into)?;
+    // A nested key under objects/ is refused the same way.
+    let mut m = manifest(&tampered)?;
+    let files = m["files"].as_object_mut().ok_or("files")?;
+    files.retain(|k, _| !k.starts_with('/'));
+    let sha = files.get("objects/t-000.brief").cloned().ok_or("t-000")?;
+    files.insert("objects/sub/t-000.brief".into(), sha);
+    std::fs::write(
+        tampered.join("manifest.json"),
+        serde_json::to_vec_pretty(&m)?,
+    )?;
+    let err = restore(&tampered, &into);
+    assert!(
+        matches!(&err, Err(BackupError::Manifest { field: "files" })),
+        "{err:?}"
+    );
+    nothing_staged(&into)
+}
+
+/// `objects_n` is the number of briefs staged and moved into place, checked against a
+/// manifest that lists N of them.
+#[test]
+fn restore_objects_n_counts_the_staged_briefs() -> R {
+    let base = scratch("objects-n")?;
+    let n = 4;
+    let (ledger, work) = seed(&base, n)?;
+    let store = Store::open(&ledger)?;
+    store.apply(&"t-000".parse()?, Event::Admit)?;
+    let backup = backup_to(&store, &work, &base.join("backups"), SameDisk::Allow)?;
+    let listed = manifest(&backup.dir)?["files"]
+        .as_object()
+        .ok_or("files")?
+        .keys()
+        .filter(|k| k.starts_with("objects/"))
+        .count();
+    assert_eq!(listed, n);
+    let into = base.join("into");
+    let report = restore(&backup.dir, &into)?;
+    let mut restored = Vec::new();
+    let briefs = into.join("work").join("briefs");
+    walk(&briefs, &briefs, &mut restored)?;
+    assert_eq!((report.objects_n, report.objects_total), (n, n));
+    assert_eq!(restored.len(), report.objects_n);
+    Ok(())
+}
+
+/// A copy of a good backup with two briefs, made in `<base>/tampered`.
+fn tampered_copy(base: &Path) -> Result<PathBuf, Box<dyn Error>> {
+    let (ledger, work) = seed(base, 2)?;
+    let store = Store::open(&ledger)?;
+    store.apply(&"t-000".parse()?, Event::Admit)?;
+    let backup = backup_to(&store, &work, &base.join("backups"), SameDisk::Allow)?;
+    let tampered = base.join("tampered");
+    copy_tree(&backup.dir, &tampered)?;
+    Ok(tampered)
+}
+
+/// Replace `<dir>/<rel>` by a symlink to a file outside the backup with the same bytes (so
+/// its sha matches the manifest), then make that outside file unreadable: a restore that
+/// followed the link would answer `Io` or stage it.
+fn symlink_out(dir: &Path, rel: &str, outside: &Path) -> R {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::copy(dir.join(rel), outside)?;
+    std::fs::remove_file(dir.join(rel))?;
+    std::os::unix::fs::symlink(outside, dir.join(rel))?;
+    std::fs::set_permissions(outside, std::fs::Permissions::from_mode(0o000))?;
+    Ok(())
+}
+
+/// A symlinked object, a symlinked ledger and a symlinked `objects/` dir are each refused as
+/// `NotRegular` naming the file; nothing is read through the link or staged.
+#[test]
+fn restore_refuses_a_symlinked_object() -> R {
+    for (case, rel) in [
+        ("object", "objects/t-000.brief"),
+        ("ledger", "ledger.sqlite3"),
+    ] {
+        let base = scratch(&format!("symlinked-{case}"))?;
+        let tampered = tampered_copy(&base)?;
+        symlink_out(&tampered, rel, &base.join("outside"))?;
+        let into = base.join("into");
+        let err = restore(&tampered, &into);
+        assert!(
+            matches!(&err, Err(BackupError::NotRegular { file }) if file == rel),
+            "{case}: {err:?}"
+        );
+        nothing_staged(&into)?;
+    }
+    let base = scratch("symlinked-objects-dir")?;
+    let tampered = tampered_copy(&base)?;
+    let outside = base.join("outside-objects");
+    std::fs::rename(tampered.join("objects"), &outside)?;
+    std::os::unix::fs::symlink(&outside, tampered.join("objects"))?;
+    let into = base.join("into");
+    let err = restore(&tampered, &into);
+    assert!(
+        matches!(&err, Err(BackupError::NotRegular { file }) if file == "objects"),
+        "{err:?}"
+    );
+    nothing_staged(&into)
+}
+
+/// A manifest `id` is joined into the staging path, so one not of the writer's shape is
+/// refused before anything is joined: an id that climbs out of `into` leaves a pre-existing
+/// directory there (the one a failed restore would `remove_dir_all`) untouched.
+#[test]
+fn restore_refuses_a_traversing_id() -> R {
+    let base = scratch("traversing-id")?;
+    let tampered = tampered_copy(&base)?;
+    let into = base.join("into");
+    // `<into>/.restore-/../../victim.tmp` resolves to `<base>/victim.tmp` once `.restore-`
+    // exists.
+    std::fs::create_dir_all(into.join(".restore-"))?;
+    let victim = base.join("victim.tmp");
+    std::fs::create_dir_all(&victim)?;
+    std::fs::write(victim.join("precious.txt"), b"keep me\n")?;
+    for id in [
+        "/../../victim",
+        "b-000000000000-00000000/../../../victim",
+        "b-../../victim",
+        "b-0000000000AB-00000000",
+        "",
+    ] {
+        let mut m = manifest(&tampered)?;
+        m["id"] = Value::from(id);
+        std::fs::write(
+            tampered.join("manifest.json"),
+            serde_json::to_vec_pretty(&m)?,
+        )?;
+        let err = restore(&tampered, &into);
+        assert!(
+            matches!(&err, Err(BackupError::Manifest { field: "id" })),
+            "{id:?}: {err:?}"
+        );
+        assert_eq!(std::fs::read(victim.join("precious.txt"))?, b"keep me\n");
+        assert!(
+            !into.join("ledger.sqlite3").exists(),
+            "{id:?} staged a ledger"
+        );
+    }
+    Ok(())
+}
+
+/// A complete backup as far as retention can tell: a `b-*` dir whose manifest names it.
+fn plant_backup(root: &Path, id: &str, ts_ms: i64) -> R {
+    let dir = root.join(id);
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("ledger.sqlite3"), b"planted")?;
+    std::fs::write(
+        dir.join("manifest.json"),
+        serde_json::to_vec(&serde_json::json!({"id": id, "ts_ms": ts_ms}))?,
+    )?;
+    Ok(())
+}
+
+fn complete_ids(root: &Path) -> Result<Vec<String>, Box<dyn Error>> {
+    let mut ids = Vec::new();
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with("b-") && entry.path().join("manifest.json").is_file() {
+            ids.push(name);
+        }
+    }
+    ids.sort();
+    Ok(ids)
+}
+
+/// KEEP+3 planted complete backups (ids in the opposite order to their `ts_ms`, one
+/// future-dated with the lexically smallest id), then one real backup: exactly KEEP complete
+/// backups remain, the just-written one and the newest by `ts_ms` among them; an incomplete
+/// `b-*` dir, a foreign file and a non-`b-*` dir with a manifest are untouched.
+#[test]
+fn retention_keeps_the_newest_and_never_the_just_written() -> R {
+    let base = scratch("retention")?;
+    let (ledger, work) = seed(&base, 1)?;
+    let store = Store::open(&ledger)?;
+    store.apply(&"t-000".parse()?, Event::Admit)?;
+    let root = base.join("backups");
+    std::fs::create_dir_all(&root)?;
+    let now = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis(),
+    )?;
+    let mut planted: Vec<BackupMeta> = Vec::new();
+    let future = BackupMeta {
+        id: format!("b-{:012x}-{:08x}", 0, 0),
+        ts_ms: now + 86_400_000,
+    };
+    plant_backup(&root, &future.id, future.ts_ms)?;
+    planted.push(future.clone());
+    for i in 1..BACKUP_KEEP + 3 {
+        let step = i64::try_from(i)?;
+        let meta = BackupMeta {
+            id: format!("b-{i:012x}-{:08x}", 0),
+            ts_ms: now - 60_000 * step * step,
+        };
+        plant_backup(&root, &meta.id, meta.ts_ms)?;
+        planted.push(meta);
+    }
+    std::fs::create_dir_all(root.join("b-ffffffffffff-incomplete"))?;
+    std::fs::write(root.join("backup.log"), b"foreign\n")?;
+    plant_backup(&root.join("keepme"), "keepme", 0)?;
+
+    let report = backup_to(&store, &work, &root, SameDisk::Allow)?;
+    let remaining = complete_ids(&root)?;
+    assert_eq!(remaining.len(), BACKUP_KEEP, "{remaining:?}");
+    assert!(
+        remaining.contains(&report.id),
+        "the just-written backup stays"
+    );
+    assert!(
+        remaining.contains(&future.id),
+        "ordered by ts_ms, not by name"
+    );
+    let mut by_age = planted.clone();
+    by_age.sort_by_key(|m| std::cmp::Reverse(m.ts_ms));
+    let mut expected_pruned: Vec<String> = by_age[BACKUP_KEEP - 1..]
+        .iter()
+        .map(|m| m.id.clone())
+        .collect();
+    expected_pruned.sort();
+    let mut pruned = report.pruned.clone();
+    pruned.sort();
+    assert_eq!(pruned, expected_pruned);
+    assert_eq!(report.prune_failed, vec![]);
+    assert!(
+        root.join("b-ffffffffffff-incomplete").is_dir(),
+        "incomplete untouched"
+    );
+    assert_eq!(std::fs::read(root.join("backup.log"))?, b"foreign\n");
+    assert!(
+        root.join("keepme")
+            .join("keepme")
+            .join("manifest.json")
+            .is_file()
+    );
+    let leftovers: Vec<String> = std::fs::read_dir(&root)?
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(".pruning-"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+
+    // A second backup prunes exactly one more and still keeps KEEP.
+    let again = backup_to(&store, &work, &root, SameDisk::Allow)?;
+    assert_eq!(complete_ids(&root)?.len(), BACKUP_KEEP);
+    assert_eq!(again.pruned.len(), 1);
+    assert!(
+        !again.pruned.contains(&report.id) && !again.pruned.contains(&future.id),
+        "{:?}",
+        again.pruned
+    );
+    Ok(())
+}
+
+/// The pure rule: the just-written id is never returned, even when it is the oldest and
+/// `keep` is 0.
+#[test]
+fn retain_never_returns_the_just_written() {
+    let metas: Vec<BackupMeta> = (0..4)
+        .map(|i| BackupMeta {
+            id: format!("b-{i}"),
+            ts_ms: i,
+        })
+        .collect();
+    for keep in 0..6 {
+        let gone = retain(&metas, keep, "b-0");
+        assert!(!gone.contains(&"b-0".to_owned()), "keep={keep}");
+        assert_eq!(
+            gone.len(),
+            4_usize.saturating_sub(keep.max(1)),
+            "keep={keep}"
+        );
+    }
+    assert_eq!(
+        retain(&metas, 2, "b-0"),
+        vec!["b-2".to_owned(), "b-1".to_owned()]
+    );
 }

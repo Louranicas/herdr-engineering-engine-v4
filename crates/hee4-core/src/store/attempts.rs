@@ -937,14 +937,11 @@ mod tests {
         let d = row(&decided).ok_or("decided row")?;
         assert_eq!(
             (d.rule, d.after),
-            (
-                Some(RecoveryRule::R12VerificationBoundary),
-                Phase::Verifying
-            )
+            (Some(RecoveryRule::R12VerificationBoundary), Phase::Accepted)
         );
         assert_eq!(
             (report.applied, report.complete),
-            (1, true),
+            (2, true),
             "{:?}",
             report.findings
         );

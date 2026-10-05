@@ -39,7 +39,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use hee4_contracts::{
     ChainBreak, Event, Observation, ObservationId, Phase, Receipt, Refusal, Sha256Hex, TaskId,
-    TaskState, transition,
+    TaskState, Verdict, transition,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::Value;
@@ -443,6 +443,96 @@ fn apply_in(
     Ok(phase)
 }
 
+/// [`Store::append_receipt`]'s body inside the caller's transaction: verify the chain with the
+/// new receipt, check every cited observation is ledgered for its task, insert the row.
+fn append_receipt_in(tx: &Transaction<'_>, receipt: &Receipt) -> Result<(), StoreError> {
+    let task = receipt.task_id();
+    let mut chain = Vec::new();
+    {
+        let mut stmt =
+            tx.prepare_cached("SELECT json FROM receipts WHERE task_id = ?1 ORDER BY seq")?;
+        for json in stmt.query_map([task.as_str()], |r| r.get::<_, String>(0))? {
+            chain.push(serde_json::from_str::<Receipt>(&json?)?);
+        }
+    }
+    chain.push(receipt.clone());
+    Receipt::verify_chain(&chain).map_err(StoreError::Chain)?;
+    for obs in receipt.observed() {
+        let owner: Option<String> = tx
+            .query_row(
+                "SELECT task_id FROM observations WHERE id = ?1",
+                [obs.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if owner.as_deref() != Some(task.as_str()) {
+            return Err(StoreError::UnledgeredObservation(obs.clone()));
+        }
+    }
+    tx.execute(
+        "INSERT INTO receipts(id, task_id, json, hash_prev, hash_self, ts)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            receipt.id().as_str(),
+            task.as_str(),
+            serde_json::to_string(receipt)?,
+            receipt.hash_prev().to_string(),
+            receipt.hash_self().to_string(),
+            now_ms()
+        ],
+    )?;
+    Ok(())
+}
+
+/// What a `verifying` task that a non-atomic settle left behind still needs (R12's
+/// convergence). Only [`sealed_step`] chooses one; only [`Store::finish_sealed`] applies it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SealedStep {
+    /// The chain holds more receipts than the history holds `Decide`s: a receipt was sealed
+    /// and its `Decide` never written. The missing `Decide` carries the latest receipt's
+    /// sealed verdict (copied, never recomputed), then `Accept` on a `Pass`.
+    DecideFromSeal,
+    /// A `Decide(Pass)` follows the latest `Dispatch` and the task is still `verifying`: the
+    /// `Accept` was never written.
+    AcceptAfterPass,
+}
+
+/// What [`Store::finish_sealed`] applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SealedFinish {
+    /// Which convergence fired.
+    pub step: SealedStep,
+    /// The phase after the last event.
+    pub phase: Phase,
+    /// Events appended (1 or 2), all in one transaction.
+    pub events: usize,
+}
+
+/// The pure choice of [`SealedStep`] from a task's replayed phase, its history and its receipt
+/// count; `None` for every task that is not `verifying` or holds nothing sealed to finish (the
+/// unsealed `verifying` task stays R12's quarantine). Receipts beyond the `Decide` count win
+/// over an awaiting `Accept`, so a seal is never skipped.
+#[must_use]
+pub fn sealed_step(phase: Phase, history: &[Event], receipts: u64) -> Option<SealedStep> {
+    if phase != Phase::Verifying {
+        return None;
+    }
+    let decides = history
+        .iter()
+        .filter(|e| matches!(e, Event::Decide(_)))
+        .count();
+    if receipts > u64::try_from(decides).unwrap_or(u64::MAX) {
+        return Some(SealedStep::DecideFromSeal);
+    }
+    let last_decide_since_dispatch = history
+        .iter()
+        .rev()
+        .take_while(|e| **e != Event::Dispatch)
+        .find(|e| matches!(e, Event::Decide(_)));
+    (last_decide_since_dispatch == Some(&Event::Decide(Verdict::Pass)))
+        .then_some(SealedStep::AcceptAfterPass)
+}
+
 /// Apply every migration the file lacks, inside `tx`; seed a legacy file's rows from its
 /// `user_version`; refuse a row this binary does not know. Returns the count of applied rows.
 fn migrate(tx: &Transaction<'_>, list: &[migrations::Migration]) -> Result<usize, StoreError> {
@@ -772,49 +862,98 @@ impl Store {
 
     /// Append a sealed receipt to its task's chain. The chain with the new receipt must pass
     /// [`Receipt::verify_chain`] (so `hash_prev` is the last `hash_self` or `GENESIS`), and every
-    /// observation it cites must be ledgered for the same task.
+    /// observation it cites must be ledgered for the same task. Applies no event: the
+    /// dispatcher's settle path uses [`Store::seal_and_decide`], which seals and decides in one
+    /// transaction.
     ///
     /// # Errors
     /// [`StoreError::Chain`], [`StoreError::UnledgeredObservation`].
     pub fn append_receipt(&self, receipt: &Receipt) -> Result<(), StoreError> {
-        let task = receipt.task_id();
         let tx = self.begin()?;
-        let mut chain = Vec::new();
-        {
-            let mut stmt =
-                tx.prepare_cached("SELECT json FROM receipts WHERE task_id = ?1 ORDER BY seq")?;
-            for json in stmt.query_map([task.as_str()], |r| r.get::<_, String>(0))? {
-                chain.push(serde_json::from_str::<Receipt>(&json?)?);
-            }
-        }
-        chain.push(receipt.clone());
-        Receipt::verify_chain(&chain).map_err(StoreError::Chain)?;
-        for obs in receipt.observed() {
-            let owner: Option<String> = tx
-                .query_row(
-                    "SELECT task_id FROM observations WHERE id = ?1",
-                    [obs.as_str()],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            if owner.as_deref() != Some(task.as_str()) {
-                return Err(StoreError::UnledgeredObservation(obs.clone()));
-            }
-        }
-        tx.execute(
-            "INSERT INTO receipts(id, task_id, json, hash_prev, hash_self, ts)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                receipt.id().as_str(),
-                task.as_str(),
-                serde_json::to_string(receipt)?,
-                receipt.hash_prev().to_string(),
-                receipt.hash_self().to_string(),
-                now_ms()
-            ],
-        )?;
+        append_receipt_in(&tx, receipt)?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Seal `receipt` and apply its verdict in ONE `BEGIN IMMEDIATE` transaction: the chain
+    /// checks and insert of [`Store::append_receipt`], then `Decide(receipt.decision().verdict)`
+    /// and, when that leaves a `Pass` in `verifying`, `Accept`, each through `transition` (the
+    /// one writer). The verdict is the sealed one, never recomputed. Any refusal rolls the whole
+    /// transaction back: no receipt row and no event is written, so there is no state in which
+    /// a receipt is sealed and its `Decide` is missing. Returns the phase after the last event.
+    ///
+    /// # Errors
+    /// [`StoreError::Chain`], [`StoreError::UnledgeredObservation`]; [`StoreError::Refused`]
+    /// when `transition` refuses the `Decide` (for example, the task is not `verifying`).
+    pub fn seal_and_decide(&self, receipt: &Receipt) -> Result<Phase, StoreError> {
+        let task = receipt.task_id();
+        let verdict = receipt.decision().verdict;
+        let tx = self.begin()?;
+        append_receipt_in(&tx, receipt)?;
+        let mut phase = apply_in(&tx, &self.serve_cgroup, task, Event::Decide(verdict))?;
+        if verdict == Verdict::Pass && phase == Phase::Verifying {
+            phase = apply_in(&tx, &self.serve_cgroup, task, Event::Accept)?;
+        }
+        tx.commit()?;
+        Ok(phase)
+    }
+
+    /// Finish a `verifying` task a legacy, non-atomic settle left behind (R12's convergence,
+    /// level-triggered; `recovery::reconcile` is its caller). Inside one `BEGIN IMMEDIATE`
+    /// transaction it re-reads the history and the chain and picks [`sealed_step`]:
+    /// [`SealedStep::DecideFromSeal`] applies `Decide` with the verdict COPIED from the latest
+    /// sealed receipt (then `Accept` when that leaves a `Pass` in `verifying`);
+    /// [`SealedStep::AcceptAfterPass`] applies `Accept`. Nothing to finish (or another writer
+    /// finished it first) answers `None` and writes nothing, so a second call is a no-op.
+    ///
+    /// # Errors
+    /// [`StoreError::Refused`] from `transition`; [`StoreError::Corrupt`] for an unreadable
+    /// history or receipt.
+    pub fn finish_sealed(&self, task: &TaskId) -> Result<Option<SealedFinish>, StoreError> {
+        let tx = self.begin()?;
+        let history = load_events(&tx, task)?;
+        let Some(state) = replay(task, &history)? else {
+            return Ok(None);
+        };
+        let receipts: i64 = tx.query_row(
+            "SELECT count(*) FROM receipts WHERE task_id = ?1",
+            [task.as_str()],
+            |r| r.get(0),
+        )?;
+        let receipts = u64::try_from(receipts).unwrap_or(0);
+        let Some(step) = sealed_step(state.phase(), &history, receipts) else {
+            return Ok(None);
+        };
+        let decided_here = match step {
+            SealedStep::AcceptAfterPass => false,
+            SealedStep::DecideFromSeal => {
+                let json: String = tx.query_row(
+                    "SELECT json FROM receipts WHERE task_id = ?1 ORDER BY seq DESC LIMIT 1",
+                    [task.as_str()],
+                    |r| r.get(0),
+                )?;
+                let sealed: Receipt = serde_json::from_str(&json)
+                    .map_err(|e| corrupt(task, format!("latest receipt: {e}")))?;
+                let verdict = sealed.decision().verdict;
+                let phase = apply_in(&tx, &self.serve_cgroup, task, Event::Decide(verdict))?;
+                if verdict != Verdict::Pass || phase != Phase::Verifying {
+                    tx.commit()?;
+                    return Ok(Some(SealedFinish {
+                        step,
+                        phase,
+                        events: 1,
+                    }));
+                }
+                true
+            }
+        };
+        let phase = apply_in(&tx, &self.serve_cgroup, task, Event::Accept)?;
+        tx.commit()?;
+        Ok(Some(SealedFinish {
+            step,
+            phase,
+            events: if decided_here { 2 } else { 1 },
+        }))
     }
 
     /// The last `hash_self` of `task`'s chain, or `GENESIS`.
