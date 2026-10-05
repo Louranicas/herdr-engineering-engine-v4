@@ -880,14 +880,18 @@ fn is_close_frame(line: &str) -> bool {
     line.contains("\"kind\":\"close\"") && line.contains("slow_consumer")
 }
 
-/// A subscriber that reads one line per 64 submits is a slow consumer against a real
-/// `hee4 serve`: the submit loop stops at the first signal (the server's log line, a close frame
-/// or EOF on the subscriber) or at 3000 submits, and the wait after it is bounded by the same
-/// signals, so the test finishes in seconds without weakening `delivered || logged`.
+/// A subscriber that never reads is a slow consumer against a real `hee4 serve`: its queue
+/// accepts no frame for `stream.stall_ms` (set to 500 ms here through `HEE4_BUDGETS`, so the test
+/// stays fast). The submit loop never touches the subscriber; it stops at the server's log line
+/// or at 3000 submits, and the bounded drain after it then finds the close frame or EOF. (Before
+/// 2026-10-06 this test read one line per 64 submits, which the instant-drop rule also dropped;
+/// under the stall rule a draining reader is never dropped, so the test now truly never reads.)
 #[test]
 fn a_subscriber_that_never_reads_gets_the_close_frame_or_the_log_line() -> R<()> {
     let (_run, dir) = fsync_cheap_dir("e2e-slow")?;
-    let mut server = start(&dir, "serve.log")?;
+    let budgets = dir.join("budgets.json");
+    fs::write(&budgets, r#"{"stream":{"stall_ms":500}}"#)?;
+    let mut server = start_with(&dir, "serve.log", false, &[("HEE4_BUDGETS", &budgets)])?;
     let log = dir.join("serve.log");
     let mut sub = subscribe(&server.sock, 0, None)?;
     sub.get_ref()
@@ -915,15 +919,6 @@ fn a_subscriber_that_never_reads_gets_the_close_frame_or_the_log_line() -> R<()>
         }
         if log_says(&log, "slow_consumer") {
             signal = Some("log");
-        }
-        let mut l = String::new();
-        match sub.read_line(&mut l) {
-            Ok(0) => signal = Some("eof"),
-            Ok(_) if is_close_frame(&l) => {
-                delivered = true;
-                signal = Some("close_frame");
-            }
-            Ok(_) | Err(_) => {}
         }
     }
     // Bounded wait: drain the subscriber to the close frame or EOF, re-reading the log.

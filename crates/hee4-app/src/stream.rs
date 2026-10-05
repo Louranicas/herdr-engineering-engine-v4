@@ -5,9 +5,14 @@
 //!
 //! Three threads per subscriber: the connection thread writes frames; a reader thread polls
 //! the ledger through its own read-only SQLite connection and offers frames to a bounded queue;
-//! a close watcher reads the socket until EOF. The reader never waits on the subscriber: a
-//! full queue drops the subscriber with a `slow_consumer` close frame. The `Store` mutex is
-//! taken only to decode a batch's histories (`Store::history`, the one event decoder).
+//! a close watcher reads the socket until EOF. Each subscriber's reader is its own thread on its
+//! own connection, so waiting on one subscriber never delays the dispatcher or another
+//! subscriber. When the queue is full the reader waits for space, bounded by
+//! `stream.stall_ms`: every accepted frame restarts the window, and only a queue that accepts
+//! nothing for the whole window drops the subscriber with a `slow_consumer` close frame. A reader
+//! that is behind but draining (a long replay) is never dropped. The `Store` mutex is taken only
+//! to decode a batch's histories (`Store::history`, the one event decoder); no ledger read is open
+//! while the reader waits.
 
 use std::collections::HashMap;
 use std::io::{Read as _, Write as _};
@@ -16,7 +21,7 @@ use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hee4_contracts::{Event, StreamBudget, TaskId, TaskState};
 use rusqlite::{Connection, OpenFlags, params};
@@ -28,22 +33,36 @@ use crate::wire::{self, Code};
 /// Why the reader stopped offering frames.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stop {
-    /// The queue was full: the subscriber is a slow consumer.
+    /// The queue stayed full for the whole stall window: the subscriber is a slow consumer.
     SlowConsumer,
     /// The writer is gone (client closed).
     Gone,
 }
 
-/// Offer `frames` without waiting. A full queue is [`Stop::SlowConsumer`].
+/// Offer `frames`, waiting for queue space for at most `stall` per frame: each accepted frame
+/// restarts the window, so a subscriber that drains at any pace receives everything. A frame the
+/// queue does not accept within `stall` is [`Stop::SlowConsumer`]; the wait is never unbounded.
 ///
 /// # Errors
 /// [`Stop`].
-pub fn offer(tx: &SyncSender<Value>, frames: Vec<Value>) -> Result<(), Stop> {
-    for frame in frames {
-        match tx.try_send(frame) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) => return Err(Stop::SlowConsumer),
-            Err(TrySendError::Disconnected(_)) => return Err(Stop::Gone),
+pub fn offer(tx: &SyncSender<Value>, frames: Vec<Value>, stall: Duration) -> Result<(), Stop> {
+    // The retry interval: short enough that a draining reader is fed promptly, never longer than
+    // the window itself.
+    let step = stall.min(Duration::from_millis(5));
+    for mut frame in frames {
+        let deadline = Instant::now() + stall;
+        loop {
+            match tx.try_send(frame) {
+                Ok(()) => break,
+                Err(TrySendError::Disconnected(_)) => return Err(Stop::Gone),
+                Err(TrySendError::Full(back)) => {
+                    if Instant::now() >= deadline {
+                        return Err(Stop::SlowConsumer);
+                    }
+                    frame = back;
+                    std::thread::sleep(step);
+                }
+            }
         }
     }
     Ok(())
@@ -132,7 +151,7 @@ fn read_ledger(
             std::thread::sleep(budget.poll());
             continue;
         };
-        if let Err(stop) = offer(tx, frames(engine, &rows)?) {
+        if let Err(stop) = offer(tx, frames(engine, &rows)?, budget.stall()) {
             return Ok(stop);
         }
         cursor = last;
@@ -244,15 +263,55 @@ mod tests {
         Ok(())
     }
 
+    /// Rewritten from the old instant-drop rule (`a_full_queue_is_a_slow_consumer_not_a_wait`):
+    /// a queue that never drains is still dropped, but only after the stall window, and the wait
+    /// is bounded.
     #[test]
-    fn a_full_queue_is_a_slow_consumer_not_a_wait() {
+    fn a_full_queue_that_never_drains_is_a_slow_consumer_after_the_stall_window() {
+        let stall = Duration::from_millis(80);
         let (tx, rx) = sync_channel(1);
+        let t0 = Instant::now();
         assert_eq!(
-            offer(&tx, vec![json!(1), json!(2)]),
+            offer(&tx, vec![json!(1), json!(2)], stall),
             Err(Stop::SlowConsumer)
         );
+        let waited = t0.elapsed();
+        assert!(waited >= stall, "dropped before the window: {waited:?}");
+        assert!(waited < stall * 10, "the wait was not bounded: {waited:?}");
         assert_eq!(rx.try_recv().ok(), Some(json!(1)));
         drop(rx);
-        assert_eq!(offer(&tx, vec![json!(3)]), Err(Stop::Gone));
+        assert_eq!(offer(&tx, vec![json!(3)], stall), Err(Stop::Gone));
+    }
+
+    /// The defect the cut tier found: a reader slower than the server but steadily draining is
+    /// fed a replay longer than three queues to the end, in order, with no `slow_consumer`.
+    #[test]
+    fn a_steady_slow_reader_receives_a_replay_longer_than_the_queue() {
+        let budget = StreamBudget::DEFAULT;
+        let q = usize::try_from(budget.queue_frames).unwrap_or(usize::MAX);
+        let batch = usize::try_from(budget.batch_rows).unwrap_or(usize::MAX);
+        let total = 3 * q + 1;
+        let (tx, rx) = sync_channel(q);
+        let reader = std::thread::spawn(move || {
+            let mut got = Vec::new();
+            while let Ok(v) = rx.recv_timeout(Duration::from_secs(5)) {
+                got.push(v);
+                std::thread::sleep(Duration::from_micros(300)); // slower than the offerer
+                if got.len() == total {
+                    break;
+                }
+            }
+            got
+        });
+        let frames: Vec<Value> = (0..total).map(|i| json!(i)).collect();
+        for chunk in frames.chunks(batch) {
+            assert_eq!(offer(&tx, chunk.to_vec(), budget.stall()), Ok(()));
+        }
+        let got = reader.join().unwrap_or_default();
+        assert_eq!(got.len(), total);
+        assert!(
+            got.iter().enumerate().all(|(i, v)| *v == json!(i)),
+            "frames out of order"
+        );
     }
 }

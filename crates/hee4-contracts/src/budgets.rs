@@ -117,6 +117,11 @@ pub struct StreamBudget {
     /// Time to flush on close (replaces `CLOSE_DEADLINE = from_millis(200)`,
     /// hee4-app/src/stream.rs:148).
     pub close_deadline_ms: u64,
+    /// How long a full queue may accept no frame before the subscriber is a slow consumer.
+    /// A subscriber that is behind but draining is never dropped: every accepted frame restarts
+    /// this window. The instant-drop rule it replaces cut off steady readers once a replay from
+    /// `since_seq` 0 exceeded `queue_frames` (the cut tier's drive at ~800 events, 2026-10-06).
+    pub stall_ms: u64,
 }
 
 impl StreamBudget {
@@ -126,12 +131,19 @@ impl StreamBudget {
         batch_rows: 256,
         poll_ms: 100,
         close_deadline_ms: 200,
+        stall_ms: 10_000,
     };
 
     /// `poll_ms` as a [`Duration`].
     #[must_use]
     pub const fn poll(&self) -> Duration {
         Duration::from_millis(self.poll_ms)
+    }
+
+    /// `stall_ms` as a [`Duration`].
+    #[must_use]
+    pub const fn stall(&self) -> Duration {
+        Duration::from_millis(self.stall_ms)
     }
 
     /// `close_deadline_ms` as a [`Duration`].
@@ -536,7 +548,7 @@ struct Field {
 }
 
 /// Every field in declaration order; the only place a name, floor or ceiling is bound to a field.
-const FIELDS: [Field; 28] = [
+const FIELDS: [Field; 29] = [
     Field {
         name: "socket.max_connections",
         get: |b| b.socket.max_connections,
@@ -594,6 +606,12 @@ const FIELDS: [Field; 28] = [
     Field {
         name: "stream.close_deadline_ms",
         get: |b| b.stream.close_deadline_ms,
+        floor: 1,
+        max: MAX_DEADLINE_MS,
+    },
+    Field {
+        name: "stream.stall_ms",
+        get: |b| b.stream.stall_ms,
         floor: 1,
         max: MAX_DEADLINE_MS,
     },
@@ -708,10 +726,12 @@ const FIELDS: [Field; 28] = [
 ];
 
 /// Order rules, `(lesser, greater)` by field name: a body fits in the attempt's total; the
-/// stream can close inside the socket's write deadline.
-const ORDER: [(&str, &str); 2] = [
+/// stream can close inside the socket's write deadline; a stall window lasts at least one poll, so
+/// a subscriber always gets at least one poll's chance to drain before it is judged slow.
+const ORDER: [(&str, &str); 3] = [
     ("door.max_body_bytes", "door.max_total_bytes"),
     ("stream.close_deadline_ms", "socket.write_deadline_ms"),
+    ("stream.poll_ms", "stream.stall_ms"),
 ];
 
 fn field(name: &str) -> Option<&'static Field> {
