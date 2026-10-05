@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""prune [--apply] [--keep K] [--older-than HOURS] [--cache-root DIR] [--repo DIR]
+
+Build-cache prune (ops O2; DEPLOYMENT_ATLAS §6 "pure policy over the directory listing"). Dry-run by
+default: it lists and removes nothing. The policy is computed fresh from the listing on every run,
+and --apply removes exactly the candidates that same run printed. Two declared patterns, nothing else:
+  (a) <root>/hee4-gate-target/<12 hex>   beyond the newest --keep by mtime; never the dir named by
+      HEAD[:12] or origin/main[:12] (no origin/main: `origin_main=UNMEASURED`, only HEAD is kept)
+  (b) <root>/hee4-target-<[a-z0-9-]+>     whose newest mtime (dir, debug/, release/) is older than
+      --older-than hours and whose debug/.cargo-lock or release/.cargo-lock is not flocked
+Never candidates: <root>/hee4-target (the deploy build), <root>/hee4-target-gate, the basename of
+$CARGO_TARGET_DIR when it lies under root, and <root>/hee4-gate (logs are evidence). A non-directory
+entry inside hee4-gate-target is skipped; a directory there that is not 12 hex is
+`refuse_prune unexpected_name=<path>` and the run is FAIL with nothing removed.
+Lines:
+  prune_candidate path=<p> bytes=<n> reason=beyond_keep|stale_target
+  prune_keep path=<p> reason=newest|head|origin_main|protected|in_use|young
+and last
+  prune verdict=PASS|FAIL mode=dry|apply candidates=N keep=K bytes=B removed=N bytes_freed=B
+Exit 0 PASS, 1 FAIL. The root is HEE4_CACHE_ROOT (or --cache-root), default ~/.cache.
+"""
+import argparse, fcntl, os, re, shutil, subprocess, sys, time
+
+SHA12 = re.compile(r"^[0-9a-f]{12}$")
+SIBLING = re.compile(r"^hee4-target-[a-z0-9-]+$")
+GATE_TARGET = "hee4-gate-target"
+PROTECTED = {"hee4-target", "hee4-target-gate"}
+
+
+def rev12(repo, rev):
+    try:
+        r = subprocess.run(["git", "-C", repo, "rev-parse", "--verify", "-q", f"{rev}^{{commit}}"],
+                           capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    out = r.stdout.strip()
+    return out[:12] if r.returncode == 0 and out else None
+
+
+def size(path):
+    total = 0
+    for d, dirs, files in os.walk(path):
+        for n in dirs + files:
+            try:
+                st = os.lstat(os.path.join(d, n))
+            except OSError:
+                continue
+            if not os.path.isdir(os.path.join(d, n)) or os.path.islink(os.path.join(d, n)):
+                total += st.st_size
+    return total
+
+
+def newest_mtime(path):
+    ts = []
+    for p in (path, os.path.join(path, "debug"), os.path.join(path, "release")):
+        try:
+            ts.append(os.lstat(p).st_mtime)
+        except OSError:
+            continue
+    return max(ts)
+
+
+def in_use(path):
+    """True when a cargo lock under path is held (flock LOCK_EX|LOCK_NB probe, released at once)."""
+    for sub in ("debug", "release"):
+        lock = os.path.join(path, sub, ".cargo-lock")
+        try:
+            fd = os.open(lock, os.O_RDONLY)
+        except OSError:
+            continue
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except BlockingIOError:
+            return True
+        finally:
+            os.close(fd)
+    return False
+
+
+def plan(a, root):
+    """(candidates [(path, bytes, reason, parent, pattern)], refused) — prints every keep/refuse line."""
+    cands, refused = [], False
+    head = os.environ.get("HEE4_HEAD", "").strip()[:12] or rev12(a.repo, "HEAD")
+    if not head:
+        print(f"refuse_prune head=UNMEASURED(no HEAD in {a.repo})")
+        return [], True
+    origin = rev12(a.repo, "origin/main")
+    print(f"prune_policy root={root} head={head} origin_main={origin or 'UNMEASURED'} keep={a.keep} older_than={a.older_than}h")
+    gt = os.path.join(root, GATE_TARGET)
+    if os.path.isdir(gt) and not os.path.islink(gt):
+        dirs = []
+        for e in os.scandir(gt):
+            if not e.is_dir(follow_symlinks=False):
+                continue
+            if not SHA12.match(e.name):
+                print(f"refuse_prune unexpected_name={e.path}")
+                refused = True
+                continue
+            dirs.append((e.stat(follow_symlinks=False).st_mtime, e.name, e.path))
+        dirs.sort(reverse=True)
+        for i, (_, name, path) in enumerate(dirs):
+            if name == head:
+                print(f"prune_keep path={path} reason=head")
+            elif origin and name == origin:
+                print(f"prune_keep path={path} reason=origin_main")
+            elif i < a.keep:
+                print(f"prune_keep path={path} reason=newest")
+            else:
+                cands.append((path, size(path), "beyond_keep", gt, SHA12))
+    protected = set(PROTECTED)
+    ctd = os.environ.get("CARGO_TARGET_DIR", "")
+    if ctd and os.path.dirname(os.path.realpath(ctd)) == root:
+        protected.add(os.path.basename(os.path.realpath(ctd)))
+    cutoff = time.time() - a.older_than * 3600
+    for e in sorted(os.scandir(root), key=lambda e: e.name):
+        if not e.is_dir(follow_symlinks=False) or not (SIBLING.match(e.name) or e.name in protected):
+            continue
+        if e.name in protected:
+            print(f"prune_keep path={e.path} reason=protected")
+        elif newest_mtime(e.path) > cutoff:
+            print(f"prune_keep path={e.path} reason=young")
+        elif in_use(e.path):
+            print(f"prune_keep path={e.path} reason=in_use")
+        else:
+            cands.append((e.path, size(e.path), "stale_target", root, SIBLING))
+    return cands, refused
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--apply", action="store_true", help="remove the listed candidates (default: dry run, nothing removed)")
+    ap.add_argument("--keep", type=int, default=3, help="hee4-gate-target/<sha12> dirs kept, newest by mtime (default 3)")
+    ap.add_argument("--older-than", type=float, default=24.0, help="hours a hee4-target-<name> dir must be idle (default 24)")
+    ap.add_argument("--cache-root", default=os.environ.get("HEE4_CACHE_ROOT") or os.path.join(os.path.expanduser("~"), ".cache"))
+    ap.add_argument("--repo", default=os.getcwd(), help="the repo whose HEAD and origin/main are kept (default: cwd)")
+    a = ap.parse_args()
+    if a.keep < 1 or a.older_than <= 0:
+        print("prune verdict=FAIL reason=keep_below_1_or_older_than_not_positive")
+        sys.exit(2)
+    root = os.path.realpath(a.cache_root)
+    mode = "apply" if a.apply else "dry"
+    cands, refused = plan(a, root)
+    for path, b, reason, _, _ in cands:
+        print(f"prune_candidate path={path} bytes={b} reason={reason}")
+    removed = freed = 0
+    failed = refused
+    if a.apply and not refused:
+        for path, b, _, parent, pattern in cands:
+            name = os.path.basename(path)
+            if os.path.islink(path) or os.path.dirname(os.path.realpath(path)) != parent or not pattern.match(name):
+                print(f"refuse_prune path={path} reason=recheck_failed")
+                failed = True
+                continue
+            try:
+                shutil.rmtree(path)
+            except OSError as e:
+                print(f"prune_failed path={path} error={type(e).__name__}")
+                failed = True
+                continue
+            removed += 1
+            freed += b
+    total = sum(b for _, b, _, _, _ in cands)
+    v = "FAIL" if failed else "PASS"
+    print(f"prune verdict={v} mode={mode} candidates={len(cands)} keep={a.keep} bytes={total} removed={removed} bytes_freed={freed}")
+    sys.exit(0 if v == "PASS" else 1)
+
+
+if __name__ == "__main__":
+    main()
