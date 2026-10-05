@@ -11,25 +11,26 @@ A-15. One managed habitat service: its owner, its systemd unit, the cached healt
 
 ## How to get to it (user POV)
 
-`hee4 service.inspect` (binary); wrapper "generated"; Pi `hee4_service_inspect` (PROPOSAL). At v4.0 and v4.1, `unavailable` with `because` = v4.2. From v4.2 an operator reaches it after a probe or an action, or to read cached health.
+`hee4 service.inspect --body JSON` (binary, the generic client); Pi `hee4_service_inspect` (PROPOSAL). At v4.0 and v4.1, `unavailable` with `because` = v4.2. From v4.2 an operator reaches it after a probe or an action, or to read cached health.
 
 ## Driving it with hee4
 
-Preconditions (v4.2): a `Read` grant; a `service_id` (`UNWRITTEN: where service ids come from; no list action exists for services in the 22`).
+Preconditions (v4.2): a `Read` grant; a `service_id`. Service ids are the rows `serve` seeds into `service_facts` at start (the service family's `on_serve_start`, `actions/service.rs` `SEEDS`): `self` (`hee4.service`), `model` (`ollama.service`), `drive` (`hee4-drive.service`), each `owner_id` `deploy`. There is no list action for services in the 22.
+
+Concrete, deployed frame (rev 2026-10-05 drive) (run all of it with `tools/drive --only service.inspect`):
 
 ```bash
-hee4 service.inspect                                                                                   # v4.0: unavailable by name
-hee4-sh service.inspect service_id=<id> operation:=null                                                # v4.2
-hee4-sh service.inspect service_id=<id> 'operation:={"source_action":"service.probe","idempotency_key":"<uuid>"}'
+hee4 service.inspect --body '{"service_id":"drive","operation":null}'
+hee4 service.inspect --body '{"service_id":"drive","operation":{"source_action":"service.probe","idempotency_key":"<key>"}}'
 ```
 
-Socket: request `body` `{service_id, operation}` (FACT required both); result `body` `{service_id, owner_id, unit_id, cached_health, operation}` (API Map A-15). `UNWRITTEN: the cached_health / Observation shape on the wire and the generated wrapper spelling.`
+Socket: request `body` `{service_id, operation: null | {source_action, idempotency_key}}` (both members required; a missing `operation` is `invalid_argument` at `/body/operation`); result `body` `{service_id, owner_id, unit_id, owner_sha256, generation, cached_health, operation}`. `generation` and `owner_sha256` are additive to API Map A-15: they are what `service.action` names as its precondition and `expected_owner_sha256`. `cached_health` is `null` or the committed `Observation` (`hee4_contracts::Observation`: `{source, input_sha256, tool{name, version}, head_sha, outcome, evidence[{label, sha256}], advisory, elapsed_ms, budget_ms}`). `operation` is `null` or `{operation_id, action, idempotency_key, ts, result}`, selected through `Store::operation_by_key` with the engine principal; a row whose subject is another service is `not_found` at `/body/operation`.
 
-- v4.0 path: the `unavailable` refusal.
-- v4.2 success: after `service.probe`, `cached_health` equals the probe's `observation`; after `service.action`, `operation` by key returns that action's `operation_id` and `observed_state`.
-- Error: unknown `service_id` → `not_found`.
-- Empty: `operation:=null` returns the facts without an operation.
-- Persistence: `cached_health` survives restart (T-14 "health rebuildable after restart"); it is a read of committed facts, not a live probe.
+- Seeded: `drive` reads `cached_health: null`, `generation: 1`, `owner_sha256 = sha256("deploy")`.
+- After `service.probe`: `cached_health` equals the probe's `observation`; `operation` by key returns its `operation_id`.
+- After `service.action`: `operation` by key returns that action's `operation_id` and stored `observed_state`; `generation` moved by one.
+- Error: unknown `service_id` → `not_found` at `/body/service_id`.
+- Persistence: `cached_health` survives restart; it is a read of committed facts, not a live probe.
 - Side effect: none.
 
 ## Gotchas

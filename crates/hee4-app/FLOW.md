@@ -52,6 +52,7 @@ and a family that leaves one of its owner's catalogued ids without a handler
 | `actions/task.rs` | `FAMILY` | `Task` | v4.0 | `task.submit`, `task.get`, `task.list`, `task.cancel`, `task.preview`, `task.resolve` | none |
 | `actions/task.rs` | `EVENTS` | `Notify` | v4.0 | `events.subscribe` | none |
 | `actions/tools.rs` | `FAMILY` | `Actions` | v4.0 | `tools.list`, `tools.inspect` | none |
+| `actions/service.rs` | `FAMILY` | `Service` | v4.2 | `service.inspect`, `service.probe`, `service.action` (busctl only through `service_runner.rs` → `spawn::plan/run`; commits through `Store::service_*`) | seed `service_facts` (`self`, `model`, `drive`), pin the busctl digest (`HEE4_BUSCTL_SHA256` or measured), print `busctl_sha256=` |
 
 Unregistered owners (`Roster` v4.1; `Service`, `Cohort`, `Numerical` v4.2; `Judge` held) have no
 module: their ids are catalogued, listed by `tools.list`, inspected by `tools.inspect`, and refused

@@ -8,6 +8,7 @@
 pub mod actions;
 pub mod dispatcher;
 pub mod doctor;
+pub mod service_runner;
 pub mod socket;
 pub mod stream;
 pub mod wire;
