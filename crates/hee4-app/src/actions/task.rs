@@ -234,9 +234,19 @@ fn preview(engine: &Engine, body: &Value) -> Reply {
         .iter()
         .any(|s| matches!(s.kind, StepKind::Generate { .. }));
     let client = OllamaClient::new(dispatcher::MODEL_URL);
-    match dispatcher::route(&engine.cfg, &client, wants_model && engine.cfg.live) {
+    let (roster, exclusions) =
+        dispatcher::roster_from_store(engine, &engine.cfg).map_err(|e| internal(&e))?;
+    match dispatcher::route(
+        &engine.cfg,
+        &client,
+        wants_model && engine.cfg.live,
+        &roster,
+    ) {
         Ok(sel) => Ok((false, json!({"eligible": true, "model": sel.model}))),
-        Err(r) => not_eligible(Code::NoRoute, r.to_string()),
+        Err(r) => Ok((
+            false,
+            json!({"eligible": false, "refusal": Code::NoRoute.name(), "message": r.to_string(), "exclusions": exclusions}),
+        )),
     }
 }
 

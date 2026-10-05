@@ -52,6 +52,7 @@ and a family that leaves one of its owner's catalogued ids without a handler
 | `actions/task.rs` | `FAMILY` | `Task` | v4.0 | `task.submit`, `task.get`, `task.list`, `task.cancel`, `task.preview`, `task.resolve` | none |
 | `actions/task.rs` | `EVENTS` | `Notify` | v4.0 | `events.subscribe` | none |
 | `actions/tools.rs` | `FAMILY` | `Actions` | v4.0 | `tools.list`, `tools.inspect` | none |
+| `actions/roster.rs` | `FAMILY` | `Roster` | v4.1 | `roster.list`, `roster.inspect`, `roster.update`, `roster.disable` | composes `model:<HEE4_MODEL>` under `Owner::Deploy` (`deploy.install`, principal `deploy`) via `Store::roster_compose_deploy`; prints `roster deploy record=<id> replayed=<bool> operation=<id>` |
 
 Unregistered owners (`Roster` v4.1; `Service`, `Cohort`, `Numerical` v4.2; `Judge` held) have no
 module: their ids are catalogued, listed by `tools.list`, inspected by `tools.inspect`, and refused
