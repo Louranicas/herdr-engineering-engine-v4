@@ -23,7 +23,7 @@ diagnostic text. Prints `check-deployed control cases=k/9 verdict=PASS|FAIL`. Th
 children die with it (PR_SET_PDEATHSIG) and a control start sweeps cd-control-* dirs whose pid is dead.
 --control-skip D<n> (test only) removes that one plant: the control must then print cases=8/9.
 """
-import argparse, ctypes, hashlib, http.server, json, os, shlex, shutil, signal, socket, sqlite3, stat, subprocess, sys, tempfile, threading, time, uuid
+import argparse, ctypes, hashlib, importlib.machinery, importlib.util, http.server, json, os, shlex, shutil, signal, socket, sqlite3, stat, subprocess, sys, tempfile, threading, time, uuid
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
@@ -417,6 +417,39 @@ def d4(a, ctx):
     return r
 
 
+def manifest_objects(m):
+    """(objects_n, objects_bound) from a ledger backup manifest (hee4-core backup.rs writes both); None where absent."""
+    n, bound = m.get("objects_n"), m.get("objects_bound")
+    ok = lambda v: isinstance(v, int) and not isinstance(v, bool) and v >= 0
+    return (n if ok(n) else None), (bound if ok(bound) else None)
+
+
+def habitat_tool():
+    """tools/habitat-backup as a module: it owns the verdict contract and its parse (verdict_of, last_run)."""
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "habitat-backup")
+    loader = importlib.machinery.SourceFileLoader("habitat_backup", path)
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("habitat_backup", loader))
+    loader.exec_module(mod)
+    return mod
+
+
+def last_habitat_run(log):
+    """The tool's own log, its last run block only: ({run line fields}, verdict or None); None when no run."""
+    try:
+        with open(log) as f:
+            text = f.read()
+    except OSError:
+        return None
+    return habitat_tool().last_run(text)
+
+
+def habitat_agrees(verdict, result, status):
+    """The unit's last ExecMainStatus is the code its last verdict line maps to, and Result says success
+    exactly when that code is 0 or 10 (SuccessExitStatus=10). A disagreement is refused, never reconciled."""
+    want = habitat_tool().EXIT.get(verdict, 30)
+    return status == str(want) and (result == "success") == (want in (0, 10))
+
+
 def d5(a, ctx):
     r = Row("D5")
     b = a.backups
@@ -431,9 +464,10 @@ def d5(a, ctx):
         mp = os.path.join(b, newest, "manifest.json")
         try:
             m = json.load(open(mp))
-            objs = m.get("objects")
             r.val("newest", newest)
-            r.val("objects", len(objs) if isinstance(objs, list) else objs)
+            n, bound = manifest_objects(m)
+            r.check("objects", "absent" if n is None else n, n is not None and bound is not None and n <= bound)
+            r.val("objects_bound", "absent" if bound is None else bound)
             r.val("age_s", int(time.time() - os.stat(mp).st_mtime))
         except (OSError, ValueError) as e:
             r.check("manifest", f"unparseable({e})", False)
@@ -445,8 +479,20 @@ def d5(a, ctx):
         r.unm("restore_log", f"no {lg}")
     rc, out, _ = sh("systemctl", "--user", "is-enabled", "hee4-backup.timer")
     r.check("timer", out or f"rc={rc}", out == "enabled")
-    rc, p, _ = show("hee4-backup.service", "Result", "ExecMainStatus")
+    rc, p, _ = show("hee4-backup.service", "Result", "ExecMainStatus", "ExecMainExitTimestamp", "InvocationID")
     r.val("last_run", f"{p.get('Result', '?')}/{p.get('ExecMainStatus', '?')}")
+    # A unit that never ran reads Result=success ExecMainStatus=0 with an empty exit timestamp: not a run.
+    ran = bool(p.get("ExecMainExitTimestamp")) and bool(p.get("InvocationID"))
+    r.check("unit_ran", "yes" if ran else "never", ran)
+    run = last_habitat_run(a.habitat_log)
+    fields, hv = run if run else ({}, None)
+    r.check("habitat_verdict", hv or "absent", hv == "PASS")
+    # The log's last block must be this unit's last run, not a manual --service run or an older block.
+    inv, unit_inv = fields.get("invocation", "none"), p.get("InvocationID", "")
+    same_run = ran and inv == unit_inv
+    r.check("habitat_run", "unit" if same_run else f"other(log={inv[:12]},unit={unit_inv[:12] or 'none'})", same_run)
+    agree = habitat_agrees(hv, p.get("Result"), p.get("ExecMainStatus"))
+    r.check("habitat_agree", "yes" if agree else f"no(verdict={hv or 'absent'},status={p.get('ExecMainStatus', '?')})", agree)
     try:
         same = os.stat(b).st_dev == os.stat(os.path.expanduser("~")).st_dev
         r.check("other_device", "no" if same else "yes", not same)
@@ -914,6 +960,7 @@ def main():
     ap.add_argument("--evidence-root", default=os.path.expanduser("~/.cache/hee4-drive"))
     ap.add_argument("--drill-root", default=os.path.expanduser("~/.cache/hee4-drill"))
     ap.add_argument("--backups", default="/mnt/storage-10tb/hee4-backups")
+    ap.add_argument("--habitat-log", default=os.path.expanduser("~/.local/state/hee4/habitat-backup.log"))
     ap.add_argument("--model", default="", help="default: HEE4_MODEL env, else the unit's Environment")
     ap.add_argument("--model-url", default="http://127.0.0.1:11434")
     ap.add_argument("--drive-cmd", default=f"{HERE}/drive --doctor-first --allow-restart")

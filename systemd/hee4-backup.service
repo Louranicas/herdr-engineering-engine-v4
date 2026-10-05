@@ -1,0 +1,21 @@
+[Unit]
+Description=HEE v4 habitat backup: codebase mirror, evidence, handoffs to another disk (tools/habitat-backup)
+Documentation=file:///mnt/storage-10tb/herdr-engineering-engine-v4/tools/habitat-backup
+
+[Service]
+Type=oneshot
+# systemd does not parse hee4.env's `: ${VAR:=...}` form, so the two homes are spelled here.
+Environment=HEE4_EVIDENCE=/mnt/storage-10tb/hee4-evidence
+Environment=HEE4_HANDOFFS=/mnt/storage-10tb/handoffs
+# --service derives the exit status from the run's last `verdict=` line (PASS 0, PASS_WITH_GAPS 10,
+# FAIL 20, no line 30), never from the runtime's rc, and appends the run to ~/.local/state/hee4/habitat-backup.log.
+ExecStart=/usr/bin/python3 /mnt/storage-10tb/herdr-engineering-engine-v4/tools/habitat-backup --service
+# PASS_WITH_GAPS is a gap, not a failure (the roster contract).
+SuccessExitStatus=10
+UMask=0077
+NoNewPrivileges=true
+Nice=10
+MemoryMax=1G
+TimeoutStartSec=3600
+StandardOutput=journal
+StandardError=journal

@@ -1,0 +1,11 @@
+[Unit]
+Description=HEE v4 habitat backup daily at 03:15 (tools/habitat-backup; not the ledger backup, which serve takes itself)
+
+[Timer]
+OnCalendar=*-*-* 03:15:00
+Persistent=true
+RandomizedDelaySec=5m
+Unit=hee4-backup.service
+
+[Install]
+WantedBy=timers.target

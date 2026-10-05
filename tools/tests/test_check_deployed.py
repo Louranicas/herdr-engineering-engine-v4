@@ -1,4 +1,4 @@
-import importlib.machinery, importlib.util, os, shutil, signal, subprocess, sys, tempfile, time, types, unittest
+import importlib.machinery, importlib.util, json, os, shutil, signal, subprocess, sys, tempfile, time, types, unittest, unittest.mock
 from common import TOOLS, run
 
 CD = os.path.join(TOOLS, "check-deployed")
@@ -143,6 +143,105 @@ class CheckDeployedTests(unittest.TestCase):
                  "drive feature=e verdict=FAIL paths=2/3 evidence=e reason=a FAIL is never excused",
                  "drive feature=f verdict=PASS_WITH_GAPS paths=2/3 evidence=e"]
         self.assertEqual(m.feature_counts(feats), (1, 2, 4))
+
+    # A ledger backup manifest's top-level keys as hee4-core backup.rs writes them (live b-01a10b4a227a-0000001c, 2026-10-05).
+    LEDGER_MANIFEST = {"boot": 28, "epoch": "1a107794ef1", "id": "b-01a10b4a227a-0000001c", "objects_bound": 1024,
+                       "objects_n": 120, "task_count": 120, "ts_ms": 1791190770298, "files": {"ledger.sqlite3": "e9" * 32}}
+
+    def test_d5_manifest_objects_reads_objects_n_with_its_bound(self):
+        m = load()
+        self.assertEqual(m.manifest_objects(self.LEDGER_MANIFEST), (120, 1024))
+        self.assertEqual(m.manifest_objects({"objects": [1, 2]}), (None, None))  # the key D5 used to read: never None silently
+        self.assertEqual(m.manifest_objects({"objects_n": True, "objects_bound": -1}), (None, None))
+
+    INV = "0123456789abcdef0123456789abcdef"
+
+    def _d5(self, enabled, verdict_line, status="0", result="success", exit_ts="Mon 2026-10-05 03:15:09 AEDT",
+            unit_inv=INV, log_text=None):
+        """d5() against a fixture world: a ledger backup on another device than HOME, a stubbed systemctl
+        (is-enabled answers `enabled`; show answers Result, ExecMainStatus, ExecMainExitTimestamp, InvocationID),
+        a stub restore, and the habitat tool's log (one run block of the unit's invocation, unless log_text)."""
+        m = load()
+        os.makedirs(os.path.expanduser("~/.cache/hee4-host"), exist_ok=True)
+        home = tempfile.mkdtemp(prefix="cd-d5-home-", dir=os.path.expanduser("~/.cache/hee4-host"))
+        other = tempfile.mkdtemp(prefix="cd-d5-backups-")
+        self.addCleanup(shutil.rmtree, home, True); self.addCleanup(shutil.rmtree, other, True)
+        self.assertNotEqual(os.stat(home).st_dev, os.stat(other).st_dev, "the fixture needs two devices")
+        bid = self.LEDGER_MANIFEST["id"]
+        os.makedirs(os.path.join(other, bid))
+        with open(os.path.join(other, bid, "manifest.json"), "w") as f:
+            json.dump(self.LEDGER_MANIFEST, f)
+        with open(os.path.join(other, "restore.log"), "w") as f:
+            f.write(f"restore backup={bid} ledger=e9580e780f40 objects=120/120 rto_s=0.075 verdict=PASS\n")
+        bindir = os.path.join(home, "bin"); os.makedirs(bindir)
+        def script(name, body):
+            with open(os.path.join(bindir, name), "w") as f:
+                f.write("#!/usr/bin/env bash\n" + body)
+            os.chmod(os.path.join(bindir, name), 0o755)
+        script("systemctl", f"""case " $* " in
+  *" is-enabled hee4-backup.timer "*) {'echo enabled' if enabled else 'echo "Failed to get unit file state for hee4-backup.timer: No such file or directory" >&2; exit 1'} ;;
+  *" show "*) echo Result={result}; echo ExecMainStatus={status}; echo "ExecMainExitTimestamp={exit_ts}"; echo InvocationID={unit_inv} ;;
+  *) exit 1 ;;
+esac
+""")
+        script("hee4", f'[ "$1" = restore ] && echo "restore backup={bid} ledger=e9580e780f40 objects=120/120 rto_s=0.01 verdict=PASS"\n')
+        log = os.path.join(home, "habitat-backup.log")
+        if log_text is None and verdict_line is not None:
+            log_text = f"habitat-backup run ts=2026-10-05T03:15:00Z invocation={self.INV} child_rc=0 exit=0\n{verdict_line}\n"
+        if log_text is not None:
+            with open(log, "w") as f:
+                f.write(log_text)
+        env = {"HOME": home, "PATH": bindir + ":" + os.environ["PATH"]}
+        with unittest.mock.patch.dict(os.environ, env):
+            r = m.d5(types.SimpleNamespace(backups=other, habitat_log=log), {"bin": os.path.join(bindir, "hee4")})
+        kv = {}
+        for t in r.line().split():  # the first key wins: restore_log= quotes a line with its own objects=
+            if "=" in t:
+                kv.setdefault(*t.split("=", 1))
+        return r.line(), kv
+
+    PASS_LINE = "habitat-backup verdict=PASS objects=208 bytes=1 backup=h-20261005T031500-000000Z dest=/d keep=14 pruned=0"
+
+    def test_d5_timer_enabled_and_last_verdict_pass_passes(self):
+        line, kv = self._d5(True, self.PASS_LINE)
+        self.assertEqual((kv["objects"], kv["objects_bound"], kv["timer"]), ("120", "1024", "enabled"))
+        self.assertEqual((kv["habitat_verdict"], kv["habitat_agree"], kv["last_run"]), ("PASS", "yes", "success/0"))
+        self.assertEqual((kv["unit_ran"], kv["habitat_run"]), ("yes", "unit"))
+        self.assertTrue(line.endswith(" PASS"), line)
+
+    def test_d5_never_run_unit_fails_even_with_a_manual_pass_in_the_log(self):
+        # the live never-run shape (measured 2026-10-05): Result=success ExecMainStatus=0, empty timestamp and InvocationID;
+        # the log holds a manual `--service` PASS from a shell whose INVOCATION_ID is some other unit's
+        manual = ("habitat-backup run ts=2026-10-05T09:00:00Z invocation=1552d8453bb040148a87f6cfd8af62f0 child_rc=0 exit=0\n"
+                  + self.PASS_LINE + "\n")
+        line, kv = self._d5(True, None, exit_ts="", unit_inv="", log_text=manual)
+        self.assertEqual((kv["unit_ran"], kv["habitat_verdict"]), ("never", "PASS"))
+        self.assertTrue(kv["habitat_run"].startswith("other("), kv["habitat_run"])
+        self.assertTrue(line.endswith(" FAIL"), line)
+
+    def test_d5_crash_block_after_a_pass_fails(self):
+        crash = (f"habitat-backup run ts=2026-10-04T03:15:00Z invocation=aaaa child_rc=0 exit=0\n{self.PASS_LINE}\n"
+                 f"habitat-backup run ts=2026-10-05T03:15:00Z invocation={self.INV} child_rc=1 exit=30\n"
+                 "habitat-backup child_stderr='NotADirectoryError: /x/verdict=PASS'\n")
+        line, kv = self._d5(True, None, status="30", result="exit-code", log_text=crash)
+        self.assertEqual((kv["habitat_verdict"], kv["habitat_run"]), ("absent", "unit"))
+        self.assertTrue(line.endswith(" FAIL"), line)
+
+    def test_d5_log_block_from_another_invocation_fails(self):
+        line, kv = self._d5(True, self.PASS_LINE, unit_inv="ffffffffffffffffffffffffffffffff")
+        self.assertEqual(kv["habitat_verdict"], "PASS"); self.assertEqual(kv["habitat_run"], "other(log=0123456789ab,unit=ffffffffffff)")
+        self.assertTrue(line.endswith(" FAIL"), line)
+
+    def test_d5_timer_absent_fails(self):
+        line, kv = self._d5(False, None, status="", result="", exit_ts="", unit_inv="")
+        self.assertEqual(kv["timer"], "rc=1"); self.assertEqual(kv["habitat_verdict"], "absent")
+        self.assertTrue(line.endswith(" FAIL"), line)
+
+    def test_d5_verdict_and_exit_status_disagree_fails(self):
+        line, kv = self._d5(True, self.PASS_LINE, status="30", result="exit-code")  # a crash after an old PASS line
+        self.assertEqual(kv["habitat_agree"], "no(verdict=PASS,status=30)"); self.assertTrue(line.endswith(" FAIL"), line)
+        line, kv = self._d5(True, self.PASS_LINE.replace("PASS", "FAIL"), status="0")  # an rc that reads FAIL as success
+        self.assertEqual(kv["habitat_agree"], "no(verdict=FAIL,status=0)"); self.assertTrue(line.endswith(" FAIL"), line)
 
     def test_no_declaration_is_parsed(self):
         src = open(CD).read()
