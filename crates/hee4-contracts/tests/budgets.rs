@@ -104,6 +104,41 @@ fn unknown_key_is_a_json_error_not_a_default() {
         Budgets::parse("not json"),
         Err(BudgetParseError::Json(_))
     ));
+    // A positional array never names a key: refused, not read as the default.
+    for text in [
+        "[]",
+        "[[7]]",
+        r#"{"door":[3]}"#,
+        "[[],[],[],[],[],[],[],[]]",
+    ] {
+        let err = Budgets::parse(text).unwrap_err();
+        assert!(matches!(err, BudgetParseError::Json(_)), "{text}: {err}");
+        assert!(
+            err.to_string().contains("expected an object"),
+            "{text}: {err}"
+        );
+    }
+    assert!(Budgets::parse(r#"{"door":{}}"#).is_ok());
+}
+
+/// `serde_json::from_str::<Budgets>` is the same path as `parse`: an unvalidated `Budgets`
+/// cannot come out of serde.
+#[test]
+fn deserialize_runs_the_same_checks_as_parse() {
+    let err = serde_json::from_str::<Budgets>(r#"{"door":{"pool":0}}"#).unwrap_err();
+    assert!(err.to_string().contains("door.pool is zero"), "{err}");
+    let err = serde_json::from_str::<Budgets>("[]").unwrap_err();
+    assert!(err.to_string().contains("expected an object"), "{err}");
+    let err = serde_json::from_str::<Budgets>(r#"{"door":{"max_requst":3}}"#).unwrap_err();
+    assert!(err.to_string().contains("max_requst"), "{err}");
+    let ok: Budgets = serde_json::from_str(r#"{"door":{"max_requests":3}}"#).unwrap();
+    assert_eq!(
+        ok,
+        Budgets::parse(r#"{"door":{"max_requests":3}}"#).unwrap()
+    );
+    let round: Budgets =
+        serde_json::from_str(&serde_json::to_string(&Budgets::DEFAULT).unwrap()).unwrap();
+    assert_eq!(round, Budgets::DEFAULT);
 }
 
 #[test]

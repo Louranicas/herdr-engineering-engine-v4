@@ -8,10 +8,19 @@
 //! One table, [`FIELDS`], holds every field's dotted name, getter, floor and ceiling; `validate`
 //! and `render` both walk it, so a field cannot be checked under one name and printed under
 //! another.
+//!
+//! What the type keeps and what it does not. [`Budgets::parse`] and `Deserialize` share one
+//! path: the top value and every section must be JSON objects (a positional array never names a
+//! key, so it is refused, not read as the default), an unknown key is refused, then `validate`
+//! runs. The fields are `pub` for reading, so a struct literal or a field write after `parse` is
+//! not checked, and a section parsed on its own (`DoorBudget` alone) is not checked: rung-2
+//! doors, named in `FLOW.md`, for a later slice to close with private fields.
 
 use std::time::Duration;
 
+use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// Ceiling for `socket.max_connections`.
 pub const MAX_CONNECTIONS_CEILING: u64 = 65_535;
@@ -369,11 +378,13 @@ impl Default for LedgerBudget {
     }
 }
 
-/// Every budget the runtime reads. A value of this type passed [`Budgets::validate`] or is
-/// [`Budgets::DEFAULT`]; a partial file overrides only the keys it names; an unknown key is a
-/// parse failure, never a silent default.
+/// Every budget the runtime reads. A value that came out of [`Budgets::parse`] or `Deserialize`
+/// passed [`Budgets::validate`]; [`Budgets::DEFAULT`] does too. A partial file overrides only
+/// the keys it names; an unknown key, or an array where an object is required, is a parse
+/// failure, never a silent default. The fields are `pub` for reading: a literal or a write after
+/// `parse` is not checked (see the module doc).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
+#[serde(try_from = "Value")]
 pub struct Budgets {
     /// The engine socket.
     pub socket: SocketBudget,
@@ -396,6 +407,69 @@ pub struct Budgets {
 impl Default for Budgets {
     fn default() -> Self {
         Self::DEFAULT
+    }
+}
+
+/// The file's shape as serde reads it, before the checks: the same sections as [`Budgets`],
+/// missing ones defaulted, unknown ones refused. Private, so the only way to a `Budgets` from
+/// JSON is through [`TryFrom<Value>`], which runs the shape check and [`Budgets::validate`].
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct RawBudgets {
+    socket: SocketBudget,
+    stream: StreamBudget,
+    door: DoorBudget,
+    attempt: AttemptBudget,
+    dispatcher: DispatcherBudget,
+    recovery: RecoveryBudget,
+    model: ModelBudget,
+    ledger: LedgerBudget,
+}
+
+/// Refuse a value that is not a JSON object. The derive would read an array positionally, which
+/// never names a key; a budgets file is read by name only.
+fn require_object(value: &Value, what: &str) -> Result<(), serde_json::Error> {
+    if value.is_object() {
+        return Ok(());
+    }
+    let found = match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    };
+    Err(serde_json::Error::custom(format!(
+        "expected an object for {what}, found {found}"
+    )))
+}
+
+impl TryFrom<Value> for Budgets {
+    type Error = BudgetParseError;
+
+    /// The one path from JSON to a `Budgets`: the top value and every section must be objects,
+    /// then the derive reads the keys (unknown ones refused), then [`Budgets::validate`].
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        require_object(&value, "the budgets file")?;
+        if let Some(sections) = value.as_object() {
+            for (key, section) in sections {
+                require_object(section, &format!("`{key}`"))?;
+            }
+        }
+        let raw: RawBudgets = serde_json::from_value(value)?;
+        let budgets = Self {
+            socket: raw.socket,
+            stream: raw.stream,
+            door: raw.door,
+            attempt: raw.attempt,
+            dispatcher: raw.dispatcher,
+            recovery: raw.recovery,
+            model: raw.model,
+            ledger: raw.ledger,
+        };
+        budgets.validate()?;
+        Ok(budgets)
     }
 }
 
@@ -658,15 +732,15 @@ impl Budgets {
     };
 
     /// Parse the budgets file's text (JSON; `{}` is [`Budgets::DEFAULT`]; a partial object
-    /// overrides only the keys it names) and validate the result.
+    /// overrides only the keys it names) and validate the result. Same path as `Deserialize`.
     ///
     /// # Errors
-    /// [`BudgetParseError::Json`] when the text is not the shape, including an unknown key;
+    /// [`BudgetParseError::Json`] when the text is not the shape: malformed, an array or scalar
+    /// where an object is required (the top value or a section), or an unknown key;
     /// [`BudgetParseError::Refused`] with the first [`BudgetRefusal`] in field order.
     pub fn parse(json: &str) -> Result<Self, BudgetParseError> {
-        let budgets: Self = serde_json::from_str(json)?;
-        budgets.validate()?;
-        Ok(budgets)
+        let value: Value = serde_json::from_str(json)?;
+        Self::try_from(value)
     }
 
     /// Check every field against the table: non-zero, at or above its floor, at or under its

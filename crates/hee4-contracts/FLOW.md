@@ -22,7 +22,7 @@ STACK-MAP §2 (I1, I3, I4), `gates/features/crash-restart.md` (R01–R14).
 | `Receipt` (I4) | `seal(prev, ReceiptBody)` hashes decision + observed + `hash_prev` together over canonical JSON (keys sorted, no whitespace); read-only fields | `Receipt::seal`; `verify_chain` returns the first `ChainBreak{index, cause}` |
 | `Refusal` | `#[non_exhaustive]`, named variants with typed fields, never strings | this crate |
 | `VerifyLine` | one VERIFY line after normalisation: Shell / Exec / Unsupported (`model:` is Unsupported{model}); the only home of the VERIFY line grammar (K6 playbook maps it) | `VerifyLine::parse_all` |
-| `Budgets` | parsed and validated: every field non-zero, under its ceiling in budgets.rs, ordered; unknown key refused | `Budgets::DEFAULT`, `Budgets::parse` |
+| `Budgets` | validated only through `Budgets::parse` (and `Deserialize`, the same path): the top value and every section an object (a positional array is refused, never read as the default), unknown key refused, every field non-zero, under its ceiling in budgets.rs, ordered. Fields are `pub` for reading; a literal, a field write after `parse`, or a section parsed alone (`DoorBudget`) is not checked: rung 2, for a later slice with private fields | `Budgets::DEFAULT`, `Budgets::parse` |
 
 ## Whitelist (`transition`)
 
@@ -76,7 +76,7 @@ Counted by `tests/transition.rs` over 14 sources × 32 events: `legal=65/65 ille
 |---|---|---|
 | K1 `hee4-core` (store, task) | call `transition`; persist `Phase::as_str`; rehydrate by `TaskState::replay` | build a `TaskState` any other way; write a state `transition` did not return |
 | K4 `decide` | build `Verdict`, `Decision`, `ReceiptBody`; call `Receipt::seal` | mutate a sealed `Receipt`; attach `observed` after the seal |
-| K6 host (admission, wire) | `Brief::parse` + `check_restatement` + `check_verify`; parse `Observation`, ids and digests from the wire; load `Budgets` by `parse` at serve start only; host and worker receive the validated value | pass a raw `String` where a newtype is required; admit a brief that failed any check |
+| K6 host (admission, wire) | `Brief::parse` + `check_restatement` + `check_verify`; parse `Observation`, ids and digests from the wire; load `Budgets` by `parse` at serve start only; host and worker receive the validated value | pass a raw `String` where a newtype is required; admit a brief that failed any check; build a `Budgets` from a literal or write one of its fields after `parse` |
 
 ## What `check_verify` does not catch
 
