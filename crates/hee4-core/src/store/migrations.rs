@@ -127,6 +127,7 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "m004_serve_cgroup",
         apply: m004_serve_cgroup,
     },
+    super::service::MIGRATION,
 ];
 
 /// The migrations a legacy file (no `migration:` rows) has already applied, by its
