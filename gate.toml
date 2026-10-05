@@ -11,7 +11,7 @@
 base = "HEAD~1"            # `stack` diffs <base>..<subject>; override with --base
 
 [tier.commit]
-steps = ["fmt", "clippy", "test"]
+steps = ["features", "fmt", "clippy", "test"]
 
 [tier.stack]
 includes = "commit"
@@ -20,6 +20,11 @@ steps = ["ddf"]
 [tier.cut]
 includes = "stack"
 steps = ["drill", "drive", "doctor"]
+
+[step.features]
+cmd = "tools/features-check --served"
+budget_s = 30
+expect = "tool_rc"
 
 [step.fmt]
 cmd = "cargo fmt --all -- --check"

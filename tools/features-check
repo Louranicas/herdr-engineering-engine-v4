@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""features-check [--repo DIR] [--served]
+
+The feature-file check (gates/features/README.md "The four-questions rule"), the `features` step
+of the commit tier. Walks <repo>/gates/features/*.md minus README.md and prints per file
+  feature=<name> h2=k/4|exempt marker=present|absent hee4_sh=<n> dead=<m> status=PASS|FAIL [reason=...]
+and last
+  features-check verdict=PASS|FAIL files=n drifted=d head=<sha12>
+Rules:
+  four-H2: the `## ` lines are exactly `## Sub-features`, `## How to get to it (user POV)`,
+    `## Driving it with hee4`, `## Gotchas`, in that order, nothing else; the two cross-cutting
+    files README.md names (crash-restart, multi-surface-journeys) are exempt.
+  marker (--served only): a served feature (a name some tools/drive.d plugin exports) must carry
+    the "(rev 2026-10-05 drive)" marker in its "Driving it with hee4" section.
+  dead lines (--served only): a `hee4-sh` line inside a served file's marker block (the marker
+    line to the next `## `) that does not say UNMEASURED is dead (hee4-sh exists in no crate).
+hee4_sh=<n> counts every hee4-sh line in the file; only dead ones fail. A plugin that cannot be
+served (drive_d.PluginFault) is FAIL naming the module.
+Exit: 0 PASS, 1 FAIL, 3 UNMEASURED (no gates/features directory).
+"""
+import argparse, importlib.util, os, subprocess, sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+H2S = ["## Sub-features", "## How to get to it (user POV)", "## Driving it with hee4", "## Gotchas"]
+EXEMPT = {"crash-restart", "multi-surface-journeys"}  # README.md "Cross-cutting": journeys and crash/restart, not action files
+
+
+def load_drive_d():
+    """Register tools/drive.d/__init__.py as the module 'drive_d' (the directory name is not importable)."""
+    d = os.path.join(HERE, "drive.d")
+    spec = importlib.util.spec_from_file_location("drive_d", os.path.join(d, "__init__.py"), submodule_search_locations=[d])
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["drive_d"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def head_of(repo):
+    head = os.environ.get("HEE4_HEAD", "").strip()
+    if not head:
+        try:
+            r = subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"], capture_output=True, text=True, timeout=10)
+            head = r.stdout.strip() if r.returncode == 0 else ""
+        except (OSError, subprocess.TimeoutExpired):
+            head = ""
+    return head[:12] if head else "unmeasured"
+
+
+def h2_rule(name, lines):
+    """(k, reasons): k = leading H2s in their expected place; reasons name every drift."""
+    h2s = [l.rstrip() for l in lines if l.startswith("## ")]
+    k = sum(1 for i, want in enumerate(H2S) if i < len(h2s) and h2s[i] == want)
+    reasons = []
+    if h2s != H2S:
+        missing = [h for h in H2S if h not in h2s]
+        extra = [h for h in h2s if h not in H2S]
+        if missing: reasons.append("missing H2 " + "|".join(missing))
+        if extra: reasons.append("extra H2 " + "|".join(extra))
+        if not missing and not extra: reasons.append("H2 order " + "|".join(h2s))
+    return k, reasons
+
+
+def marker_block(lines, mark):
+    """Line numbers (1-based) from the marker line to the next `## `, or [] without a marker."""
+    start = next((i for i, l in enumerate(lines) if mark in l), None)
+    if start is None:
+        return []
+    end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("## ")), len(lines))
+    return list(range(start + 1, end + 1))
+
+
+def check_file(name, path, mark, served):
+    lines = open(path).read().splitlines()
+    reasons, h2 = [], "exempt"
+    if name not in EXEMPT:
+        k, reasons = h2_rule(name, lines)
+        h2 = f"{k}/{len(H2S)}"
+    drive_sect = "\n".join(lines).split("## Driving it with hee4", 1)[-1].split("\n## ", 1)[0]
+    marker = mark in drive_sect
+    block = marker_block(lines, mark)
+    dead = [n for n in block if "hee4-sh" in lines[n - 1] and "UNMEASURED" not in lines[n - 1]]
+    hee4_sh = sum(1 for l in lines if "hee4-sh" in l)
+    if served is not None and name in served:
+        if not marker:
+            reasons.append(f"served file lacks the marker {mark} in its Driving section")
+        if dead:
+            reasons.append("dead hee4-sh line(s) " + ",".join(str(n) for n in dead))
+    status = "FAIL" if reasons else "PASS"
+    print(f"feature={name} h2={h2} marker={'present' if marker else 'absent'} hee4_sh={hee4_sh} dead={len(dead)} status={status}"
+          + (f" reason={'; '.join(reasons)}" if reasons else ""))
+    return status == "PASS"
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="features-check", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--repo", default=REPO)
+    ap.add_argument("--served", action="store_true", help="also apply the marker and dead-line rules to the plugin-served files")
+    a = ap.parse_args()
+    head = head_of(a.repo)
+    fdir = os.path.join(a.repo, "gates/features")
+    drive_d = load_drive_d()
+    if not os.path.isdir(fdir):
+        print(f"features-check verdict=UNMEASURED files=0 drifted=0 head={head} reason=no directory {fdir}")
+        sys.exit(3)
+    served = None
+    if a.served:
+        try:
+            served = drive_d.load_plugins(os.path.join(a.repo, "tools/drive.d"), fdir)
+        except drive_d.PluginFault as e:
+            print(f"features-check verdict=FAIL files=0 drifted=0 head={head} reason=plugin {e.module}: {e.reason}")
+            sys.exit(1)
+    names = sorted(f[:-3] for f in os.listdir(fdir) if f.endswith(".md") and f != "README.md")
+    drifted = sum(1 for n in names if not check_file(n, os.path.join(fdir, n + ".md"), drive_d.MARK, served))
+    v = "PASS" if names and not drifted else "FAIL"
+    print(f"features-check verdict={v} files={len(names)} drifted={drifted} head={head}" + ("" if names else " reason=no feature files"))
+    sys.exit(0 if v == "PASS" else 1)
+
+
+if __name__ == "__main__":
+    main()
