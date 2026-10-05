@@ -117,15 +117,15 @@ DC proposal below.
 |---|---|---|
 | first `admitted` task | `Store::task_ids`, `phase` | — |
 | brief | `<W>/briefs/<task>.brief`, `Brief::parse` | `Resolve(Abandon(BriefUnreadable))` |
-| playbook | VERIFY lines: absolute path → `Run` (bare argv); `sh: <line>` → `Run{/bin/sh, [-c, line]}` (the line runs inside the sandbox: no network, only `$HEE4_MODEL_SOCKET`); `model: <prompt>` → `Generate`, a recorded skip whose reason names `sh:`; else `Unsupported` (named skip) | — |
+| playbook | VERIFY lines: absolute path → `Run` (bare argv); `sh: <line>` → `Run{/bin/sh, [-c, line]}` (the line runs inside the sandbox: no network, only `$HEE4_MODEL_SOCKET`); `model: <prompt>` → `Unsupported{kind:"model"}`, a named skip whose reason names `sh:`; else `Unsupported` (named skip) | — |
 | route | `route::select` over a one-row roster (`HEE4_MODEL`, default `qwen2.5-coder:7b`), floor local-only, baseline = that model; availability probed (`tags`) only when a model step will run | `Resolve(Abandon(RouteRefused{floor_unmet}))` |
-| namespace | `NamespaceTask::with_door_root(task, W, <control socket dir>, needs_model, TIMEBOX)` → `plan_for`; `needs_model` = a `Generate` or `sh:` step and `HEE4_LIVE_MODEL=1` | `Resolve(Abandon(NamespaceRefused))`; work dir → `WorkDirUnavailable`; unknown head → `HeadUnknown`; door upstream unparsable → `NoPermit` |
+| namespace | `NamespaceTask::with_door_root(task, W, <control socket dir>, needs_model, TIMEBOX)` → `plan_for`; `needs_model` = a `sh:` step (`dispatcher::wants_model`, shared with `task.preview`) and `HEE4_LIVE_MODEL=1` | `Resolve(Abandon(NamespaceRefused))`; work dir → `WorkDirUnavailable`; unknown head → `HeadUnknown`; door upstream unparsable → `NoPermit` |
 | permit | `Permit::mint(ReceiptId "r-<task>-<ns>", scope = the Run programs)` | — |
 | dispatch | `Store::apply(Dispatch)` → running (refused before reconcile by K1) | — |
-| attempt | `Attempt::run` (bwrap for Run steps; Generate steps skip with no loopback when not live, `UNMEASURED` printed) | error or a `Failed` step: `Settle(NotReady)` → `Stop` → failed, no receipt |
+| attempt | `Attempt::run` (bwrap for Run steps; `sh:` steps run without a door when not live, `UNMEASURED` printed) | error or a `Failed` step: `Settle(NotReady)` → `Stop` → failed, no receipt |
 | settle | `Settle(Ready)` → verifying | — |
 | observe | per observation: `observation_id`, `Store::record_observation`, `apply(Observe)` | — |
-| decide + seal | `decide_and_seal(chain_head, receipt_id, ids, obs, subject)`; ids: collector = digest(ledger epoch), locks = digest(permit), standards = digest(`gate.toml` baked at build); subject input = first model prompt, else VERIFY text | — |
+| decide + seal | `decide_and_seal(chain_head, receipt_id, ids, obs, subject)`; ids: collector = digest(ledger epoch), locks = digest(permit), standards = digest(`gate.toml` baked at build); subject input = VERIFY text | — |
 | receipt | `Store::append_receipt` (K1 re-runs `verify_chain`) | — |
 | verdict | `apply(Decide(verdict))`; `Pass` → `apply(Accept)` | — |
 

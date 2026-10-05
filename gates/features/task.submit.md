@@ -48,6 +48,7 @@ hee4 task.submit --brief-file brief.txt --key $(uuidgen)       # prints the repl
 
 - Success: `{task_id:"t-<24 hex>", phase:"admitted"}`, `replayed=false`. Replay (same key, same bytes): `replayed=true`, same `task_id`. Same key, other bytes: `conflict` at `/idempotency_key`.
 - Empty brief `""`: `invalid_argument` at `/body/brief`, message names `GOAL` (the first absent field). Missing RESTATEMENT line: `invalid_argument` at `/body/brief` naming `RESTATEMENT`. No key: `invalid_argument` at `/idempotency_key`.
+- VERIFY lines: an absolute path or `sh: <line>` runs in the sandbox; `model: <prompt>` and any other line are admitted and recorded as a named skip (`driver has no handler for step kind model; use a `sh:` step ...`), never run and never an observation.
 
 ## Gotchas
 
