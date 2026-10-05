@@ -41,13 +41,15 @@ hee4 roster.update --key "$(uuidgen)" --precondition '{"resource":"roster","id":
 hee4 roster.inspect --body '{"selector":{"source_action":"roster.update","idempotency_key":"'"$K"'"}}'
 ```
 
-- Definition schema: `{kind: agent|model|runtime, caps: {ctx_tokens: u32, json_mode: bool, tool_use: bool, local: bool}, cost_milli: u32, latency_ms: u32, quality: u32, capability: null|string, locality: local|remote}`, every member required, unknown members refused.
-- Record id: `<kind-word>:<name>` (`^[a-z]+:[A-Za-z0-9._:-]{1,128}$`-shaped); another shape → `invalid_argument` at `/body/record_id`.
+- Definition schema: `{kind: agent|model|runtime, caps: {ctx_tokens: u32, json_mode: bool, tool_use: bool, local: bool}, cost_milli: u32, latency_ms: u32, quality: u32, capability: null|string, locality: local|remote}`, every member required, unknown members refused. `caps.local` must equal `locality == "local"` (one privacy fact, refused at `/body/definition` when the two disagree).
+- Record id: `<kind-word>:<name>` (`^[a-z]+:[A-Za-z0-9._:/-]+$`-shaped, at most MAX_TOKEN_BYTES; `/` admits Ollama namespaces such as `model:library/qwen2.5:0.5b`); another shape → `invalid_argument` at `/body/record_id`.
+- Kind: fixed at creation; a revise naming another `kind` → `invalid_argument` at `/body/definition/kind` (a kind change would drop a model from routing without a disable).
 - Change: `change` is `"created"` (generation 1) or `"revised"` (generation + 1); each writes one `roster_revisions` row carrying the `operation_id`.
-- Precondition: optional on revise; when given it is `{resource:"roster", id:<record_id>, generation}`; `id` ≠ `record_id` → `invalid_argument` at `/precondition/id`; a generation behind the record's → `stale_generation` at `/precondition/generation` with `current_generation`.
+- Precondition: optional on revise; when given it is `{resource:"roster", id:<record_id>, generation}`; `id` ≠ `record_id` → `invalid_argument` at `/precondition/id`; a generation behind the record's → `stale_generation` at `/precondition/generation` with `current_generation`. The generation is compared inside the write transaction, so two serves on one ledger cannot both revise from one generation.
+- Live socket: the drive procedure runs the create/revise paths only against a disposable serve; against the live unit's socket they print UNMEASURED and only write-nothing refusals run.
 - Error: same key, other bytes → `conflict` at `/idempotency_key`; no key → `invalid_argument` at `/idempotency_key`.
 - Empty: `definition: {}` (or missing `kind`/`caps`) → `invalid_argument` at `/body/definition`: a refusal, never a no-op revision.
-- `forbidden` (operator capability): UNMEASURED, no grant exists in this release (owner: the grants slice; README.md:67 UNWRITTEN).
+- `forbidden` (operator capability): UNMEASURED, no grant exists in this release (owner: the grants slice; README.md:67 UNWRITTEN). It is not a drive path: no code emits it, so the procedure cannot drive it, and it stays UNMEASURED here until the grants slice adds the emitter.
 - Retention of `roster_observations`: UNMEASURED, no writer in this release (owner: the retention slice).
 
 - v4.0 path: the `unavailable` refusal.

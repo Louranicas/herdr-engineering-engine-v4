@@ -13,7 +13,7 @@ use hee4_contracts::{
     Settlement, Sha256Hex, SourceId, TaskId, Verdict,
 };
 use hee4_core::StoreError;
-use hee4_core::roster::{RosterDefinition, RosterFilter, RosterKind};
+use hee4_core::roster::RosterDefinition;
 use hee4_evidence::{Identities, Identity, Source, Subject, Why, decide_and_seal, observation_id};
 use hee4_host::model::OllamaClient;
 use hee4_host::model_door::Upstream;
@@ -158,7 +158,7 @@ const fn route_reason(r: &RouteRefusal) -> AbandonReason {
 }
 
 /// The roster `route` selects over, read from the ledger, and the ids of the disabled model
-/// records (`task.preview`'s `exclusions`). One `ModelEntry` per eligible record (kind `model`,
+/// records and of `model:` ids of another kind (`task.preview`'s `exclusions`). One `ModelEntry` per eligible record (kind `model`,
 /// not disabled; name = the id without `model:`; caps and figures from the definition;
 /// availability `Unknown` until `route` probes). The ledger is read under one `engine.store()`
 /// lock and released before anything else. When the roster table is empty (the roster family's
@@ -169,18 +169,12 @@ pub(crate) fn roster_from_store(
     engine: &Engine,
     cfg: &Config,
 ) -> Result<(Roster, Vec<String>), StoreError> {
-    let (count, eligible, models) = {
+    let (count, eligible, excluded) = {
         let store = engine.store();
-        let models = RosterFilter {
-            kinds: vec![RosterKind::Model],
-            capability: None,
-            locality: None,
-            include_disabled: true,
-        };
         (
             store.roster_count()?,
             store.roster_eligible()?,
-            store.roster_list(&models, None, MAX_VIEW_ITEMS)?,
+            store.roster_excluded(MAX_VIEW_ITEMS)?,
         )
     };
     if count == 0 {
@@ -203,11 +197,6 @@ pub(crate) fn roster_from_store(
             })
             .collect(),
     };
-    let excluded = models
-        .iter()
-        .filter(|h| h.disabled)
-        .map(|h| h.id.as_str().to_owned())
-        .collect();
     Ok((roster, excluded))
 }
 
@@ -228,31 +217,62 @@ fn entry(name: &str, d: &RosterDefinition) -> ModelEntry {
     }
 }
 
-/// Route by floor over `roster`, baseline = the declared model. Availability is probed (one
-/// `tags` call, applied to every row) only when the model is needed; otherwise it is `Unknown`,
-/// which routes to the declared baseline when it is in the roster.
+/// Route by floor over `roster`, baseline = the declared model. When the model is needed, one
+/// `tags` call lists what the upstream holds and each row is `Up` exactly when its name is listed
+/// (a name without a tag also matches `<name>:latest`), `Down` otherwise or when the call fails;
+/// when it is not needed every row is `Unknown`, which routes to the declared baseline when it is
+/// in the roster.
 pub(crate) fn route(
     cfg: &Config,
     client: &OllamaClient,
     needs_model: bool,
     roster: &Roster,
 ) -> Result<Selection, RouteRefusal> {
-    let availability = if needs_model {
-        if client.tags().is_ok() {
+    if !needs_model {
+        return route_with(cfg, roster, |_| Availability::Unknown);
+    }
+    let listed = client.tags().unwrap_or_default();
+    route_with(cfg, roster, |name| {
+        let held = listed
+            .iter()
+            .any(|t| t == name || (!name.contains(':') && *t == format!("{name}:latest")));
+        if held {
             Availability::Up
         } else {
             Availability::Down
         }
+    })
+}
+
+/// The model the dispatcher would select now with no upstream call: every row `Up` when the
+/// engine is live (the dispatcher's view whenever the upstream holds every eligible model),
+/// `Unknown` otherwise. `roster.disable` reads it to find the attempts on a record; it is an
+/// approximation until attempts record their model (K1-attempts-ledger).
+pub(crate) fn route_as_dispatched(
+    cfg: &Config,
+    roster: &Roster,
+) -> Result<Selection, RouteRefusal> {
+    let availability = if cfg.live {
+        Availability::Up
     } else {
         Availability::Unknown
     };
+    route_with(cfg, roster, |_| availability)
+}
+
+/// `select` over `roster` with each row's availability from `availability(name)`.
+fn route_with(
+    cfg: &Config,
+    roster: &Roster,
+    availability: impl Fn(&str) -> Availability,
+) -> Result<Selection, RouteRefusal> {
     let roster = Roster {
         models: roster
             .models
             .iter()
             .cloned()
             .map(|mut m| {
-                m.availability = availability;
+                m.availability = availability(&m.name);
                 m
             })
             .collect(),

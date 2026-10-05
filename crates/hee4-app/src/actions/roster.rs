@@ -18,7 +18,6 @@ use hee4_core::roster::{
     RosterKind,
 };
 use hee4_core::{OperationKey, StoreError};
-use hee4_host::model::OllamaClient;
 use serde_json::{Value, json};
 
 use super::page::{Cursor, PageIn, PageOut};
@@ -173,6 +172,7 @@ fn roster_fault(e: RosterError) -> Fault {
         .with_generation(current),
         RosterError::NotFound(_) => Fault::new(Code::NotFound, "/body/record_id", "no such record"),
         RosterError::Id(e) => invalid("/body/record_id", e.to_string()),
+        e @ RosterError::KindImmutable { .. } => invalid("/body/definition/kind", e.to_string()),
     }
 }
 
@@ -326,13 +326,13 @@ fn update(engine: &Engine, req: &Request) -> Reply {
     Ok((operation.replayed, reply))
 }
 
-/// The tasks mid-attempt on `id` now (module doc INTERP): empty unless `id` is the model
-/// `route` selects over the stored roster.
+/// The tasks mid-attempt on `id` now (module doc INTERP): empty unless `id` is the model the
+/// dispatcher selects over the stored roster, evaluated as the dispatcher does when live
+/// (`route_as_dispatched`: no upstream call from a roster path).
 fn active_attempts(engine: &Engine, id: &RosterId) -> Result<Vec<TaskId>, Fault> {
     let (roster, _) =
         dispatcher::roster_from_store(engine, &engine.cfg).map_err(|e| internal(&e))?;
-    let client = OllamaClient::new(dispatcher::MODEL_URL);
-    let selected = dispatcher::route(&engine.cfg, &client, false, &roster)
+    let selected = dispatcher::route_as_dispatched(&engine.cfg, &roster)
         .ok()
         .map(|s| s.model);
     if selected.as_deref() != id.model_name() {
@@ -588,6 +588,41 @@ mod tests {
             json!({"record_id": "Model x", "definition": default_definition().to_json(), "audit_reason": "r"}),
         );
         assert_eq!(bad_id["field"], "/body/record_id");
+        Ok(())
+    }
+
+    #[test]
+    fn update_kind_change_is_refused_at_definition_kind_and_exclusions_name_it() -> R {
+        let e = ready("roster-update-kind")?;
+        let model = default_definition().to_json();
+        let created = call(
+            &e,
+            "roster.update",
+            Some("k1"),
+            json!({"record_id": "model:x", "definition": model, "audit_reason": "add"}),
+        );
+        assert_eq!(created["body"]["change"], "created", "{created}");
+        let mut agent = model.clone();
+        agent["kind"] = json!("agent");
+        let moved = call(
+            &e,
+            "roster.update",
+            Some("k2"),
+            json!({"record_id": "model:x", "definition": agent, "audit_reason": "hide"}),
+        );
+        assert_eq!(moved["code"], "invalid_argument", "{moved}");
+        assert_eq!(moved["field"], "/body/definition/kind", "{moved}");
+        let odd = call(
+            &e,
+            "roster.update",
+            Some("k3"),
+            json!({"record_id": "model:y", "definition": agent, "audit_reason": "odd"}),
+        );
+        assert_eq!(odd["body"]["change"], "created", "{odd}");
+        let (roster, exclusions) = dispatcher::roster_from_store(&e, &e.cfg)?;
+        let routed: Vec<&str> = roster.models.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(routed, vec!["x"]);
+        assert_eq!(exclusions, vec!["model:y".to_owned()]);
         Ok(())
     }
 

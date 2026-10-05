@@ -41,7 +41,8 @@ hee4 task.preview --body '{"brief":"<eleven fields>"}'   # eligible:false, exclu
 - Success: the record reads `disabled:true`, generation + 1; `roster.list` hides it, `include_disabled:true` shows it; both arrays present (empty with no active attempts); a later `task.preview` answers `eligible:false` with `exclusions` holding the record id, and a submitted task ends `abandoned` (`RouteRefused`): no fallback to `HEE4_MODEL` while records exist.
 - `request_cancel`: each listed task gets `Store::apply(Cancel)` after the disable commits; the obligation is `{task_id, phase_after}` or `{task_id, refusal}` (a refused edge is text in the obligation, never an error frame).
 - Error: stale generation → `stale_generation` at `/precondition/generation` with `current_generation`; unknown record → `not_found` at `/body/record_id`; over `MAX_VIEW_ITEMS` active attempts → `resource_exhausted` naming both numbers (the earlier "arrays over 100 → invalid_argument" line is superseded).
-- `forbidden` (operator capability): UNMEASURED, no grant exists in this release (owner: the grants slice; README.md:67 UNWRITTEN).
+- `forbidden` (operator capability): UNMEASURED, no grant exists in this release (owner: the grants slice; README.md:67 UNWRITTEN). It is not a drive path: no code emits it, so the procedure cannot drive it, and it stays UNMEASURED here until the grants slice adds the emitter.
+- Live socket: the disable, the preview-after-disable and the task.submit paths run only against a disposable serve (re-enable is not an action); against the live unit's socket they print UNMEASURED and only write-nothing refusals run. The deploy record's id is read from the serve, not from the drive's `HEE4_MODEL`.
 
 - v4.0 path: the `unavailable` refusal.
 - v4.1 success: the record reads disabled; with `request_cancel`, each listed task shows `cancellation_requested` (or the `cancel` field on a waiting variant) and `cancellation_obligations` has one entry per task.
@@ -53,7 +54,7 @@ hee4 task.preview --body '{"brief":"<eleven fields>"}'   # eligible:false, exclu
 ## Gotchas
 
 - The cancel on affected tasks is an **intent** (task.cancel.md): they close only when their attempts settle and `Stop` runs. The reply lists obligations, not closed tasks.
-- A dispatcher permit (RL-2 "roster permit") must refuse the disabled record for new dispatches; read a subsequent `task.preview` to see the record in `exclusions`.
+- A dispatcher permit (RL-2 "roster permit") must refuse the disabled record for new dispatches; read a subsequent `task.preview` to see the record in `exclusions` (every disabled model record, and every `model:` id whose kind is not `model`).
 - The `request_cancel` → `transition(Cancel)` coupling is INTERP from the reply shape; no authority states it in prose. Pin it when the v4.1 slice names it.
-- Active attempts are INTERP until K1-attempts-ledger lands (that slice is the refinement): the tasks in `running`, `verifying` or `cancellation_requested` when the disabled record's id is `model:` + the model `route` selects now. No attempts table binds a task to a record yet.
+- Active attempts are INTERP until K1-attempts-ledger lands (that slice is the refinement): the tasks in `running`, `verifying` or `cancellation_requested` when the disabled record's id is `model:` + the model the dispatcher selects now, evaluated without an upstream call (`dispatcher::route_as_dispatched`: every eligible row `Up` when the engine is live, `Unknown` otherwise). No attempts table binds a task to a record yet. Limit: when the upstream lacks an eligible model the live dispatcher sees that row `Down` and may have selected another, so the list can name tasks running on another model or miss the disabled one's; with `request_cancel` that can cancel the wrong tasks. Only the attempts ledger closes this.
 - No D-row; v4.1 slice evidence only.
