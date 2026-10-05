@@ -483,20 +483,22 @@ fn a_non_advisory_timeout_row_still_decides_refused_timeout() {
     );
 }
 
-/// The stub forks a sleeping grandchild (`sleep 30`) and writes its pid. At the deadline the
-/// adapter kills the whole process group, so the grandchild is gone too (`kill(pid, 0)` is
-/// `ESRCH` once its new parent reaps it).
-#[test]
-fn a_grandchild_is_gone_after_the_timeout() {
-    use rustix::io::Errno;
-    use rustix::process::{Pid, Signal, kill_process, test_kill_process};
-
+/// Run the grandchild stub in `mode` (`wait` or `exit`); return what the adapter said, how long
+/// the call took, and the grandchild's pid.
+fn run_grandchild_stub(
+    mode: &str,
+    budget: Duration,
+) -> (
+    Result<hee4_contracts::Observation, AdapterError>,
+    Duration,
+    rustix::process::Pid,
+) {
     let pidfile = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("ddf-grandchild-{}.pid", std::process::id()));
+        .join(format!("ddf-grandchild-{mode}-{}.pid", std::process::id()));
     let _ = std::fs::remove_file(&pidfile);
     let mut diff = pidfile.as_os_str().as_encoded_bytes().to_vec();
-    diff.push(b'\n');
-    let budget = Duration::from_millis(500);
+    diff.extend_from_slice(format!(" {mode}\n").as_bytes());
+    let t0 = Instant::now();
     let got = ddf::observe_with(
         &stub("ddf-grandchild.sh"),
         &diff,
@@ -504,11 +506,20 @@ fn a_grandchild_is_gone_after_the_timeout() {
         &TestClock::new(0),
         budget,
     );
-    assert!(matches!(got, Err(AdapterError::Timeout { .. })), "{got:?}");
+    let elapsed = t0.elapsed();
     let text = std::fs::read_to_string(&pidfile).expect("the stub wrote the grandchild pid");
     let _ = std::fs::remove_file(&pidfile);
-    let pid = Pid::from_raw(text.trim().parse().expect("a pid")).expect("a positive pid");
-    // A killed orphan is a zombie until its new parent reaps it; give that a moment.
+    let pid = rustix::process::Pid::from_raw(text.trim().parse().expect("a pid"))
+        .expect("a positive pid");
+    (got, elapsed, pid)
+}
+
+/// Whether `pid` is gone (`kill(pid, 0)` is `ESRCH`). A killed orphan is a zombie until its new
+/// parent reaps it, so give that a moment; a survivor is killed so a red run leaks nothing.
+fn assert_gone(pid: rustix::process::Pid) {
+    use rustix::io::Errno;
+    use rustix::process::{Signal, kill_process, test_kill_process};
+
     let gone_by = Instant::now() + Duration::from_secs(5);
     let mut alive = test_kill_process(pid);
     while alive.is_ok() && Instant::now() < gone_by {
@@ -518,11 +529,45 @@ fn a_grandchild_is_gone_after_the_timeout() {
     if alive.is_ok() {
         let _ = kill_process(pid, Signal::KILL); // never leak the sleeper, even when red
     }
-    assert_eq!(
-        alive,
-        Err(Errno::SRCH),
-        "grandchild {pid:?} survived the deadline"
+    assert_eq!(alive, Err(Errno::SRCH), "grandchild {pid:?} survived");
+}
+
+/// The stub forks a sleeping grandchild (`sleep 30`) and writes its pid. At the deadline the
+/// adapter kills the whole process group, so the grandchild is gone too.
+#[test]
+fn a_grandchild_is_gone_after_the_timeout() {
+    let (got, _, pid) = run_grandchild_stub("wait", Duration::from_millis(500));
+    assert!(matches!(got, Err(AdapterError::Timeout { .. })), "{got:?}");
+    assert_gone(pid);
+}
+
+/// The tool exits 0 at once (with no output) but leaves a grandchild holding stdout and stderr.
+/// The adapter kills the group as soon as the tool has exited, so the drains end and the call
+/// returns long before the grandchild's `sleep 30` (or the budget) would; the grandchild is gone.
+#[test]
+fn a_grandchild_holding_the_pipes_after_a_normal_exit_neither_holds_the_call_nor_survives() {
+    let (got, elapsed, pid) = run_grandchild_stub("exit", Duration::from_secs(20));
+    println!("MEASURED exit-with-grandchild elapsed={elapsed:?}");
+    assert!(matches!(got, Err(AdapterError::Malformed(_))), "{got:?}");
+    assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+    assert_gone(pid);
+}
+
+/// A grandchild that left the group (`setsid`) survives the group kill and keeps the pipes open.
+/// The drains after a normal exit are bounded by what is left of the budget, so the call is a
+/// timeout at the deadline, never a wait for the grandchild. The escaped grandchild is not the
+/// adapter's to kill (FLOW.md, "The deadline"); the test kills it by its exact pid.
+#[test]
+fn an_escaped_grandchild_holding_the_pipes_cannot_hold_the_call_past_the_deadline() {
+    let budget = Duration::from_millis(700);
+    let (got, elapsed, pid) = run_grandchild_stub("escape", budget);
+    println!("MEASURED escaped-grandchild elapsed={elapsed:?}");
+    let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+    assert!(
+        matches!(got, Err(AdapterError::Timeout { budget: b }) if b == budget),
+        "{got:?}"
     );
+    assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
 }
 
 #[test]
