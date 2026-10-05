@@ -153,18 +153,66 @@ pub enum HostRefusal {
 pub const MODEL_SOCKET_ENV: &str = "HEE4_MODEL_SOCKET";
 
 /// A fully built, permitted spawn.
+///
+/// The fields are private: [`plan`] is the only constructor, so every plan that reaches
+/// [`start`] or [`run`] was built under a [`Permit`]. Callers read it through the getters.
+/// A plan literal outside this module does not compile:
+///
+/// ```compile_fail,E0451
+/// use hee4_host::spawn::{PermitId, ReceiptId, SpawnPlan};
+/// use std::{path::PathBuf, time::Duration};
+/// let _bypass = SpawnPlan {
+///     permit: PermitId(0),
+///     receipt: ReceiptId(String::new()),
+///     program: PathBuf::from("/bin/sh"),
+///     argv: vec![],
+///     timeout: Duration::from_secs(1),
+/// };
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpawnPlan {
     /// Permit this plan was built under.
-    pub permit: PermitId,
+    permit: PermitId,
     /// Receipt the spawn actuates under.
-    pub receipt: ReceiptId,
+    receipt: ReceiptId,
     /// Program to execute (bwrap).
-    pub program: PathBuf,
+    program: PathBuf,
     /// Exact argv after the program.
-    pub argv: Vec<String>,
+    argv: Vec<String>,
     /// Kill deadline.
-    pub timeout: Duration,
+    timeout: Duration,
+}
+
+impl SpawnPlan {
+    /// The permit this plan was built under.
+    #[must_use]
+    pub fn permit(&self) -> PermitId {
+        self.permit
+    }
+
+    /// The receipt the spawn actuates under.
+    #[must_use]
+    pub fn receipt(&self) -> &ReceiptId {
+        &self.receipt
+    }
+
+    /// The program to execute ([`BWRAP`] for every planned spawn).
+    #[must_use]
+    pub fn program(&self) -> &Path {
+        &self.program
+    }
+
+    /// The exact argv after the program.
+    #[must_use]
+    pub fn argv(&self) -> &[String] {
+        &self.argv
+    }
+
+    /// The kill deadline.
+    #[must_use]
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
 }
 
 /// Build the bwrap invocation, or refuse.
