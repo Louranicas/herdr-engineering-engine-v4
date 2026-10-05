@@ -4,11 +4,17 @@
 Verbs (each one transaction, BEGIN IMMEDIATE, under the writer flock; stdlib only):
   init                                   create/migrate the DB from schema/*.sql (idempotent; refuses a changed applied file)
   record unit|brief|spawn|claim|verify|receipt|exit|andon  --k v ...   one row; refusals are typed (exit 20)
+  record brief --unit U --path P [--head-sha S]   brief_sha, standing_sha (and head_sha from git) are computed, never typed;
+                                         refuses a missing `LABEL:` field or summarised standing orders (PROTOCOL §2)
+  record spawn ... [--brief-sha X]       refuses a unit with no recorded brief, a closed unit, a brief of another unit
   clear-andon --id N --by WHO
+  close-unit --id U --by WHO             refuses an open andon or a spawn without an exit; reports unverified MEASURED claims
   q 'SELECT ...'                         one bounded read-only SELECT through tursodb --readonly (exit 30 if absent)
-  status                                 open units, spawned vs planned, open andon (JSON)
+  status                                 open units, spawned vs planned, briefs, open andon (JSON)
 Exit codes: 0 ok · 2 usage · 3 setup · 20 refused · 30 unmeasured.
 Engine roles follow ops/db/README.md "Writer safety": Python sqlite3 writes; tursodb is never opened read-write.
+Homes: FM_HOME selects the home; FM_DB (hee4.env exports it) overrides the file but must lie inside FM_HOME when both are
+set, so `FM_HOME=$(mktemp -d) fm-db init` under a sourced hee4.env is refused (exit 3) instead of writing the live DB.
 """
 from __future__ import annotations
 
@@ -23,10 +29,23 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-FM_HOME = Path(os.environ.get("FM_HOME", Path.home() / "firstmate"))
-DB = Path(os.environ.get("FM_DB", FM_HOME / "data" / "firstmate.db"))
+FM_HOME = Path(os.environ.get("FM_HOME") or Path.home() / "firstmate")
+DB = Path(os.environ.get("FM_DB") or FM_HOME / "data" / "firstmate.db")
+HEE4_ROOT = Path(os.environ.get("HEE4_ROOT") or HERE.parent.parent)
+STANDING_ORDERS = HEE4_ROOT / "agents" / "standing-orders.md"
 TURSODB = os.environ.get("HEE4DB_TURSODB", str(Path.home() / ".local/bin/tursodb"))
 Q_CAP = 200  # rows per read-back; a larger answer is a report, not a query
+# The eleven I1 fields; a field is a line that starts at column 0 with `LABEL:` (crates/hee4-contracts/src/brief.rs:63-64,
+# BriefField::opens). fm-db mirrors that one rule for its file door; it owns no second grammar.
+BRIEF_FIELDS = ("GOAL", "SCOPE", "CONTEXT", "ACCEPTANCE", "VERIFY", "TIMEBOX", "FORBIDDEN", "REPORT", "STANDING", "RECON", "RESTATEMENT")
+BRIEF_KEYS = ["unit_id", "path", "head_sha", "ts"]   # the caller's keys for `record brief`; every sha is computed here
+
+
+def db_outside_home() -> str | None:
+    """Both FM_HOME and FM_DB named and FM_DB not inside FM_HOME: two homes, refuse before any write (setup, exit 3)."""
+    if os.environ.get("FM_HOME") and os.environ.get("FM_DB") and not DB.resolve().is_relative_to(FM_HOME.resolve()):
+        return f"fm_db_outside_fm_home: FM_DB={DB} is not under FM_HOME={FM_HOME}; unset FM_DB or point it inside the home"
+    return None
 
 
 def out(verb: str, verdict: str, code: int, **kw) -> int:
@@ -95,7 +114,7 @@ def init() -> int:
 COLS = {
     "unit": ("units", ["unit_id", "project", "kind", "mode", "yolo", "brief_path", "planned_agents", "opened_ts"]),
     "brief": ("briefs", ["brief_sha", "unit_id", "path", "head_sha", "standing_sha", "ts"]),
-    "spawn": ("spawns", ["task_id", "unit_id", "agent", "harness", "model", "backend", "worktree", "fresh", "ts"]),
+    "spawn": ("spawns", ["task_id", "unit_id", "agent", "harness", "model", "backend", "worktree", "fresh", "ts", "brief_sha"]),
     "claim": ("claims", ["task_id", "text", "label", "witness_cmd", "head_sha", "ts"]),
     "verify": ("verifications", ["claim_id", "verifier_task", "verdict", "result", "ts"]),
     "receipt": ("receipts", ["task_id", "event", "detail", "pr", "head_sha", "ts"]),
@@ -103,6 +122,43 @@ COLS = {
     "andon": ("andon", ["unit_id", "raised_by", "reason", "measured", "ts"]),
 }
 STATUS_VERBS = {"done": "PASS", "failed": "FAIL", "blocked": "BLOCKED", "needs-decision": "BLOCKED", "paused": "PASS_WITH_GAPS"}
+
+
+def collapsed(text: str) -> list[str]:
+    """Each line with its whitespace collapsed to single spaces; a verbatim paste survives re-wrapping of indentation only."""
+    return [" ".join(ln.split()) for ln in text.splitlines()]
+
+
+def brief_row(d: dict[str, str]) -> str | None:
+    """Fill the computed brief columns in place; return the typed refusal detail, or None when the brief is admissible."""
+    path = Path(d.get("path") or "")
+    if not path.is_file():
+        return f"brief_path_unreadable: {path}"
+    if not STANDING_ORDERS.is_file():
+        return f"standing_orders_absent: {STANDING_ORDERS}"
+    body = path.read_bytes()
+    standing = STANDING_ORDERS.read_bytes()
+    if not d.get("head_sha"):
+        try:
+            g = subprocess.run(["git", "-C", str(HEE4_ROOT), "rev-parse", "HEAD"], capture_output=True, text=True, stdin=subprocess.DEVNULL)
+            d["head_sha"] = g.stdout.strip() if g.returncode == 0 else ""
+        except OSError:
+            d["head_sha"] = ""
+        if not d["head_sha"]:                                            # never an empty string (standing order 4, AP-29)
+            return f"head_sha_unmeasured; pass --head-sha (git -C {HEE4_ROOT} rev-parse HEAD failed)"
+    text = body.decode("utf-8", "replace")
+    for label in BRIEF_FIELDS:                                           # column 0, `LABEL:` — brief.rs:63-64
+        if not any(ln.startswith(label + ":") for ln in text.splitlines()):
+            return f"brief_field_missing={label}"
+    standing_lines = standing.decode("utf-8", "replace").splitlines()
+    first_body = 1 if standing_lines and standing_lines[0].startswith("#") else 0   # the H1 is the file's title, not an order
+    present = set(collapsed(text))
+    for n, ln in enumerate(standing_lines, start=1):
+        if n > first_body and ln.strip() and " ".join(ln.split()) not in present:
+            return f"standing_not_verbatim line={n}: standing orders are pasted verbatim, never summarised (PROTOCOL §2)"
+    d["brief_sha"] = hashlib.sha256(body).hexdigest()
+    d["standing_sha"] = hashlib.sha256(standing).hexdigest()
+    return None
 
 
 def record(kind: str, args: list[str]) -> int:
@@ -113,25 +169,42 @@ def record(kind: str, args: list[str]) -> int:
     d.setdefault("ts", ts())
     if kind == "unit":
         d.setdefault("opened_ts", d.pop("ts"))
+    if kind == "brief" and "unit" in d:
+        d["unit_id"] = d.pop("unit")                                     # `--unit U` is the CLI spelling of unit_id
     if kind == "exit" and d.get("verdict") in STATUS_VERBS:        # Firstmate status verb → roster verdict
         d["verdict"] = STATUS_VERBS[d["verdict"]]
     if kind == "andon":
         d["measured"] = "1" if d.get("measured", "0") in ("1", "true", "yes") else "0"
-    row = {c: d.get(c) for c in cols}
-    extra = sorted(set(d) - set(cols))
+    extra = sorted(set(d) - set(BRIEF_KEYS if kind == "brief" else cols))
     if extra:
-        return out("record", "USAGE", 2, detail=f"unknown keys {extra}; allowed {cols}")
+        return out("record", "USAGE", 2, detail=f"unknown keys {extra}; allowed {BRIEF_KEYS if kind == 'brief' else cols}")
+    if kind == "brief":
+        refusal = brief_row(d)
+        if refusal:
+            return out("record", "REFUSED", 20, detail=refusal)
+    row = {c: d.get(c) for c in cols}
     try:
         with Writer() as con:
             if kind == "spawn":  # planned_agents is enforced HERE (Firstmate has no cap)
-                r = con.execute("SELECT planned_agents, (SELECT count(*) FROM spawns WHERE unit_id=?) FROM units WHERE unit_id=?",
-                                (row["unit_id"], row["unit_id"])).fetchone()
+                u = row["unit_id"]
+                r = con.execute("SELECT planned_agents, (SELECT count(*) FROM spawns WHERE unit_id=?), closed_ts FROM units WHERE unit_id=?",
+                                (u, u)).fetchone()
                 if r is None:
-                    return out("record", "REFUSED", 20, detail=f"no unit {row['unit_id']!r}; record the unit first")
+                    return out("record", "REFUSED", 20, detail=f"no unit {u!r}; record the unit first")
+                if r[2] is not None:
+                    return out("record", "REFUSED", 20, detail=f"unit_closed: {u} closed at {r[2]}; open a new unit")
                 if r[1] >= r[0]:
                     return out("record", "REFUSED", 20, detail=f"planned_agents={r[0]} already spawned={r[1]}; raise the plan in a new unit, do not exceed it")
-                if con.execute("SELECT 1 FROM andon WHERE unit_id=? AND cleared_ts IS NULL", (row["unit_id"],)).fetchone():
+                if con.execute("SELECT 1 FROM andon WHERE unit_id=? AND cleared_ts IS NULL", (u,)).fetchone():
                     return out("record", "REFUSED", 20, detail="open andon on this unit: no spawn until the captain clears it")
+                if not con.execute("SELECT 1 FROM briefs WHERE unit_id=?", (u,)).fetchone():   # PROTOCOL §2: the brief is the only start
+                    return out("record", "REFUSED", 20, detail=f"no brief recorded for unit {u}; record the brief first")
+                if row["brief_sha"] is not None:
+                    b = con.execute("SELECT unit_id FROM briefs WHERE brief_sha=?", (row["brief_sha"],)).fetchone()
+                    if b is None:
+                        return out("record", "REFUSED", 20, detail=f"brief_sha_unknown: {row['brief_sha']} is not a recorded brief")
+                    if b[0] != u:
+                        return out("record", "REFUSED", 20, detail=f"brief_sha_unit_mismatch: brief belongs to unit {b[0]}, spawn names {u}")
             given = [c for c in cols if row[c] is not None]          # absent keys take the schema's defaults
             cur = con.execute(f"INSERT INTO {table} ({','.join(given)}) VALUES ({','.join('?' * len(given))})", [row[c] for c in given])
             rid = cur.lastrowid
@@ -145,6 +218,32 @@ def clear_andon(args: list[str]) -> int:
     with Writer() as con:
         n = con.execute("UPDATE andon SET cleared_by=?, cleared_ts=? WHERE andon_id=? AND cleared_ts IS NULL", (d.get("by"), ts(), d.get("id"))).rowcount
     return out("clear-andon", "PASS" if n else "REFUSED", 0 if n else 20, cleared=n)
+
+
+def close_unit(args: list[str]) -> int:
+    """Close a unit: every spawn has an exit and no andon is open; unverified MEASURED claims are reported, not refused."""
+    d = kv(args)
+    u, who = d.get("id"), d.get("by")
+    if not u or not who or set(d) - {"id", "by"}:
+        return out("close-unit", "USAGE", 2, detail="close-unit --id UNIT --by WHO")
+    with Writer() as con:
+        r = con.execute("SELECT closed_ts FROM units WHERE unit_id=?", (u,)).fetchone()
+        if r is None:
+            return out("close-unit", "REFUSED", 20, detail=f"no unit {u!r}")
+        if r[0] is not None:
+            return out("close-unit", "REFUSED", 20, detail=f"already_closed: {u} closed at {r[0]}")
+        if con.execute("SELECT 1 FROM andon WHERE unit_id=? AND cleared_ts IS NULL", (u,)).fetchone():
+            return out("close-unit", "REFUSED", 20, detail="open andon on this unit: the captain clears it before the unit closes")
+        m = con.execute("SELECT s.task_id FROM spawns s LEFT JOIN exits e ON e.task_id = s.task_id "
+                        "WHERE s.unit_id=? AND e.task_id IS NULL ORDER BY s.ts, s.task_id LIMIT 1", (u,)).fetchone()
+        if m:
+            return out("close-unit", "REFUSED", 20, detail=f"spawn_without_exit task_id={m[0]}; record its exit first")
+        k = con.execute("SELECT count(*) FROM spawns WHERE unit_id=?", (u,)).fetchone()[0]
+        e = con.execute("SELECT count(*) FROM exits e JOIN spawns s ON s.task_id = e.task_id WHERE s.unit_id=?", (u,)).fetchone()[0]
+        n = con.execute("SELECT count(*) FROM claims c JOIN spawns s ON s.task_id = c.task_id WHERE s.unit_id=? AND c.label='MEASURED' "
+                        "AND NOT EXISTS (SELECT 1 FROM verifications v WHERE v.claim_id = c.claim_id)", (u,)).fetchone()[0]
+        con.execute("UPDATE units SET closed_ts=? WHERE unit_id=?", (ts(), u))
+    return out("close-unit", "PASS", 0, unit_id=u, by=who, spawns=k, exits=e, unverified=n)
 
 
 def q(sql: str) -> int:
@@ -162,7 +261,8 @@ def status() -> int:
     if not DB.exists():
         return out("status", "UNMEASURED", 30, detail="no database; run fm-db init")
     con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
-    units = [dict(zip(("unit_id", "project", "kind", "planned_agents", "spawned", "open_andon"), r)) for r in con.execute("SELECT * FROM open_units")]
+    names = ("unit_id", "project", "kind", "planned_agents", "spawned", "open_andon", "briefs")   # open_units, 002_brief_link.sql
+    units = [dict(zip(names, r)) for r in con.execute("SELECT * FROM open_units")]
     unverified = con.execute("SELECT count(*) FROM claims c WHERE c.label='MEASURED' AND NOT EXISTS (SELECT 1 FROM verifications v WHERE v.claim_id=c.claim_id)").fetchone()[0]
     con.close()
     return out("status", "PASS", 0, open_units=units, measured_claims_unverified=unverified)
@@ -172,9 +272,13 @@ def main(argv: list[str]) -> int:
     if len(argv) < 2:
         print(__doc__); return 2
     v = argv[1]
+    homes = db_outside_home()
+    if homes:
+        return out(v, "SETUP", 3, detail=homes)
     if v == "init": return init()
     if v == "record": return record(argv[2], argv[3:]) if len(argv) > 2 else out("record", "USAGE", 2)
     if v == "clear-andon": return clear_andon(argv[2:])
+    if v == "close-unit": return close_unit(argv[2:])
     if v == "q": return q(" ".join(argv[2:]))
     if v == "status": return status()
     print(__doc__); return 2
