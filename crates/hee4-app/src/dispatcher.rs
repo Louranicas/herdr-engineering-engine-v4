@@ -1015,7 +1015,7 @@ impl DiffFault {
 enum Entry {
     /// A regular file, with its executable bit.
     File {
-        /// Whether any execute bit is set.
+        /// Whether any `x` permission bit is set.
         exec: bool,
         /// The contents.
         bytes: Vec<u8>,
@@ -1041,7 +1041,7 @@ impl Entry {
 }
 
 /// The workspace's entries keyed by relative path, read in-process: no git, so nothing the
-/// candidate wrote (a `.git/config`, a `.gitattributes`, a `gitdir:` file) is ever executed
+/// candidate wrote (a `.git/config`, a `.gitattributes`, a `gitdir:` file) is ever run
 /// or followed on the host. Every entry named `.git` (at any depth) is left out, as git does.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Snapshot(BTreeMap<Vec<u8>, Entry>);
