@@ -197,7 +197,7 @@ def main():
             F.check("driver", False, f"{type(e).__name__}: {e}")
         F.f.close()
         v, k, n = F.verdict(); verdicts.append(v)
-        print(f"drive feature={name} verdict={v} paths={k}/{n} evidence={evp}")
+        print(f"drive feature={name} verdict={v} paths={k}/{n} evidence={evp}" + (drive_d.feature_reason(F.paths) if v == "UNMEASURED" else ""))
         for p, st, d in F.paths:
             if st != "PASS": print(f"  path={p} status={st} detail={d[:300]}")
     v = "FAIL" if "FAIL" in verdicts else "UNMEASURED" if "UNMEASURED" in verdicts or not verdicts else "PASS"
