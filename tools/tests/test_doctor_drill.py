@@ -245,12 +245,12 @@ class DrillTests(unittest.TestCase):
             r.save("0/2")  # the write dies after the bytes went out: a reader must still see the old record, whole
         self.assertIn("drill rehearsal=UNWRITTEN(", buf.getvalue())
         self.assertEqual(open(p).read(), old)
-        self.assertEqual(os.listdir(tree), ["rehearsal.json"], "a temp file was left behind")
+        self.assertEqual(sorted(os.listdir(tree)), [".lock", "rehearsal.json"], "a temp file was left behind")
         with contextlib.redirect_stdout(io.StringIO()):
             r.save("2/2")
         rec = json.load(open(p))
         self.assertEqual((rec["submitted"], rec["acked_present"], rec["task_ids"]), (2, "2/2", ["t-old", "t-new1", "t-new2"]))
-        self.assertEqual(os.listdir(tree), ["rehearsal.json"])
+        self.assertEqual(sorted(os.listdir(tree)), [".lock", "rehearsal.json"])
 
     def test_fire_submit_run_that_acked_nothing_keeps_the_submitting_record(self):
         # the cut tier always passes --submit 3: with the unit down (UNMEASURED, rc=3) or the socket gone
@@ -275,6 +275,34 @@ class DrillTests(unittest.TestCase):
                 self.assertEqual((rec["submitted"], rec["acked_present"]), (3, "3/3"))
                 self.assertEqual([s["status"] for s in rec["steps"]], ["MEASURED"] * 7)
                 self.assertEqual(sorted(rec["task_ids"]), sorted(w.submitted))
+
+    def test_fire_interleaved_saves_lose_no_record_and_no_id(self):
+        # a second drill's save runs inside the first one's write (the read-merge-write window): with the
+        # per-tree flock the inner save waits, then merges onto the outer record; without it one is erased
+        import argparse, importlib.machinery, importlib.util, io, contextlib
+        from unittest import mock
+        loader = importlib.machinery.SourceFileLoader("drill_lock_under_test", DRILL)
+        mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader)); loader.exec_module(mod)
+        def ns(n):
+            return argparse.Namespace(drill_root=root, unit="hee4.service", submit=n, restart_budget=1)
+        for outer_ids, inner_ids in (([], ["t-sub1", "t-sub2", "t-sub3"]), (["t-a1", "t-a2"], ["t-b1", "t-b2", "t-b3"])):
+            with self.subTest(outer=outer_ids, inner=inner_ids):
+                root = tempfile.mkdtemp(prefix="dr-")
+                outer, inner = mod.Run(ns(len(outer_ids)), "abcdef012345"), mod.Run(ns(len(inner_ids)), "abcdef012345")
+                outer.ids, inner.ids = list(outer_ids), list(inner_ids)
+                real, fired, t = mod.write_atomic, [], []
+                def hook(path, text):
+                    if not fired:
+                        fired.append(1)
+                        th = threading.Thread(target=inner.save, args=(f"{len(inner_ids)}/{len(inner_ids)}",)); th.start(); t.append(th)
+                        th.join(1.0)  # with the lock the inner save is still blocked here; without it, it has written
+                    real(path, text)
+                with mock.patch.object(mod, "write_atomic", hook), contextlib.redirect_stdout(io.StringIO()):
+                    outer.save(f"{len(outer_ids)}/{len(outer_ids)}")
+                    t[0].join(10); self.assertFalse(t[0].is_alive())
+                rec = json.load(open(os.path.join(root, "abcdef012345", "rehearsal.json")))
+                self.assertEqual(rec["submitted"], len(inner_ids))
+                self.assertEqual(sorted(rec["task_ids"]), sorted(outer_ids + inner_ids))
 
     def test_cut_tier_drill_step_submits(self):
         import re, tomllib
