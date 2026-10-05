@@ -102,7 +102,9 @@ def _load(name: str, path: Path):
 def load_world(repo: Path) -> World:
     mf = _load("hee4_module_funnel", repo / "ops/checks/module_funnel.py")
     db = _load("hee4_hee4db", repo / "ops/db/hee4db")
-    roots = {k: Path(v) for k, v in db.ROOTS.items()}
+    # The repo root is the one this hook resolved, not hee4db's default (HEE4_ROOT or the main
+    # checkout): from a worktree the two differ and the worktree's world files go unseen.
+    roots = {**{k: Path(v) for k, v in db.ROOTS.items()}, "repo": repo}
     legend = {k: (Path(v) if os.path.isabs(v) else repo / v) for k, v in mf.LEGEND.items()}
     return World(repo=repo, roots=roots, legend=legend, files=tuple(db.WORLD_FILES),
                  globs=tuple(db.WORLD_GLOBS), excluded=frozenset(db.EXCLUDED))

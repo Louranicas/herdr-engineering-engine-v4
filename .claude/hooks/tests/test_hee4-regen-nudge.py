@@ -67,6 +67,23 @@ def main() -> int:
         rc, out, err, dt = run_hook(HOOK, payload)
         c.check(name, "quiet", rc == 0 and out.strip() == "" and dt < BUDGET_S, f"rc={rc} out={out[:120]!r} t={dt:.2f}s")
 
+    # The repo root is this checkout's, from any cwd and whatever hee4db's own default says
+    # (a worktree must not read the main checkout's world).
+    decoy_env = {"HEE4_ROOT": "/nonexistent-hee4-root", "HEE4DB_REPO": "/nonexistent-hee4-root"}
+    with tempfile.TemporaryDirectory() as td:
+        here = os.getcwd()
+        os.chdir(td)
+        try:
+            rc, out, err, dt = run_hook(HOOK, {"tool_name": "Edit", "tool_input": {"file_path": str(REPO / "plan/DECISIONS.md")}},
+                                        decoy_env)
+        finally:
+            os.chdir(here)
+        got = steps_of(out)
+        want = ["just repin DEC", "hee4db ingest", "just verify"]
+        c.check("DECISIONS from another cwd, decoy HEE4_ROOT", "fire", rc == 0 and got == want, f"rc={rc} got={got} want={want}")
+    roots_repo = regen_nudge.load_world(REPO).roots["repo"]
+    c.check("load_world roots.repo is the given repo", "fire", roots_repo == REPO, f"roots.repo={roots_repo} repo={REPO}")
+
     # The key is derived from LEGEND: a fake legend entry produces its own key.
     with tempfile.TemporaryDirectory() as td:
         f = Path(td) / "zz.md"
