@@ -9,6 +9,17 @@ def stub(dirpath, name, body):
         f.write("#!/usr/bin/env bash\n" + body)
     os.chmod(p, 0o755)
 
+def hee4_stub(dirpath, head):
+    """A fake `hee4`: `--version` names `head`; `health` ends with the JSON reply the doctor reads
+    (body.budgets, served since U-stack-04 wave 3); `doctor` prints the binary's own budgets row
+    with the same key=value set."""
+    health = json.dumps({"kind": "result", "request_id": "cli-1", "replayed": False,
+                         "body": {"ok": True, "recovery_complete": True, "uptime_s": 1,
+                                  "budgets": {"socket": {"max_connections": 256}, "door": {"pool": 8}}}})
+    stub(dirpath, "hee4", f'case "$1" in --version) echo "hee4 {head}";; '
+         'doctor) echo "doctor row=budgets present door.pool=8 socket.max_connections=256";; '
+         "*) echo 'ready=true recovery=complete database=ready socket=owned'; echo '" + health + "';; esac\n")
+
 def ps_handler(models):
     class H(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
@@ -35,7 +46,7 @@ class World:
         self.proc = None
         self.start_main()
         stub(self.bin, "systemctl", f'echo LoadState=loaded; echo ActiveState=active; echo MainPID=$(cat {self.pidfile})\n')
-        stub(self.bin, "hee4", 'case "$1" in --version) echo "hee4 HEADSHA";; *) echo "ready=true recovery=complete database=ready socket=owned";; esac\n')
+        hee4_stub(self.bin, "HEADSHA")
         self.env = {"PATH": self.bin + ":" + os.environ["PATH"]}
     def serve(self):
         while True:
@@ -72,7 +83,7 @@ def head_of(repo):
 
 def healthy_doctor(w, *extra):
     head = head_of(TOOLS)
-    stub(w.bin, "hee4", f'case "$1" in --version) echo "hee4 {head}";; *) echo "ready=true recovery=complete database=ready socket=owned";; esac\n')
+    hee4_stub(w.bin, head)
     return run(DOCTOR, "--socket", w.sockpath, "--model-url", w.url, "--repo", TOOLS, *extra, env=w.env)
 
 class DoctorTests(unittest.TestCase):
