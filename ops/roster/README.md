@@ -1,7 +1,7 @@
 # Agent roster: operations
 One runner for every roster agent: `run-agent.sh <agent> light|deep|selfcheck`.
 - **Code measures** (`<agent>/measure.sh`); the agent reads the measurements and curates. Every measurement section prints `UNMEASURED (<reason>)` when its source is absent (an unmounted STORAGE, a missing vault, script or evidence dir) or it looked at nothing (F138); a 0 from an absent source is never printed.
-- **The exit code is the agent's typed verdict**, read from the report's LAST non-empty line only (trailing CR stripped), which must match `^<agent without hee4-> verdict=(PASS_WITH_GAPS|PASS|FAIL|BLOCKED|STOP)( |$)` (BLOCKED and STOP added 2026-10-05, V4-84, so the runner and `.claude/agents/PROTOCOL.md` §5 agree):
+- **The exit code is the agent's typed verdict**, read from the report's LAST non-empty line only (trailing CR stripped), which must match `^<agent without hee4-> verdict=(PASS_WITH_GAPS|PASS|FAIL|BLOCKED|STOP)( |$)` (BLOCKED and STOP added 2026-10-05, V4-84, so the runner, `.claude/agents/PROTOCOL.md` §5 and `ops/firstmate/schema/001_init.sql`'s `exits` CHECK agree; `selfcheck.py` case `vocabulary` measures the three homes):
 
 | Exit | Meaning |
 |---|---|
@@ -12,32 +12,46 @@ One runner for every roster agent: `run-agent.sh <agent> light|deep|selfcheck`.
 | 40 | SKIPPED: another run of the same agent held the lock; one line in `skipped.log` and in that run's log |
 | 2 / 3 | usage / setup |
 
-- Every run log carries `exit=N measure_rc=M` (`M` is measure.sh's own exit status; `NA` on a skip), then one `db_record=ok|failed rc=N run_rc=R measurement_rc=M` line: after the exit line the runner records the run and its measurements in the ops DB (`ops/db/hee4db record run --log`, `record measurement --file`; hee4db's output in `db-<stamp>-<mode>.txt`). A DB failure is logged and **never changes the exit code** (stub battery: 36/36 cases give the same exit with hee4db working and with it replaced by `/bin/false`, 2026-10-01). A failed record is backfilled by the daily upkeep below.
-- `hee4-curator`'s `v3_refs` scans all three v4 homes (repo, `~/hee4-evidence`, the v4 vault) for v3 **paths**, honouring `ops/v3-independence-exclusions.txt` (`<home>:<path> | <reason>`), and prints a per-home breakdown then `v3_refs=N homes=3/3 files_scanned=N …` (CN-05).
+- Every run log carries `exit=N measure_rc=M` (`M` is measure.sh's own exit status; `NA` on a skip), then one `db_record=ok|failed rc=N run_rc=R measurement_rc=M` line: after the exit line the runner records the run and its measurements in the ops DB (`ops/db/hee4db record run --log`, `record measurement --file`; hee4db's output in `db-<stamp>-<mode>.txt`). A DB failure is logged and **never changes the exit code** (stub battery: 36/36 cases give the same exit with hee4db working and with it replaced by `/bin/false`, 2026-10-01).
 - Single-instance per agent (flock on fd 9, closed for the measure and claude children); budget-capped per mode (`<agent>/modes.conf`).
-- `dontAsk` permissions from `<agent>/settings.json`, least privilege (V4-26): Read only the v4 repo, `~/hee4-evidence` and the v4 vault (Read denied on `~/.claude/**` and the v3 homes); Edit only the agent's own vault files and its report dir; the repo is denied; no hooks (`disableAllHooks`, V4-21). Bash: the curator may run exactly `mempalace mine <v4 vault>` with or without `--dry-run`, and `mempalace search`; the workflow curator runs no Bash.
-- Logs, measurements and reports: `~/hee4-evidence/roster/<agent>/`.
+- `dontAsk` permissions from `<agent>/settings.json`, least privilege (V4-26): Read only the v4 repo, `$HEE4_EVIDENCE` and the v4 vault (Read denied on `~/.claude/**` and the v3 homes); Edit only the agent's own vault files and its report dir; the repo is denied; no hooks (`disableAllHooks`, V4-21). Bash: only the exact spellings the agent's `settings.json` allows.
+- Logs, measurements and reports: `$HEE4_EVIDENCE/roster/<agent>/`.
+- The runner's precondition is `ops/roster/<agent>/{measure.sh,modes.conf,settings.json}` plus `.claude/agents/<agent>.md`; it exits 2 otherwise. Today no roster agent has that directory (`ls ops/roster` → `README.md run-agent.sh selfcheck.py`), so the runner has no live subject: it stays because `ops/db/hee4db` parses `run-agent.sh <agent> <mode>` schedule lines, `hee4-watch-fence` greps its permission mode and `runbooks/roster-selfcheck.toml` names it.
 
-| Agent | Definition | Subject |
+## Roster
+The rows below are generated from `.claude/agents/ROSTER.md` (first-column backticked `hee4-*` tokens, in order; `ops/roster/selfcheck.py` case `roster_rows_have_files` keeps them equal to the agent files). Spawn a roster agent with the `Agent` tool or `/hee4-roster`; the brief comes first (PROTOCOL §2).
+
+| Agent | Definition | Section in ROSTER.md |
 |---|---|---|
-| hee4-curator | `.claude/agents/hee4-curator.md` | corpus state vs measured tree |
-| hee4-workflow-curator | `.claude/agents/hee4-workflow-curator.md` | workflows and loops: record, measure, propose |
+| `hee4-contracts-architect` | `.claude/agents/hee4-contracts-architect.md` | Facet specialists |
+| `hee4-store-recovery` | `.claude/agents/hee4-store-recovery.md` | Facet specialists |
+| `hee4-app-runtime` | `.claude/agents/hee4-app-runtime.md` | Facet specialists |
+| `hee4-isolation` | `.claude/agents/hee4-isolation.md` | Facet specialists |
+| `hee4-verdict` | `.claude/agents/hee4-verdict.md` | Facet specialists |
+| `hee4-control-socket` | `.claude/agents/hee4-control-socket.md` | Facet specialists |
+| `hee4-worker-route` | `.claude/agents/hee4-worker-route.md` | Facet specialists |
+| `hee4-receipts-chain` | `.claude/agents/hee4-receipts-chain.md` | Facet specialists |
+| `hee4-gate` | `.claude/agents/hee4-gate.md` | Facet specialists |
+| `hee4-outer-loop` | `.claude/agents/hee4-outer-loop.md` | Facet specialists |
+| `hee4-craft-curator` | `.claude/agents/hee4-craft-curator.md` | Facet specialists |
+| `hee4-floor-display` | `.claude/agents/hee4-floor-display.md` | Facet specialists |
+| `hee4-watch-drift` | `.claude/agents/hee4-watch-drift.md` | Watchers |
+| `hee4-watch-contradiction` | `.claude/agents/hee4-watch-contradiction.md` | Watchers |
+| `hee4-watch-evidence` | `.claude/agents/hee4-watch-evidence.md` | Watchers |
+| `hee4-watch-recovery` | `.claude/agents/hee4-watch-recovery.md` | Watchers |
+| `hee4-watch-fence` | `.claude/agents/hee4-watch-fence.md` | Watchers |
+| `hee4-watch-budget` | `.claude/agents/hee4-watch-budget.md` | Watchers |
+| `hee4-coordinator` | `.claude/agents/hee4-coordinator.md` | Collaboration roles |
+| `hee4-refuter` | `.claude/agents/hee4-refuter.md` | Collaboration roles |
+| `hee4-scribe` | `.claude/agents/hee4-scribe.md` | Collaboration roles |
 
-**Adding an agent:** `.claude/agents/<name>.md`, then `ops/roster/<name>/{measure.sh,modes.conf,settings.json}`, a row here, a row in the vault's `80 Agents/Agent Roster`, and a selfcheck run that exits 0 or 10.
+**Adding an agent:** `.claude/agents/<name>.md` with the H2s the selfcheck requires (`Facet and rung`, `Law`, `Draws from`, `Reads`, `Writes`, `Refuses`, `Report shape`) and its typed verdict token, a row in `ROSTER.md`, then `just roster-selfcheck` (exit 0). For the paid runner, add `ops/roster/<name>/{measure.sh,modes.conf,settings.json}` and a selfcheck run that exits 0 or 10.
 
-## Schedule (host crontab; crond is active)
-```
-XDG_RUNTIME_DIR=/run/user/1000
-DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
-RUN="/usr/bin/toolbox run -c fedora-toolbox-44 /var/home/Louranicas/herdr-engineering-engine-v4/ops/roster/run-agent.sh"
-17 */6 * * * $RUN hee4-curator light
-40 2 * * *   $RUN hee4-curator deep
-47 */8 * * * $RUN hee4-workflow-curator light
-10 3 * * *   $RUN hee4-workflow-curator deep
-30 2 * * *   /usr/bin/toolbox run -c fedora-toolbox-44 /var/home/Louranicas/herdr-engineering-engine-v4/ops/db/daily.sh
-```
-The 02:30 line (added 2026-10-01, CN-04) is not a roster agent: `ops/db/daily.sh` runs `hee4db ingest`, backfills runs and measurements (`--from-logs`, `--from-measure-files`), records yesterday's Jev egress **counts** (`record jev-daily`) and runs `hee4db check`, so curator deep at 02:40 reads a current DB. Its log is `~/hee4-evidence/db/daily/daily-<stamp>.log`, last line `daily verdict=… steps_ok=K/5`. No model, no spend.
-The deep runs start at 02:40 and 03:10: after the evidence backup at 01:30, and not overlapping each other.
+## Schedule
+This host runs no cron and no roster timer: roster work runs through the `Agent` tool under a brief (V4-93).
+The sibling slice `ops-db-schedule` owns timers and rewrites this section if it lands.
+Until then nothing here runs unattended and nothing here spends.
 
-**9 runs a day:** curator light 4 (00:17, 06:17, 12:17, 18:17) + curator deep 1 + workflow-curator light 3 (00:47, 08:47, 16:47) + workflow-curator deep 1.
-**Spend ceiling** (each run is capped by `--max-budget-usd` from `modes.conf`; a run that hits its cap exits 30): curator 4 × $1.00 + $4.00 = $8.00; workflow curator 3 × $1.00 + $3.00 = $6.00; **$14.00/day at most, about $420 per 30 days.** Measured spend is lower (selfchecks printed `cost_usd` ≈ 0.20–0.23, V4-24); read `cost_usd=` in the run logs, never this ceiling, for the real figure.
+## Self-check
+- `just roster-selfcheck` ($0): `python3 ops/roster/selfcheck.py` reads files only (no process, no model, no network) and prints one `case=` line per structural case, then `roster-selfcheck verdict=PASS|FAIL cases=k/n`; `--control` plants one fault per case over a temp copy and prints `roster-selfcheck control cases=k/k verdict=PASS`. `just verify` runs it as a step.
+- `just roster-selfcheck AGENT` (paid, about $0.25 per run): `run-agent.sh AGENT selfcheck`, kept for an agent that has `ops/roster/AGENT/`.
