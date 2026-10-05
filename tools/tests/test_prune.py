@@ -1,7 +1,29 @@
-import fcntl, os, re, subprocess, tempfile, time, unittest
+import fcntl, os, re, subprocess, sys, tempfile, time, unittest
 from common import TOOLS, run
 
 PRUNE = os.path.join(TOOLS, "prune")
+
+# Runs tools/prune's main() with plan() wrapped: after the plan has judged every dir (unlocked, old),
+# a "build" starts on argv[1] -- it takes the cargo lock (lock) or touches debug/ (touch) -- before
+# any rmtree. The plan's own in_use/young tests can no longer see it; only the apply-time re-check can.
+AFTER_PLAN = """
+import fcntl, os, sys
+from importlib.machinery import SourceFileLoader
+prune = SourceFileLoader("prune", sys.argv[1]).load_module()
+target, how = sys.argv[2], sys.argv[3]
+orig, held = prune.plan, []
+def plan(a, root):
+    out = orig(a, root)
+    if how == "lock":
+        fd = os.open(os.path.join(target, "debug", ".cargo-lock"), os.O_RDONLY)
+        fcntl.flock(fd, fcntl.LOCK_EX); held.append(fd)
+    else:
+        os.utime(os.path.join(target, "debug"))
+    return out
+prune.plan = plan
+sys.argv = ["prune"] + sys.argv[4:]
+prune.main()
+"""
 
 
 def git_repo():
@@ -102,6 +124,29 @@ class TestPrune(unittest.TestCase):
         rc, out, _ = self.prune("--keep", "2", "--apply")
         self.assertEqual(rc, 0, out)
         self.assertIn("candidates=0 ", out); self.assertIn("removed=0 ", out)
+
+    def apply_with_build_after_plan(self, how):
+        busy, stale = os.path.join(self.root, "hee4-target-busy"), os.path.join(self.root, "hee4-target-old")
+        mkdir(busy, age_h=48); mkdir(stale, age_h=48)
+        open(os.path.join(busy, "debug", ".cargo-lock"), "w").close()
+        t = time.time() - 48 * 3600
+        os.utime(os.path.join(busy, "debug"), (t, t))
+        env = {"HEE4_CACHE_ROOT": self.root, "CARGO_TARGET_DIR": os.path.join(self.root, "hee4-target-mine")}
+        rc, out, err = run(sys.executable, "-c", AFTER_PLAN, PRUNE, busy, how, "--repo", self.repo, "--keep", "2", "--apply", env=env)
+        cands = re.findall(r"^prune_candidate path=(\S+) ", out, re.M)
+        self.assertIn(busy, cands, out + err)  # the plan judged it stale and unlocked
+        self.assertTrue(os.path.isdir(busy), out + err)
+        self.assertFalse(os.path.exists(stale), out + err)
+        self.assertEqual(rc, 0, out + err)
+        return out
+
+    def test_lock_taken_after_the_plan_keeps_the_dir_in_use(self):
+        out = self.apply_with_build_after_plan("lock")
+        self.assertIn(f"prune_keep path={os.path.join(self.root, 'hee4-target-busy')} reason=in_use", out)
+
+    def test_build_touching_debug_after_the_plan_keeps_the_dir_young(self):
+        out = self.apply_with_build_after_plan("touch")
+        self.assertIn(f"prune_keep path={os.path.join(self.root, 'hee4-target-busy')} reason=young", out)
 
 
 if __name__ == "__main__":
