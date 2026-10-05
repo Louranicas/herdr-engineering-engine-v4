@@ -110,13 +110,40 @@ class DriveTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertRegex(out.splitlines()[-1], r"^drive verdict=FAIL ")
 
+    def test_drives_the_vacuous_verify_door_and_a_real_verify_is_accepted(self):
+        rc, out, _ = self.drive("--only", "task.submit,task.get,task.list,task.cancel")
+        self.assertIn("verdict=PASS", self.lines(out, "task.submit")[0], out)
+        head = os.listdir(self.ev)[0]
+        with open(os.path.join(self.ev, head, "task.submit.jsonl")) as f:
+            rows = [json.loads(l) for l in f]
+        pairs = list(zip([r for r in rows if r["dir"] == "send"], [r for r in rows if r["dir"] == "recv"]))
+        vac = [json.loads(g["raw"]) for s, g in pairs if "VERIFY: /usr/bin/true" in s["raw"]]
+        self.assertEqual(len(vac), 1, rows)
+        self.assertEqual((vac[0]["code"], vac[0]["field"], vac[0]["retry"]), ("invalid_argument", "/body/brief", "never"))
+        self.assertIn("VERIFY is vacuous", vac[0]["message"])
+        # The drive's own brief is admitted and its VERIFY runs to a pass in the sandbox.
+        con = sqlite3.connect(f"file:{self.ledger}?mode=ro", uri=True)
+        try:
+            states = {r[0] for r in con.execute("SELECT phase FROM tasks")}
+        finally:
+            con.close()
+        self.assertIn("accepted", states)
+
+    def test_fires_when_the_vacuous_verify_door_is_planted_open(self):
+        p = os.path.join(self.d, "rt", "proxy-vv.sock")
+        Proxy(p, self.sock, "VERIFY is vacuous", "VERIFY is fine").start()
+        rc, out, _ = self.drive("--only", "task.submit", sock=p)
+        self.assertIn("verdict=FAIL", self.lines(out, "task.submit")[0], out)
+        self.assertIn("path=vacuous_verify status=FAIL", out)
+        self.assertEqual(rc, 1)
+
     def test_evidence_holds_every_frame_sent_and_received(self):
         self.drive()
         head = os.listdir(self.ev)[0]
         with open(os.path.join(self.ev, head, "task.submit.jsonl")) as f:
             rows = [json.loads(l) for l in f]
         sent = [r for r in rows if r["dir"] == "send"]; got = [r for r in rows if r["dir"] == "recv"]
-        self.assertEqual((len(sent), len(got)), (7, 7))
+        self.assertEqual((len(sent), len(got)), (10, 10))  # 7 submit paths + task.list, vacuous submit, task.list
         self.assertTrue(all(json.loads(r["raw"])["kind"] in ("result", "error") for r in got))
         self.assertEqual(json.loads(sent[0]["raw"])["action"], "task.submit")
         self.assertEqual(list(json.loads(sent[0]["raw"])), ["request_id", "action", "action_version", "idempotency_key", "body"])

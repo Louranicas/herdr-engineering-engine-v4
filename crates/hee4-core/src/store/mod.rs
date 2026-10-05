@@ -836,6 +836,20 @@ impl Store {
         })
     }
 
+    /// How many receipts `task`'s chain holds (recovery compares it with the `Decide` events:
+    /// the dispatcher seals one receipt, then applies one `Decide`).
+    ///
+    /// # Errors
+    /// SQLite errors.
+    pub fn receipt_count(&self, task: &TaskId) -> Result<u64, StoreError> {
+        let n: i64 = self.conn.query_row(
+            "SELECT count(*) FROM receipts WHERE task_id = ?1",
+            [task.as_str()],
+            |r| r.get(0),
+        )?;
+        Ok(u64::try_from(n).unwrap_or(0))
+    }
+
     /// `task`'s decoded event history, oldest first.
     ///
     /// # Errors

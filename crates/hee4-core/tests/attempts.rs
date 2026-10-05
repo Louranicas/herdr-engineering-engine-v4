@@ -117,6 +117,7 @@ fn facts(phase: Phase, attempt_open: bool) -> Facts {
         generation: 1,
         attempt_open,
         closes: Vec::new(),
+        verdict_unsealed: false,
     }
 }
 

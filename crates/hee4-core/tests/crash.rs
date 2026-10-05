@@ -201,7 +201,11 @@ fn probe_only_is_r07_unacknowledged(
     // Probe-only: what the observation alone decides, before the parent adds anything.
     let probe_only = decide(
         &store.epoch()?,
-        &Facts::from_history(Phase::Running, &store.history_with_seq(task)?),
+        &Facts::from_history(
+            Phase::Running,
+            &store.history_with_seq(task)?,
+            store.receipt_count(task)?,
+        ),
         Some(&AttemptFacts::from_row(row)),
         ProcessCustody::Unobserved,
         WorkspaceReadback::Unobserved,

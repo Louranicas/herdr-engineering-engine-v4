@@ -48,6 +48,7 @@ hee4 task.submit --brief-file brief.txt --key $(uuidgen)       # prints the repl
 
 - Success: `{task_id:"t-<24 hex>", phase:"admitted"}`, `replayed=false`. Replay (same key, same bytes): `replayed=true`, same `task_id`. Same key, other bytes: `conflict` at `/idempotency_key`.
 - Empty brief `""`: `invalid_argument` at `/body/brief`, message names `GOAL` (the first absent field). Missing RESTATEMENT line: `invalid_argument` at `/body/brief` naming `RESTATEMENT`. No key: `invalid_argument` at `/idempotency_key`.
+- Vacuous VERIFY (V4-94, `Brief::check_verify`): a brief whose every runnable VERIFY line is a no-op (`/usr/bin/true`, `sh: true`, `:`, `exit 0`, a bare echo), or that runs nothing, is refused at admission: `invalid_argument` at `/body/brief`, retry `never`, message `VERIFY is vacuous: ...` (`Refusal::VacuousVerify`); `task.list` row count unchanged. The drive's own brief (`drive_d.BRIEF`) verifies `/usr/bin/test -w .` (the sandbox's work dir is writable).
 - VERIFY lines: an absolute path or `sh: <line>` runs in the sandbox; `model: <prompt>` and any other line are admitted and recorded as a named skip (`driver has no handler for step kind model; use a `sh:` step ...`), never run and never an observation.
 
 ## Gotchas
