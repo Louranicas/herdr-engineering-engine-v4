@@ -19,9 +19,11 @@ if [ "$rc" -eq 0 ] && [ "${ran:-0}" -gt 0 ]; then
   printf '%s\n' "$out" | tail -n 4
   echo "tools-tests verdict=PASS ran=$ran"; exit 0
 fi
-# each failure block runs from its FAIL:/ERROR: header to the next ===== rule or the Ran line
+# a failure block is its FAIL:/ERROR: header, a ----- rule and the traceback, up to the next rule
+# (===== before the next block, ----- before the Ran line) or the Ran line
 printf '%s\n' "$out" | awk -v cap=200 '
-  /^(FAIL|ERROR): / { inb = 1 }
+  /^(FAIL|ERROR): / { inb = 1; rules = 0 }
+  inb && /^-+$/ && ++rules == 2 { inb = 0 }
   inb && (/^=+$/ || /^Ran [0-9]+ test/) { inb = 0 }
   inb { if (n < cap) print; else cut++; n++ }
   END { if (cut) printf "tools-tests failures truncated: %d more lines in the log\n", cut }'
