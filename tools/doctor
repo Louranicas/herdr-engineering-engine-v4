@@ -7,6 +7,7 @@ UNMEASURED always names its reason; it is never a 0 and it is red. Last line
   doctor verdict=PASS|FAIL|UNMEASURED measured=k/n unmeasured=u fail=f advisory=a head=<sha12>
 Exit: 0 PASS (every counted check MEASURED and ok), 1 FAIL (any check measured bad), 3 UNMEASURED.
 Checks: tool cargo, tool bwrap, unit active, socket perms, ledger opens (hee4 health),
+budgets (the last line of hee4 health is the JSON reply; body.budgets rendered key=value in key order),
 model_endpoint (/api/ps parses), model_gpu (the pinned model listed with size_vram > 0; a CPU copy
 is FAIL; not resident or no name is UNMEASURED with scope=advisory, excluded from the verdict and
 counted in advisory=, unless --require-gpu), binary sha = HEAD.
@@ -91,6 +92,25 @@ def main():
         emit("ledger", "MEASURED", out.splitlines()[0])
     else:
         emit("ledger", "FAIL", f"rc={rc} {out or err}")
+
+    # budgets: the health reply's body.budgets, read from the last stdout line (the JSON reply)
+    if rc is None:
+        emit("budgets", "UNMEASURED", "hee4 binary not on PATH; health reply unreadable")
+    else:
+        last = out.splitlines()[-1] if out else ""
+        try:
+            reply = json.loads(last)
+        except ValueError:
+            reply = None
+        budgets = reply.get("body", {}).get("budgets") if isinstance(reply, dict) else None
+        if reply is None:
+            emit("budgets", "UNMEASURED", "last line of hee4 health is not JSON")
+        elif not isinstance(budgets, dict):
+            emit("budgets", "UNMEASURED", "health reply has no budgets (the serving binary predates them)")
+        else:
+            line = " ".join(f"{sec}.{k}={v}" for sec, fields in budgets.items()
+                            for k, v in (fields.items() if isinstance(fields, dict) else []))
+            emit("budgets", "MEASURED", line)
 
     # model endpoint: /api/ps parses
     models = None
