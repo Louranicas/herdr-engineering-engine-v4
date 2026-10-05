@@ -1,16 +1,19 @@
 """Out-of-release features: driven by their refusal (gates/features/README.md "The drive").
 
-A feature with no procedure in tools/drive.d is asked about through tools.inspect. When the
-catalogue entry's `scope` is not the release this tree builds (the workspace version in
-Cargo.toml, 4.0.x -> v40), the feature is measured by two paths:
-  catalogued        tools.inspect lists the action with that scope
+A feature with no procedure in tools/drive.d is asked about through tools.inspect. The running
+binary is the truth: tools.inspect says `served` (the action's owner is composed in this binary,
+crates/hee4-app/src/actions/mod.rs composed()) and `scope` (the catalogue's Scope wire name).
+An action with `served` false is out of release, whatever the version of the tree, and is
+measured by two paths:
+  catalogued        tools.inspect lists the action, with a scope that has a `because` text
   refused_by_scope  the action, sent with a minimal well-formed body, is refused `unavailable` at
                     /action with exactly that scope's `because` text
 The `because` text of each scope is read from the one place the refusal is built from,
 crates/hee4-contracts/src/catalogue.rs (`impl Scope`: `wire_name` and `because`), never written
-here; the scope is read from tools.inspect, never written here. A served answer, another code or
-another `because` is a FAIL by path name. A feature in the release's own scope, or one whose
-scope tools.inspect does not give, is not out of release: it stays UNMEASURED, no procedure.
+here; the scope and `served` are read from tools.inspect, never written here. A served answer,
+another code or another `because` is a FAIL by path name. An action tools.inspect says is served
+(it has no procedure yet), or one whose `served` tools.inspect does not give, is not out of
+release: it stays UNMEASURED, no procedure.
 
 FEATURES is empty: this module serves no feature by name; tools/drive calls drive() from its
 unserved branch.
@@ -49,16 +52,6 @@ def scope_because(repo):
     return {w: because[v] for v, w in wire.items() if v in because}
 
 
-def release_scope(repo):
-    """The wire scope of the release this tree builds: `v<major><minor>` of the workspace version."""
-    try:
-        with open(os.path.join(repo, "Cargo.toml")) as f:
-            m = re.search(r'^version\s*=\s*"(\d+)\.(\d+)\.', f.read(), re.M)
-    except OSError:
-        return None
-    return f"v{m.group(1)}{m.group(2)}" if m else None
-
-
 def display(wire):
     """v42 -> v4.2 (the spelling of the feature files); any other wire name is printed as it is."""
     m = re.fullmatch(r"v(\d)(\d+)", wire)
@@ -75,25 +68,26 @@ def minimal_body(feature_text):
 
 
 def drive(F, name, repo, feature_text):
-    """(scope, why): runs the two paths and returns the display scope, or (None, why) when the
-    feature is not out of release (no path run; the caller prints UNMEASURED, no procedure)."""
+    """(scope, why): runs the two paths and returns the display scope, or (None, why) when
+    tools.inspect does not say the action is unserved (no path run; the caller prints
+    UNMEASURED, no procedure)."""
     r = F.req("tools.inspect", {"action": name, "version": 1})
-    body = (r.get("body") or {}) if is_result(r) else {}
-    scope = body.get("scope")
     if not is_result(r):
         return None, f"tools.inspect {name} answered {json.dumps(r)[:120]}"
-    if not isinstance(scope, str):
-        return None, f"tools.inspect {name} carries no scope member"
-    release = release_scope(repo)
-    if release is None:
-        return None, "no workspace version in Cargo.toml"
-    if scope == release:
-        return None, f"scope {display(scope)} is this release's"
-    because = scope_because(repo).get(scope)
-    F.check("catalogued", body.get("action") == name, f"tools.inspect action={body.get('action')} scope={scope}")
+    body = r.get("body") or {}
+    served = body.get("served")
+    if not isinstance(served, bool):
+        return None, f"tools.inspect {name} carries no served member"
+    if served:
+        return None, f"tools.inspect {name} says served=true"
+    scope = body.get("scope")
+    because = scope_because(repo).get(scope) if isinstance(scope, str) else None
+    F.check("catalogued", body.get("action") == name and because is not None,
+            f"tools.inspect action={body.get('action')} scope={scope} because={'found' if because else f'none in {CATALOGUE}'}")
+    shown = display(scope) if isinstance(scope, str) else "none"
     if because is None:
         F.check("refused_by_scope", False, f"scope {scope} has no because text in {CATALOGUE}")
-        return display(scope), ""
+        return shown, ""
     reply = F.req(name, minimal_body(feature_text), key=f"drive-scope-{uuid.uuid4().hex[:12]}")
     F.refuse("refused_by_scope", reply, "unavailable", "/action", extra={"because": because})
-    return display(scope), ""
+    return shown, ""

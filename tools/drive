@@ -10,11 +10,13 @@ The served set is the plugins: tools/drive.d/<family>.py, each exporting FEATURE
   drive feature=<name> verdict=PASS|FAIL|UNMEASURED paths=k/n evidence=<path>
 (UNMEASURED always names a reason; never a 0) and a last line
   drive verdict=PASS|FAIL|UNMEASURED features=k/n unserved=u head=<sha12>
-An unserved feature (no procedure in tools/drive.d) whose catalogue scope (tools.inspect) is not
-this release's is driven by its refusal (tools/drive.d/scoped.py) and prints
-  drive feature=<name> verdict=PASS|FAIL paths=k/2 evidence=<path> scope=<v4.2> (refused by release scope, as catalogued)
+An unserved feature (no procedure in tools/drive.d) that tools.inspect says the running binary
+does not serve (served=false: its owner is not composed) is out of release, driven by its
+refusal (tools/drive.d/scoped.py), and prints
+  drive feature=<name> verdict=PASS|FAIL paths=k/2 evidence=<path> scope=<v4.2> served=false (refused by release scope, as catalogued)
 counted in features=k/n. Any other unserved feature prints UNMEASURED with scope=unserved (the
-reason names why it is not out of release) and is counted in unserved=, not in features=k/n. A feature file without the
+reason names why it is not out of release, e.g. served=true) and is counted in unserved=, not in
+features=k/n. A feature file without the
 "(rev 2026-10-05 drive)" marker in its Driving block is UNMEASURED: procedure UNWRITTEN.
 --only NAME[,NAME...]: run only these plugin features (a name no plugin serves exits 2).
 --ledger PATH: the ledger a procedure may read back, read-only (ctx["ledger"]; drive_d.ledger_ro);
@@ -239,7 +241,7 @@ def main():
                 continue
             F.f.close(); out_of_release += 1
             v, k, n = F.verdict(); verdicts.append(v)
-            print(f"drive feature={name} verdict={v} paths={k}/{n} evidence={evp} scope={scope} (refused by release scope, as catalogued)")
+            print(f"drive feature={name} verdict={v} paths={k}/{n} evidence={evp} scope={scope} served=false (refused by release scope, as catalogued)")
             for p, st, d in F.paths:
                 if st != "PASS": print(f"  path={p} status={st} detail={d[:300]}")
             continue

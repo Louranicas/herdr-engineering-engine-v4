@@ -1,8 +1,10 @@
 """tools/drive.d/scoped.py through tools/drive: an out-of-release feature is driven by its refusal.
 
-A planted serve (a thread on an AF_UNIX socket) answers tools.inspect with a planted scope and the
-action with a planted reply. The scope and its `because` text come from tools.inspect and from
-catalogue.rs, so each test changes the plant and the expectation follows it.
+Out of release means tools.inspect says served=false (the owner is not composed in this binary),
+never a version. A planted serve (a thread on an AF_UNIX socket) answers tools.inspect with a
+planted `scope` and `served` and the action with a planted reply; the scope and its `because`
+text come from tools.inspect and from catalogue.rs, so each test changes the plant and the
+expectation follows it. RealServeTests drives a disposable `hee4 serve` directly, no proxy.
 """
 import json, os, re, shutil, socket, subprocess, sys, tempfile, threading, time, unittest
 from common import TOOLS, run
@@ -15,15 +17,16 @@ REPO = os.path.dirname(TOOLS)
 drive_d = load_tool("drive_d", os.path.join(TOOLS, "drive.d", "__init__.py"))
 scoped = load_tool("drive_d.scoped", os.path.join(TOOLS, "drive.d", "scoped.py"))
 BECAUSE = scoped.scope_because(REPO)
+UNSERVED_V42 = ("thread.get", "thread.list", "analysis.get", "analysis.request")
 
 
 class PlantedServe(threading.Thread):
-    """tools.inspect -> {action, scope: scopes[action]} (no scope member when absent);
+    """tools.inspect -> {action, version, effect} plus inspect[action] (e.g. {scope, served});
     any other action -> replies[action](request)."""
 
-    def __init__(self, path, scopes, replies):
+    def __init__(self, path, inspect, replies):
         super().__init__(daemon=True)
-        self.scopes, self.replies, self.seen = scopes, replies, []
+        self.inspect, self.replies, self.seen = inspect, replies, []
         self.s = socket.socket(socket.AF_UNIX); self.s.bind(path); self.s.listen(16)
 
     def run(self):
@@ -38,9 +41,7 @@ class PlantedServe(threading.Thread):
                 act, rid = req.get("action"), req.get("request_id")
                 if act == "tools.inspect":
                     name = req["body"]["action"]
-                    body = {"action": name, "version": 1, "effect": "read"}
-                    if name in self.scopes:
-                        body["scope"] = self.scopes[name]
+                    body = {"action": name, "version": 1, "effect": "read", **self.inspect.get(name, {})}
                     reply = {"kind": "result", "request_id": rid, "replayed": False, "body": body}
                 else:
                     reply = self.replies[act](req)
@@ -49,6 +50,10 @@ class PlantedServe(threading.Thread):
             except (OSError, ValueError, KeyError):
                 pass
             c.close()
+
+
+def unserved(scope):
+    return {"scope": scope, "served": False}
 
 
 def refused(scope):
@@ -81,8 +86,8 @@ class ScopedDriveTests(unittest.TestCase):
         self.d = tempfile.mkdtemp(prefix="drv-sc-")
         self.sock = os.path.join(self.d, "s.sock")
 
-    def drive(self, scopes, replies, features):
-        srv = PlantedServe(self.sock, scopes, replies); srv.start()
+    def drive(self, inspect, replies, features):
+        srv = PlantedServe(self.sock, inspect, replies); srv.start()
         rc, out, err = run(DRIVE, "--socket", self.sock, "--repo", plant_repo(features),
                            "--evidence-root", os.path.join(self.d, "ev"), timeout=60)
         srv.s.close()
@@ -94,11 +99,12 @@ class ScopedDriveTests(unittest.TestCase):
         return hits[0]
 
     def test_out_of_release_features_pass_by_their_refusal(self):
-        names = ["thread.get", "thread.list", "analysis.get", "analysis.request"]
-        rc, out, err, srv = self.drive({n: "v42" for n in names}, {n: refused("v42") for n in names},
+        names = list(UNSERVED_V42)
+        rc, out, err, srv = self.drive({n: unserved("v42") for n in names}, {n: refused("v42") for n in names},
                                        {n: real_feature(n) for n in names})
         for n in names:
-            self.assertRegex(self.line(out, n), r"verdict=PASS paths=2/2 .* scope=v4\.2 \(refused by release scope, as catalogued\)$")
+            self.assertRegex(self.line(out, n),
+                             r"verdict=PASS paths=2/2 .* scope=v4\.2 served=false \(refused by release scope, as catalogued\)$")
         self.assertRegex(out.splitlines()[-1], rf"^drive verdict=PASS features={len(names)}/{len(names)} unserved=0 ")
         self.assertEqual(rc, 0, out + err)
         # the action got the minimal well-formed body named by its feature file
@@ -107,82 +113,53 @@ class ScopedDriveTests(unittest.TestCase):
 
     def test_a_served_answer_fails_the_scoped_path_by_name(self):
         ok = lambda req: {"kind": "result", "replayed": False, "body": {"thread_id": "x", "state": "open"}}
-        rc, out, _, _ = self.drive({"thread.get": "v42"}, {"thread.get": ok}, {"thread.get": real_feature("thread.get")})
+        rc, out, _, _ = self.drive({"thread.get": unserved("v42")}, {"thread.get": ok},
+                                   {"thread.get": real_feature("thread.get")})
         self.assertIn("verdict=FAIL paths=1/2", self.line(out, "thread.get"))
         self.assertRegex(out, r"path=refused_by_scope status=FAIL detail=expected error unavailable")
         self.assertRegex(out.splitlines()[-1], r"^drive verdict=FAIL ")
         self.assertEqual(rc, 1)
 
-    def test_a_v40_feature_with_no_procedure_stays_unmeasured(self):
-        release = scoped.release_scope(REPO)
-        rc, out, _, srv = self.drive({"zz.planted": release}, {}, {"zz.planted": "# zz.planted\n\n## Driving it with hee4\n\nnone\n"})
+    def test_a_served_action_with_no_procedure_stays_unmeasured(self):
+        # served=true decides, even with a scope other than v4.0: never driven by its refusal
+        rc, out, _, srv = self.drive({"zz.planted": {"scope": "v42", "served": True}}, {},
+                                     {"zz.planted": "# zz.planted\n\n## Driving it with hee4\n\nnone\n"})
         line = self.line(out, "zz.planted")
         self.assertIn("verdict=UNMEASURED paths=0/0", line)
-        self.assertIn("scope=unserved reason=no procedure in tools/drive.d", line)
-        self.assertIn(f"scope {scoped.display(release)} is this release's", line)
-        self.assertNotIn("zz.planted", [r["action"] for r in srv.seen])  # in-release: never driven by refusal
+        self.assertIn("scope=unserved reason=no procedure in tools/drive.d (tools.inspect zz.planted says served=true)", line)
+        self.assertNotIn("zz.planted", [r["action"] for r in srv.seen])
         self.assertRegex(out.splitlines()[-1], r"unserved=1 ")
 
-    def test_no_scope_member_stays_unmeasured_naming_it(self):
-        rc, out, _, _ = self.drive({}, {}, {"thread.get": real_feature("thread.get")})
-        self.assertIn("scope=unserved reason=no procedure in tools/drive.d (tools.inspect thread.get carries no scope member)",
+    def test_out_of_release_is_served_false_never_the_version(self):
+        # a v4.0-scoped action this binary does not serve is still driven by its refusal
+        rc, out, _, _ = self.drive({"thread.get": unserved("v40")}, {"thread.get": refused("v40")},
+                                   {"thread.get": real_feature("thread.get")})
+        self.assertRegex(self.line(out, "thread.get"), r"verdict=PASS paths=2/2 .* scope=v4\.0 served=false ")
+        self.assertEqual(rc, 0, out)
+
+    def test_no_served_member_stays_unmeasured_naming_it(self):
+        rc, out, _, _ = self.drive({"thread.get": {"scope": "v42"}}, {}, {"thread.get": real_feature("thread.get")})
+        self.assertIn("scope=unserved reason=no procedure in tools/drive.d (tools.inspect thread.get carries no served member)",
                       self.line(out, "thread.get"))
 
     def test_the_scope_comes_from_tools_inspect(self):
-        others = sorted(s for s in BECAUSE if s not in ("v42", scoped.release_scope(REPO)))
+        others = sorted(s for s in BECAUSE if s != "v42")
         self.assertTrue(others, BECAUSE)
         planted = others[0]
         feats = {"thread.get": real_feature("thread.get")}
-        rc, out, _, _ = self.drive({"thread.get": planted}, {"thread.get": refused(planted)}, feats)
-        self.assertIn(f"verdict=PASS paths=2/2", self.line(out, "thread.get"))
-        self.assertIn(f"scope={scoped.display(planted)} (refused", self.line(out, "thread.get"))
+        rc, out, _, _ = self.drive({"thread.get": unserved(planted)}, {"thread.get": refused(planted)}, feats)
+        self.assertIn("verdict=PASS paths=2/2", self.line(out, "thread.get"))
+        self.assertIn(f"scope={scoped.display(planted)} served=false (refused", self.line(out, "thread.get"))
         os.unlink(self.sock)
         # the serve still refuses with v4.2's text while tools.inspect now says `planted`: the because no longer matches
-        rc, out, _, _ = self.drive({"thread.get": planted}, {"thread.get": refused("v42")}, feats)
+        rc, out, _, _ = self.drive({"thread.get": unserved(planted)}, {"thread.get": refused("v42")}, feats)
         self.assertIn("verdict=FAIL", self.line(out, "thread.get"))
         self.assertRegex(out, r"path=refused_by_scope status=FAIL detail=because=")
         self.assertEqual(rc, 1)
 
 
-def catalogue_scopes():
-    """id -> wire scope, from the catalogue entries in catalogue.rs (the server's own table)."""
-    with open(os.path.join(REPO, scoped.CATALOGUE)) as f:
-        src = f.read()
-    return {i: v.lower() for i, v in re.findall(r'id: "([\w.]+)",.*?scope: Scope::(\w+),', src, re.S)}
-
-
-class InjectScope(threading.Thread):
-    """Forwards each frame to a real serve; adds `scope` (from catalogue.rs) to tools.inspect results.
-
-    The real engine's tools.inspect carries no scope member today (tools.rs inspect); this proxy
-    is the plant that shows the real refusals agree with the catalogue once it does."""
-
-    def __init__(self, path, upstream):
-        super().__init__(daemon=True)
-        self.up, self.scopes = upstream, catalogue_scopes()
-        self.s = socket.socket(socket.AF_UNIX); self.s.bind(path); self.s.listen(16)
-
-    def run(self):
-        while True:
-            try:
-                c, _ = self.s.accept()
-            except OSError:
-                return
-            try:
-                line = c.makefile("rb").readline()
-                u = socket.socket(socket.AF_UNIX); u.connect(self.up); u.sendall(line)
-                reply = json.loads(u.makefile("rb").readline()); u.close()
-                body = reply.get("body") if reply.get("kind") == "result" else None
-                if json.loads(line).get("action") == "tools.inspect" and isinstance(body, dict):
-                    body["scope"] = self.scopes.get(body.get("action"))
-                c.sendall(json.dumps(reply).encode() + b"\n")
-            except (OSError, ValueError):
-                pass
-            c.close()
-
-
 class RealServeTests(unittest.TestCase):
-    """A disposable `hee4 serve`; tools.inspect's scope injected from catalogue.rs by InjectScope."""
+    """A disposable `hee4 serve`, driven directly: no proxy, tools.inspect's own scope and served."""
 
     @classmethod
     def setUpClass(cls):
@@ -206,23 +183,30 @@ class RealServeTests(unittest.TestCase):
     def tearDownClass(cls):
         cls.srv.kill(); cls.srv.wait(); shutil.rmtree(cls.d, ignore_errors=True)
 
-    def test_every_out_of_release_feature_passes_on_a_disposable_serve(self):
-        release = scoped.release_scope(REPO)
+    def inspect(self, name):
+        c = socket.socket(socket.AF_UNIX); c.connect(self.sock)
+        c.sendall(json.dumps({"request_id": "t", "action": "tools.inspect", "action_version": 1,
+                              "idempotency_key": None, "body": {"action": name, "version": 1}}).encode() + b"\n")
+        reply = json.loads(c.makefile("rb").readline()); c.close()
+        return reply.get("body") or {}
+
+    def test_every_unserved_feature_passes_by_its_refusal_on_a_disposable_serve(self):
         fdir = os.path.join(REPO, "gates", "features")
-        unserved = sorted(n for n in (f[:-3] for f in os.listdir(fdir) if f.endswith(".md") and f != "README.md")
-                          if n not in drive_d.load_plugins(os.path.join(TOOLS, "drive.d"), fdir))
-        out_of_release = [n for n in unserved if catalogue_scopes().get(n, release) != release]
-        self.assertTrue(out_of_release, unserved)
-        p = os.path.join(self.d, "rt", "inject.sock")
-        InjectScope(p, self.sock).start()
         plugins = sorted(drive_d.load_plugins(os.path.join(TOOLS, "drive.d"), fdir))
-        rc, out, err = run(DRIVE, "--socket", p, "--only", plugins[0], "--evidence-root", os.path.join(self.d, "ev"), timeout=100)
+        no_procedure = sorted(n for n in (f[:-3] for f in os.listdir(fdir) if f.endswith(".md") and f != "README.md")
+                              if n not in plugins)
+        inspected = {n: self.inspect(n) for n in no_procedure}
+        out_of_release = [n for n in no_procedure if inspected[n].get("served") is False]
+        for n in UNSERVED_V42:
+            self.assertIn(n, out_of_release, inspected)
+        rc, out, err = run(DRIVE, "--socket", self.sock, "--only", plugins[0], "--evidence-root",
+                           os.path.join(self.d, "ev"), timeout=100)
         for n in out_of_release:
-            want = scoped.display(catalogue_scopes()[n])
+            want = scoped.display(inspected[n]["scope"])
             hit = [l for l in out.splitlines() if l.startswith(f"drive feature={n} ")]
             self.assertEqual(len(hit), 1, out)
-            self.assertRegex(hit[0], rf"verdict=PASS paths=2/2 .* scope={re.escape(want)} \(refused by release scope, as catalogued\)$")
-        self.assertNotIn("scope=unserved", "\n".join(l for l in out.splitlines() if any(f"feature={n} " in l for n in out_of_release)))
+            self.assertRegex(hit[0], rf"verdict=PASS paths=2/2 .* scope={re.escape(want)} served=false "
+                                     r"\(refused by release scope, as catalogued\)$")
 
 
 class ScopeTableTests(unittest.TestCase):
