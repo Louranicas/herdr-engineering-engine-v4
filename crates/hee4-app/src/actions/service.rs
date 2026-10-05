@@ -4,7 +4,7 @@
 //! work (the `service_facts` seed and the busctl digest pin) is this family's `on_serve_start`
 //! hook, the single place it happens.
 
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 use hee4_contracts::Sha256Hex;
 use hee4_contracts::catalogue::Owner;
@@ -27,6 +27,12 @@ pub const SEEDS: &[Seed<'static>] = &[
     ("model", "deploy", "ollama.service"),
     ("drive", "deploy", "hee4-drive.service"),
 ];
+
+/// One lock per seed, in [`SEEDS`] order: `service.action` holds its service's lock across the
+/// replay check, the CAS check, `runner.act` and the commit, so two requests on one service
+/// never both reach the manager. The loser waits, then reads the moved generation (or its own
+/// committed key) and is refused (or replayed) without acting.
+static ACT_LOCKS: [Mutex<()>; SEEDS.len()] = [const { Mutex::new(()) }; SEEDS.len()];
 
 /// The `probe_version` this release serves.
 pub const PROBE_VERSION: u64 = 1;
@@ -343,6 +349,12 @@ fn action_body(body: &Value) -> Result<(&str, &str, UnitAction, Sha256Hex), Faul
 /// settled. An unsettled read-back is `effect_unknown` and writes no operations row.
 fn action(engine: &Engine, req: &Request, runner: Option<&dyn ServiceRunner>) -> Reply {
     let (service_id, unit_id, act, owner) = action_body(&req.body)?;
+    let lock = SEEDS
+        .iter()
+        .position(|(id, _, _)| *id == service_id)
+        .and_then(|i| ACT_LOCKS.get(i))
+        .ok_or_else(not_found)?;
+    let _held = lock.lock().unwrap_or_else(PoisonError::into_inner);
     let op = op_key(engine, req);
     let bytes = body_bytes(&req.body)?;
     if let Some(stored) = engine
@@ -422,6 +434,8 @@ mod tests {
         probe: Result<Observation, ProbeFault>,
         act: Result<ActionOutcome, ActFault>,
         calls: AtomicUsize,
+        /// How long `act` takes, so concurrent requests overlap inside it.
+        act_ms: u64,
     }
 
     impl ServiceRunner for Stub {
@@ -443,6 +457,7 @@ mod tests {
             _: &ProbeBudget,
         ) -> Result<ActionOutcome, ActFault> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(self.act_ms));
             self.act.clone()
         }
     }
@@ -472,6 +487,7 @@ mod tests {
             probe,
             act,
             calls: AtomicUsize::new(0),
+            act_ms: 0,
         }
     }
 
@@ -725,6 +741,75 @@ mod tests {
             (Some("stale_generation"), Some("/precondition/generation"))
         );
         assert_eq!(stale["current_generation"], 2);
+        Ok(())
+    }
+
+    /// Two concurrent requests on one service at one generation, run on two threads against
+    /// a slow stub: `keys` names each request's idempotency key. Returns the replies, as error
+    /// frames or `{"replayed": .., "body": ..}`, and how many times the stub acted.
+    fn race(
+        name: &str,
+        keys: [&str; 2],
+    ) -> Result<(Vec<Value>, usize), Box<dyn std::error::Error>> {
+        let e = ready(name)?;
+        let mut s = ok_stub()?;
+        s.act_ms = 150;
+        let reqs = keys
+            .iter()
+            .map(|k| {
+                req(
+                    "service.action",
+                    Some(k),
+                    action_body(json!({})),
+                    Some(pre(1)),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let replies = std::thread::scope(|scope| {
+            let handles: Vec<_> = reqs
+                .iter()
+                .map(|r| {
+                    let (e, s) = (&e, &s);
+                    scope.spawn(move || match action(e, r, Some(s)) {
+                        Ok((replayed, body)) => json!({"replayed": replayed, "body": body}),
+                        Err(f) => wire::error("r", &f),
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or_else(|_| json!({"panicked": true})))
+                .collect::<Vec<_>>()
+        });
+        Ok((replies, s.calls.load(Ordering::SeqCst)))
+    }
+
+    #[test]
+    fn service_action_concurrent_keys_act_once_and_the_loser_is_stale() -> R {
+        let (replies, calls) = race("svc-race-keys", ["c1", "c2"])?;
+        assert_eq!(
+            calls, 1,
+            "only one request reaches the manager: {replies:?}"
+        );
+        let won = replies.iter().filter(|r| r["replayed"] == false).count();
+        let stale = replies
+            .iter()
+            .filter(|r| r["code"] == "stale_generation" && r["current_generation"] == 2)
+            .count();
+        assert_eq!((won, stale), (1, 1), "{replies:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn service_action_concurrent_same_key_acts_once_and_replays() -> R {
+        let (replies, calls) = race("svc-race-same", ["c1", "c1"])?;
+        assert_eq!(calls, 1, "a same-key race acts once: {replies:?}");
+        let flags: Vec<_> = replies.iter().map(|r| r["replayed"].clone()).collect();
+        assert!(
+            flags.contains(&json!(false)) && flags.contains(&json!(true)),
+            "{replies:?}"
+        );
+        assert_eq!(replies[0]["body"], replies[1]["body"]);
         Ok(())
     }
 
