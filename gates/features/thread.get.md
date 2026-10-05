@@ -25,7 +25,7 @@ hee4-sh thread.get thread_id=<id> expected_brief_revision=<stale r>             
 
 Socket: request `body` `{thread_id, expected_brief_revision}` (FACT required both); result `body` `{thread_id, task_id, brief_revision, state, obligations, children, artifacts}` (API Map A-18). `UNWRITTEN: the thread state enum, obligation and child shapes, and the generated wrapper spelling.`
 
-- v4.0 path: the `unavailable` refusal.
+- v4.0 path: the `unavailable` refusal. Driven by `tools/drive` through `tools/drive.d/scoped.py`: the scope is read from `tools.inspect` (path `catalogued`), and the action, sent with a placeholder for each `Socket:` request member, must be refused `unavailable` at `/action` with exactly that scope's `because` from `Scope::because` (path `refused_by_scope`); the line is `verdict=PASS paths=2/2 scope=v4.2 (refused by release scope, as catalogued)`. Until `tools.inspect` carries `scope`, the line stays UNMEASURED `scope=unserved` naming the missing member.
 - v4.2 success: the thread for an accepted cohort task shows its children and artifacts; `task.get` on `task_id` agrees on the task state.
 - Error: unknown thread → `not_found`; stale `expected_brief_revision` → `stale_generation` + `current_generation`; children over 100 → `resource_exhausted` past the view bound (INTERP from task.get's rule).
 - Empty: a thread with no children returns empty arrays.
