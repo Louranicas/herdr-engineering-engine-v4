@@ -83,9 +83,29 @@ fn order_does_not_change_the_seal_and_the_set_does() {
 fn the_seal_names_exactly_the_observations_read() {
     let (a, b) = (obs("a", Outcome::Pass), obs("b", Outcome::Fail));
     let r = seal(&[b.clone(), a.clone()]);
-    let mut want = vec![observation_id(&a).unwrap(), observation_id(&b).unwrap()];
+    let task = r.task_id().clone();
+    let mut want = vec![
+        observation_id(&task, &a).unwrap(),
+        observation_id(&task, &b).unwrap(),
+    ];
     want.sort_by(|x, y| x.as_str().cmp(y.as_str()));
     assert_eq!(r.observed(), want.as_slice());
     assert!(r.observed()[0].as_str().starts_with("obs-"));
     assert_eq!(r.observed()[0].as_str().len(), 68);
+}
+
+#[test]
+fn the_same_observation_for_two_tasks_has_two_ids() {
+    let o = obs("a", Outcome::Pass);
+    let t1: hee4_contracts::TaskId = "t-1".parse().unwrap();
+    let t2: hee4_contracts::TaskId = "t-2".parse().unwrap();
+    assert_ne!(
+        observation_id(&t1, &o).unwrap(),
+        observation_id(&t2, &o).unwrap(),
+        "the ledger binds an observation to its task; identical content across tasks must not collide"
+    );
+    assert_eq!(
+        observation_id(&t1, &o).unwrap(),
+        observation_id(&t1, &o).unwrap()
+    );
 }

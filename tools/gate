@@ -127,9 +127,9 @@ def main():
         if rb.returncode:
             die(f"base {base!r} does not resolve in {a.repo}")
         base = rb.stdout.decode().strip()
-        if base == sha:
-            die(f"base equals the subject {sha[:12]}: nothing to diff")
-        print(f"subject={sha[:12]} base={base[:12]}")
+        # base == subject is not refused here: the diff is empty and the diff tool refuses it by
+        # name (deep-diff-forge rc 7 "0 files"), which the ddf step reports as FAIL with the reason.
+        print(f"subject={sha[:12]} base={base[:12]}" + (" empty_range=true" if base == sha else ""))
         env = dict(os.environ)
         env["HEE4_HEAD"] = sha
         env["CARGO_TARGET_DIR"] = os.path.abspath(os.path.expanduser(

@@ -335,7 +335,7 @@ fn settle_and_decide(
     }
     apply(engine, task, Event::Settle(Settlement::Ready))?;
     for obs in &outcome.observations {
-        let id = observation_id(obs)?;
+        let id = observation_id(task, obs)?;
         engine.store().record_observation(task, &id, obs)?;
         apply(engine, task, Event::Observe)?;
     }

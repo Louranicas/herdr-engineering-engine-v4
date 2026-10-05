@@ -6,7 +6,7 @@ at the ddf step, against the checkout's HEAD, which by then was the new commit, 
 `HEAD~1..<subject>` was empty.
 
 **Rule.** A rev in gate config is relative to the subject sha, resolved to a sha once before
-any step runs, and a base equal to the subject is a refusal, not an empty diff. Same family as
+any step runs. A base equal to the subject is allowed through: the diff is empty and the diff tool refuses it by name (`deep-diff-forge` rc 7 "0 files"), so the ddf step is FAIL with the reason rather than a silent green; `tools/tests/test_gate.py::test_ddf_rc7_is_fail_with_reason` pins that. Same family as
 [[compile-time-paths-break-in-cached-exports]] and [[shared-target-dir-leaks-build-rs]]: the
 gate judges an export at a sha, and every input it reads must be pinned to that sha, not to
 whatever the live checkout is doing.

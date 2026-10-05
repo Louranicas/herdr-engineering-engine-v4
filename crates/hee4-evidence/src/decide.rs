@@ -141,12 +141,18 @@ pub enum SealError {
     Id(#[from] Refusal),
 }
 
-/// The content address of an observation: `obs-` + SHA-256 of its canonical JSON.
+/// The content address of an observation for one task: `obs-` + SHA-256 of the task id, a
+/// newline, and the observation's canonical JSON. The ledger binds an observation row to its
+/// task, so two tasks with byte-identical observations (same head, same input digest,
+/// `/usr/bin/true` in 0 ms: the feature drive run twice on one ledger) must not share an id.
 ///
 /// # Errors
 /// [`SealError`] if the observation does not serialize or the id does not parse.
-pub fn observation_id(o: &Observation) -> Result<ObservationId, SealError> {
-    let digest = Sha256Hex::digest(canonical_json(&serde_json::to_value(o)?).as_bytes());
+pub fn observation_id(task: &TaskId, o: &Observation) -> Result<ObservationId, SealError> {
+    let mut bytes = task.as_str().as_bytes().to_vec();
+    bytes.push(b'\n');
+    bytes.extend_from_slice(canonical_json(&serde_json::to_value(o)?).as_bytes());
+    let digest = Sha256Hex::digest(&bytes);
     Ok(format!("obs-{digest}").parse()?)
 }
 
@@ -168,7 +174,7 @@ pub fn decide_and_seal(
 ) -> Result<Receipt, SealError> {
     let mut observed = obs
         .iter()
-        .map(observation_id)
+        .map(|o| observation_id(&subject.task_id, o))
         .collect::<Result<Vec<_>, _>>()?;
     observed.sort_by(|a, b| a.as_str().cmp(b.as_str()));
     observed.dedup();
