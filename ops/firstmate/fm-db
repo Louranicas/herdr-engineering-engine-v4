@@ -203,6 +203,29 @@ SHELL_OPERATOR = re.compile(r"[|;]|&&")
 ENV_ARG_SHORT = "uCS"
 ENV_ARG_LONG = ("--unset", "--chdir", "--split-string")
 SHELLS = ("bash", "sh")
+# Transparent command wrappers: each runs the command after its options and operands and passes that command's status
+# through (or adds only failures unrelated to the work: timeout's 124 on expiry, sudo's auth failure). Name -> (short
+# options that take the next word, long options that take the next word, operands before the command). `env` keeps its
+# own reader above (`-S STRING` is a command line). Wrappers nest and may precede or follow `env`.
+WRAPPERS: dict[str, tuple[str, tuple[str, ...], int]] = {
+    "nice": ("n", ("--adjustment",), 0),
+    "timeout": ("sk", ("--signal", "--kill-after"), 1),                  # DURATION
+    "nohup": ("", (), 0),
+    "stdbuf": ("ioe", ("--input", "--output", "--error"), 0),
+    "setsid": ("", (), 0),
+    "ionice": ("cn", ("--class", "--classdata"), 0),
+    "taskset": ("", (), 1),                                                # MASK, or LIST under -c
+    "chrt": ("TPD", ("--sched-runtime", "--sched-period", "--sched-deadline"), 1),   # PRIORITY
+    "sudo": ("ugpChDrtUTRa", ("--user", "--group", "--prompt", "--close-from", "--host", "--chdir", "--role", "--type",
+                              "--other-user", "--command-timeout", "--chroot", "--auth-type"), 0),
+    "doas": ("uC", (), 0),
+    "command": ("", (), 0),
+    "exec": ("a", (), 0),
+    "time": ("of", ("--output", "--format"), 0),
+}
+# Wrapper options after which no command runs (`ionice -p PID`, `taskset -p`, `chrt -p`, `command -v`): reading stops,
+# and the fail-closed scan of `_shell_c` still judges any later `bash -c`.
+WRAPPER_NO_COMMAND = {"ionice": "pP", "taskset": "p", "chrt": "pm", "command": "vV"}
 ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 PIPEFAIL_ON = re.compile(r"(?:^|\s)-[A-Za-z]*o\s+pipefail\b")
 PIPEFAIL_OFF = re.compile(r"(?:^|\s)\+[A-Za-z]*o\s+pipefail\b")
@@ -258,45 +281,31 @@ def _unquote(raw: str) -> str:
     return raw
 
 
-def _shell_c(bare: str, raw: str) -> set[str]:
-    """The shapes of the command string when this command is `bash -c '...'` / `sh -c` / `env ... bash -c`; else none.
-
-    Leading `VAR=v` words and an `env` prefix (its options, the argument of `-u`/`-C`/`-S`/`--unset`/`--chdir`, and its
-    `VAR=v` words) are skipped. The shell's first non-option word after a `-c` cluster is the command string; words after
-    it (`2>&1`, `_`, positional arguments) are not part of it. `env -S STRING` is itself a command line and is read the same
-    way. `bash -o pipefail -c '...'` judges the string with pipefail on."""
-    words = [(bare[a:b], raw[a:b]) for a, b in _words(bare)]
-    i = 0
-    while i < len(words) and ASSIGNMENT.match(words[i][0]):
+def _skip_options(words: list[tuple[str, str]], i: int, short_arg: str, long_arg: tuple[str, ...],
+                  stop: str = "") -> tuple[int, bool]:
+    """(index after the options starting at `i`, whether an option in `stop` was seen). An option in `short_arg` (clustered,
+    as in `-oL`) or `long_arg` takes the rest of its word or the next word; `--opt=v` carries its own value; `--` ends them."""
+    stopped = False
+    while i < len(words) and words[i][0].startswith("-") and words[i][0] != "-":
+        w = words[i][0]
         i += 1
-    if i < len(words) and os.path.basename(words[i][0]) == "env":
-        i += 1
-        while i < len(words) and words[i][0].startswith("-") and words[i][0] != "-":
-            w, wr = words[i]
-            i += 1
-            if w == "--":
+        if w == "--":
+            break
+        if w.startswith("--"):
+            if w in long_arg:
+                i += 1
+            continue
+        for k, ch in enumerate(w[1:], start=1):
+            stopped = stopped or ch in stop
+            if ch in short_arg:
+                if k + 1 == len(w):
+                    i += 1
                 break
-            split = None
-            if w.startswith("--"):
-                if w in ENV_ARG_LONG and i < len(words):
-                    split, i = (words[i][1] if w == "--split-string" else None), i + 1
-                elif w.startswith("--split-string="):
-                    split = wr.split("=", 1)[1]
-            else:
-                for k, ch in enumerate(w[1:], start=1):
-                    if ch in ENV_ARG_SHORT:
-                        if k + 1 < len(w):
-                            split = wr[k + 1:]
-                        elif i < len(words):
-                            split, i = words[i][1], i + 1
-                        if ch != "S":
-                            split = None
-                        break
-            if split is not None:                                     # `-S STRING`: the rest of the command is that string
-                inner = _unquote(split) + " " + " ".join(r for _, r in words[i:])
-                return _shell_c(_mask(inner), inner)
-        while i < len(words) and ASSIGNMENT.match(words[i][0]):
-            i += 1
+    return i, stopped
+
+
+def _shell_string(words: list[tuple[str, str]], i: int) -> set[str]:
+    """The shapes of the command string when `words[i]` is a shell (`bash`, `sh`) run with a `-c` cluster; else none."""
     if i >= len(words) or os.path.basename(words[i][0]) not in SHELLS:
         return set()
     i += 1
@@ -317,6 +326,71 @@ def _shell_c(bare: str, raw: str) -> set[str]:
         return set()
     inner = _unquote(words[i][1])
     return set(verify_cannot_fail(("set -o pipefail; " if pipefail else "") + inner))
+
+
+def _shell_c(bare: str, raw: str) -> set[str]:
+    """The shapes of the command string when this command runs `bash -c '...'` / `sh -c`, directly or behind wrappers.
+
+    Leading `VAR=v` words are skipped, then any chain of `env` and the transparent wrappers of WRAPPERS (`nice`,
+    `timeout`, `nohup`, `stdbuf`, `setsid`, `ionice`, `taskset`, `chrt`, `sudo`, `doas`, `command`, `exec`, `time`), each
+    with its own options, the argument of those that take one, its operands (timeout's DURATION, taskset's MASK, chrt's
+    PRIORITY) and any `VAR=v` words after it; they nest in any order (`nice timeout 60 env X=1 bash -c ...`). `env`'s
+    options are `-u`/`-C`/`-S`/`--unset`/`--chdir`/`--split-string`; `env -S STRING` is itself a command line and is read
+    the same way. The shell's first non-option word after a `-c` cluster is the command string; words after it (`2>&1`,
+    `_`, positional arguments) are not part of it. `bash -o pipefail -c '...'` judges the string with pipefail on.
+
+    Fail closed: when the word reached is not a shell (an unknown wrapper such as `mywrap --opt bash -c '...'`, or a
+    wrapper option after which no command runs), every later unquoted word whose basename is a shell and which is followed
+    by a `-c` cluster has its string judged too. Reading an unknown wrapper as transparent can only refuse more lines
+    whose string cannot fail; it never admits one."""
+    words = [(bare[a:b], raw[a:b]) for a, b in _words(bare)]
+    i = 0
+    while i < len(words) and ASSIGNMENT.match(words[i][0]):
+        i += 1
+    while i < len(words):
+        name = os.path.basename(words[i][0])
+        if name == "env":
+            i += 1
+            while i < len(words) and words[i][0].startswith("-") and words[i][0] != "-":
+                w, wr = words[i]
+                i += 1
+                if w == "--":
+                    break
+                split = None
+                if w.startswith("--"):
+                    if w in ENV_ARG_LONG and i < len(words):
+                        split, i = (words[i][1] if w == "--split-string" else None), i + 1
+                    elif w.startswith("--split-string="):
+                        split = wr.split("=", 1)[1]
+                else:
+                    for k, ch in enumerate(w[1:], start=1):
+                        if ch in ENV_ARG_SHORT:
+                            if k + 1 < len(w):
+                                split = wr[k + 1:]
+                            elif i < len(words):
+                                split, i = words[i][1], i + 1
+                            if ch != "S":
+                                split = None
+                            break
+                if split is not None:                                 # `-S STRING`: the rest of the command is that string
+                    inner = _unquote(split) + " " + " ".join(r for _, r in words[i:])
+                    return _shell_c(_mask(inner), inner)
+        elif name in WRAPPERS:
+            short_arg, long_arg, operands = WRAPPERS[name]
+            i, stopped = _skip_options(words, i + 1, short_arg, long_arg, WRAPPER_NO_COMMAND.get(name, ""))
+            if stopped:
+                break
+            i += operands
+        else:
+            break
+        while i < len(words) and ASSIGNMENT.match(words[i][0]):
+            i += 1
+    if i < len(words) and os.path.basename(words[i][0]) in SHELLS:
+        return _shell_string(words, i)
+    shapes: set[str] = set()
+    for j in range(i + 1, len(words)):                                # fail closed: a shell later on the line
+        shapes |= _shell_string(words, j)
+    return shapes
 
 
 def _pipefail(bare: str, on: bool) -> bool:
@@ -367,7 +441,9 @@ def verify_cannot_fail(line: str) -> list[str]:
     masked; an unquoted `#` at the start or after whitespace starts a comment, which is dropped; a whole line `( ... )`
     that opens with a prose word (VERIFY_DESCRIPTION: `(from the worktree root)`) and holds no unquoted `|`, `;`, `&&` or
     `||` is a description and is not judged, and any other parenthesised text is a subshell, judged as a command. The command
-    string of `bash -c`, `sh -c` or `env [options] [VAR=v] bash -c` is judged as a line of its own, recursively (`_shell_c`). A trailing annotation after two or more spaces,
+    string of `bash -c` or `sh -c`, directly or behind `env` and the transparent wrappers of WRAPPERS (`nice`, `timeout`,
+    `sudo` ...), is judged as a line of its own, recursively; an unknown wrapper fails closed (`_shell_c`).
+    A trailing annotation after two or more spaces,
     `x  (rc=0; ...)`, is cut off, and the line before it and the annotation (unless a description) are judged apart.
 
     How: `a; b` exits with b, so only the last `;` command counts; in it every `&&`/`||` part must carry its status to
