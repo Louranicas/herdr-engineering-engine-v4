@@ -10,6 +10,9 @@ Exit 0 only on PASS. A step is red if rc!=0, if it overran its budget (killed, r
 or if it looked at nothing (flag looked_at_nothing, AP-29). Logs: ~/.cache/hee4-gate/<stamp>/.
 Every step gets HEE4_HEAD=<full subject sha> (the export has no .git) and
 CARGO_TARGET_DIR=~/.cache/hee4-gate-target/<sha12> (per subject; --target-dir overrides). Prints target_dir=.
+A tool_rc step's last line lends its `unserved=`/`unmeasured=` counts to the step line. The run is
+also written to <logs>/summary.json {subject, tier, steps[{name,rc,ok,flags,extra,elapsed}], verdict};
+printed once as summary=<path>.
 """
 import argparse, json, os, re, shutil, signal, subprocess, sys, tempfile, time, tomllib
 
@@ -69,8 +72,16 @@ def judge(expect, rc, out, err):
                 extra["input_sha256"] = sha
             else:
                 flags.append("looked_at_nothing")
-    elif expect == "tool_rc" and rc == 3:
-        flags.append("unmeasured")
+    elif expect == "tool_rc":
+        # The tool's last line carries its own counts (drive `unserved=`, doctor `unmeasured=`);
+        # lift them into the step line so a caller reads the gate, not the log.
+        lines = [l for l in out.decode("utf-8", "replace").splitlines() if l.strip()]
+        for key in ("unserved", "unmeasured"):
+            m = re.search(rf"\b{key}=(\d+)\b", lines[-1]) if lines else None
+            if m:
+                extra[key] = int(m.group(1))
+        if rc == 3:
+            flags.append("unmeasured")
     return rc == 0 and not flags, flags, extra
 
 def main():
@@ -88,8 +99,12 @@ def main():
         die(f"subject {a.subject!r} does not resolve in {a.repo}")
     sha = r.stdout.decode().strip()
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-    logs = os.path.expanduser(f"~/.cache/hee4-gate/{stamp}-{sha[:12]}")
-    os.makedirs(logs, exist_ok=True)
+    root = os.path.expanduser("~/.cache/hee4-gate")
+    logs, n = os.path.join(root, f"{stamp}-{sha[:12]}"), 0
+    while os.path.exists(logs):  # a second run on this sha inside the same second keeps its own record
+        n += 1
+        logs = os.path.join(root, f"{stamp}.{n}-{sha[:12]}")
+    os.makedirs(logs)
     tmp = tempfile.mkdtemp(prefix="hee4-gate-", dir=os.path.expanduser("~/.cache"))
     try:
         ar = subprocess.run(f"git -C {a.repo!s} archive {sha} | tar -x -C {tmp}", shell=True, capture_output=True)
@@ -122,7 +137,7 @@ def main():
         print(f"target_dir={env['CARGO_TARGET_DIR']}")
         env["HEE4_GATE_SUBJECT"] = sha
         env["HEE4_GATE_REPO"] = os.path.abspath(a.repo)
-        ok_n = 0
+        ok_n, steps = 0, []
         for name in names:
             st = cfg.get("step", {}).get(name)
             if st is None or "cmd" not in st:
@@ -148,7 +163,13 @@ def main():
             print(f"step={name} rc={rc} elapsed={el:.1f}/{budget}s margin={budget - el:.1f}"
                   + "".join(f" {fl}" for fl in flags) + extras + ("" if ok else f" log={logs}/{name}.log"))
             ok_n += ok
+            steps.append({"name": name, "rc": rc, "ok": bool(ok), "flags": flags, "extra": extra, "elapsed": round(el, 3)})
         v = "PASS" if ok_n == len(names) else "FAIL"
+        # One machine-readable record per run (cold-clone matches against it by name and ok).
+        summary = os.path.join(logs, "summary.json")
+        with open(summary, "w") as f:
+            json.dump({"subject": sha, "tier": a.tier, "steps": steps, "verdict": v}, f, indent=1)
+        print(f"summary={summary}")
         print(f"gate tier={a.tier} verdict={v} steps={ok_n}/{len(names)} subject={sha[:12]}")
         sys.exit(0 if v == "PASS" else 1)
     finally:

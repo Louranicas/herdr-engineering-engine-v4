@@ -83,9 +83,12 @@ class GateTests(unittest.TestCase):
         self.assertEqual(rc, 0, out); self.assertRegex(out, r"input_sha256=[0-9a-f]{64}")
 
     def test_ddf_rc7_is_fail_with_reason(self):
+        import subprocess
         d, _ = make_repo(toml(("ddf", "deep-diff-forge --stdin-patch --rank --json --require-files --require-hunks", 30, "ddf_sealed")))
-        rc, out, _ = gate(d, "t", "--base", "HEAD")
-        self.assertEqual(rc, 1); self.assertIn("rc=7", out); self.assertIn("refused: 0 files", out)
+        # an empty commit: HEAD~1..HEAD is an empty patch (the gate refuses base == subject by name, rc 2)
+        subprocess.run(["git", "-C", d, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "empty"], check=True)
+        rc, out, _ = gate(d)
+        self.assertEqual(rc, 1, out); self.assertIn("rc=7", out); self.assertIn("refused: 0 files", out)
 
     def test_step_without_budget_is_refused(self):
         d, _ = make_repo('[tier.t]\nsteps=["a"]\n[step.a]\ncmd="true"\n')
@@ -100,6 +103,37 @@ class GateTests(unittest.TestCase):
         for name, st in cfg["step"].items():
             self.assertIn("budget_s", st, name)
             self.assertNotRegex(st.get("expect", ""), r"\d")
+
+    def test_summary_json_written_with_step_shape(self):
+        import json
+        d, sha = make_repo(toml(("good", "true", 5, "none"), ("planted", "exit 9", 5, "none")))
+        rc, out, _ = gate(d)
+        self.assertEqual(rc, 1)
+        paths = [l[len("summary="):] for l in out.splitlines() if l.startswith("summary=")]
+        self.assertEqual(len(paths), 1, out)
+        self.assertTrue(os.path.isfile(paths[0]), paths[0])
+        with open(paths[0]) as f:
+            s = json.load(f)
+        self.assertEqual(set(s), {"subject", "tier", "steps", "verdict"})
+        self.assertRegex(s["subject"], r"^[0-9a-f]{40}$"); self.assertEqual(s["subject"], sha)
+        self.assertEqual(s["tier"], "t"); self.assertEqual(s["verdict"], "FAIL")
+        self.assertEqual([st["name"] for st in s["steps"]], ["good", "planted"])
+        for st in s["steps"]:
+            self.assertEqual(set(st), {"name", "rc", "ok", "flags", "extra", "elapsed"})
+        self.assertEqual((s["steps"][0]["ok"], s["steps"][0]["rc"]), (True, 0))
+        self.assertEqual((s["steps"][1]["ok"], s["steps"][1]["rc"]), (False, 9))
+        self.assertLess(out.index("summary="), out.index("gate tier=t verdict=FAIL"))
+
+    def test_tool_rc_extras_unserved_unmeasured(self):
+        import json
+        d, _ = make_repo(toml(("drive", "echo 'x verdict=PASS features=1/1 unserved=19 unmeasured=2 head=abc'", 5, "tool_rc")))
+        rc, out, _ = gate(d)
+        self.assertEqual(rc, 0, out)
+        self.assertRegex(out, r"(?m)^step=drive rc=0 .* unserved=19 unmeasured=2$")
+        path = [l for l in out.splitlines() if l.startswith("summary=")][0][len("summary="):]
+        with open(path) as f:
+            s = json.load(f)
+        self.assertEqual(s["steps"][0]["extra"], {"unserved": 19, "unmeasured": 2})
 
 if __name__ == "__main__":
     unittest.main()
