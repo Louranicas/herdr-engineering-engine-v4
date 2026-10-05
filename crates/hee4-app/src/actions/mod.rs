@@ -9,6 +9,7 @@
 
 pub mod page;
 pub mod registry;
+pub mod roster;
 pub mod task;
 pub mod tools;
 
@@ -32,7 +33,13 @@ pub use registry::{Family, Handler, Registry, RegistryFault, StartFault, StartHo
 /// [`RegistryFault`]: a compose-time defect (held owner, duplicate owner, unknown id, owner
 /// mismatch).
 pub fn composed() -> Result<Registry, RegistryFault> {
-    Registry::new(&[task::HEALTH, task::FAMILY, task::EVENTS, tools::FAMILY])
+    Registry::new(&[
+        task::HEALTH,
+        task::FAMILY,
+        task::EVENTS,
+        tools::FAMILY,
+        roster::FAMILY,
+    ])
 }
 
 /// Unix nanoseconds now, saturating. K1-store-foundation's `Store::boot()` replaces the source of

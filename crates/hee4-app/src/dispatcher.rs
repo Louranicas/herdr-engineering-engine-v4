@@ -7,11 +7,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use hee4_contracts::bounds::MAX_VIEW_ITEMS;
 use hee4_contracts::{
     AbandonReason, Brief, BriefField, Event, GitSha, Observation, Phase, ReceiptId, Resolution,
     Settlement, Sha256Hex, SourceId, TaskId, Verdict,
 };
 use hee4_core::StoreError;
+use hee4_core::roster::RosterDefinition;
 use hee4_evidence::{Identities, Identity, Source, Subject, Why, decide_and_seal, observation_id};
 use hee4_host::model::OllamaClient;
 use hee4_host::model_door::Upstream;
@@ -166,36 +168,125 @@ const fn route_reason(r: &RouteRefusal) -> AbandonReason {
     }
 }
 
-/// Route by floor over a one-row roster of the declared model. Availability is probed only
-/// when the model is needed; otherwise it is `Unknown`, which routes to the declared baseline.
+/// The roster `route` selects over, read from the ledger, and the ids of the disabled model
+/// records and of `model:` ids of another kind (`task.preview`'s `exclusions`). One `ModelEntry` per eligible record (kind `model`,
+/// not disabled; name = the id without `model:`; caps and figures from the definition;
+/// availability `Unknown` until `route` probes). The ledger is read under one `engine.store()`
+/// lock and released before anything else. When the roster table is empty (the roster family's
+/// hook never ran: a unit-test engine) the one-row roster of the declared model is built from
+/// `actions::roster::default_definition`; when rows exist but none is eligible the roster is
+/// empty and `route` refuses, so a disabled model is never re-enabled by a fallback.
+pub(crate) fn roster_from_store(
+    engine: &Engine,
+    cfg: &Config,
+) -> Result<(Roster, Vec<String>), StoreError> {
+    let (count, eligible, excluded) = {
+        let store = engine.store();
+        (
+            store.roster_count()?,
+            store.roster_eligible()?,
+            store.roster_excluded(MAX_VIEW_ITEMS)?,
+        )
+    };
+    if count == 0 {
+        let fallback = entry(&cfg.model, &crate::actions::roster::default_definition());
+        return Ok((
+            Roster {
+                models: vec![fallback],
+            },
+            Vec::new(),
+        ));
+    }
+    let roster = Roster {
+        models: eligible
+            .iter()
+            .map(|r| {
+                entry(
+                    r.head.id.model_name().unwrap_or(r.head.id.as_str()),
+                    &r.definition,
+                )
+            })
+            .collect(),
+    };
+    Ok((roster, excluded))
+}
+
+/// A roster record's definition as the route's row; availability is `route`'s to set.
+fn entry(name: &str, d: &RosterDefinition) -> ModelEntry {
+    ModelEntry {
+        name: name.to_owned(),
+        caps: Capabilities {
+            ctx_tokens: d.caps.ctx_tokens,
+            json_mode: d.caps.json_mode,
+            tool_use: d.caps.tool_use,
+            local: d.caps.local,
+        },
+        availability: Availability::Unknown,
+        cost_milli: d.cost_milli,
+        latency_ms: d.latency_ms,
+        quality: d.quality,
+    }
+}
+
+/// Route by floor over `roster`, baseline = the declared model. When the model is needed, one
+/// `tags` call lists what the upstream holds and each row is `Up` exactly when its name is listed
+/// (a name without a tag also matches `<name>:latest`), `Down` otherwise or when the call fails;
+/// when it is not needed every row is `Unknown`, which routes to the declared baseline when it is
+/// in the roster.
 pub(crate) fn route(
     cfg: &Config,
     client: &OllamaClient,
     needs_model: bool,
+    roster: &Roster,
 ) -> Result<Selection, RouteRefusal> {
-    let availability = if needs_model {
-        if client.tags().is_ok() {
+    if !needs_model {
+        return route_with(cfg, roster, |_| Availability::Unknown);
+    }
+    let listed = client.tags().unwrap_or_default();
+    route_with(cfg, roster, |name| {
+        let held = listed
+            .iter()
+            .any(|t| t == name || (!name.contains(':') && *t == format!("{name}:latest")));
+        if held {
             Availability::Up
         } else {
             Availability::Down
         }
+    })
+}
+
+/// The model the dispatcher would select now with no upstream call: every row `Up` when the
+/// engine is live (the dispatcher's view whenever the upstream holds every eligible model),
+/// `Unknown` otherwise. `roster.disable` reads it to find the attempts on a record; it is an
+/// approximation until attempts record their model (K1-attempts-ledger).
+pub(crate) fn route_as_dispatched(
+    cfg: &Config,
+    roster: &Roster,
+) -> Result<Selection, RouteRefusal> {
+    let availability = if cfg.live {
+        Availability::Up
     } else {
         Availability::Unknown
     };
+    route_with(cfg, roster, |_| availability)
+}
+
+/// `select` over `roster` with each row's availability from `availability(name)`.
+fn route_with(
+    cfg: &Config,
+    roster: &Roster,
+    availability: impl Fn(&str) -> Availability,
+) -> Result<Selection, RouteRefusal> {
     let roster = Roster {
-        models: vec![ModelEntry {
-            name: cfg.model.clone(),
-            caps: Capabilities {
-                ctx_tokens: 32_768,
-                json_mode: true,
-                tool_use: false,
-                local: true,
-            },
-            availability,
-            cost_milli: 0,
-            latency_ms: 0,
-            quality: 0,
-        }],
+        models: roster
+            .models
+            .iter()
+            .cloned()
+            .map(|mut m| {
+                m.availability = availability(&m.name);
+                m
+            })
+            .collect(),
     };
     let input = RouteInput {
         floor: CapabilityFloor {
@@ -240,7 +331,8 @@ pub fn step(engine: &Engine, cfg: &Config) -> Result<Option<(TaskId, Phase)>, Di
     }
     let needs_model = wants_model && cfg.live;
     let client = OllamaClient::new(MODEL_URL);
-    let selection = match route(cfg, &client, needs_model) {
+    let (roster, _) = roster_from_store(engine, cfg)?;
+    let selection = match route(cfg, &client, needs_model, &roster) {
         Ok(s) => s,
         Err(r) => {
             return Ok(Some((

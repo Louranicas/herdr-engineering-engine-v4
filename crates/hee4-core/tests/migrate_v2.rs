@@ -1,5 +1,5 @@
 //! A legacy v2 file (the verbatim v1+v2 SQL, `user_version=2`, no `migration:` rows) opened by
-//! this binary: the named rows are seeded and m003/m004 applied, the data stays intact, the
+//! this binary: the named rows are seeded and m003/m004/m005 applied, the data stays intact, the
 //! operations row carries its derived id, a second open changes nothing, and a row naming a
 //! migration this binary does not know is refused by name.
 
@@ -190,7 +190,8 @@ fn a_v2_file_gains_the_named_rows_and_keeps_its_data() -> R {
             "migration:m002_cache_heals",
             "migration:m003_operations_subject",
             "migration:m004_serve_cgroup",
-            "migration:m005_checkpoints"
+            "migration:m005_checkpoints",
+            "migration:m005_roster"
         ]
     );
     assert_eq!(store.epoch()?, LEGACY_EPOCH, "epoch is kept, not re-minted");

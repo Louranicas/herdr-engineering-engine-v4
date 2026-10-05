@@ -21,6 +21,7 @@ pub use attempts::{
     AttemptId, AttemptIdFault, AttemptOutcome, AttemptRow, AttemptStart, AttemptState, Cleanup,
     Effect, Lease,
 };
+pub mod roster;
 
 use std::collections::BTreeSet;
 use std::os::unix::fs::PermissionsExt;

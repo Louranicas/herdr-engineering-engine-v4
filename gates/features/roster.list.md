@@ -20,11 +20,25 @@ Preconditions (v4.0): README shared preconditions. Preconditions (v4.1): a `Read
 
 ```bash
 hee4 roster.list                                   # v4.0: unavailable by name, because=v4.1
-hee4-sh roster.list 'kinds:=[…]' capability:=null locality:=null include_disabled:=false 'page:={"limit":100,"cursor":null}'   # v4.1
-hee4-sh roster.list 'kinds:=[…]' capability:=null locality:=null include_disabled:=true  'page:={"limit":100,"cursor":null}'
+hee4-sh roster.list 'kinds:=[…]' capability:=null locality:=null include_disabled:=false 'page:={"limit":100,"cursor":null}'   # v4.1; UNMEASURED: no hee4-sh exists in the six crates
+hee4-sh roster.list 'kinds:=[…]' capability:=null locality:=null include_disabled:=true  'page:={"limit":100,"cursor":null}'    # UNMEASURED: no hee4-sh
 ```
 
-Socket: request `body` `{kinds[], capability, locality, include_disabled, page}` (FACT required all five); result `body` `{page: PageOutV1<RosterHeadV1>}` (API Map A-11). `UNWRITTEN: RosterHeadV1 fields, the kinds/capability/locality value domains, and the generated wrapper spelling (not spelled before the v4.1 schema exists in K0).`
+Socket: request `body` `{kinds[], capability, locality, include_disabled, page}` (FACT required all five); result `body` `{page: PageOutV1<RosterHeadV1>}` (API Map A-11).
+
+(rev 2026-10-05 drive) Served from v4.1 by `actions/roster.rs` (`tools/drive.d/roster.py` `d_list`):
+
+```bash
+hee4 roster.list --body '{"kinds":[],"capability":null,"locality":null,"include_disabled":false,"page":{"limit":100,"cursor":null}}'
+hee4 roster.list --body '{"kinds":["model"],"capability":null,"locality":"local","include_disabled":true,"page":{"limit":100,"cursor":null}}'
+```
+
+- Body: all five members required; a missing or mistyped one is `invalid_argument` at its pointer (`/body/kinds`, `/body/capability`, `/body/locality`, `/body/include_disabled`, `/body/page/limit` for a missing `page`). `kinds` is an array of distinct `agent|model|runtime` (empty admits every kind); `capability` is `null` or a string; `locality` is `null`, `"local"` or `"remote"`.
+- RosterHeadV1 is `{id, kind, generation, disabled, capability, locality}`; items sorted by `id`, keyset-paged; the cursor `{after_key, boot, filter_sha256}` is pinned to the serve's boot and the filter's digest (`actions/page.rs`).
+- Success: the deploy record `model:<HEE4_MODEL>` is listed (kind `model`, generation 1, `disabled:false`); `include_disabled:true` shows a disabled record with `disabled:true`.
+- Error: `page.limit` 0 or 101 → `invalid_argument` at `/body/page/limit`; a cursor minted under another boot → `resync_required` at `/body/page/cursor` (`because` "epoch moved"), another filter → "filter moved".
+- Empty: `kinds:["runtime"]` on a fresh serve → `items:[]`, `cursor:null`, a `result`.
+- Retention (`roster_observations` cap): UNMEASURED, no writer of observations under a record exists in this release (owner: the retention slice).
 
 - v4.0 path (the only reachable one): `unavailable`, `retry=after_condition`, `because` names the scope; assert the `because` string per unserved id (card actions §9 #2).
 - v4.1 success: the installed records appear; `include_disabled=false` hides a record after `roster.disable`; `true` shows it with its disabled marker.
