@@ -60,6 +60,9 @@ def refusal_table(repo):
     return out
 
 
+MINE = []  # (socket, task id) for every task.submit frame of THIS drive run: the only tasks settle() may touch
+
+
 class Feature:
     def __init__(self, name, path, sock, table):
         self.name, self.path, self.sock, self.table = name, path, sock, table
@@ -98,7 +101,12 @@ class Feature:
         if precondition is not None:
             obj["precondition"] = precondition
         obj["body"] = body
-        return self.frame(obj)
+        r = self.frame(obj)
+        if action == "task.submit" and isinstance(r, dict) and r.get("kind") == "result":
+            t = (r.get("body") or {}).get("task_id")
+            if t and (self.sock, t) not in MINE:
+                MINE.append((self.sock, t))
+        return r
 
     def check(self, name, ok, detail, unmeasured=False):
         self.paths.append((name, "UNMEASURED" if unmeasured else "PASS" if ok else "FAIL", detail))
@@ -128,6 +136,39 @@ class Feature:
         st = [p[1] for p in self.paths]
         v = "FAIL" if "FAIL" in st else "UNMEASURED" if "UNMEASURED" in st or not st else "PASS"
         return v, st.count("PASS"), len(st)
+
+
+TERMINAL_PHASES = {"accepted", "failed", "cancelled", "abandoned"}
+
+
+def settle(sock, ev, table, budget=60):
+    """Leave no debris on the unit: the drive's own restart path (persistence_restart) and the
+    unit's recovery can leave tasks THIS run submitted in `blocked` (R12) or `effect_unknown` (R08).
+    Abandon exactly those through task.resolve (reason attempt_failed), wait for the rest of this
+    run's tasks on `sock` to finish, and print one line. Tasks submitted to another socket (a
+    procedure's own disposable serve) and tasks this run did not submit are never touched.
+    PASS when all are terminal; FAIL when a resolve is refused; UNMEASURED, naming them, when some
+    are still open after `budget` seconds (e.g. a serve that never dispatches)."""
+    mine = [t for s_, t in MINE if s_ == sock]
+    if not mine:
+        print("drive settle mine=0 terminal=0/0 resolved=0 refused=none open=none")
+        return "PASS"
+    F = Feature("settle", os.path.join(ev, "settle.jsonl"), sock, table)
+    resolved, refused, t0, phases = [], [], time.monotonic(), {}
+    while True:
+        phases = {t: ((F.req("task.get", {"task_id": t}) or {}).get("body") or {}).get("phase") for t in mine}
+        for t, ph in phases.items():
+            if ph in ("blocked", "effect_unknown") and t not in resolved and t not in refused:
+                r = F.req("task.resolve", {"task_id": t, "resolution": "abandon", "reason": "attempt_failed"}, key=f"drive-settle-{t}")
+                (resolved if isinstance(r, dict) and r.get("kind") == "result" else refused).append(t)
+        if all(ph in TERMINAL_PHASES for ph in phases.values()) or time.monotonic() - t0 > budget:
+            break
+        time.sleep(0.5)
+    F.f.close()
+    open_ = [f"{t}:{ph}" for t, ph in phases.items() if ph not in TERMINAL_PHASES]
+    print(f"drive settle mine={len(mine)} terminal={len(mine) - len(open_)}/{len(mine)} resolved={len(resolved)} "
+          f"refused={','.join(refused) or 'none'} open={','.join(open_) or 'none'}")
+    return "FAIL" if refused else "UNMEASURED" if open_ else "PASS"
 
 
 def main():
@@ -200,6 +241,9 @@ def main():
         print(f"drive feature={name} verdict={v} paths={k}/{n} evidence={evp}" + (drive_d.feature_reason(F.paths) if v == "UNMEASURED" else ""))
         for p, st, d in F.paths:
             if st != "PASS": print(f"  path={p} status={st} detail={d[:300]}")
+    sv = settle(a.socket, ev, table)
+    if sv != "PASS":
+        verdicts.append(sv)
     v = "FAIL" if "FAIL" in verdicts else "UNMEASURED" if "UNMEASURED" in verdicts or not verdicts else "PASS"
     print(f"drive verdict={v} features={verdicts.count('PASS')}/{len(verdicts)} unserved={len(unserved)} head={head}")
     sys.exit({"PASS": 0, "FAIL": 1, "UNMEASURED": 3}[v])
