@@ -9,18 +9,22 @@
 //! and `render` both walk it, so a field cannot be checked under one name and printed under
 //! another.
 //!
-//! What the type keeps and what it does not. [`Budgets::parse`] and `Deserialize` share one
-//! path: the top value and every section must be JSON objects (a positional array never names a
-//! key, so it is refused, not read as the default), an unknown key is refused, then `validate`
-//! runs. The fields are `pub` for reading, so a struct literal or a field write after `parse` is
-//! not checked, and a section parsed on its own (`DoorBudget` alone) is not checked: rung-2
-//! doors, named in `FLOW.md`, for a later slice to close with private fields.
+//! What the type keeps and what it does not. [`Budgets::parse`] is the only door in from text:
+//! one streaming read of the `&str` itself, never of a parsed `serde_json::Value` (which has
+//! already collapsed a repeated key last-wins). The top value and every section must be JSON
+//! objects (a positional array never names a key, so it is refused, not read as the default),
+//! an unknown key is refused, a key named twice is refused (never last-wins), then `validate`
+//! runs. Neither `Budgets` nor a section implements `Deserialize`, so no other deserializer can
+//! build one unchecked or past the duplicate-key check. The fields
+//! are `pub` for reading, so a struct literal or a field write after `parse` is not checked: a
+//! rung-2 door, named in `FLOW.md`, for a later slice to close with private fields (a DC row).
 
 use std::time::Duration;
 
-use serde::de::Error as _;
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use std::fmt;
+
+use serde::de::{self, DeserializeSeed, Error as _, MapAccess, Visitor};
+use serde::{Deserializer, Serialize};
 
 /// Ceiling for `socket.max_connections`.
 pub const MAX_CONNECTIONS_CEILING: u64 = 65_535;
@@ -44,8 +48,7 @@ pub const MAX_COUNT_CEILING: u64 = 1_000_000;
 pub const MAX_CTX_TOKENS: u64 = 1_048_576;
 
 /// The engine's Unix socket: connection count, frame size and the per-stream deadlines.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct SocketBudget {
     /// Concurrent client connections (replaces `MAX_CONNECTIONS = 256`, hee4-app/src/socket.rs:115).
     pub max_connections: u64,
@@ -105,8 +108,7 @@ impl Default for SocketBudget {
 }
 
 /// The receipt stream: queue depth, batch size, poll and close deadlines.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct StreamBudget {
     /// Frames queued per subscriber (replaces `QUEUE_FRAMES = 256`, hee4-app/src/stream.rs:27).
     pub queue_frames: u64,
@@ -160,8 +162,7 @@ impl Default for StreamBudget {
 }
 
 /// The model door the host opens for an attempt: request count, sizes, deadlines and pool.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct DoorBudget {
     /// Requests forwarded before the door answers `429` (replaces `64`,
     /// hee4-host/src/model_door.rs:90).
@@ -228,8 +229,7 @@ impl Default for DoorBudget {
 }
 
 /// One attempt: its default timebox, hard deadline and model context.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct AttemptBudget {
     /// TIMEBOX when the brief gives none (replaces the `from_secs(120)` fallback of `timebox`,
     /// hee4-app/src/dispatcher.rs:106-118).
@@ -270,8 +270,7 @@ impl Default for AttemptBudget {
 }
 
 /// The dispatch loop: how long it idles with nothing to do and after an error.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct DispatcherBudget {
     /// Sleep when no task is admitted (replaces `from_millis(100)`, hee4-app/src/lib.rs:140).
     pub idle_ms: u64,
@@ -306,8 +305,7 @@ impl Default for DispatcherBudget {
 }
 
 /// Crash recovery: how much workspace it reads back and how many open attempts it will adopt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct RecoveryBudget {
     /// Bytes of workspace read back on restart: 1 GiB (`WORKSPACE_REMOVAL_BUDGET` family,
     /// gates/features/crash-restart.md:122). UNMEASURED stand-in.
@@ -332,8 +330,7 @@ impl Default for RecoveryBudget {
 }
 
 /// The model host: how long a tags probe may take.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ModelBudget {
     /// Timeout on the `/api/tags` probe (replaces `from_secs(10)`, hee4-host/src/model.rs:52).
     pub tags_timeout_ms: u64,
@@ -359,8 +356,7 @@ impl Default for ModelBudget {
 }
 
 /// The ledger: its busy timeout and checkpoint cadence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct LedgerBudget {
     /// `SQLite` busy timeout (replaces `busy_timeout(from_secs(5))`, hee4-core/src/store.rs:310;
     /// the follow-up is `Store::open_with(path, &LedgerBudget)`).
@@ -390,13 +386,11 @@ impl Default for LedgerBudget {
     }
 }
 
-/// Every budget the runtime reads. A value that came out of [`Budgets::parse`] or `Deserialize`
-/// passed [`Budgets::validate`]; [`Budgets::DEFAULT`] does too. A partial file overrides only
-/// the keys it names; an unknown key, or an array where an object is required, is a parse
-/// failure, never a silent default. The fields are `pub` for reading: a literal or a write after
-/// `parse` is not checked (see the module doc).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "Value")]
+/// Every budget the runtime reads. A value that came out of [`Budgets::parse`] passed [`Budgets::validate`]; [`Budgets::DEFAULT`] does too. A partial file overrides only
+/// the keys it names; an unknown key, a key named twice, or an array where an object is
+/// required, is a parse failure, never a silent default. The fields are `pub` for reading: a
+/// literal or a write after `parse` is not checked (see the module doc).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct Budgets {
     /// The engine socket.
     pub socket: SocketBudget,
@@ -422,66 +416,76 @@ impl Default for Budgets {
     }
 }
 
-/// The file's shape as serde reads it, before the checks: the same sections as [`Budgets`],
-/// missing ones defaulted, unknown ones refused. Private, so the only way to a `Budgets` from
-/// JSON is through [`TryFrom<Value>`], which runs the shape check and [`Budgets::validate`].
-#[derive(Default, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-struct RawBudgets {
-    socket: SocketBudget,
-    stream: StreamBudget,
-    door: DoorBudget,
-    attempt: AttemptBudget,
-    dispatcher: DispatcherBudget,
-    recovery: RecoveryBudget,
-    model: ModelBudget,
-    ledger: LedgerBudget,
-}
+/// Read one budgets file from a serde map, by name only: every key is a section of
+/// [`FIELDS`], every section a map of that section's fields. Starts from [`Budgets::DEFAULT`],
+/// so a partial file overrides only the keys it names. Does not validate.
+struct FileVisitor;
 
-/// Refuse a value that is not a JSON object. The derive would read an array positionally, which
-/// never names a key; a budgets file is read by name only.
-fn require_object(value: &Value, what: &str) -> Result<(), serde_json::Error> {
-    if value.is_object() {
-        return Ok(());
+impl<'de> Visitor<'de> for FileVisitor {
+    type Value = Budgets;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("an object for the budgets file")
     }
-    let found = match value {
-        Value::Null => "null",
-        Value::Bool(_) => "a boolean",
-        Value::Number(_) => "a number",
-        Value::String(_) => "a string",
-        Value::Array(_) => "an array",
-        Value::Object(_) => "an object",
-    };
-    Err(serde_json::Error::custom(format!(
-        "expected an object for {what}, found {found}"
-    )))
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Budgets, A::Error> {
+        let mut budgets = Budgets::DEFAULT;
+        let mut seen: Vec<String> = Vec::new();
+        while let Some(section) = map.next_key::<String>()? {
+            if seen.contains(&section) {
+                return Err(A::Error::custom(format!("duplicate field `{section}`")));
+            }
+            if !FIELDS.iter().any(|f| f.section() == section) {
+                return Err(A::Error::custom(format!("unknown field `{section}`")));
+            }
+            map.next_value_seed(SectionSeed {
+                section: &section,
+                budgets: &mut budgets,
+            })?;
+            seen.push(section);
+        }
+        Ok(budgets)
+    }
 }
 
-impl TryFrom<Value> for Budgets {
-    type Error = BudgetParseError;
+/// One section of the file, written into `budgets` field by field through [`FIELDS`].
+struct SectionSeed<'a> {
+    section: &'a str,
+    budgets: &'a mut Budgets,
+}
 
-    /// The one path from JSON to a `Budgets`: the top value and every section must be objects,
-    /// then the derive reads the keys (unknown ones refused), then [`Budgets::validate`].
-    fn try_from(value: Value) -> Result<Self, Self::Error> {
-        require_object(&value, "the budgets file")?;
-        if let Some(sections) = value.as_object() {
-            for (key, section) in sections {
-                require_object(section, &format!("`{key}`"))?;
+impl<'de> DeserializeSeed<'de> for SectionSeed<'_> {
+    type Value = ();
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        deserializer.deserialize_map(self)
+    }
+}
+
+impl<'de> Visitor<'de> for SectionSeed<'_> {
+    type Value = ();
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "an object for `{}`", self.section)
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        let mut seen: Vec<&'static str> = Vec::new();
+        while let Some(key) = map.next_key::<String>()? {
+            let dotted = format!("{}.{key}", self.section);
+            let Some(field) = FIELDS.iter().find(|f| f.name == dotted) else {
+                return Err(A::Error::custom(format!("unknown field `{dotted}`")));
+            };
+            if seen.contains(&field.name) {
+                return Err(A::Error::custom(format!(
+                    "duplicate field `{}`",
+                    field.name
+                )));
             }
+            seen.push(field.name);
+            (field.set)(self.budgets, map.next_value::<u64>()?);
         }
-        let raw: RawBudgets = serde_json::from_value(value)?;
-        let budgets = Self {
-            socket: raw.socket,
-            stream: raw.stream,
-            door: raw.door,
-            attempt: raw.attempt,
-            dispatcher: raw.dispatcher,
-            recovery: raw.recovery,
-            model: raw.model,
-            ledger: raw.ledger,
-        };
-        budgets.validate()?;
-        Ok(budgets)
+        Ok(())
     }
 }
 
@@ -539,12 +543,23 @@ pub enum BudgetParseError {
     Refused(#[from] BudgetRefusal),
 }
 
-/// One row of the field table: the dotted name, where the value lives, its floor and ceiling.
+/// One row of the field table: the dotted name, where the value lives (read and written), its
+/// floor and ceiling.
 struct Field {
     name: &'static str,
     get: fn(&Budgets) -> u64,
+    set: fn(&mut Budgets, u64),
     floor: u64,
     max: u64,
+}
+
+impl Field {
+    /// The section part of the dotted name (`door` for `door.pool`).
+    fn section(&self) -> &'static str {
+        self.name
+            .split_once('.')
+            .map_or(self.name, |(section, _)| section)
+    }
 }
 
 /// Every field in declaration order; the only place a name, floor or ceiling is bound to a field.
@@ -552,174 +567,203 @@ const FIELDS: [Field; 29] = [
     Field {
         name: "socket.max_connections",
         get: |b| b.socket.max_connections,
+        set: |b, v| b.socket.max_connections = v,
         floor: 1,
         max: MAX_CONNECTIONS_CEILING,
     },
     Field {
         name: "socket.frame_bytes",
         get: |b| b.socket.frame_bytes,
+        set: |b, v| b.socket.frame_bytes = v,
         floor: MIN_FRAME_BYTES,
         max: MAX_FRAME_CEILING,
     },
     Field {
         name: "socket.read_deadline_ms",
         get: |b| b.socket.read_deadline_ms,
+        set: |b, v| b.socket.read_deadline_ms = v,
         floor: 1,
         max: MAX_DEADLINE_MS,
     },
     Field {
         name: "socket.write_deadline_ms",
         get: |b| b.socket.write_deadline_ms,
+        set: |b, v| b.socket.write_deadline_ms = v,
         floor: 1,
         max: MAX_DEADLINE_MS,
     },
     Field {
         name: "socket.refusal_write_ms",
         get: |b| b.socket.refusal_write_ms,
+        set: |b, v| b.socket.refusal_write_ms = v,
         floor: 1,
         max: MAX_DEADLINE_MS,
     },
     Field {
         name: "socket.client_read_ms",
         get: |b| b.socket.client_read_ms,
+        set: |b, v| b.socket.client_read_ms = v,
         floor: 1,
         max: MAX_DEADLINE_MS,
     },
     Field {
         name: "stream.queue_frames",
         get: |b| b.stream.queue_frames,
+        set: |b, v| b.stream.queue_frames = v,
         floor: 1,
         max: MAX_QUEUE_FRAMES,
     },
     Field {
         name: "stream.batch_rows",
         get: |b| b.stream.batch_rows,
+        set: |b, v| b.stream.batch_rows = v,
         floor: 1,
         max: MAX_QUEUE_FRAMES,
     },
     Field {
         name: "stream.poll_ms",
         get: |b| b.stream.poll_ms,
+        set: |b, v| b.stream.poll_ms = v,
         floor: 1,
         max: MAX_DEADLINE_MS,
     },
     Field {
         name: "stream.close_deadline_ms",
         get: |b| b.stream.close_deadline_ms,
+        set: |b, v| b.stream.close_deadline_ms = v,
         floor: 1,
         max: MAX_DEADLINE_MS,
     },
     Field {
         name: "stream.stall_ms",
         get: |b| b.stream.stall_ms,
+        set: |b, v| b.stream.stall_ms = v,
         floor: 1,
         max: MAX_DEADLINE_MS,
     },
     Field {
         name: "door.max_requests",
         get: |b| b.door.max_requests,
+        set: |b, v| b.door.max_requests = v,
         floor: 1,
         max: MAX_COUNT_CEILING,
     },
     Field {
         name: "door.max_body_bytes",
         get: |b| b.door.max_body_bytes,
+        set: |b, v| b.door.max_body_bytes = v,
         floor: 1,
         max: MAX_BYTES_CEILING,
     },
     Field {
         name: "door.max_total_bytes",
         get: |b| b.door.max_total_bytes,
+        set: |b, v| b.door.max_total_bytes = v,
         floor: 1,
         max: MAX_BYTES_CEILING,
     },
     Field {
         name: "door.header_deadline_ms",
         get: |b| b.door.header_deadline_ms,
+        set: |b, v| b.door.header_deadline_ms = v,
         floor: 1,
         max: MAX_DEADLINE_MS,
     },
     Field {
         name: "door.body_deadline_ms",
         get: |b| b.door.body_deadline_ms,
+        set: |b, v| b.door.body_deadline_ms = v,
         floor: 1,
         max: MAX_DEADLINE_MS,
     },
     Field {
         name: "door.io_timeout_ms",
         get: |b| b.door.io_timeout_ms,
+        set: |b, v| b.door.io_timeout_ms = v,
         floor: 1,
         max: MAX_DEADLINE_MS,
     },
     Field {
         name: "door.max_header_bytes",
         get: |b| b.door.max_header_bytes,
+        set: |b, v| b.door.max_header_bytes = v,
         floor: 1,
         max: MAX_BYTES_CEILING,
     },
     Field {
         name: "door.pool",
         get: |b| b.door.pool,
+        set: |b, v| b.door.pool = v,
         floor: 1,
         max: MAX_POOL,
     },
     Field {
         name: "attempt.timebox_default_ms",
         get: |b| b.attempt.timebox_default_ms,
+        set: |b, v| b.attempt.timebox_default_ms = v,
         floor: 1,
         max: MAX_DEADLINE_MS,
     },
     Field {
         name: "attempt.deadline_ms",
         get: |b| b.attempt.deadline_ms,
+        set: |b, v| b.attempt.deadline_ms = v,
         floor: 1,
         max: MAX_DEADLINE_MS,
     },
     Field {
         name: "attempt.ctx_tokens",
         get: |b| b.attempt.ctx_tokens,
+        set: |b, v| b.attempt.ctx_tokens = v,
         floor: 1,
         max: MAX_CTX_TOKENS,
     },
     Field {
         name: "dispatcher.idle_ms",
         get: |b| b.dispatcher.idle_ms,
+        set: |b, v| b.dispatcher.idle_ms = v,
         floor: 1,
         max: MAX_DEADLINE_MS,
     },
     Field {
         name: "dispatcher.error_backoff_ms",
         get: |b| b.dispatcher.error_backoff_ms,
+        set: |b, v| b.dispatcher.error_backoff_ms = v,
         floor: 1,
         max: MAX_DEADLINE_MS,
     },
     Field {
         name: "recovery.workspace_readback_bytes",
         get: |b| b.recovery.workspace_readback_bytes,
+        set: |b, v| b.recovery.workspace_readback_bytes = v,
         floor: 1,
         max: MAX_BYTES_CEILING,
     },
     Field {
         name: "recovery.open_attempt_limit",
         get: |b| b.recovery.open_attempt_limit,
+        set: |b, v| b.recovery.open_attempt_limit = v,
         floor: 1,
         max: MAX_COUNT_CEILING,
     },
     Field {
         name: "model.tags_timeout_ms",
         get: |b| b.model.tags_timeout_ms,
+        set: |b, v| b.model.tags_timeout_ms = v,
         floor: 1,
         max: MAX_DEADLINE_MS,
     },
     Field {
         name: "ledger.busy_timeout_ms",
         get: |b| b.ledger.busy_timeout_ms,
+        set: |b, v| b.ledger.busy_timeout_ms = v,
         floor: 1,
         max: MAX_DEADLINE_MS,
     },
     Field {
         name: "ledger.checkpoint_every",
         get: |b| b.ledger.checkpoint_every,
+        set: |b, v| b.ledger.checkpoint_every = v,
         floor: 1,
         max: MAX_COUNT_CEILING,
     },
@@ -756,15 +800,21 @@ impl Budgets {
     };
 
     /// Parse the budgets file's text (JSON; `{}` is [`Budgets::DEFAULT`]; a partial object
-    /// overrides only the keys it names) and validate the result. Same path as `Deserialize`.
+    /// overrides only the keys it names) and validate the result. The only door in from text
+    /// (`Budgets` has no `Deserialize`): one streaming read of the text, so a key named twice is
+    /// seen and refused.
     ///
     /// # Errors
     /// [`BudgetParseError::Json`] when the text is not the shape: malformed, an array or scalar
-    /// where an object is required (the top value or a section), or an unknown key;
-    /// [`BudgetParseError::Refused`] with the first [`BudgetRefusal`] in field order.
+    /// where an object is required (the top value or a section), an unknown key, or a key named
+    /// twice (`duplicate field`, naming it); [`BudgetParseError::Refused`] with the first
+    /// [`BudgetRefusal`] in field order.
     pub fn parse(json: &str) -> Result<Self, BudgetParseError> {
-        let value: Value = serde_json::from_str(json)?;
-        Self::try_from(value)
+        let mut deserializer = serde_json::Deserializer::from_str(json);
+        let budgets = de::Deserializer::deserialize_map(&mut deserializer, FileVisitor)?;
+        deserializer.end()?;
+        budgets.validate()?;
+        Ok(budgets)
     }
 
     /// Check every field against the table: non-zero, at or above its floor, at or under its

@@ -89,24 +89,101 @@ fn refusal_text_leads_with_verify() {
     );
     assert_eq!(
         check("sh: true\n/bin/true").unwrap_err().to_string(),
-        "VERIFY is vacuous: all 2 runnable line(s) are no-ops (true, :, exit 0, echo)"
+        "VERIFY is vacuous: all 2 runnable line(s) cannot fail (true, :, exit 0, echo, || true, ; exit 0)"
     );
 }
 
-/// Admission reads the text, not the effect: each of these runs a real command and is a Pass
-/// at admission on purpose. The list is `FLOW.md`, "What `check_verify` does not catch";
-/// a change there changes this test.
+/// Every line here runs, and its exit status cannot be non-zero: a listed no-op after
+/// normalisation, a compound of listed no-ops, or a forced exit. `FLOW.md`, "What
+/// `check_verify` refuses beyond the exact table"; a change there changes this test.
 #[test]
-fn deliberately_not_caught() {
-    let not_caught: [&str; 8] = [
+fn cannot_fail_lines_are_refused() {
+    let cannot_fail = [
+        // Normalised no-ops (the six lines hee4-app pinned as admitted, 2026-10-05).
+        "/usr/bin/env true",
+        "sh: \"true\"",
+        "sh: exit 0;",
+        "sh: true;",
+        "/usr/bin/../bin/true",
+        "//usr/bin/true",
+        // Forced exits.
+        "sh: /usr/bin/false; exit 0",
+        "sh: cargo test || true",
+        "sh: cargo test || :",
+        // Compounds of no-ops (FLOW.md listed these as not caught before this slice).
         "sh: true && true",
         "sh: true; :",
         "sh: true # comment",
         "/bin/sh -c true",
+        // The same rules, one step further.
+        "sh: 'true'",
+        "sh: /usr/./bin//true",
+        "sh: env true",
+        "sh: sh -c 'cargo test || true'",
+        "/usr/bin/env sh -c true",
+        "sh: cargo test || exit 0",
+        "sh: cargo test && cargo clippy || true",
+        "sh: cargo test; true",
+        "sh: cargo test; echo done",
+        "sh: exit 0; cargo test",
+        "sh: cargo test &",
+        "sh: cargo test | true",
+        // No pipefail: the dispatcher runs `/bin/sh -c <command>` (hee4-app dispatcher.rs).
+        "sh: cargo test | tail -1",
+        "sh: cargo test 2>&1 | head -n 5",
+        // `|&` is a pipe (bash pipes stderr too), not `|` then `&`.
+        "sh: cargo test |& tail -1",
+        // A no-op whose only redirections cannot fail is still a no-op.
+        "sh: cargo test || true 2>/dev/null",
+        "sh: cargo test || : >/dev/null 2>&1",
+        "sh: cargo test || echo failed >&2",
+        "sh: cargo test || true &>/dev/null",
+        "sh: true </dev/null",
+    ];
+    for text in cannot_fail {
+        assert_eq!(
+            check(text),
+            Err(Refusal::VacuousVerify {
+                cause: VerifyFault::OnlyNoOps { lines: 1 }
+            }),
+            "{text:?}"
+        );
+    }
+}
+
+/// Admission reads the text, not the effect: each of these runs a real command whose status
+/// can be non-zero, and is a Pass at admission on purpose. The list is `FLOW.md`, "What
+/// `check_verify` does not catch"; a change there changes this test.
+#[test]
+fn deliberately_not_caught() {
+    let not_caught = [
         "sh: printf ok",
         "sh: cat /dev/null",
         "sh: exit 1",
         "/usr/bin/test -d /usr",
+        "sh: cargo test --workspace",
+        "/usr/bin/env cargo test",
+        // A command that can fail, then a no-op only on its success: the line can still fail.
+        "sh: test -f out && true",
+        // A masked command mid-line: the line's status is the last command's.
+        "sh: cargo test || true; cargo clippy",
+        // A bare `exit` keeps the status before it.
+        "sh: cargo test; exit",
+        // A built-in that can end the shell: `set -e` makes `false` fatal.
+        "sh: set -e; false; true",
+        "sh: cargo test || exit 1; true",
+        // Text the reader does not follow is a line that may fail.
+        "sh: (cargo test) || true",
+        "sh: if cargo test; then :; fi",
+        "sh: test -n \"$(cat f)\" || true",
+        // A `#` inside a word is not a comment; a quoted operator is not an operator.
+        "sh: echo a#b > f",
+        "sh: grep -q 'a || true' f",
+        // A redirection that can fail makes the no-op one that can fail: a file that may not
+        // open, an fd that may be closed.
+        "sh: cargo test || true > out",
+        "sh: cargo test || true <&3",
+        "sh: cargo test || true 2>",
     ];
     for text in not_caught {
         assert_eq!(check(text).as_deref(), Ok(text), "{text:?}");
