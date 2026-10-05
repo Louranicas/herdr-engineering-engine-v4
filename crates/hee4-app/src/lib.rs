@@ -77,6 +77,17 @@ pub enum ServeError {
     /// field, e.g. `budgets: door.max_body_bytes is zero`); the engine does not open the ledger.
     #[error("{0}")]
     Budgets(#[from] BudgetParseError),
+    /// The ledger holds more open attempts than recovery will adopt
+    /// (`recovery.open_attempt_limit`); the engine does not probe, reconcile or listen.
+    #[error(
+        "budgets: recovery.open_attempt_limit={limit} but the ledger holds {open} open attempts"
+    )]
+    OpenAttempts {
+        /// Open attempts in the ledger.
+        open: usize,
+        /// `recovery.open_attempt_limit`.
+        limit: u64,
+    },
     /// The ledger failed.
     #[error("ledger: {0}")]
     Store(#[from] hee4_core::StoreError),
@@ -95,6 +106,18 @@ pub enum ServeError {
     /// A family's startup hook refused; the engine does not listen.
     #[error("start: {0}")]
     Start(#[from] actions::StartFault),
+}
+
+/// Recovery adopts at most `limit` (`recovery.open_attempt_limit`) open attempts; more is a
+/// refusal naming the field, before any probe.
+///
+/// # Errors
+/// [`ServeError::OpenAttempts`] when `open > limit`.
+fn adoptable(open: usize, limit: u64) -> Result<(), ServeError> {
+    if u64::try_from(open).unwrap_or(u64::MAX) > limit {
+        return Err(ServeError::OpenAttempts { open, limit });
+    }
+    Ok(())
 }
 
 /// Open, reconcile, start the dispatcher, then listen. Does not return while serving.
@@ -121,6 +144,7 @@ pub fn serve(args: &ServeArgs, cfg: &dispatcher::Config) -> Result<(), ServeErro
     std::fs::create_dir_all(&args.work)?;
     let store = Store::open(&args.ledger)?;
     let open = store.open_attempts()?;
+    adoptable(open.len(), budgets.recovery.open_attempt_limit)?;
     let observed = probe::observe(&open, budgets.recovery.workspace_readback_bytes);
     for row in &open {
         eprintln!(
@@ -191,4 +215,23 @@ pub fn serve(args: &ServeArgs, cfg: &dispatcher::Config) -> Result<(), ServeErro
     );
     socket::serve(&listener, &engine);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_attempts_over_the_limit_are_refused_by_field_name() {
+        assert!(adoptable(0, 1).is_ok());
+        assert!(adoptable(64, 64).is_ok());
+        let refused = adoptable(65, 64).map_err(|e| e.to_string());
+        assert_eq!(
+            refused,
+            Err(
+                "budgets: recovery.open_attempt_limit=64 but the ledger holds 65 open attempts"
+                    .to_owned()
+            )
+        );
+    }
 }

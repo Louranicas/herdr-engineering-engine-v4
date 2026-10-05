@@ -10,6 +10,8 @@ hee4 serve --socket S --ledger L --work W [--budgets F]
   Budgets::parse(read F)              F = --budgets, else env HEE4_BUDGETS, else Budgets::DEFAULT; read once, before
                                       the ledger; a refusal is `hee4 serve refused: budgets: <field> ...`, exit 1, never listens
   Store::open(L)                      (resets recovery_complete=0)
+  open_attempts ≤ recovery.open_attempt_limit   else `hee4 serve refused: budgets: recovery.open_attempt_limit=<n> but the ledger
+                                      holds <m> open attempts`, exit 1, no probe, never listens
   probe::observe(open_attempts)       per open attempt: custody from /proc/<pid>/stat vs the recorded (pid, start_ticks),
                                       workspace readback bounded by recovery.workspace_readback_bytes; one
                                       `recovery probe attempt=<id> custody=<..> workspace=<..>` line each
