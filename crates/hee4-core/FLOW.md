@@ -96,7 +96,16 @@ transaction; `Store::cache_heals()` reads them.
 `MAX_BACKUP_OBJECTS`, else `ObjectsOverBound`), and `manifest.json` LAST, renamed into place
 (`id`, `ts_ms`, `epoch`, `boot`, `task_count`, `objects_n`, `objects_bound`, `files: {path:
 sha256}`); `id` is `b-<ts_ms 12 hex>-<boot 8 hex>`, lexically sortable. A dir without a
-manifest is incomplete by construction and `restore` refuses it (`Incomplete`). `SameDisk::Refuse`
+manifest is incomplete by construction and `restore` refuses it (`Incomplete`).
+Retention runs inside `backup_to` only after the manifest rename succeeds: the pure
+`retain(metas, keep, just_written)` orders the complete `b-*` backups under `dest_root` (a real
+dir whose manifest `id` equals its name, with an integer `ts_ms`) by manifest `ts_ms`, never by
+name, keeps `BACKUP_KEEP` (14, UNMEASURED, INFERRED from the habitat `--keep 14`; a K0
+`backup.keep` field is a scribe proposal) with the one just written always among them, and each
+removed backup is renamed `.pruning-<id>` before `remove_dir_all` (a leftover `.pruning-b-*` is
+removed by the next prune). Incomplete dirs, foreign files and non-`b-*` dirs are never touched.
+`BackupReport.pruned` lists the removed ids; a failed removal is `prune_failed` (a typed
+`PruneFailure{path, kind}`) and never fails the backup. `SameDisk::Refuse`
 (serve's default) refuses a `dest_root` on the ledger's device (`SameDevice`).
 `restore(backup_dir, into)` first refuses any manifest `files` key other than `ledger.sqlite3`
 or `objects/<one normal component>.brief` (`Manifest{field: "files"}`: a `..`, absolute or nested

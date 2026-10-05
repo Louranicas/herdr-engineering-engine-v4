@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use hee4_contracts::{Event, Sha256Hex};
-use hee4_core::backup::{backup_to, restore};
+use hee4_core::backup::{BACKUP_KEEP, BackupMeta, backup_to, restore, retain};
 use hee4_core::{BackupError, CursorVerdict, Observations, SameDisk, Store, StoreError, reconcile};
 use serde_json::Value;
 
@@ -455,4 +455,143 @@ fn restore_objects_n_counts_the_staged_briefs() -> R {
     assert_eq!((report.objects_n, report.objects_total), (n, n));
     assert_eq!(restored.len(), report.objects_n);
     Ok(())
+}
+
+/// A complete backup as far as retention can tell: a `b-*` dir whose manifest names it.
+fn plant_backup(root: &Path, id: &str, ts_ms: i64) -> R {
+    let dir = root.join(id);
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("ledger.sqlite3"), b"planted")?;
+    std::fs::write(
+        dir.join("manifest.json"),
+        serde_json::to_vec(&serde_json::json!({"id": id, "ts_ms": ts_ms}))?,
+    )?;
+    Ok(())
+}
+
+fn complete_ids(root: &Path) -> Result<Vec<String>, Box<dyn Error>> {
+    let mut ids = Vec::new();
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with("b-") && entry.path().join("manifest.json").is_file() {
+            ids.push(name);
+        }
+    }
+    ids.sort();
+    Ok(ids)
+}
+
+/// KEEP+3 planted complete backups (ids in the opposite order to their `ts_ms`, one
+/// future-dated with the lexically smallest id), then one real backup: exactly KEEP complete
+/// backups remain, the just-written one and the newest by `ts_ms` among them; an incomplete
+/// `b-*` dir, a foreign file and a non-`b-*` dir with a manifest are untouched.
+#[test]
+fn retention_keeps_the_newest_and_never_the_just_written() -> R {
+    let base = scratch("retention")?;
+    let (ledger, work) = seed(&base, 1)?;
+    let store = Store::open(&ledger)?;
+    store.apply(&"t-000".parse()?, Event::Admit)?;
+    let root = base.join("backups");
+    std::fs::create_dir_all(&root)?;
+    let now = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis(),
+    )?;
+    let mut planted: Vec<BackupMeta> = Vec::new();
+    let future = BackupMeta {
+        id: format!("b-{:012x}-{:08x}", 0, 0),
+        ts_ms: now + 86_400_000,
+    };
+    plant_backup(&root, &future.id, future.ts_ms)?;
+    planted.push(future.clone());
+    for i in 1..BACKUP_KEEP + 3 {
+        let step = i64::try_from(i)?;
+        let meta = BackupMeta {
+            id: format!("b-{i:012x}-{:08x}", 0),
+            ts_ms: now - 60_000 * step * step,
+        };
+        plant_backup(&root, &meta.id, meta.ts_ms)?;
+        planted.push(meta);
+    }
+    std::fs::create_dir_all(root.join("b-ffffffffffff-incomplete"))?;
+    std::fs::write(root.join("backup.log"), b"foreign\n")?;
+    plant_backup(&root.join("keepme"), "keepme", 0)?;
+
+    let report = backup_to(&store, &work, &root, SameDisk::Allow)?;
+    let remaining = complete_ids(&root)?;
+    assert_eq!(remaining.len(), BACKUP_KEEP, "{remaining:?}");
+    assert!(
+        remaining.contains(&report.id),
+        "the just-written backup stays"
+    );
+    assert!(
+        remaining.contains(&future.id),
+        "ordered by ts_ms, not by name"
+    );
+    let mut by_age = planted.clone();
+    by_age.sort_by_key(|m| std::cmp::Reverse(m.ts_ms));
+    let mut expected_pruned: Vec<String> = by_age[BACKUP_KEEP - 1..]
+        .iter()
+        .map(|m| m.id.clone())
+        .collect();
+    expected_pruned.sort();
+    let mut pruned = report.pruned.clone();
+    pruned.sort();
+    assert_eq!(pruned, expected_pruned);
+    assert_eq!(report.prune_failed, vec![]);
+    assert!(
+        root.join("b-ffffffffffff-incomplete").is_dir(),
+        "incomplete untouched"
+    );
+    assert_eq!(std::fs::read(root.join("backup.log"))?, b"foreign\n");
+    assert!(
+        root.join("keepme")
+            .join("keepme")
+            .join("manifest.json")
+            .is_file()
+    );
+    let leftovers: Vec<String> = std::fs::read_dir(&root)?
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(".pruning-"))
+        .collect();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+
+    // A second backup prunes exactly one more and still keeps KEEP.
+    let again = backup_to(&store, &work, &root, SameDisk::Allow)?;
+    assert_eq!(complete_ids(&root)?.len(), BACKUP_KEEP);
+    assert_eq!(again.pruned.len(), 1);
+    assert!(
+        !again.pruned.contains(&report.id) && !again.pruned.contains(&future.id),
+        "{:?}",
+        again.pruned
+    );
+    Ok(())
+}
+
+/// The pure rule: the just-written id is never returned, even when it is the oldest and
+/// `keep` is 0.
+#[test]
+fn retain_never_returns_the_just_written() {
+    let metas: Vec<BackupMeta> = (0..4)
+        .map(|i| BackupMeta {
+            id: format!("b-{i}"),
+            ts_ms: i,
+        })
+        .collect();
+    for keep in 0..6 {
+        let gone = retain(&metas, keep, "b-0");
+        assert!(!gone.contains(&"b-0".to_owned()), "keep={keep}");
+        assert_eq!(
+            gone.len(),
+            4_usize.saturating_sub(keep.max(1)),
+            "keep={keep}"
+        );
+    }
+    assert_eq!(
+        retain(&metas, 2, "b-0"),
+        vec!["b-2".to_owned(), "b-1".to_owned()]
+    );
 }

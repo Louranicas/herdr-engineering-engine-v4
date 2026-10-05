@@ -22,6 +22,13 @@ use crate::store::{Store, StoreError};
 /// writing a backup it would not verify in bounded time.
 pub const MAX_BACKUP_OBJECTS: usize = 1024;
 
+/// How many complete backups [`backup_to`] keeps under its root, the one it just wrote
+/// included. UNMEASURED: INFERRED from the habitat backup's `--keep 14`; a K0 field
+/// `backup.keep` is a `hee4-scribe` proposal (DC-05: retention is a pure fn in K1).
+pub const BACKUP_KEEP: usize = 14;
+
+const BACKUP_PREFIX: &str = "b-";
+const PRUNING_PREFIX: &str = ".pruning-";
 const LEDGER_FILE: &str = "ledger.sqlite3";
 const MANIFEST_FILE: &str = "manifest.json";
 const OBJECTS_DIR: &str = "objects";
@@ -126,6 +133,44 @@ pub struct BackupReport {
     pub objects_n: usize,
     /// sha256 of the snapshot.
     pub ledger_sha256: String,
+    /// Ids of the complete backups retention removed after this one's manifest landed
+    /// ([`retain`] with [`BACKUP_KEEP`]).
+    pub pruned: Vec<String>,
+    /// Removals that failed. The backup itself is complete either way; a failed removal never
+    /// fails the backup.
+    pub prune_failed: Vec<PruneFailure>,
+}
+
+/// A retention removal the file system refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PruneFailure {
+    /// The path it tried to remove (or list).
+    pub path: PathBuf,
+    /// The OS's answer.
+    pub kind: std::io::ErrorKind,
+}
+
+/// One complete backup under a root, as its manifest names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupMeta {
+    /// The manifest's `id` (equal to the directory name).
+    pub id: String,
+    /// The manifest's `ts_ms`: retention orders by it, never by name.
+    pub ts_ms: i64,
+}
+
+/// Retention, pure: the ids in `metas` to remove so that `keep` backups remain, newest by
+/// `ts_ms` first (ties by id). `just_written` is never returned and counts toward `keep`.
+#[must_use]
+pub fn retain(metas: &[BackupMeta], keep: usize, just_written: &str) -> Vec<String> {
+    let mut others: Vec<&BackupMeta> = metas.iter().filter(|m| m.id != just_written).collect();
+    others.sort_by(|a, b| b.ts_ms.cmp(&a.ts_ms).then_with(|| b.id.cmp(&a.id)));
+    let held = usize::from(metas.iter().any(|m| m.id == just_written));
+    others
+        .into_iter()
+        .skip(keep.saturating_sub(held))
+        .map(|m| m.id.clone())
+        .collect()
 }
 
 /// What [`restore`] did.
@@ -194,8 +239,10 @@ fn file_name(path: &Path) -> Result<String, BackupError> {
 }
 
 /// Snapshot `store` and copy every brief under `<work_briefs>/briefs/` into
-/// `<dest_root>/<id>/`, then write `manifest.json` last (renamed into place). Returns the
-/// report; the backup dir is `report.dir`.
+/// `<dest_root>/<id>/`, then write `manifest.json` last (renamed into place). Only after that
+/// rename succeeds, retention ([`retain`], [`BACKUP_KEEP`]) removes the older complete `b-*`
+/// backups under `dest_root`, never the one just written; the removed ids are
+/// `report.pruned`. Returns the report; the backup dir is `report.dir`.
 ///
 /// # Errors
 /// [`BackupError::SameDevice`] under [`SameDisk::Refuse`] when `dest_root` is on the
@@ -258,6 +305,7 @@ pub fn backup_to(
         "files": files,
     });
     write_manifest_last(&dir, &manifest)?;
+    let (pruned, prune_failed) = prune(dest_root, &id, BACKUP_KEEP);
     Ok(BackupReport {
         id,
         dir,
@@ -267,7 +315,93 @@ pub fn backup_to(
         task_count,
         objects_n: objects.len(),
         ledger_sha256,
+        pruned,
+        prune_failed,
     })
+}
+
+/// Every complete backup directly under `root`: a real directory (not a symlink) named
+/// `b-*` whose `manifest.json` parses with an `id` equal to the name and an integer `ts_ms`.
+/// An incomplete, foreign or unreadable entry is not listed, so retention never touches it.
+fn complete_backups(root: &Path) -> Result<Vec<BackupMeta>, std::io::Error> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !name.starts_with(BACKUP_PREFIX) || !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(entry.path().join(MANIFEST_FILE)) else {
+            continue;
+        };
+        let Ok(manifest) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        let id = manifest.get("id").and_then(Value::as_str);
+        let ts_ms = manifest.get("ts_ms").and_then(Value::as_i64);
+        if let (Some(id), Some(ts_ms)) = (id, ts_ms)
+            && id == name
+        {
+            out.push(BackupMeta { id: name, ts_ms });
+        }
+    }
+    Ok(out)
+}
+
+/// Remove what [`retain`] names under `root`: each is renamed to `.pruning-<id>` first (so a
+/// half-removed backup is never mistaken for a complete one), then removed; a `.pruning-*`
+/// left by an interrupted earlier prune is removed too. A backup another writer already
+/// removed (`NotFound`) is neither pruned nor failed here.
+fn prune(root: &Path, just_written: &str, keep: usize) -> (Vec<String>, Vec<PruneFailure>) {
+    let mut pruned = Vec::new();
+    let mut failed = Vec::new();
+    let metas = match complete_backups(root) {
+        Ok(metas) => metas,
+        Err(e) => {
+            failed.push(PruneFailure {
+                path: root.to_path_buf(),
+                kind: e.kind(),
+            });
+            return (pruned, failed);
+        }
+    };
+    let mut doomed: Vec<(Option<String>, PathBuf)> = Vec::new();
+    for id in retain(&metas, keep, just_written) {
+        let from = root.join(&id);
+        let to = root.join(format!("{PRUNING_PREFIX}{id}"));
+        match std::fs::rename(&from, &to) {
+            Ok(()) => doomed.push((Some(id), to)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => failed.push(PruneFailure {
+                path: from,
+                kind: e.kind(),
+            }),
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let stale = entry.file_name().to_str().is_some_and(|n| {
+                n.strip_prefix(PRUNING_PREFIX)
+                    .is_some_and(|id| id.starts_with(BACKUP_PREFIX))
+            });
+            if stale && !doomed.iter().any(|(_, p)| *p == entry.path()) {
+                doomed.push((None, entry.path()));
+            }
+        }
+    }
+    for (id, path) in doomed {
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => pruned.extend(id),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => failed.push(PruneFailure {
+                path,
+                kind: e.kind(),
+            }),
+        }
+    }
+    (pruned, failed)
 }
 
 /// Write `manifest.json.tmp`, fsync it, rename it to `manifest.json`: the manifest exists only
