@@ -1535,7 +1535,7 @@ mod tests {
     fn workspace_diff_without_git_dir_is_a_patch() -> R<()> {
         let ws = scratch("no-git-dir")?;
         let before = Snapshot::of(&ws, CAP)?;
-        assert!(workspace_diff(&ws, &before, CAP)?.is_empty());
+        assert_eq!(workspace_diff(&ws, &before, CAP)?, b"");
         fs::write(ws.join("f"), "x\n")?;
         assert_eq!(
             String::from_utf8(workspace_diff(&ws, &before, CAP)?)?,
