@@ -262,6 +262,11 @@ cut-check:
       echo "cut-check verdict=REFUSED reason=binary_head_mismatch binary=$bin head=$s12 hint='just deploy first'"; exit 2
     fi
     stamp=$(date -u +%Y%m%dT%H%M%SZ); logs="$root/$stamp-$s12"; mkdir -p "$logs" "$root/$s12"
+    # an earlier run's record never outlives this one: RUNNING replaces it atomically before any door
+    # runs, so a killed or failed run leaves nothing `just tag` admits (ATLAS:41)
+    rec="$root/$s12/cut-check.json"
+    printf '{"sha": "%s", "run": "%s", "verdict": "RUNNING"}\n' "$sha" "$stamp-$s12" > "$rec.tmp.$$" && mv -f "$rec.tmp.$$" "$rec" \
+      || { echo "cut-check verdict=FAIL reason=record_unwritable record=$rec"; exit 1; }
     # the control runs before the aggregate's first real use (ATLAS §1, P7)
     names=(mirror gate_cut check_deployed_control check_deployed cold_clone push_scan layers watch)
     cmds=(
@@ -285,7 +290,7 @@ cut-check:
     done
     # Compose the D10 fields ONLY from the lines these doors just printed (ATLAS D10, the one home).
     python3 - "$logs" "$root/$s12/cut-check.json" "$sha" "$ok" "$total" $steps <<'PY'
-    import json, sys, time
+    import json, os, sys, time
     logs, out, sha, ok, total, steps = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), int(sys.argv[5]), sys.argv[6:]
     steps = [{"name": s.split("=")[0], "rc": int(s.split("=")[1])} for s in steps]
     def lines(n):
@@ -336,9 +341,12 @@ cut-check:
         missing.append("dirty")
     if "watchers" not in watch: missing.append("watch")
     v = "PASS" if ok == total and not missing and not bad else "FAIL"
-    rec = {"sha": sha, "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "verdict": v, "steps": steps, "fields": f}
-    with open(out, "w") as fh:
+    rec = {"sha": sha, "run": os.path.basename(logs), "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+           "verdict": v, "steps": steps, "fields": f}
+    tmp = f"{out}.tmp.{os.getpid()}"
+    with open(tmp, "w") as fh:
         json.dump(rec, fh, indent=1)
+    os.replace(tmp, out)
     failed = [s["name"] for s in steps if s["rc"] != 0]
     g = lambda k, pre: f[k][len(pre):] if k in f else "UNMEASURED(missing)"
     print(f"cut-check verdict={v}" + (f" missing_field={','.join(missing)}" if missing else "")
@@ -350,7 +358,7 @@ cut-check:
     sys.exit(0 if v == "PASS" else 1)
     PY
 
-# Lay the annotated D10 tag NAME at HEAD from HEAD's PASS cut-check record, LOCALLY (never pushed); refuses unless the positional argument is `confirm`
+# Lay the annotated D10 tag NAME at HEAD from HEAD's newest PASS cut-check record, LOCALLY (never pushed); refuses unless `hee4 --version` is HEAD and the positional argument is `confirm`
 tag NAME CONFIRM="":
     #!/usr/bin/env bash
     set -uo pipefail
@@ -359,20 +367,29 @@ tag NAME CONFIRM="":
     s12=${sha:0:12}; rec="$root/$s12/cut-check.json"; msg=$(mktemp); trap 'rm -f "$msg"' EXIT
     refuse() { echo "tag verdict=REFUSED reason=$1 name=$NAME sha=$s12${2:+ $2}"; exit 3; }
     NAME="$1"
+    # the binary that cut-check measured must still be the installed one (same compare as cut-check)
+    bin=$(hee4 --version 2>/dev/null < /dev/null | awk '{print $3}')
+    [[ "$bin" =~ ^[0-9a-f]{12}$ ]] || bin="UNMEASURED(hee4_--version)"
+    [ "$bin" = "$s12" ] || refuse binary_head_mismatch "binary=$bin head=$s12 hint='just deploy first'"
     [ -f "$rec" ] || refuse no_cut_check_at_sha "record=$rec"
-    # the six message lines, in the D10 order, from THIS sha's record only
-    why=$(python3 - "$rec" "$sha" "$msg" <<'PY'
-    import json, sys
-    rec, sha, msg = sys.argv[1:4]
+    # the six message lines, in the D10 order, from THIS sha's record only, and only from the newest run
+    why=$(python3 - "$rec" "$sha" "$msg" "$root" <<'PY'
+    import glob, json, os, sys
+    rec, sha, msg, root = sys.argv[1:5]
     try:
         r = json.load(open(rec))
-        f = r["fields"]
+        f = r["fields"] if r.get("verdict") != "RUNNING" else None
     except (OSError, ValueError, KeyError, TypeError):
         print("cut_check_failed"); sys.exit(1)
     if r.get("sha") != sha:
         print("no_cut_check_at_sha"); sys.exit(1)
+    if r.get("verdict") == "RUNNING":
+        print("cut_check_incomplete"); sys.exit(1)
     if r.get("verdict") != "PASS":
         print("cut_check_failed"); sys.exit(1)
+    runs = sorted(os.path.basename(d) for d in glob.glob(os.path.join(root, f"*-{sha[:12]}")) if os.path.isdir(d))
+    if not runs or r.get("run") != runs[-1]:
+        print("stale_cut_check"); sys.exit(1)
     try:
         body = [f["scoreboard"], f["deployed"], f["cold_clone"], f["push_scan"], f["apparatus_ratio"], f"tree={f['tree']} dirty={f['dirty']}"]
     except KeyError:
