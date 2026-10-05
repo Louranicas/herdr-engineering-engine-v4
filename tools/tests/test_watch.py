@@ -125,11 +125,25 @@ class TestWatch(unittest.TestCase):
         row = self.assert_only(w, "evidence")["evidence"]
         self.assertIn(f"subject={HEAD[:12]} not_ok=test", row)
 
+    def test_newer_commit_tier_pass_at_head_never_hides_the_cut_fail(self):
+        # cut-check runs cold-clone after gate cut: its cold commit-tier PASS at head is newer than the cut FAIL
+        w = World(); w.summary([{"name": "drill", "rc": 1, "ok": False, "flags": []}], mtime=1_000_000)
+        w.summary([{"name": "test", "rc": 0, "ok": True, "flags": []}], tier="commit",
+                  stamp="20261006T000000Z", mtime=2_000_000)
+        row = self.assert_only(w, "evidence")["evidence"]
+        self.assertIn(f"subject={HEAD[:12]} not_ok=drill", row)
+
+    def test_only_a_commit_tier_summary_at_head_is_unmeasured(self):
+        w = World(); shutil.rmtree(w.gate)
+        w.summary([{"name": "test", "rc": 0, "ok": True, "flags": []}], tier="commit")
+        row = self.assert_only(w, "evidence", "UNMEASURED", 3)["evidence"]
+        self.assertIn(f"UNMEASURED(no cut gate summary at {HEAD[:12]})", row)
+
     def test_only_a_foreign_subject_summary_is_unmeasured(self):
         w = World(); shutil.rmtree(w.gate)
         w.summary([{"name": "test", "rc": 0, "ok": True, "flags": []}], subject="a2036d948d97" + "0" * 28, tier="cut")
         row = self.assert_only(w, "evidence", "UNMEASURED", 3)["evidence"]
-        self.assertIn(f"UNMEASURED(no gate summary at {HEAD[:12]})", row)
+        self.assertIn(f"UNMEASURED(no cut gate summary at {HEAD[:12]})", row)
 
     def test_rehearsal_that_submitted_nothing_is_unmeasured_never_pass(self):
         w = World(); w.rehearsal("0/0", submitted=0)

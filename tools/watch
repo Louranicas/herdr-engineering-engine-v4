@@ -13,7 +13,8 @@ Exit: 0 PASS (every watcher PASS), 1 FAIL (any FAIL), 3 UNMEASURED.
 Detectors:
   drift          tools/layers
   contradiction  python3 ops/checks/cite_pins.py status; python3 ops/checks/module_funnel.py; tools/features-check
-  evidence       newest <gate-logs>/*/summary.json whose subject is head and tier commit|stack|cut
+  evidence       newest <gate-logs>/*/summary.json whose subject is head and tier cut (a commit-tier
+                 run at head, e.g. cold-clone's cold run, never speaks for the cut)
                  (ok=false or looked_at_nothing is FAIL; none at head is UNMEASURED), plus the
                  count of `unmeasured` frames in <evidence-root>/<head12>/*.jsonl (informational)
   recovery       <drill-root>/<head12>/rehearsal.json (submitted N>=1, acked_present k/N with k=N=submitted,
@@ -27,8 +28,9 @@ import argparse, glob, json, os, shutil, subprocess, sys
 AGENT = "agent=UNMEASURED(agent)"
 # The terminal phases of crates/hee4-contracts/src/state.rs Phase::is_terminal (informational count only).
 TERMINAL = {"accepted", "failed", "cancelled", "abandoned"}
-# The tools/gate tiers whose summary speaks for a head (a test fixture's tier does not).
-TIERS = {"commit", "stack", "cut"}
+# The one tools/gate tier whose summary speaks for a head at the cut: a test fixture's tier does not,
+# and neither does a commit-tier run (cut-check's cold-clone writes one at head after `gate cut`).
+TIER = "cut"
 
 rows = []
 
@@ -131,8 +133,8 @@ def evidence(a, head):
         except OSError:
             continue
     drive = f"drive_unmeasured={unm}"
-    # only a summary whose subject IS head, at a real tier, speaks for head; a fixture or another
-    # sha's run is someone else's evidence, never this head's PASS
+    # only a summary whose subject IS head, at the cut tier, speaks for head; a fixture, a commit-tier
+    # run or another sha's run is someone else's evidence, never this head's PASS
     mine = []
     for p in glob.glob(os.path.join(a.gate_logs, "*", "summary.json")):
         try:
@@ -140,10 +142,10 @@ def evidence(a, head):
                 s = json.load(f)
         except (OSError, ValueError):
             continue
-        if isinstance(s, dict) and str(s.get("subject", ""))[:12] == head and s.get("tier") in TIERS:
+        if isinstance(s, dict) and str(s.get("subject", ""))[:12] == head and s.get("tier") == TIER:
             mine.append((os.path.getmtime(p), p, s))
     if not mine:
-        emit("evidence", "UNMEASURED", f"UNMEASURED(no gate summary at {head}) {drive}")
+        emit("evidence", "UNMEASURED", f"UNMEASURED(no {TIER} gate summary at {head}) {drive}")
         return
     _, newest, s = max(mine, key=lambda m: m[0])
     steps = s.get("steps")
