@@ -6,10 +6,12 @@ refusal site prints. Quiet cases run the same verbs on a clean world and require
 recomputes brief_sha and standing_sha with hashlib and compares them with what fm-db recorded (no sha is ever
 accepted from the caller). fm-db runs as a subprocess with FM_HOME=<tempdir> (FM_DB unset) and HEE4_ROOT=<temp tree
 holding agents/standing-orders.md copied from the repo>; --head-sha is always passed except in the case that proves
-its absence is refused. Read-back goes through `fm-db status` and `fm-db q` only (never sqlite3 against any DB).
+its absence is refused. Read-back goes through `fm-db status` and `fm-db q`; sqlite3 opens only a temp home's DB, to
+build a 001-only database (the schema-behind case) and to try raw SQL around the spawn door (schema/003's triggers).
 The init-atomicity case SIGKILLs fm-db between a migration's DDL and its schema_migrations row (fm-db's
-FM_DB_CONTROL_KILL_BEFORE_ROW seam) and requires the rerun to apply that migration whole. The curator-parity case reads
-the roster briefs ($FM_ROSTER) and the workflow curator's detector ($WFC_BIN) read-only, importing both scripts' functions.
+FM_DB_CONTROL_KILL_BEFORE_ROW seam) and requires the rerun to apply that migration whole. The section-parity case reads
+the U-stack-04 roster briefs ($FM_ROSTER) and the workflow curator's section reader ($WFC_BIN) read-only, importing both
+scripts' functions. The temp homes live under $TMPDIR (tempfile's rule).
 
 Prints one line per case, then `fm-db-control cases=k/n quiet=q/q real_db_unchanged=yes verdict=PASS|FAIL`.
 Exit 0 on PASS, 20 on FAIL, 3 on setup failure.
@@ -154,6 +156,10 @@ class World:
     @property
     def standing(self) -> Path:
         return self.hee4_root / "agents" / "standing-orders.md"
+
+    @property
+    def db(self) -> Path:
+        return self.fm_home / "data" / "firstmate.db"
 
     def fm(self, *args: str, env: dict[str, str] | None = None) -> tuple[int, dict]:
         p = subprocess.run([sys.executable, str(FM_DB_BIN), *args], env={**self.env, **(env or {})}, capture_output=True, text=True,
@@ -333,11 +339,51 @@ def main() -> int:
             rc, j = w.fm("record", "spawn", "--task-id", "t1", "--unit-id", "U1", "--agent", "hee4-gate", "--harness", "agent")
             case("spawn-before-brief", "fault", rc, j, 20, "no brief recorded")
             b1 = w.brief("U1")
+            rc, j = w.fm("record", "spawn", "--task-id", "t0", "--unit-id", "U1", "--agent", "hee4-gate", "--harness", "agent")
+            spawned = next((u["spawned"] for u in w.fm("status")[1].get("open_units", []) if u["unit_id"] == "U1"), None)
+            case("spawn-without-brief-sha", "fault", rc, j, 20, "brief_sha_missing", spawned == 0, f"spawned={spawned}")
+            rc, j = w.fm("record", "brief", "--unit", "U1", "--path", str(w.root / f"brief-{w.n}.md"), "--head-sha", HEAD)
+            d = j.get("detail", "") or ""
+            case("duplicate-brief-typed", "fault", rc, j, 20, f"brief_already_recorded sha={b1[:12]} unit=U1",
+                 "UNIQUE constraint" not in d, f"raw_sqlite_text={'UNIQUE constraint' in d}")
             rc, j = w.fm("record", "spawn", "--task-id", "t1", "--unit-id", "U1", "--agent", "hee4-gate", "--harness", "agent", "--brief-sha", b1)
             case("spawn-after-brief", "quiet", rc, j, 0, None)
             w.brief("U2", brief_text().replace("GOAL: drive", "GOAL: other"))
             rc, j = w.fm("record", "spawn", "--task-id", "t2", "--unit-id", "U2", "--agent", "hee4-gate", "--harness", "agent", "--brief-sha", b1)
             case("spawn-brief-sha-other-unit", "fault", rc, j, 20, "brief_sha_unit_mismatch")
+            rc, j = w.fm("record", "spawn", "--task-id", "t3", "--unit-id", "U1", "--agent", "hee4-gate", "--harness", "agent",
+                         "--brief-sha", "0" * 64)
+            case("spawn-brief-sha-unknown", "fault", rc, j, 20, "brief_sha_unknown")
+
+            # --- schema level: a DB behind schema/*.sql is refused by every verb but init, which then levels it -------
+            ws = World(base, "schema-behind")
+            migration_001_only(ws.db)
+            behind = f"schema_behind={MIGRATIONS[1]}"
+            for verb in (("status",), ("record", "spawn", "--task-id", "t1", "--unit-id", "U0", "--agent", "a", "--harness", "agent",
+                                       "--brief-sha", "0" * 64),
+                         ("record", "brief", "--unit", "U0", "--path", str(ws.brief_file(brief_text())), "--head-sha", HEAD)):
+                rc, j = ws.fm(*verb)
+                case(f"schema-behind-refuses-{'-'.join(verb[:2])}", "fault", rc, j, 3, behind)
+            rc, j = ws.fm("init")
+            case("schema-behind-init-levels", "quiet", rc, j, 0, None, j.get("applied") == MIGRATIONS[1:], f"applied={j.get('applied')}")
+            rc, j = ws.fm("status")
+            units = j.get("open_units") or [{}]
+            case("schema-behind-status-briefs", "quiet", rc, j, 0, None, "briefs" in units[0] and units[0].get("spawned") == 1,
+                 f"open_units={units}")
+
+            # --- schema/003 in SQLite itself: raw SQL cannot record a spawn without its unit's brief ----------------
+            con = sqlite3.connect(f"file:{ws.db}?mode=ro", uri=True)
+            kept = con.execute("SELECT task_id, brief_sha FROM spawns").fetchall()
+            con.close()
+            bu = ws.brief("U0")
+            ws.spawn("U0", "t1", brief_sha=bu)
+            ins = "INSERT INTO spawns (task_id, unit_id, agent, harness, ts, brief_sha) VALUES (?, 'U0', 'a', 'agent', 'x', ?)"
+            null = raw_refusal(ws.db, ins, ("raw1", None))
+            other = raw_refusal(ws.db, ins, ("raw2", "0" * 64))
+            blank = raw_refusal(ws.db, "UPDATE spawns SET brief_sha = NULL WHERE task_id = 't1'")
+            ok3 = kept == [("s0", None)] and "brief_sha_missing" in null and "brief_sha_not_of_unit" in other and "brief_sha_kept" in blank
+            case("spawn-null-brief-sha-trigger", "fault", 0, {}, 0, None, ok3,
+                 f"pre002_rows={kept} null={null!r} other={other!r} blank={blank!r}")
 
             # --- self-verification (001_init.sql trigger) ---------------------------------------------------------
             w.ok("record", "claim", "--task-id", "t1", "--text", "x", "--label", "MEASURED", "--witness-cmd", "true", "--head-sha", HEAD)
@@ -375,10 +421,10 @@ def main() -> int:
             killed = rc == -signal.SIGKILL and "verb" not in j
             rc, j = w.fm("init")                                              # the rerun must apply 002 whole
             case("init-killed-before-row-rerun-applies", "fault", rc, j, 0, None,
-                 killed and j.get("applied") == [LATER_MIGRATION] and j.get("already") == [FIRST_MIGRATION],
+                 killed and j.get("applied") == [LATER_MIGRATION] and j.get("already") == MIGRATIONS[:-1],
                  f"killed={killed} applied={j.get('applied')} already={j.get('already')}")
             rc, j = w.fm("init")
-            case("init-twice", "quiet", rc, j, 0, None, j.get("applied") == [] and j.get("already") == [FIRST_MIGRATION, LATER_MIGRATION],
+            case("init-twice", "quiet", rc, j, 0, None, j.get("applied") == [] and j.get("already") == MIGRATIONS,
                  f"applied={j.get('applied')} already={j.get('already')}")
             rc, j = w.fm("status")
             case("init-rerun-status", "quiet", rc, j, 0, None, j.get("open_units") == [], f"open_units={j.get('open_units')}")

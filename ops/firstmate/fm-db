@@ -9,11 +9,15 @@ Verbs (each one transaction, BEGIN IMMEDIATE, under the writer flock; stdlib onl
                                          refuses a missing `LABEL:` field or summarised standing orders (PROTOCOL §2), and
                                          a VERIFY line that cannot fail (verify_line_cannot_fail line=N shape=S); the door
                                          judges each new `record brief`, never a row already recorded
-  record spawn ... [--brief-sha X]       refuses a unit with no recorded brief, a closed unit, a brief of another unit
+  record spawn ... --brief-sha X         refuses a missing brief sha (brief_sha_missing), an unrecorded one
+                                         (brief_sha_unknown), a brief of another unit (brief_sha_unit_mismatch), a unit with
+                                         no recorded brief and a closed unit; schema/003 refuses a NULL brief_sha in SQLite too
   clear-andon --id N --by WHO
   close-unit --id U --by WHO             refuses an open andon or a spawn without an exit; reports unverified MEASURED claims
   q 'SELECT ...'                         one bounded read-only SELECT through tursodb --readonly (exit 30 if absent)
   status                                 open units, spawned vs planned, briefs, open andon (JSON)
+Every verb but init first compares schema/*.sql with schema_migrations and refuses `schema_behind=<file>` (exit 3);
+`status` on a home with no database stays UNMEASURED (exit 30).
 Exit codes: 0 ok · 2 usage · 3 setup · 20 refused · 30 unmeasured.
 Engine roles follow ops/db/README.md "Writer safety": Python sqlite3 writes; tursodb is never opened read-write.
 Homes: FM_HOME selects the home; FM_DB (hee4.env exports it) overrides the file but must lie inside FM_HOME when both are
@@ -99,6 +103,26 @@ class Writer:
         fcntl.flock(self.lock, fcntl.LOCK_UN)
         self.lock.close()
         return False
+
+
+def schema_behind() -> str | None:
+    """The first schema/*.sql file that this DB's schema_migrations does not hold, as the setup refusal; None when the DB
+    is level with the files. Read-only: an absent DB or table is behind by every file and nothing is created."""
+    files = sorted(p.name for p in (HERE / "schema").glob("*.sql"))
+    applied: set[str] = set()
+    if DB.exists():
+        try:
+            con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+            try:
+                applied = {r[0] for r in con.execute("SELECT file FROM schema_migrations")}
+            finally:
+                con.close()
+        except sqlite3.OperationalError:
+            applied = set()                                              # no schema_migrations table: nothing applied
+    missing = [f for f in files if f not in applied]
+    if missing:
+        return f"schema_behind={missing[0]}: this DB lacks {len(missing)} of schema/*.sql ({', '.join(missing)}); run fm-db init"
+    return None
 
 
 FIRST_MIGRATION = "001_init.sql"   # sets PRAGMA journal_mode (illegal inside a transaction) and is IF NOT EXISTS throughout
@@ -402,12 +426,17 @@ def record(kind: str, args: list[str]) -> int:
                     return out("record", "REFUSED", 20, detail="open andon on this unit: no spawn until the captain clears it")
                 if not con.execute("SELECT 1 FROM briefs WHERE unit_id=?", (u,)).fetchone():   # PROTOCOL §2: the brief is the only start
                     return out("record", "REFUSED", 20, detail=f"no brief recorded for unit {u}; record the brief first")
-                if row["brief_sha"] is not None:
-                    b = con.execute("SELECT unit_id FROM briefs WHERE brief_sha=?", (row["brief_sha"],)).fetchone()
-                    if b is None:
-                        return out("record", "REFUSED", 20, detail=f"brief_sha_unknown: {row['brief_sha']} is not a recorded brief")
-                    if b[0] != u:
-                        return out("record", "REFUSED", 20, detail=f"brief_sha_unit_mismatch: brief belongs to unit {b[0]}, spawn names {u}")
+                if not row["brief_sha"]:                                 # V4-99: the spawn names the brief it starts from
+                    return out("record", "REFUSED", 20, detail=f"brief_sha_missing: pass --brief-sha (the sha of unit {u}'s recorded brief)")
+                b = con.execute("SELECT unit_id FROM briefs WHERE brief_sha=?", (row["brief_sha"],)).fetchone()
+                if b is None:
+                    return out("record", "REFUSED", 20, detail=f"brief_sha_unknown: {row['brief_sha']} is not a recorded brief")
+                if b[0] != u:
+                    return out("record", "REFUSED", 20, detail=f"brief_sha_unit_mismatch: brief belongs to unit {b[0]}, spawn names {u}")
+            if kind == "brief":
+                b = con.execute("SELECT unit_id FROM briefs WHERE brief_sha=?", (row["brief_sha"],)).fetchone()
+                if b is not None:
+                    return out("record", "REFUSED", 20, detail=f"brief_already_recorded sha={row['brief_sha'][:12]} unit={b[0]}")
             given = [c for c in cols if row[c] is not None]          # absent keys take the schema's defaults
             cur = con.execute(f"INSERT INTO {table} ({','.join(given)}) VALUES ({','.join('?' * len(given))})", [row[c] for c in given])
             rid = cur.lastrowid
@@ -464,8 +493,9 @@ def status() -> int:
     if not DB.exists():
         return out("status", "UNMEASURED", 30, detail="no database; run fm-db init")
     con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
-    names = ("unit_id", "project", "kind", "planned_agents", "spawned", "open_andon", "briefs")   # open_units, 002_brief_link.sql
-    units = [dict(zip(names, r)) for r in con.execute("SELECT * FROM open_units")]
+    cur = con.execute("SELECT * FROM open_units")
+    names = [c[0] for c in cur.description]                              # the view's own columns, never a typed list
+    units = [dict(zip(names, r, strict=True)) for r in cur]
     unverified = con.execute("SELECT count(*) FROM claims c WHERE c.label='MEASURED' AND NOT EXISTS (SELECT 1 FROM verifications v WHERE v.claim_id=c.claim_id)").fetchone()[0]
     con.close()
     return out("status", "PASS", 0, open_units=units, measured_claims_unverified=unverified)
@@ -479,6 +509,10 @@ def main(argv: list[str]) -> int:
     if homes:
         return out(v, "SETUP", 3, detail=homes)
     if v == "init": return init()
+    if v in ("record", "clear-andon", "close-unit", "q", "status") and (DB.exists() or v != "status"):
+        behind = schema_behind()                                         # before any write or read-back
+        if behind:
+            return out(v, "SETUP", 3, detail=behind)
     if v == "record": return record(argv[2], argv[3:]) if len(argv) > 2 else out("record", "USAGE", 2)
     if v == "clear-andon": return clear_andon(argv[2:])
     if v == "close-unit": return close_unit(argv[2:])
