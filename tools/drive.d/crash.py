@@ -9,10 +9,17 @@ after-state that is terminal, `blocked` or `effect_unknown` (the R08 row of the 
 then a SIGTERM stop and a third start whose recovery moves that task nowhere (the policy is pure:
 a second pass may name it again, e.g. R10 effect_unknown -> effect_unknown, but never changes it).
 On the live unit's socket every path is UNMEASURED reason=disposable serve: the live kill is
-tools/drill, run by the captain. Nothing here signals any process but the serve it started.
+tools/drill, run by the captain. Nothing here signals any process but the serve it started, or a
+serve a dead drive left behind (reap_stale).
+
+The serve cannot outlive the drive: it starts with PR_SET_PDEATHSIG=SIGKILL, so the kernel kills it
+when the drive dies however it dies (SIGKILL, SIGTERM, a caller's timeout), and each run dir holds
+an `owner` file (drive pid and start time) so a later leg reaps a run whose owner is gone.
 """
+import ctypes
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -34,6 +41,75 @@ CRASH_BRIEF = (BRIEF.replace("VERIFY: /usr/bin/test -w .", "VERIFY: /usr/bin/sle
                .replace("RESTATEMENT: check the work dir is writable", "RESTATEMENT: sleep until killed"))
 ACKED = 2  # quick tasks acked behind the running one: admitted at the kill, present after it
 WAIT_S = 10
+ROOT = os.path.expanduser("~/.cache/hee4-crash")
+RUN_RE = re.compile(r"^[0-9a-f]{12}$")
+PR_SET_PDEATHSIG = 1
+
+
+def proc_start(pid):
+    """The start time (clock ticks since boot, /proc/<pid>/stat field 22) of `pid`, or None if it is gone."""
+    try:
+        with open(f"/proc/{pid}/stat") as fh:
+            return fh.read().rsplit(")", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return None
+
+
+def die_with(parent):
+    """preexec_fn: the kernel SIGKILLs this child when `parent` dies; if it already died, exit now."""
+    def arm():
+        if ctypes.CDLL(None, use_errno=True).prctl(PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0) != 0:
+            os._exit(127)
+        if os.getppid() != parent:  # the drive died between fork and prctl
+            os._exit(127)
+    return arm
+
+
+def serves_of(run):
+    """Pids of hee4 serves whose --socket is under `run`."""
+    sock, pids = os.path.join(run, "rt", "control.sock"), []
+    for d in os.listdir("/proc"):
+        if not d.isdigit():
+            continue
+        try:
+            with open(f"/proc/{d}/cmdline", "rb") as fh:
+                argv = fh.read().split(b"\0")
+            exe = os.readlink(f"/proc/{d}/exe")
+        except OSError:
+            continue
+        if os.path.basename(exe) == "hee4" and b"serve" in argv and sock.encode() in argv:
+            pids.append(int(d))
+    return pids
+
+
+def owner_alive(run):
+    try:
+        with open(os.path.join(run, "owner")) as fh:
+            pid, start = fh.read().split()
+    except (OSError, ValueError):
+        return False
+    return proc_start(int(pid)) == start
+
+
+def reap_stale(root=ROOT):
+    """SIGKILL the serves of, and remove, every <root>/<12hex> run whose owning drive is gone; returns the reaped runs."""
+    reaped = []
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return reaped
+    for name in names:
+        run = os.path.join(root, name)
+        if not RUN_RE.match(name) or owner_alive(run):
+            continue
+        for pid in serves_of(run):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+        shutil.rmtree(run, ignore_errors=True)
+        reaped.append(name)
+    return reaped
 
 
 def unmeasured_all(F, reason):
@@ -74,7 +150,8 @@ class Serve:
         env = {k: v for k, v in os.environ.items() if k != "HEE4_LIVE_MODEL"}  # no model call from a drill serve
         with open(self.err, "w") as fh:
             self.proc = subprocess.Popen([self.exe, "serve", "--socket", self.sock, "--ledger", os.path.join(self.run, "ledger.sqlite3"),
-                                          "--work", os.path.join(self.run, "work")], stdout=fh, stderr=fh, env=env)
+                                          "--work", os.path.join(self.run, "work")], stdout=fh, stderr=fh, env=env,
+                                         preexec_fn=die_with(os.getpid()))
 
     def stderr(self):
         try:
@@ -181,8 +258,15 @@ def d_crash(F, ctx):
     exe, why = peer_binary(F.sock)
     if exe is None:
         return unmeasured_all(F, f"disposable serve not startable: {why}")
-    run = os.path.join(os.path.expanduser("~/.cache/hee4-crash"), uuid.uuid4().hex[:12])
-    os.makedirs(os.path.join(run, "rt"), mode=0o700)
+    reaped = reap_stale()
+    if reaped:
+        record(F, "reap_stale", f"reaped runs whose drive is gone: {reaped}")
+    run = os.path.join(ROOT, uuid.uuid4().hex[:12])
+    staging = run + ".new"  # not a 12hex name: a concurrent reap_stale never sees a run without its owner
+    os.makedirs(os.path.join(staging, "rt"), mode=0o700)
+    with open(os.path.join(staging, "owner"), "w") as fh:
+        fh.write(f"{os.getpid()} {proc_start(os.getpid())}\n")
+    os.rename(staging, run)
     srv, driven = Serve(exe, run), F.sock
     F.sock = srv.sock  # every frame of the leg goes to the disposable serve and into this feature's evidence
     try:
