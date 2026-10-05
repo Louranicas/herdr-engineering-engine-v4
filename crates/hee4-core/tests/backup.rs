@@ -8,9 +8,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use hee4_contracts::Event;
+use hee4_contracts::{Event, Sha256Hex};
 use hee4_core::backup::{backup_to, restore};
-use hee4_core::{BackupError, CursorVerdict, Observations, SameDisk, Store, reconcile};
+use hee4_core::{BackupError, CursorVerdict, Observations, SameDisk, Store, StoreError, reconcile};
 use serde_json::Value;
 
 type R = Result<(), Box<dyn Error>>;
@@ -268,6 +268,76 @@ fn restore_refuses_a_planted_byte_a_missing_object_and_an_occupied_target() -> R
     assert!(
         matches!(&err, Err(BackupError::TargetOccupied { path }) if path == &into.join("ledger.sqlite3")),
         "{err:?}"
+    );
+    Ok(())
+}
+
+/// A backup whose ledger this binary cannot open (a `migration:m999_future` row: a snapshot
+/// newer than the binary) is refused as `BackupError::Store(UnknownMigration)` AFTER the
+/// digests passed, and still leaves nothing under `<into>`: no ledger, no briefs, no staging
+/// dir. The retry with a good backup into the same dir is not `TargetOccupied`.
+#[test]
+fn a_restore_whose_open_fails_leaves_nothing_behind_and_the_retry_is_not_occupied() -> R {
+    let base = scratch("future")?;
+    let (ledger, work) = seed(&base, 2)?;
+    let store = Store::open(&ledger)?;
+    store.apply(&"t-000".parse()?, Event::Admit)?;
+    let backup = backup_to(&store, &work, &base.join("backups"), SameDisk::Allow)?;
+
+    let future = base.join("future");
+    copy_tree(&backup.dir, &future)?;
+    let future_ledger = future.join("ledger.sqlite3");
+    {
+        let conn = rusqlite::Connection::open(&future_ledger)?;
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES ('migration:m999_future', '1')",
+            [],
+        )?;
+    }
+    let mut m = manifest(&future)?;
+    m["files"]["ledger.sqlite3"] =
+        Value::from(Sha256Hex::digest(&std::fs::read(&future_ledger)?).to_string());
+    std::fs::write(future.join("manifest.json"), serde_json::to_vec_pretty(&m)?)?;
+
+    let into = base.join("into");
+    let err = restore(&future, &into);
+    assert!(
+        matches!(
+            &err,
+            Err(BackupError::Store(StoreError::UnknownMigration(name))) if name == "m999_future"
+        ),
+        "{err:?}"
+    );
+    assert!(
+        !into.join("ledger.sqlite3").exists(),
+        "a restore that fails after the copy leaves no ledger behind"
+    );
+    let mut left = Vec::new();
+    if into.exists() {
+        walk(&into, &into, &mut left)?;
+    }
+    assert!(left.is_empty(), "nothing is left under <into>: {left:?}");
+    let staging: Vec<String> = match std::fs::read_dir(&into) {
+        Ok(entries) => entries
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".restore-"))
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    assert!(staging.is_empty(), "no staging dir survives: {staging:?}");
+
+    let report = restore(&backup.dir, &into)?;
+    assert!(report.recovery_complete, "{report:?}");
+    assert!(into.join("ledger.sqlite3").is_file());
+    assert!(
+        !into.join(format!(".restore-{}.tmp", backup.id)).exists(),
+        "the staging dir is gone after a completed restore"
+    );
+    let restored = Store::open(&into.join("ledger.sqlite3"))?;
+    assert_eq!(
+        restored.cursor_check(&store.epoch()?, 0)?,
+        CursorVerdict::PriorEpochOfRestore
     );
     Ok(())
 }

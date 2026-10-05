@@ -8,7 +8,7 @@
 //! trigger policy here: the four DC-22 triggers are K6's to fire.
 
 use std::collections::BTreeMap;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -292,13 +292,18 @@ fn field<'a>(manifest: &'a Value, name: &'static str) -> Result<&'a Value, Backu
 }
 
 /// Restore `backup_dir` into `into`: `<into>/ledger.sqlite3` and `<into>/work/briefs/*.brief`
-/// (the live layout). Verifies every sha256 against the manifest before copying anything, opens
-/// the copied ledger, records `restored_from` (the manifest's epoch), gives the ledger a fresh
-/// epoch, and runs `reconcile` with unobserved custody inside the verb.
+/// (the live layout). Verifies every sha256 against the manifest before copying anything, then
+/// stages the copy under `<into>/.restore-<id>.tmp/`: opens the staged ledger, records
+/// `restored_from` (the manifest's epoch), gives the ledger a fresh epoch and runs `reconcile`
+/// with unobserved custody there. Only then are the briefs and, last, the ledger renamed into
+/// place. Any failure after the copy removes the staging dir, so `<into>` holds no ledger and a
+/// retry is not `TargetOccupied`; the failure is the restore's only output.
 ///
 /// # Errors
 /// [`BackupError::Incomplete`] (no manifest, or no ledger), [`BackupError::TargetOccupied`],
-/// [`BackupError::ObjectsMissing`], [`BackupError::DigestMismatch`]; IO and store errors.
+/// [`BackupError::ObjectsMissing`], [`BackupError::DigestMismatch`]; [`BackupError::Store`]
+/// when the staged ledger cannot be opened or reconciled (a snapshot newer than this binary
+/// answers `UnknownMigration`); IO errors.
 pub fn restore(backup_dir: &Path, into: &Path) -> Result<RestoreReport, BackupError> {
     let started = Instant::now();
     let manifest_path = backup_dir.join(MANIFEST_FILE);
@@ -338,11 +343,11 @@ pub fn restore(backup_dir: &Path, into: &Path) -> Result<RestoreReport, BackupEr
             dir: backup_dir.to_path_buf(),
         });
     }
-    let objects: Vec<(&String, &Value)> = files.iter().filter(|(k, _)| *k != LEDGER_FILE).collect();
+    let objects: Vec<&String> = files.keys().filter(|k| *k != LEDGER_FILE).collect();
     let objects_total = objects.len();
     let present = objects
         .iter()
-        .filter(|(rel, _)| backup_dir.join(rel).is_file())
+        .filter(|rel| backup_dir.join(rel).is_file())
         .count();
     if present != objects_total {
         return Err(BackupError::ObjectsMissing {
@@ -359,23 +364,78 @@ pub fn restore(backup_dir: &Path, into: &Path) -> Result<RestoreReport, BackupEr
         }
     }
 
-    let briefs_dir = into.join("work").join(BRIEFS_DIR);
-    std::fs::create_dir_all(&briefs_dir).map_err(|e| io_at(&briefs_dir, e))?;
-    copy(&backup_dir.join(LEDGER_FILE), &target_ledger)?;
-    for (rel, _) in &objects {
-        let src = backup_dir.join(rel);
-        copy(&src, &briefs_dir.join(file_name(&src)?))?;
+    let staging = into.join(format!(".restore-{backup_id}.tmp"));
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging).map_err(|e| io_at(&staging, e))?;
     }
-    let store = Store::open(&target_ledger)?;
-    store.mark_restored_from(&old_epoch)?;
-    store.renew_epoch()?;
-    let report = reconcile(&store, &Observations::default())?;
+    let staged = stage(backup_dir, &staging, &objects, &old_epoch)
+        .and_then(|complete| move_into_place(&staging, into, &objects).map(|()| complete));
+    let recovery_complete = match staged {
+        Ok(complete) => complete,
+        Err(e) => {
+            if staging.exists() {
+                std::fs::remove_dir_all(&staging).map_err(|e| io_at(&staging, e))?;
+            }
+            return Err(e);
+        }
+    };
     Ok(RestoreReport {
         backup_id,
         ledger_sha256,
         objects_n: objects_total,
         objects_total,
-        recovery_complete: report.complete,
+        recovery_complete,
         rto_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
     })
+}
+
+/// Copy the verified ledger and objects into `staging`, open the staged ledger, mark
+/// `restored_from`, renew the epoch and reconcile there. Returns `reconcile`'s `complete`. The
+/// `Store` is dropped before returning, so the staged ledger has no open connection (and, under
+/// WAL, no live `-wal`/`-shm`) when it is renamed.
+fn stage(
+    backup_dir: &Path,
+    staging: &Path,
+    objects: &[&String],
+    old_epoch: &str,
+) -> Result<bool, BackupError> {
+    let briefs_dir = staging.join("work").join(BRIEFS_DIR);
+    std::fs::create_dir_all(&briefs_dir).map_err(|e| io_at(&briefs_dir, e))?;
+    copy(&backup_dir.join(LEDGER_FILE), &staging.join(LEDGER_FILE))?;
+    for rel in objects {
+        let src = backup_dir.join(rel);
+        copy(&src, &briefs_dir.join(file_name(&src)?))?;
+    }
+    let store = Store::open(&staging.join(LEDGER_FILE))?;
+    store.mark_restored_from(old_epoch)?;
+    store.renew_epoch()?;
+    let report = reconcile(&store, &Observations::default())?;
+    drop(store);
+    Ok(report.complete)
+}
+
+/// Rename the staged briefs into `<into>/work/briefs/`, then the ledger's `-wal`/`-shm` when
+/// present, then `ledger.sqlite3` LAST: the target holds a ledger only once everything else is
+/// in place. Converges `<into>` to 0700 and removes the emptied staging dir.
+fn move_into_place(staging: &Path, into: &Path, objects: &[&String]) -> Result<(), BackupError> {
+    let briefs_dir = into.join("work").join(BRIEFS_DIR);
+    std::fs::create_dir_all(&briefs_dir).map_err(|e| io_at(&briefs_dir, e))?;
+    let staged_briefs = staging.join("work").join(BRIEFS_DIR);
+    for rel in objects {
+        let name = file_name(Path::new(rel))?;
+        let dest = briefs_dir.join(&name);
+        std::fs::rename(staged_briefs.join(&name), &dest).map_err(|e| io_at(&dest, e))?;
+    }
+    for suffix in ["-wal", "-shm", ""] {
+        let name = format!("{LEDGER_FILE}{suffix}");
+        let from = staging.join(&name);
+        if from.exists() {
+            let dest = into.join(&name);
+            std::fs::rename(&from, &dest).map_err(|e| io_at(&dest, e))?;
+        }
+    }
+    std::fs::set_permissions(into, std::fs::Permissions::from_mode(0o700))
+        .map_err(|e| io_at(into, e))?;
+    std::fs::remove_dir_all(staging).map_err(|e| io_at(staging, e))?;
+    Ok(())
 }
