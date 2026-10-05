@@ -704,7 +704,9 @@ def control(a):
         print(f"check-deployed control refused: --control-skip {','.join(sorted(bad))} is not one of {','.join(ROWS)}")
         sys.exit(2)
     planted = lambda n: n not in skip
-    root = os.path.expanduser("~/.cache/hee4-host")
+    # HEE4_CONTROL_ROOT lets a test own its root: two controls sharing ~/.cache/hee4-host sweep each
+    # other's killed dirs, which made test_fire_killed_control_... flaky under concurrent runs.
+    root = os.environ.get("HEE4_CONTROL_ROOT") or os.path.expanduser("~/.cache/hee4-host")
     os.makedirs(root, exist_ok=True)
     swept = sweep_dead_controls(root)
     ctl = tempfile.mkdtemp(prefix="cd-control-", dir=root)

@@ -46,9 +46,12 @@ class CheckDeployedTests(unittest.TestCase):
         self.assertNotEqual(d1["binary"], d1["head"]); self.assertIn("exe_head", d1); self.assertNotEqual(d1["exe_head"], d1["binary"])
 
     def test_fire_killed_control_leaves_no_listener_and_is_swept(self):
-        root = os.path.expanduser("~/.cache/hee4-host")
-        before = set(os.listdir(root)) if os.path.isdir(root) else set()
-        ctl = subprocess.Popen([CD, "--control"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # A private root under ~/.cache (never /tmp): no other control on the host can sweep it.
+        root = tempfile.mkdtemp(prefix="cd-test-root-", dir=os.path.expanduser("~/.cache"))
+        self.addCleanup(shutil.rmtree, root, True)
+        env = {**os.environ, "HEE4_CONTROL_ROOT": root}
+        before = set(os.listdir(root))
+        ctl = subprocess.Popen([CD, "--control"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
         server, t0 = None, time.monotonic()
         while server is None and time.monotonic() - t0 < 20:  # wait until the control's listener child exists
             for d in os.listdir("/proc"):
@@ -70,7 +73,7 @@ class CheckDeployedTests(unittest.TestCase):
         holders = [d for d in os.listdir("/proc") if d.isdigit() and home.encode() in (open(f"/proc/{d}/cmdline", "rb").read() if os.path.exists(f"/proc/{d}/cmdline") else b"")]
         self.assertEqual(holders, [], f"processes still under {home}")
         self.assertTrue(os.path.isdir(home))  # the dir stays until the next control sweeps it
-        rc, out, err = run(CD, "--control", timeout=180)
+        rc, out, err = run(CD, "--control", timeout=180, env={"HEE4_CONTROL_ROOT": root})
         self.assertEqual(rc, 0, out + err)
         self.assertFalse(os.path.isdir(home), "the dead control's dir was not swept")
         self.assertRegex(out, r"swept_dead_controls=[1-9]")
