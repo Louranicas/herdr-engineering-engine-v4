@@ -71,7 +71,7 @@ budget_s = 60
 expect = "tool_rc"
 
 [step.drive]
-cmd = "tools/drive --doctor-first --allow-restart"
+cmd = "tools/drive --doctor-first --allow-restart --ledger ${HOME}/.local/share/hee4/ledger.sqlite3"
 budget_s = 120
 expect = "tool_rc"
 
