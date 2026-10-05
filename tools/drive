@@ -10,10 +10,17 @@ The served set is the plugins: tools/drive.d/<family>.py, each exporting FEATURE
   drive feature=<name> verdict=PASS|FAIL|UNMEASURED paths=k/n evidence=<path>
 (UNMEASURED always names a reason; never a 0) and a last line
   drive verdict=PASS|FAIL|UNMEASURED features=k/n unserved=u head=<sha12>
-Unserved features (no procedure in tools/drive.d) print UNMEASURED with scope=unserved and are
-counted in unserved=, not in features=k/n. A feature file without the
+An unserved feature (no procedure in tools/drive.d) that tools.inspect says the running binary
+does not serve (served=false: its owner is not composed) is out of release, driven by its
+refusal (tools/drive.d/scoped.py), and prints
+  drive feature=<name> verdict=PASS|FAIL paths=k/2 evidence=<path> scope=<v4.2> served=false (refused by release scope, as catalogued)
+counted in features=k/n. Any other unserved feature prints UNMEASURED with scope=unserved (the
+reason names why it is not out of release, e.g. served=true) and is counted in unserved=, not in
+features=k/n. A feature file without the
 "(rev 2026-10-05 drive)" marker in its Driving block is UNMEASURED: procedure UNWRITTEN.
---only NAME[,NAME...]: run only these plugin features (a name no plugin serves exits 2).
+--only NAME[,NAME...]: run only these features: plugin features, or features with no procedure
+  (driven by their refusal when out of release); a name with neither a plugin nor a feature file
+  exits 2. An unserved feature not named prints UNMEASURED scope=unserved, not driven.
 --ledger PATH: the ledger a procedure may read back, read-only (ctx["ledger"]; drive_d.ledger_ro);
   without it a side-effect check is UNMEASURED "--ledger not passed".
 --doctor-first: run tools/doctor; if its unit or socket check is not MEASURED, print that line, exit 3.
@@ -202,12 +209,15 @@ def main():
     except drive_d.PluginFault as e:
         print(f"drive verdict=FAIL features=0/0 unserved=0 head={head} reason=plugin {e.module}: {e.reason}")
         sys.exit(1)
+    scoped = sys.modules["drive_d.scoped"]  # tools/drive.d/scoped.py, loaded by load_plugins: the unserved branch
     selected = list(served)
+    names = sorted(f[:-3] for f in os.listdir(fdir) if f.endswith(".md") and f != "README.md")
+    wanted = None
     if a.only:
         wanted = [n for n in a.only.split(",") if n]
         for n in wanted:
-            if n not in served:
-                print(f"drive: --only {n} is not a plugin feature (plugins: {', '.join(served)})", file=sys.stderr)
+            if n not in served and n not in names:
+                print(f"drive: --only {n} is not a plugin feature, nor a feature file (plugins: {', '.join(served)})", file=sys.stderr)
                 sys.exit(2)
         selected = [n for n in served if n in wanted]
 
@@ -216,14 +226,31 @@ def main():
     is_live = os.path.realpath(a.socket) == os.path.realpath(live)
     ctx = {"unit": a.unit, "restart_ok": a.allow_restart and is_live, "ledger": a.ledger,
            "restart_why": ("--allow-restart not passed" if not a.allow_restart else "socket is not the live unit's; restart only drives the live unit")}
-    names = sorted(f[:-3] for f in os.listdir(fdir) if f.endswith(".md") and f != "README.md")
     unserved = [n for n in names if n not in served]
+    out_of_release = 0
     verdicts = []
     for name in unserved + selected:
         evp = os.path.join(ev, f"{name}.jsonl")
+        if name not in served and wanted is not None and name not in wanted:
+            open(evp, "w").write(json.dumps({"unmeasured": "no procedure in tools/drive.d; not selected by --only"}) + "\n")
+            print(f"drive feature={name} verdict=UNMEASURED paths=0/0 evidence={evp} scope=unserved reason=no procedure in tools/drive.d (not selected by --only)")
+            continue
         if name not in served:
-            open(evp, "w").write(json.dumps({"unmeasured": "no procedure in tools/drive.d"}) + "\n")
-            print(f"drive feature={name} verdict=UNMEASURED paths=0/0 evidence={evp} scope=unserved reason=no procedure in tools/drive.d")
+            F = Feature(name, evp, a.socket, table)
+            try:
+                scope, why = scoped.drive(F, name, a.repo, open(os.path.join(fdir, name + ".md")).read())
+            except Exception as e:  # a crash in the scoped procedure is a FAIL, never a silent skip
+                scope, why = "unknown", ""
+                F.check("driver", False, f"{type(e).__name__}: {e}")
+            if scope is None:
+                F.f.write(json.dumps({"unmeasured": "no procedure in tools/drive.d"}) + "\n"); F.f.close()
+                print(f"drive feature={name} verdict=UNMEASURED paths=0/0 evidence={evp} scope=unserved reason=no procedure in tools/drive.d ({why})")
+                continue
+            F.f.close(); out_of_release += 1
+            v, k, n = F.verdict(); verdicts.append(v)
+            print(f"drive feature={name} verdict={v} paths={k}/{n} evidence={evp} scope={scope} served=false (refused by release scope, as catalogued)")
+            for p, st, d in F.paths:
+                if st != "PASS": print(f"  path={p} status={st} detail={d[:300]}")
             continue
         text = open(os.path.join(fdir, name + ".md")).read()
         drive_sect = text.split("## Driving it with hee4", 1)[-1].split("\n## ", 1)[0]
@@ -245,7 +272,7 @@ def main():
     if sv != "PASS":
         verdicts.append(sv)
     v = "FAIL" if "FAIL" in verdicts else "UNMEASURED" if "UNMEASURED" in verdicts or not verdicts else "PASS"
-    print(f"drive verdict={v} features={verdicts.count('PASS')}/{len(verdicts)} unserved={len(unserved)} head={head}")
+    print(f"drive verdict={v} features={verdicts.count('PASS')}/{len(verdicts)} unserved={len(unserved) - out_of_release} head={head}")
     sys.exit({"PASS": 0, "FAIL": 1, "UNMEASURED": 3}[v])
 
 
