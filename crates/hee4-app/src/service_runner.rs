@@ -339,10 +339,7 @@ fn run_busctl(
     let sockets: Vec<PathBuf> = bus.map(Path::to_path_buf).into_iter().collect();
     let permit = Permit::mint(
         ReceiptId(format!("r-service-{nanos:x}")),
-        SpawnScope {
-            programs: vec![PathBuf::from(BUSCTL)],
-            sockets: sockets.clone(),
-        },
+        SpawnScope::with_sockets(vec![PathBuf::from(BUSCTL)], sockets.clone()),
     );
     let ro_binds: Vec<PathBuf> = RO_BINDS.iter().map(PathBuf::from).collect();
     let mut listed_mounts = ro_binds.clone();
@@ -677,6 +674,44 @@ mod tests {
         assert_eq!(ProbeId::parse("MainPID"), None);
         assert_eq!(UnitAction::parse("restart"), Some(UnitAction::Restart));
         assert_eq!(UnitAction::parse("reload"), None);
+    }
+
+    /// Every `.rs` file under `dir`, recursively.
+    fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                rust_files(&path, out)?;
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+        Ok(())
+    }
+
+    /// The one-caller rule of the socket-bearing scope: no crate source but this file (and
+    /// the constructor's own file) names `SpawnScope::with_sockets`, so no task permit can
+    /// carry a socket.
+    #[test]
+    fn service_socket_scope_has_one_caller() -> Result<(), Box<dyn std::error::Error>> {
+        let crates = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .ok_or("no crates dir")?;
+        let mut files = Vec::new();
+        rust_files(crates, &mut files)?;
+        let needle = concat!("with_", "sockets(");
+        let offenders: Vec<_> = files
+            .iter()
+            .filter(|f| !f.ends_with("hee4-app/src/service_runner.rs"))
+            .filter(|f| !f.ends_with("hee4-host/src/spawn.rs"))
+            .filter(|f| std::fs::read_to_string(f).is_ok_and(|text| text.contains(needle)))
+            .collect();
+        assert!(files.len() > 10, "scanned {} files", files.len());
+        assert!(
+            offenders.is_empty(),
+            "a socket-bearing SpawnScope outside the service runner: {offenders:?}"
+        );
+        Ok(())
     }
 
     #[test]

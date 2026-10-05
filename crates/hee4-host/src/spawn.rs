@@ -23,14 +23,16 @@ pub struct PermitId(pub u64);
 pub struct ReceiptId(pub String);
 
 /// Which programs a permit covers, and which unix sockets it allows bound read-write (data
-/// supplied by the minting caller).
+/// supplied by the minting caller). The fields are private: a scope is built by
+/// [`SpawnScope::of_programs`] (no socket: every task attempt) or [`SpawnScope::with_sockets`]
+/// (the service runner's user bus, its one caller, held by `service_runner`'s one-caller test).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpawnScope {
     /// Absolute program paths the permit allows.
-    pub programs: Vec<PathBuf>,
+    programs: Vec<PathBuf>,
     /// Absolute unix-socket paths the permit allows a plan to bind read-write (a service probe's
     /// user bus). A task attempt's permit lists none, so a candidate can never reach a bus.
-    pub sockets: Vec<PathBuf>,
+    sockets: Vec<PathBuf>,
 }
 
 impl SpawnScope {
@@ -41,6 +43,26 @@ impl SpawnScope {
             programs,
             sockets: Vec::new(),
         }
+    }
+
+    /// These programs, and these unix sockets bound read-write. Only the service runner calls
+    /// this (`hee4-app` `service_runner.rs`); a task attempt's scope is
+    /// [`SpawnScope::of_programs`].
+    #[must_use]
+    pub fn with_sockets(programs: Vec<PathBuf>, sockets: Vec<PathBuf>) -> Self {
+        Self { programs, sockets }
+    }
+
+    /// The programs this scope allows.
+    #[must_use]
+    pub fn programs(&self) -> &[PathBuf] {
+        &self.programs
+    }
+
+    /// The sockets this scope allows bound read-write (empty for every task attempt).
+    #[must_use]
+    pub fn sockets(&self) -> &[PathBuf] {
+        &self.sockets
     }
 }
 
@@ -448,10 +470,10 @@ mod tests {
         let (_, cmd, mut ns) = fixture("/usr/bin/true", None);
         let permit = Permit::mint(
             ReceiptId("r-s".into()),
-            SpawnScope {
-                programs: vec![p("/usr/bin/true")],
-                sockets: if permitted { vec![sock.into()] } else { vec![] },
-            },
+            SpawnScope::with_sockets(
+                vec![p("/usr/bin/true")],
+                if permitted { vec![sock.into()] } else { vec![] },
+            ),
         );
         ns.listed_mounts.push(sock.into());
         ns.sockets = vec![sock.into()];

@@ -441,10 +441,7 @@ mod tests {
         std::fs::create_dir_all(&root)?;
         let permit = Permit::mint(
             ReceiptId("r1".into()),
-            SpawnScope {
-                programs: programs.iter().map(PathBuf::from).collect(),
-                sockets: vec![],
-            },
+            SpawnScope::of_programs(programs.iter().map(PathBuf::from).collect()),
         );
         let task = NamespaceTask::new("t1".parse()?, &root, needs_model, Duration::from_secs(20))?;
         std::fs::create_dir_all(task.work_dir())?;

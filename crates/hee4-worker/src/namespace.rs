@@ -297,10 +297,7 @@ mod tests {
         let ns = plan_for_with(&t, |_| true);
         let permit = Permit::mint(
             ReceiptId("r".into()),
-            SpawnScope {
-                programs: vec![PathBuf::from("/usr/bin/true")],
-                sockets: vec![],
-            },
+            SpawnScope::of_programs(vec![PathBuf::from("/usr/bin/true")]),
         );
         let sp = plan(
             &permit,
