@@ -465,10 +465,15 @@ mod tests {
         because: Option<String>,
     }
 
-    /// Every `.rs` file under `src/`, cut at its `#[cfg(test)]`, doc and line comments dropped.
+    /// Every `.rs` file under `src/`, cut at its `#[cfg(test)]`, doc and line comments dropped;
+    /// none without `CARGO_MANIFEST_DIR` (the caller's resync guard then fails).
     fn crate_sources() -> Vec<(String, String)> {
         let mut out = Vec::new();
-        let mut dirs = vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")];
+        // Read at run time: a baked manifest path names a deleted export (no_baked_paths).
+        let Some(root) = std::env::var_os("CARGO_MANIFEST_DIR") else {
+            return out;
+        };
+        let mut dirs = vec![std::path::PathBuf::from(root).join("src")];
         while let Some(dir) = dirs.pop() {
             let Ok(entries) = std::fs::read_dir(&dir) else {
                 continue;
