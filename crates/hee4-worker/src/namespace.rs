@@ -308,15 +308,15 @@ mod tests {
             ns.clone(),
         )?;
         let writable: Vec<String> = sp
-            .argv
+            .argv()
             .windows(3)
             .filter(|w| w[0] == "--bind" || w[0] == "--dev-bind" || w[0] == "--tmpfs")
             .map(|w| w[1].clone())
             .collect();
         let (work, door) = (t.work_dir().display(), t.door_path().display());
         assert_eq!(writable, vec![work.to_string(), door.to_string()]);
-        assert!(sp.argv.iter().any(|a| a == "--unshare-net"));
-        assert!(!sp.argv.iter().any(|a| a == "--share-net"));
+        assert!(sp.argv().iter().any(|a| a == "--unshare-net"));
+        assert!(!sp.argv().iter().any(|a| a == "--share-net"));
         for ro in &ns.ro_binds {
             assert!(
                 !t.work_dir().starts_with(ro),
