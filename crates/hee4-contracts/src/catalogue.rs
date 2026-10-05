@@ -133,7 +133,9 @@ pub enum Scope {
     V40,
     /// The roster family.
     V41,
-    /// The service, cohort and numerical families.
+    /// The service, cohort and numerical families (service is composed in v4.0; cohort and
+    /// numerical are not). The `because` text names no family: which families a binary composes
+    /// is the registry's answer, never a constant (wave 9 found both old texts stale).
     V42,
     /// Held behind Luke's Engine Data Grant (H-8).
     Held,
@@ -146,10 +148,8 @@ impl Scope {
     pub const fn because(self) -> &'static str {
         match self {
             Self::V40 => "scope v4.0: owner not composed",
-            Self::V41 => "scope v4.1: the roster family is not composed in this release",
-            Self::V42 => {
-                "scope v4.2: the service, cohort and numerical families are not composed in this release"
-            }
+            Self::V41 => "scope v4.1: this action's family is not composed in this release",
+            Self::V42 => "scope v4.2: this action's family is not composed in this release",
             Self::Held => "held: no registry entry until the Engine Data Grant (H-8)",
         }
     }
