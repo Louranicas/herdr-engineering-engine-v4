@@ -32,6 +32,7 @@ the backup door: it imports no rusqlite item and calls `Store` doors only.
 | `Store::apply(task, Event)` | one `events` row + the `tasks` cache row | `transition` refusal; `Dispatch` while `recovery_complete=0`; unreadable history |
 | `Store::operate(key, bytes, f)` (crate-private) | `f`'s writes inside the transaction + one `operations` row with the derived `operation_id` and `f`'s `(task_id, subject, result)` | same key, other sha256 → `Conflict`; same key, same sha → replay (no write); `f`'s `Err` → rollback, no row |
 | `Store::admit(task, OperationKey, bytes, f)` | `operate`'s caller: `Admit` via `apply_in` (stamping `tasks.serve_cgroup`), subject = the task id | as `operate`; `Refused` if the task exists |
+| `store/roster.rs`: `roster_update`, `roster_disable`, `roster_compose_deploy` (each one `operate` closure; m005_roster `roster_records` + append-only `roster_revisions`) | the record row (generation 1 or +1, `disabled`) + one `roster_revisions` row carrying the `operation_id`; the deploy record under principal `deploy`, action `deploy.install` | `StaleGeneration{current}`, `NotFound`, `Conflict`; a replay writes nothing |
 | `Store::record_observation(task, id, obs)` | `observations` row | same id, other body |
 | `Store::append_receipt(receipt)` | `receipts` row | chain with it fails `Receipt::verify_chain`; cites an observation not ledgered for its task |
 | `recovery::reconcile(store, observations)` | events only through `Store::apply`; the `meta.recovery_complete` flag | — |
