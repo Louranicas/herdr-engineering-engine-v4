@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+"""drive-cut [--binary PATH] [--ledger PATH] [--socket PATH] [--repo DIR] [--evidence-root DIR] [--keep]
+
+The cut tier's drive: the feature map driven twice and merged path by path.
+
+  live        tools/drive --doctor-first --allow-restart --ledger <live ledger> against the deployed
+              unit: every path that is safe on the live unit, the restart path included.
+  disposable  tools/drive --ledger <its own ledger> against a throwaway `hee4 serve` started from
+              the INSTALLED binary (--binary, default ~/.local/bin/hee4, the one the unit runs) with
+              its own socket, ledger and work dir under the evidence root, and
+              HEE4_DRIVE_SERVICE_UNIT=1: the paths that must never touch the live unit (the
+              crash-restart kill, mutating roster paths, the service.action transient unit).
+
+The drive prints only the paths that did not pass, so a path absent from a feature's block passed
+in that run. Merge, per path: FAIL if it failed in either run; PASS if it passed in at least one;
+UNMEASURED only if it was unmeasured in both (both reasons kept). A feature is FAIL if any path is,
+else UNMEASURED if any path is, else PASS. A feature with no procedure in either run keeps the
+live run's line. Output keeps tools/drive's grammar, so the gate, watch-evidence and check-deployed
+read it unchanged:
+  drive feature=<name> verdict=V paths=k/n runs=live:<v>,disposable:<v>
+    path=<p> status=S detail=<live reason> | <disposable reason>
+  drive settle-disposable serve=stopped ...
+  drive verdict=V features=k/n unserved=u head=<sha12> (merged live+disposable)
+Exit: 0 PASS, 1 FAIL, 3 UNMEASURED; 2 refused (the disposable serve never became ready).
+"""
+import argparse, json, os, re, shutil, signal, subprocess, sys, tempfile, time
+
+TOOLS = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(TOOLS)
+FEATURE = re.compile(r"^drive feature=(\S+) verdict=(PASS|FAIL|UNMEASURED) paths=(\d+)/(\d+)(.*)$")
+PATH = re.compile(r"^  path=(\S+) status=(PASS|FAIL|UNMEASURED) detail=(.*)$")
+FINAL = re.compile(r"^drive verdict=(\S+) features=(\d+)/(\d+) unserved=(\d+) head=(\S+)")
+
+
+def parse(text):
+    """{feature: {"verdict", "k", "n", "tail", "paths": {path: (status, detail)}}} and the final line's
+    (unserved, head). Lines the drive prints between blocks (notes, journeys) are ignored."""
+    feats, cur, final = {}, None, (0, "unknown")
+    for line in text.splitlines():
+        m = FEATURE.match(line)
+        if m:
+            name, v, k, n, tail = m.groups()
+            cur = feats[name] = {"verdict": v, "k": int(k), "n": int(n), "tail": tail, "paths": {}}
+            continue
+        m = PATH.match(line)
+        if m and cur is not None:
+            cur["paths"][m.group(1)] = (m.group(2), m.group(3))
+            continue
+        m = FINAL.match(line)
+        if m:
+            final = (int(m.group(4)), m.group(5))
+            cur = None
+    return feats, final
+
+
+def merge_feature(a, b):
+    """Merge one feature's two runs (either may be None). Returns (verdict, k, n, paths, tail)."""
+    if a is None or b is None:
+        one = a or b
+        return one["verdict"], one["k"], one["n"], one["paths"], one["tail"]
+    n = max(a["n"], b["n"])
+    names = set(a["paths"]) | set(b["paths"])
+    paths = {}
+    for p in sorted(names):
+        sa, da = a["paths"].get(p, ("PASS", ""))
+        sb, db = b["paths"].get(p, ("PASS", ""))
+        if "FAIL" in (sa, sb):
+            paths[p] = ("FAIL", " | ".join(d for s, d in ((sa, da), (sb, db)) if s == "FAIL"))
+        elif sa == "UNMEASURED" and sb == "UNMEASURED":
+            paths[p] = ("UNMEASURED", f"{da} | {db}")
+        # else: PASS in at least one run and FAIL in neither -> PASS (not printed, as the drive does)
+    bad = [s for s, _ in paths.values()]
+    v = "FAIL" if "FAIL" in bad else "UNMEASURED" if "UNMEASURED" in bad else "PASS"
+    return v, n - len(paths), n, paths, ""
+
+
+def merge(live, disp):
+    out = {}
+    for name in sorted(set(live) | set(disp)):
+        out[name] = merge_feature(live.get(name), disp.get(name))
+    return out
+
+
+def run_drive(args, env, timeout):
+    p = subprocess.run([os.path.join(TOOLS, "drive"), *args], capture_output=True, text=True, env=env, timeout=timeout)
+    return p.returncode, p.stdout + p.stderr
+
+
+def start_disposable(binary, root, env):
+    """A throwaway serve under `root`; returns (proc, socket, ledger, log) once health answers."""
+    rt = os.path.join(root, "rt"); os.makedirs(rt, mode=0o700)
+    sock, ledger, work = os.path.join(rt, "control.sock"), os.path.join(root, "ledger.sqlite3"), os.path.join(root, "work")
+    log = open(os.path.join(root, "serve.log"), "w")
+    proc = subprocess.Popen([binary, "serve", "--socket", sock, "--ledger", ledger, "--work", work],
+                            stdout=log, stderr=subprocess.STDOUT, env=env, start_new_session=True)
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 30:
+        if proc.poll() is not None:
+            break
+        r = subprocess.run([binary, "health", "--socket", sock], capture_output=True, text=True)
+        if r.returncode == 0 and "ready=true" in r.stdout:
+            return proc, sock, ledger, log
+        time.sleep(0.2)
+    stop(proc)
+    return None, sock, ledger, log
+
+
+def stop(proc):
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+        proc.wait(timeout=10)
+    except (ProcessLookupError, subprocess.TimeoutExpired):
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.wait()
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="drive-cut", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    xdg = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    ap.add_argument("--binary", default=os.path.expanduser("~/.local/bin/hee4"))
+    ap.add_argument("--ledger", default=os.path.expanduser("~/.local/share/hee4/ledger.sqlite3"), help="the LIVE ledger, read back read-only")
+    ap.add_argument("--socket", default=f"{xdg}/hee4/control.sock", help="the LIVE unit's socket")
+    ap.add_argument("--repo", default=REPO)
+    ap.add_argument("--evidence-root", default=os.path.expanduser("~/.cache/hee4-drive-cut"))
+    ap.add_argument("--keep", action="store_true", help="keep the disposable serve's directory")
+    ap.add_argument("--live-args", default="--doctor-first --allow-restart", help="extra args for the live run")
+    a = ap.parse_args()
+
+    os.makedirs(a.evidence_root, exist_ok=True)
+    env = dict(os.environ)
+    live_args = [*a.live_args.split(), "--socket", a.socket, "--ledger", a.ledger, "--repo", a.repo,
+                 "--evidence-root", os.path.join(a.evidence_root, "live")]
+    rc_live, live_out = run_drive(live_args, env, 600)
+
+    root = tempfile.mkdtemp(prefix="disposable-", dir=a.evidence_root)
+    denv = {k: v for k, v in env.items() if k != "HEE4_LIVE_MODEL"}
+    denv["HEE4_DRIVE_SERVICE_UNIT"] = "1"
+    proc, sock, ledger, log = start_disposable(a.binary, root, denv)
+    if proc is None:
+        log.close()
+        print(live_out, end="")
+        print(f"drive-cut refused: the disposable serve from {a.binary} never became ready (log {root}/serve.log)")
+        sys.exit(2)
+    try:
+        rc_disp, disp_out = run_drive(["--socket", sock, "--ledger", ledger, "--repo", a.repo,
+                                       "--evidence-root", os.path.join(root, "ev")], denv, 600)
+    finally:
+        stop(proc)
+        log.close()
+    with open(os.path.join(a.evidence_root, "last-live.txt"), "w") as f:
+        f.write(live_out)
+    with open(os.path.join(root, "drive.txt"), "w") as f:
+        f.write(disp_out)
+    print(f"drive settle-disposable serve=stopped root={root} live_rc={rc_live} disposable_rc={rc_disp}")
+    if not a.keep:
+        shutil.rmtree(os.path.join(root, "work"), ignore_errors=True)
+
+    live, (unserved, head) = parse(live_out)
+    disp, _ = parse(disp_out)
+    if not live and not disp:
+        print(live_out, end=""); print(disp_out, end="")
+        print("drive verdict=FAIL features=0/0 unserved=0 head=unknown (merged: neither run printed a feature)")
+        sys.exit(1)
+    merged = merge(live, disp)
+    verdicts = []
+    for name, (v, k, n, paths, tail) in merged.items():
+        lv = live.get(name, {}).get("verdict", "absent")
+        dv = disp.get(name, {}).get("verdict", "absent")
+        print(f"drive feature={name} verdict={v} paths={k}/{n} runs=live:{lv},disposable:{dv}{tail}")
+        for p, (st, d) in paths.items():
+            print(f"  path={p} status={st} detail={d[:300]}")
+        if "scope=unserved" not in tail:
+            verdicts.append(v)
+    v = "FAIL" if "FAIL" in verdicts else "UNMEASURED" if "UNMEASURED" in verdicts or not verdicts else "PASS"
+    print(f"drive verdict={v} features={verdicts.count('PASS')}/{len(verdicts)} unserved={unserved} head={head} (merged live+disposable)")
+    sys.exit({"PASS": 0, "FAIL": 1, "UNMEASURED": 3}[v])
+
+
+if __name__ == "__main__":
+    main()
