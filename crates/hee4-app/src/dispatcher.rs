@@ -289,6 +289,9 @@ pub const fn backup_error_name(e: &BackupError) -> &'static str {
         BackupError::TargetOccupied { .. } => "target_occupied",
         BackupError::DigestMismatch { .. } => "digest_mismatch",
         BackupError::ObjectsMissing { .. } => "objects_missing",
+        BackupError::NotRegular { .. } => "not_regular",
+        // `BackupError` is `#[non_exhaustive]`: a variant added in hee4-core is named here
+        // only once this arm list grows.
         _ => "backup_error",
     }
 }
@@ -1519,6 +1522,16 @@ mod tests {
         assert_eq!(backup_due(&facts(Some((1000, b'a')), 0, 1000)), None);
         // A clock behind the backup saturates to zero age: fresh, never a wrap.
         assert_eq!(backup_due(&facts(Some((1000, b'a')), 0, 10)), None);
+    }
+
+    /// A restore that finds a symlink, directory or device where a regular file belongs is
+    /// named, not reported as the catch-all.
+    #[test]
+    fn a_not_regular_backup_file_is_named_not_regular() {
+        let e = BackupError::NotRegular {
+            file: "manifest.json".into(),
+        };
+        assert_eq!(backup_error_name(&e), "not_regular");
     }
 
     #[test]

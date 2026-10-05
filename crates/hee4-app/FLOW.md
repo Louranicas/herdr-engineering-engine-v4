@@ -183,7 +183,8 @@ lines `Brief::check_verify` names) never reaches the dispatcher: admission refus
 `restore backup=<id> ledger=<sha12> objects=<n>/<total> rto_s=<t> verdict=PASS`, or
 `... verdict=FAIL reason=<name>`: `not_found` when `B/ID` is not a directory (or ID is not one
 path component), else K1's refusal (`target_occupied`, `incomplete`, `digest_mismatch`,
-`objects_missing`, `manifest`, `io`, ...; `dispatcher::backup_error_name`). Exit 0 only on PASS.
+`objects_missing`, `not_regular` (a manifest, ledger or object in the backup that is a symlink,
+directory or device), `manifest`, `io`, ...; `dispatcher::backup_error_name`). Exit 0 only on PASS.
 No socket, no engine; the ledger is never opened or copied here.
 
 ## Peer credentials
