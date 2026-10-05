@@ -5,10 +5,13 @@
 //! native model's own record is composed by [`Store::roster_compose_deploy`] under principal
 //! `deploy`, action `deploy.install` (DECISIONS V4-62), never under an operator's key.
 //!
-//! The generation check of a revise or a disable runs before `operate` on the same connection:
-//! this `Store` holds the ledger's one writing connection (every other connection is read-only),
-//! so nothing can move a record between that read and the transaction that follows it; a replay
-//! (same key, same bytes) is answered before the check, whatever the generation is now.
+//! The generation check of a revise or a disable, the kind check of a revise and the existence
+//! check of a disable run inside the `operate` closure, so inside the IMMEDIATE transaction and
+//! after the replay lookup: a second writer on the same ledger (`Store::open` takes no lock)
+//! cannot move a record between the check and the write, and a replay (same key, same bytes) is
+//! answered before the check, whatever the generation is now. A refusal raised inside the closure
+//! rolls the transaction back and is returned as itself ([`RosterError`]), never as a
+//! `StoreError`.
 
 use hee4_contracts::bounds::MAX_TOKEN_BYTES;
 use hee4_contracts::{Sha256Hex, TaskId, canonical_json};
@@ -282,6 +285,12 @@ impl RosterDefinition {
                 member: "/locality",
                 need: "local or remote",
             })?;
+        if caps.local != (locality == Locality::Local) {
+            return Err(DefinitionFault {
+                member: "/caps/local",
+                need: "true exactly when locality is local (one privacy fact, stated twice)",
+            });
+        }
         Ok(Self {
             kind,
             caps,
@@ -322,9 +331,9 @@ impl RosterDefinition {
 /// Why a record id was refused.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum IdFault {
-    /// Not `<lowercase prefix>:<name of [A-Za-z0-9._:-]>`.
+    /// Not `<lowercase prefix>:<name of [A-Za-z0-9._:/-]>`.
     #[error(
-        "record id must be <prefix>:<name> with a lowercase prefix and a name of [A-Za-z0-9._:-]"
+        "record id must be <prefix>:<name> with a lowercase prefix and a name of [A-Za-z0-9._:/-]"
     )]
     Grammar,
     /// Over the token bound.
@@ -337,7 +346,9 @@ pub enum IdFault {
     },
 }
 
-/// A record id: `<prefix>:<name>`, at most [`MAX_TOKEN_BYTES`]; a model's is `model:<name>`.
+/// A record id: `<prefix>:<name>`, at most [`MAX_TOKEN_BYTES`]; a model's is `model:<name>`. The
+/// name admits `/`, Ollama's namespace separator (`library/qwen2.5:0.5b`, `hf.co/<user>/<repo>:<tag>`),
+/// so every model name `serve` accepts composes a record.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RosterId(String);
 
@@ -360,7 +371,7 @@ impl RosterId {
         let name_ok = !name.is_empty()
             && name
                 .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b".-_:".contains(&b));
+                .all(|b| b.is_ascii_alphanumeric() || b".-_:/".contains(&b));
         if prefix_ok && name_ok {
             Ok(Self(s.to_owned()))
         } else {
@@ -559,6 +570,17 @@ pub enum RosterError {
     /// The id does not fit the grammar.
     #[error("record id: {0}")]
     Id(#[from] IdFault),
+    /// A revise named another kind: a record's kind is fixed at creation (a kind change would
+    /// move a model out of routing without a disable).
+    #[error("record {id} is a {current} record; a revise cannot make it {requested}")]
+    KindImmutable {
+        /// The record.
+        id: RosterId,
+        /// The kind it was created with.
+        current: &'static str,
+        /// The kind the revise asked for.
+        requested: &'static str,
+    },
 }
 
 /// A `roster_records` row as SQLite hands it over.
@@ -643,26 +665,55 @@ fn sql_generation(g: u64) -> Result<i64, StoreError> {
     })
 }
 
+/// The record `id` as the transaction sees it, refused when the caller's `expected` generation
+/// is not its own (or it is absent while one was expected).
+fn expect_in(
+    tx: &Transaction<'_>,
+    id: &RosterId,
+    expected: Option<u64>,
+) -> Result<Option<RosterRecord>, RosterError> {
+    let current = get_in(tx, id)?;
+    match (expected, &current) {
+        (Some(_), None) => Err(RosterError::NotFound(id.clone())),
+        (Some(expected), Some(r)) if r.head.generation != expected => {
+            Err(RosterError::StaleGeneration {
+                id: id.clone(),
+                expected,
+                current: r.head.generation,
+            })
+        }
+        _ => Ok(current),
+    }
+}
+
 /// Create (generation 1) or revise (generation + 1) `id` with `definition`, then append the
-/// revision row; a revise keeps the `disabled` mark.
+/// revision row; a revise keeps the `disabled` mark and refuses a kind change.
 fn upsert_in(
     tx: &Transaction<'_>,
     id: &RosterId,
+    before: Option<&RosterRecord>,
     definition: &RosterDefinition,
     audit_reason: &str,
     operation_id: &str,
-) -> Result<(RosterChange, RosterRecord), StoreError> {
-    let (generation, change) = match get_in(tx, id)? {
+) -> Result<(RosterChange, RosterRecord), RosterError> {
+    let (generation, change) = match before {
         None => (1, RosterChange::Created),
+        Some(r) if r.head.kind != definition.kind => {
+            return Err(RosterError::KindImmutable {
+                id: id.clone(),
+                current: r.head.kind.wire_name(),
+                requested: definition.kind.wire_name(),
+            });
+        }
         Some(r) => (r.head.generation.saturating_add(1), RosterChange::Revised),
     };
-    let definition_json = serde_json::to_string(&definition.to_json())?;
+    let definition_json = serde_json::to_string(&definition.to_json()).map_err(StoreError::from)?;
     let ts = now_ms();
     tx.execute(
         "INSERT INTO roster_records(id, kind, definition_json, capability, locality, disabled,
            generation, updated_ts)
          VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, ?7)
-         ON CONFLICT(id) DO UPDATE SET kind = excluded.kind,
+         ON CONFLICT(id) DO UPDATE SET
            definition_json = excluded.definition_json, capability = excluded.capability,
            locality = excluded.locality, generation = excluded.generation,
            updated_ts = excluded.updated_ts",
@@ -675,7 +726,8 @@ fn upsert_in(
             sql_generation(generation)?,
             ts
         ],
-    )?;
+    )
+    .map_err(StoreError::from)?;
     tx.execute(
         "INSERT INTO roster_revisions(record_id, generation, definition_json, audit_reason,
            operation_id, ts)
@@ -688,7 +740,8 @@ fn upsert_in(
             operation_id,
             ts
         ],
-    )?;
+    )
+    .map_err(StoreError::from)?;
     let record = get_in(tx, id)?.ok_or_else(|| StoreError::Corrupt {
         task: id.to_string(),
         detail: "roster_records row absent after its upsert".into(),
@@ -700,13 +753,10 @@ fn upsert_in(
 fn disable_in(
     tx: &Transaction<'_>,
     id: &RosterId,
+    before: &RosterRecord,
     audit_reason: &str,
     operation_id: &str,
 ) -> Result<RosterRecord, StoreError> {
-    let before = get_in(tx, id)?.ok_or_else(|| StoreError::Corrupt {
-        task: id.to_string(),
-        detail: "roster_records row absent inside the disable transaction".into(),
-    })?;
     let generation = sql_generation(before.head.generation.saturating_add(1))?;
     let ts = now_ms();
     tx.execute(
@@ -816,29 +866,32 @@ impl Store {
         Ok(out)
     }
 
-    /// Refuse a revise or disable whose `expected` generation is not the record's. Runs before
-    /// `operate` (see the module doc) and only when `op` is not already recorded, so a replay
-    /// answers the stored result whatever the generation is now.
-    fn roster_expect(
+    /// `operate`, with a closure that may refuse: a [`RosterError`] other than a ledger error
+    /// rolls the transaction back and is returned as itself.
+    fn operate_roster<F>(
         &self,
         op: &OperationKey,
-        id: &RosterId,
-        expected: Option<u64>,
-    ) -> Result<(), RosterError> {
-        let Some(expected) = expected else {
-            return Ok(());
-        };
-        if self.operation_by_key(op)?.is_some() {
-            return Ok(());
-        }
-        match get_in(&self.conn, id)? {
-            None => Err(RosterError::NotFound(id.clone())),
-            Some(r) if r.head.generation != expected => Err(RosterError::StaleGeneration {
-                id: id.clone(),
-                expected,
-                current: r.head.generation,
-            }),
-            Some(_) => Ok(()),
+        request: &[u8],
+        f: F,
+    ) -> Result<Operation, RosterError>
+    where
+        F: FnOnce(&Transaction<'_>) -> Result<(Option<String>, Value), RosterError>,
+    {
+        let mut refusal = None;
+        let out = self.operate(op, request, |tx| match f(tx) {
+            Ok((subject, result)) => Ok((None, subject, result)),
+            Err(RosterError::Store(e)) => Err(e),
+            Err(r) => {
+                refusal = Some(r);
+                Err(StoreError::Corrupt {
+                    task: String::new(),
+                    detail: "roster refusal; transaction rolled back".into(),
+                })
+            }
+        });
+        match refusal {
+            Some(r) => Err(r),
+            None => Ok(out?),
         }
     }
 
@@ -849,6 +902,7 @@ impl Store {
     /// # Errors
     /// [`RosterError::StaleGeneration`] when `expected_generation` is not the record's;
     /// [`RosterError::NotFound`] when one was given for a record that does not exist;
+    /// [`RosterError::KindImmutable`] when a revise names another kind;
     /// [`StoreError::Conflict`] (wrapped) for the same key with other bytes.
     pub fn roster_update(
         &self,
@@ -859,12 +913,13 @@ impl Store {
         audit_reason: &str,
         expected_generation: Option<u64>,
     ) -> Result<Operation, RosterError> {
-        self.roster_expect(op, id, expected_generation)?;
         let op_id = operation_id(op);
-        Ok(self.operate(op, request, |tx| {
-            let (change, record) = upsert_in(tx, id, definition, audit_reason, &op_id)?;
-            Ok((None, Some(id.to_string()), change_result(change, &record)))
-        })?)
+        self.operate_roster(op, request, |tx| {
+            let before = expect_in(tx, id, expected_generation)?;
+            let (change, record) =
+                upsert_in(tx, id, before.as_ref(), definition, audit_reason, &op_id)?;
+            Ok((Some(id.to_string()), change_result(change, &record)))
+        })
     }
 
     /// Disable `id` at `expected_generation` under the caller's `op`: `disabled = 1`,
@@ -889,13 +944,13 @@ impl Store {
         audit_reason: &str,
         active_attempts: &[TaskId],
     ) -> Result<Operation, RosterError> {
-        self.roster_expect(op, id, Some(expected_generation))?;
         let op_id = operation_id(op);
         let attempts: Vec<&str> = active_attempts.iter().map(TaskId::as_str).collect();
-        Ok(self.operate(op, request, |tx| {
-            let record = disable_in(tx, id, audit_reason, &op_id)?;
+        self.operate_roster(op, request, |tx| {
+            let before = expect_in(tx, id, Some(expected_generation))?
+                .ok_or_else(|| RosterError::NotFound(id.clone()))?;
+            let record = disable_in(tx, id, &before, audit_reason, &op_id)?;
             Ok((
-                None,
                 Some(id.to_string()),
                 json!({
                     "record": record.to_json(),
@@ -903,7 +958,7 @@ impl Store {
                     "active_attempts": attempts,
                 }),
             ))
-        })?)
+        })
     }
 
     /// Compose the engine's own record for `model_name` (id `model:<name>`) as an internal
@@ -912,7 +967,9 @@ impl Store {
     /// changed definition revises the record.
     ///
     /// # Errors
-    /// [`RosterError::Id`] when the name does not fit the id grammar; the ledger's errors.
+    /// [`RosterError::Id`] when the name does not fit the id grammar;
+    /// [`RosterError::KindImmutable`] when an operator created that id with another kind; the
+    /// ledger's errors.
     pub fn roster_compose_deploy(
         &self,
         model_name: &str,
@@ -930,10 +987,46 @@ impl Store {
             idem_key: Sha256Hex::digest(request.as_bytes()).to_string(),
         };
         let op_id = operation_id(&op);
-        Ok(self.operate(&op, request.as_bytes(), |tx| {
-            let (change, record) = upsert_in(tx, &id, definition, DEPLOY_AUDIT_REASON, &op_id)?;
-            Ok((None, Some(id.to_string()), change_result(change, &record)))
-        })?)
+        self.operate_roster(&op, request.as_bytes(), |tx| {
+            let before = get_in(tx, &id)?;
+            let (change, record) = upsert_in(
+                tx,
+                &id,
+                before.as_ref(),
+                definition,
+                DEPLOY_AUDIT_REASON,
+                &op_id,
+            )?;
+            Ok((Some(id.to_string()), change_result(change, &record)))
+        })
+    }
+
+    /// The ids routing would once have been asked about but now skips: every record that is a
+    /// model by kind or by its `model:` prefix and is not eligible (disabled, or not of kind
+    /// `model`), in id order, at most `limit` (`task.preview`'s `exclusions`).
+    ///
+    /// # Errors
+    /// SQLite errors.
+    pub fn roster_excluded(&self, limit: usize) -> Result<Vec<String>, StoreError> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id FROM roster_records
+             WHERE (kind = ?1 OR substr(id, 1, length(?2)) = ?2)
+               AND NOT (kind = ?1 AND disabled = 0)
+             ORDER BY id LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                RosterKind::Model.wire_name(),
+                MODEL_PREFIX,
+                sql_count(limit)
+            ],
+            |r| r.get::<_, String>(0),
+        )?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
     }
 }
 
@@ -1280,5 +1373,147 @@ mod tests {
             RosterId::parse("model:qwen2.5-coder:7b").map(|i| i.model_name().map(str::to_owned)),
             Ok(Some("qwen2.5-coder:7b".into()))
         );
+    }
+
+    #[test]
+    fn definition_refuses_caps_local_that_contradicts_locality() {
+        let mut remote_but_local = definition(1).to_json();
+        remote_but_local["locality"] = json!("remote");
+        assert_eq!(
+            RosterDefinition::from_json(&remote_but_local).map_err(|e| e.member),
+            Err("/caps/local")
+        );
+        remote_but_local["caps"]["local"] = json!(false);
+        assert_eq!(
+            RosterDefinition::from_json(&remote_but_local).map(|d| d.locality),
+            Ok(Locality::Remote)
+        );
+    }
+
+    #[test]
+    fn revise_refuses_a_kind_change_and_writes_nothing() -> R {
+        let store = fresh("kind")?;
+        let id = id("model:epsilon")?;
+        store.roster_update(&key("k1"), b"a", &id, &definition(1), "add", None)?;
+        let before = revisions(&store, &id)?;
+        let agent = RosterDefinition {
+            kind: RosterKind::Agent,
+            ..definition(1)
+        };
+        let moved = store.roster_update(&key("k2"), b"b", &id, &agent, "hide", None);
+        assert!(
+            matches!(
+                &moved,
+                Err(RosterError::KindImmutable {
+                    current: "model",
+                    requested: "agent",
+                    ..
+                })
+            ),
+            "{moved:?}"
+        );
+        assert_eq!(
+            revisions(&store, &id)?,
+            before,
+            "a refused revise writes nothing"
+        );
+        assert!(store.operation_by_key(&key("k2"))?.is_none());
+        assert_eq!(
+            store.roster_get(&id)?.map(|r| r.head.kind),
+            Some(RosterKind::Model)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn excluded_names_disabled_models_and_model_ids_of_another_kind() -> R {
+        let store = fresh("excluded")?;
+        let up = id("model:up")?;
+        let off = id("model:off")?;
+        let odd = id("model:odd")?;
+        let agent = RosterDefinition {
+            kind: RosterKind::Agent,
+            ..definition(1)
+        };
+        store.roster_update(&key("k1"), b"a", &up, &definition(1), "add", None)?;
+        store.roster_update(&key("k2"), b"b", &off, &definition(1), "add", None)?;
+        store.roster_update(&key("k3"), b"c", &odd, &agent, "add", None)?;
+        store.roster_update(&key("k4"), b"d", &id("agent:x")?, &agent, "add", None)?;
+        store.roster_disable(
+            &key("k5"),
+            b"e",
+            &off,
+            1,
+            DisablePolicy::LetFinish,
+            "off",
+            &[],
+        )?;
+        assert_eq!(
+            store.roster_excluded(MAX_TOKEN_BYTES)?,
+            vec![odd.to_string(), off.to_string()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_revises_at_one_generation_admit_exactly_one() -> R {
+        let path = path("race")?;
+        let id = id("model:zeta")?;
+        Store::open(&path)?.roster_update(&key("k0"), b"a", &id, &definition(1), "add", None)?;
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let (path, id) = (path.clone(), id.clone());
+                std::thread::spawn(move || -> Result<bool, String> {
+                    let store = Store::open(&path).map_err(|e| e.to_string())?;
+                    let k = key(&format!("race-{i}"));
+                    let body = format!("revise-{i}");
+                    match store.roster_update(
+                        &k,
+                        body.as_bytes(),
+                        &id,
+                        &definition(2),
+                        "race",
+                        Some(1),
+                    ) {
+                        Ok(_) => Ok(true),
+                        Err(RosterError::StaleGeneration { current: 2, .. }) => Ok(false),
+                        Err(e) => Err(e.to_string()),
+                    }
+                })
+            })
+            .collect();
+        let mut admitted = 0;
+        for t in threads {
+            if t.join().map_err(|_| "thread panicked")?? {
+                admitted += 1;
+            }
+        }
+        assert_eq!(
+            admitted, 1,
+            "one revise wins generation 1; the rest are stale"
+        );
+        assert_eq!(
+            Store::open(&path)?
+                .roster_get(&id)?
+                .map(|r| r.head.generation),
+            Some(2)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compose_deploy_accepts_namespaced_ollama_names() -> R {
+        let store = fresh("namespaced")?;
+        for name in ["library/qwen2.5:0.5b", "hf.co/someone/some-repo:Q4_K_M"] {
+            let op = store.roster_compose_deploy(name, &definition(0))?;
+            assert_eq!(
+                op.subject.as_deref(),
+                Some(format!("model:{name}").as_str())
+            );
+            let rid = RosterId::model(name)?;
+            assert_eq!(rid.model_name(), Some(name));
+            assert_eq!(store.roster_get(&rid)?.map(|r| r.head.generation), Some(1));
+        }
+        Ok(())
     }
 }
