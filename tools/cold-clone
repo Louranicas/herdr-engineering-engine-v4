@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""cold-clone [--sha REV] [--origin DIR] [--tier commit] [--repo DIR] [--gate PATH] [--warm-root DIR] [--target-dir DIR]
+
+Proves a sha gates the same on a fresh clone of the LOCAL bare mirror as it did warm
+(REQUIREMENTS rank 5). Clones <origin> (--no-hardlinks) into a temp dir under ~/.cache, checks out
+the sha, runs `<gate> <tier> --repo <clone> --subject <sha> --target-dir <target>` there relaying
+its stdout unchanged, loads the cold run's summary.json (the gate prints summary=<path>) and
+matches it against the newest warm run `<warm-root>/*-<sha12>/summary.json` of the same tier and
+subject: matched = cold steps whose (name, ok) equals the warm step of that name. Prints
+  gate=<path> registry=host_cache   (method limits: the gate runner is the invoking tree's; cargo's
+                                     registry is the host's ~/.cargo until tools/offline-bundle.lock exists)
+and last
+  cold-clone sha=<sha12> origin=<path> tier=<t> steps=N matched=N verdict=PASS|FAIL|UNMEASURED
+PASS (0) iff the cold gate passed and matched == steps; FAIL (1) otherwise; UNMEASURED (3) with
+matched=UNMEASURED(no warm run at <sha12>) when no warm run exists; refused (2) when the sha is
+not in the origin (`just mirror` first) or the gate itself refused. The clone is removed in a
+finally; the target dir is kept so the second cold run is warm. The cut tier is refused: it needs
+the live unit, forbidden in a clone. Never GitHub, never the network.
+"""
+import argparse, glob, json, os, re, shutil, subprocess, sys, tempfile
+
+def die(msg, code=2):
+    print(f"cold-clone: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+def git(repo, *args):
+    r = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True)
+    return r.returncode, r.stdout.strip(), r.stderr.strip()
+
+def resolve(repo, rev):
+    rc, out, _ = git(repo, "rev-parse", "--verify", "--quiet", rev + "^{commit}")
+    return out if rc == 0 and out else None
+
+def warm_summary(root, sha, tier, cold_path):
+    """The newest `<root>/*-<sha12>/summary.json` by stamp of the same tier and subject, not the cold one."""
+    for p in sorted(glob.glob(os.path.join(root, f"*-{sha[:12]}", "summary.json")), reverse=True):
+        if os.path.realpath(p) == os.path.realpath(cold_path):
+            continue
+        try:
+            with open(p) as f:
+                s = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if s.get("tier") == tier and s.get("subject") == sha:
+            return p, s
+    return None, None
+
+def main():
+    here = os.path.dirname(os.path.abspath(__file__))
+    ap = argparse.ArgumentParser(prog="cold-clone", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--sha", default="HEAD", help="rev to gate cold (resolved in --repo, then checked in --origin)")
+    ap.add_argument("--origin", default="/mnt/storage-10tb/hee4-origin.git", help="the local bare mirror (`just mirror` fills it)")
+    ap.add_argument("--tier", default="commit")
+    ap.add_argument("--repo", default=os.getcwd())
+    ap.add_argument("--gate", default=os.path.join(here, "gate"))
+    ap.add_argument("--warm-root", default=os.path.expanduser("~/.cache/hee4-gate"))
+    ap.add_argument("--target-dir", help="CARGO_TARGET_DIR for the cold gate (default ~/.cache/hee4-cold-target/<sha12>; kept)")
+    a = ap.parse_args()
+    if a.tier == "cut":
+        die("the cut tier needs the live unit; it is forbidden in a clone")
+    if not os.path.isdir(a.origin):
+        die(f"origin {a.origin} is not a directory")
+    sha = resolve(a.repo, a.sha) or a.sha
+    if not resolve(a.origin, sha):
+        die(f"sha {a.sha} not in {a.origin} (just mirror first)")
+    sha = resolve(a.origin, sha)
+    target = os.path.abspath(os.path.expanduser(a.target_dir or f"~/.cache/hee4-cold-target/{sha[:12]}"))
+    os.makedirs(target, exist_ok=True)
+    print(f"gate={os.path.abspath(a.gate)}")
+    print("registry=host_cache")
+    cache = os.path.expanduser("~/.cache")
+    os.makedirs(cache, exist_ok=True)
+    tmp = tempfile.mkdtemp(prefix="hee4-cold-", dir=cache)
+    try:
+        r = subprocess.run(["git", "clone", "-q", "--no-hardlinks", a.origin, tmp], capture_output=True, text=True)
+        if r.returncode:
+            die(f"clone of {a.origin} failed: {r.stderr.strip()}")
+        rc, _, err = git(tmp, "checkout", "-q", sha)
+        if rc:
+            die(f"checkout {sha[:12]} failed: {err}")
+        p = subprocess.Popen([a.gate, a.tier, "--repo", tmp, "--subject", sha, "--target-dir", target],
+                             cwd=tmp, stdout=subprocess.PIPE, text=True)
+        summary_path = None
+        for line in p.stdout:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            m = re.fullmatch(r"summary=(\S+)\n?", line)
+            if m:
+                summary_path = m.group(1)
+        gate_rc = p.wait()
+        if summary_path is None:
+            die(f"gate exited {gate_rc} without a summary= line", 2 if gate_rc == 2 else 1)
+        with open(summary_path) as f:
+            cold = json.load(f)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    steps = cold.get("steps", [])
+    head = f"cold-clone sha={sha[:12]} origin={a.origin} tier={a.tier} steps={len(steps)}"
+    warm_path, warm = warm_summary(os.path.expanduser(a.warm_root), sha, a.tier, summary_path)
+    if warm is None:
+        print(f"{head} matched=UNMEASURED(no warm run at {sha[:12]}) verdict=UNMEASURED")
+        sys.exit(3)
+    by_name = {s.get("name"): s for s in warm.get("steps", [])}
+    matched = sum(1 for s in steps if s.get("name") in by_name and by_name[s["name"]].get("ok") == s.get("ok"))
+    print(f"warm={warm_path}")
+    v = "PASS" if cold.get("verdict") == "PASS" and matched == len(steps) else "FAIL"
+    print(f"{head} matched={matched} verdict={v}")
+    sys.exit(0 if v == "PASS" else 1)
+
+if __name__ == "__main__":
+    main()
