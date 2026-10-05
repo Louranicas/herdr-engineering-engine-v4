@@ -206,12 +206,42 @@ def submit_sleep(F):
     return body_of(F.req("task.submit", {"brief": SLEEP_BRIEF}, key=str(uuid.uuid4()))).get("task_id")
 
 
-def raced(F, t, reply):
-    """The reason a lifecycle path cannot be measured: the dispatcher abandoned the task first
-    (no eligible model, e.g. roster.disable ran earlier in this run); None when it did not."""
-    if (reply or {}).get("code") == "conflict" and get_phase(F, t) == "abandoned":
+RUNNING_WAIT_S = 10  # the bound on waiting for a SLEEP_BRIEF task to reach `running` before cancel
+
+
+def stopped_first(t, ph):
+    """Why the dispatcher, not the drive, ended `t` in phase `ph`: abandoned names no eligible model
+    (e.g. roster.disable earlier in the run), cancelled names the cancel-before-dispatch race; None
+    for any other phase."""
+    if ph == "abandoned":
         return f"dispatcher abandoned {t} before the drive's frame (no eligible model on this serve)"
+    if ph == "cancelled":
+        return f"dispatcher cancelled {t} before the drive's frame (cancel-before-dispatch race: the cancel landed before running)"
     return None
+
+
+def wait_running(F, t, bound=RUNNING_WAIT_S):
+    """Poll task.get until `t` is `running`: (True, None), or (False, reason). A terminal phase seen
+    first gives its cause (stopped_first) at once; only an exhausted bound names the bound and the
+    last phase seen. A cancel on a running task with an open attempt stays cancellation_requested;
+    one that lands before dispatch is Stopped to `cancelled` by the dispatcher (wave 5)."""
+    ph, t0 = None, time.monotonic()
+    while time.monotonic() - t0 < bound:
+        ph = get_phase(F, t)
+        if ph == "running":
+            return True, None
+        if ph in TERMINAL:
+            return False, stopped_first(t, ph) or f"task={t} reached terminal phase={ph} before running: no task to cancel"
+        time.sleep(0.05)
+    return False, f"task={t} never reached running within {bound}s (last phase={ph}): cancel would race the dispatch"
+
+
+def raced(F, t, reply):
+    """The reason a lifecycle path cannot be measured: a conflict on a task the dispatcher already
+    ended (stopped_first); None when the reply is no conflict or the task is not so ended."""
+    if (reply or {}).get("code") != "conflict":
+        return None
+    return stopped_first(t, get_phase(F, t))
 
 
 def d_resolve(F, ctx):
@@ -219,8 +249,9 @@ def d_resolve(F, ctx):
     # task.resolve's catalogue entry is PreconditionRule::None (crates/hee4-contracts/src/catalogue.rs:351).
     print("  note=stale_generation unreachable reason=task.resolve PreconditionRule::None (catalogue.rs:351)")
     t = submit_sleep(F)
-    c = F.req("task.cancel", {"task_id": t}, key=str(uuid.uuid4())) if t else None
-    why = raced(F, t, c) if t else None
+    up, why = wait_running(F, t) if t else (False, None)
+    c = F.req("task.cancel", {"task_id": t}, key=str(uuid.uuid4())) if up else None
+    why = why or (raced(F, t, c) if up else None)
     if why:
         F.check("cancel_then_abandon", False, why, unmeasured=True)
     else:
