@@ -55,7 +55,7 @@ def budgets_shape(budgets):
             parts.append(f"{sec}.{k}={v}")
     return " ".join(parts), None
 
-def budgets_check(out, unit, sock):
+def budgets_check(out, unit):
     """(status, detail) for the budgets row. MEASURED only when the reply's body.budgets has the
     served shape AND the binary's own `hee4 doctor` row (Budgets::parse + round trip, the
     contracts' validator) is present with the same rendered line."""
@@ -76,7 +76,8 @@ def budgets_check(out, unit, sock):
     line, why = budgets_shape(body["budgets"])
     if line is None:
         return "FAIL", why
-    rc, dout, derr = sh("hee4", "doctor", "--unit", unit, "--socket", sock, timeout=30)
+    # Same socket as the `hee4 health` above (the binary's default), so both read one server.
+    rc, dout, derr = sh("hee4", "doctor", "--unit", unit, timeout=30)
     if rc is None:
         return "UNMEASURED", f"hee4 doctor not runnable: {derr}"
     row = next((l for l in dout.splitlines() if l.startswith("doctor row=budgets ")), None)
@@ -140,7 +141,7 @@ def main():
         emit("socket", "MEASURED" if good else "FAIL", f"dir={md:o} sock={ms:o} is_socket={stat.S_ISSOCK(ss.st_mode)} uid_ok={ss.st_uid == os.getuid()}")
 
     # ledger opens, via the product's own health read
-    rc, out, err = sh("hee4", "health", "--socket", a.socket)
+    rc, out, err = sh("hee4", "health")
     if rc is None:
         emit("ledger", "UNMEASURED", "hee4 binary not on PATH; ledger open cannot be read")
     elif rc == 0 and re.search(r"\bready=true\b", out) and "recovery=complete" in out and "database=ready" in out:
@@ -152,7 +153,7 @@ def main():
     if rc is None:
         emit("budgets", "UNMEASURED", "hee4 binary not on PATH; health reply unreadable")
     else:
-        status, detail = budgets_check(out, a.unit, a.socket)
+        status, detail = budgets_check(out, a.unit)
         emit("budgets", status, detail)
 
     # model endpoint: /api/ps parses
