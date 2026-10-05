@@ -549,9 +549,37 @@ fn the_connection_after_the_cap_is_refused_by_name_and_health_still_answers() ->
         log.contains(&format!(" budgets=file:{}", file.display())),
         "{log}"
     );
+    // Hold exactly `max_connections` connections that the server has ADMITTED: each one answers a
+    // health round trip and stays open. `connect` alone proved nothing: the serve-start health
+    // polls can still hold a slot for a moment, so a held connection could be the refused one and
+    // the lingering slot then free just before `extra`, which was admitted and read until its
+    // timeout (WouldBlock under load in the cut tier, 2026-10-05). A held connection refused
+    // while a lingering slot drains is dropped and retried, within a bound.
+    let admitted = |sock: &Path| -> R<Option<UnixStream>> {
+        let mut c = UnixStream::connect(sock)?;
+        c.set_read_timeout(Some(Duration::from_secs(10)))?;
+        c.write_all(format!("{}\n", wire::request("hold", "health", None, json!({}))).as_bytes())?;
+        let mut line = String::new();
+        BufReader::new(&c).read_line(&mut line)?;
+        let v: Value = serde_json::from_str(&line)?;
+        if v["code"] == "too_many_connections" {
+            return Ok(None);
+        }
+        assert_eq!(v["body"]["ok"], true, "{v}");
+        Ok(Some(c))
+    };
     let mut held = Vec::new();
-    for _ in 0..2 {
-        held.push(UnixStream::connect(&server.sock)?);
+    let t0 = Instant::now();
+    while held.len() < 2 {
+        match admitted(&server.sock)? {
+            Some(c) => held.push(c),
+            None if t0.elapsed() < Duration::from_secs(5) => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            None => {
+                return Err("a held connection was refused for 5 s: a slot never drained".into());
+            }
+        }
     }
     let extra = UnixStream::connect(&server.sock)?;
     extra.set_read_timeout(Some(Duration::from_secs(10)))?;

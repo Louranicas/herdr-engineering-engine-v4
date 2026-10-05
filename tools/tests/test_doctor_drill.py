@@ -38,6 +38,7 @@ class World:
         self.sockpath = os.path.join(rt, "control.sock")
         self.s = socket.socket(socket.AF_UNIX); self.s.bind(self.sockpath); os.chmod(self.sockpath, 0o600); self.s.listen(8)
         self.missing, self.submitted = missing, []
+        self.phases, self.resolved = {}, []  # task.get phases a test plants; task.resolve calls received
         threading.Thread(target=self.serve, daemon=True).start()
         self.srv = http.server.HTTPServer(("127.0.0.1", 0), ps_handler([{"name": "m", "size_vram": 1}] if models is None else models))
         threading.Thread(target=self.srv.serve_forever, daemon=True).start()
@@ -60,6 +61,12 @@ class World:
                 if act == "task.submit":
                     t = "t-" + uuid.uuid4().hex[:24]; self.submitted.append(t)
                     body = {"task_id": t, "phase": "admitted"}
+                elif act == "task.get":
+                    t = req.get("body", {}).get("task_id")
+                    body = {"task_id": t, "phase": self.phases.get(t, "accepted")}
+                elif act == "task.resolve":
+                    t = req.get("body", {}).get("task_id"); self.resolved.append(t); self.phases[t] = "abandoned"
+                    body = {"task_id": t, "phase": "abandoned"}
                 elif act == "task.list":
                     shown = self.submitted[:len(self.submitted) - self.missing] if self.missing else self.submitted
                     body = {"tasks": [{"task_id": t, "phase": "admitted"} for t in shown]}
@@ -184,6 +191,25 @@ class DrillTests(unittest.TestCase):
         rc, out, _ = run(DRILL, "--socket", w.sockpath, "--restart-budget", "1", "--repo", TOOLS, "--drill-root", tempfile.mkdtemp(prefix="dr-"), env=w.env)
         self.assertEqual(rc, 1); self.assertIn("drill_step=unit_restarted status=FAIL", out)
 
+    def test_fire_rehearsal_settled_resolves_only_its_own_effect_unknown_tasks(self):
+        # The kill leaves some of the drill's own tasks effect_unknown (R08): the drill abandons
+        # those through task.resolve, waits until all its tasks are terminal, and never touches
+        # a task it did not submit (here a planted foreign effect_unknown task).
+        w = World(); self.addCleanup(w.close)
+        restarter(self, w)
+        w.phases["t-" + "f" * 24] = "effect_unknown"
+        root = tempfile.mkdtemp(prefix="dr-")
+        # every task this run submits reads effect_unknown until resolved
+        class Unknown(dict):
+            def get(self, k, d=None):
+                return dict.get(self, k, "effect_unknown" if k in w.submitted else d)
+        w.phases = Unknown(w.phases)
+        rc, out, _ = run(DRILL, "--socket", w.sockpath, "--restart-budget", "10", "--repo", TOOLS, "--submit", "3", "--drill-root", root, env=w.env)
+        self.assertEqual(rc, 0, out)
+        self.assertRegex(out, r"drill_step=rehearsal_settled status=MEASURED .* detail=terminal=3/3 resolved_effect_unknown=3 refused=none open=none")
+        self.assertEqual(sorted(w.resolved), sorted(w.submitted))
+        self.assertNotIn("t-" + "f" * 24, w.resolved)
+
     def test_quiet_submit3_acked_present_and_rehearsal(self):
         w = World(); self.addCleanup(w.close)
         restarter(self, w)
@@ -192,7 +218,7 @@ class DrillTests(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         steps = [l.split()[0] for l in out.splitlines() if l.startswith("drill_step=")]
         self.assertEqual(steps, ["drill_step=unit_active", "drill_step=submit", "drill_step=kill9", "drill_step=unit_restarted",
-                                 "drill_step=socket_perms", "drill_step=health_ready", "drill_step=acked_present"])
+                                 "drill_step=socket_perms", "drill_step=health_ready", "drill_step=acked_present", "drill_step=rehearsal_settled"])
         self.assertRegex(out, r"drill_step=submit status=MEASURED .* detail=acked=3/3 ids=t-[0-9a-f]{24},t-")
         self.assertRegex(out, r"drill_step=acked_present status=MEASURED .* detail=3/3 missing=none")
         self.assertRegex(out.strip().splitlines()[-1], r"^drill verdict=PASS steps=(\d+)/\1 unit=hee4.service head=\S+ submitted=3 acked_present=3/3$")
@@ -289,7 +315,9 @@ class DrillTests(unittest.TestCase):
                 self.assertRegex(out.strip().splitlines()[-1], r" submitted=0 acked_present=0/0 requested=3$")
                 rec = json.load(open(os.path.join(root, head_of(TOOLS), "rehearsal.json")))
                 self.assertEqual((rec["submitted"], rec["acked_present"]), (3, "3/3"))
-                self.assertEqual([s["status"] for s in rec["steps"]], ["MEASURED"] * 7)
+                # every step the submitting run recorded was MEASURED, the settle step among them (no pinned count)
+                self.assertTrue(rec["steps"] and all(s["status"] == "MEASURED" for s in rec["steps"]), rec["steps"])
+                self.assertIn("rehearsal_settled", [s.get("name") or s.get("step") for s in rec["steps"]])
                 self.assertEqual(sorted(rec["task_ids"]), sorted(w.submitted))
 
     def test_fire_interleaved_saves_lose_no_record_and_no_id(self):

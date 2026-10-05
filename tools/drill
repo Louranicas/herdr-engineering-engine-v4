@@ -108,6 +108,7 @@ class Run:
         if a.submit > 0:
             self.steps.insert(1, "submit")
             self.steps.append("acked_present")
+            self.steps.append("rehearsal_settled")
         self.ids, self.acked = [], 0
 
     def not_reached(self, after, why):
@@ -268,7 +269,37 @@ def main():
         missing = [t for t in run.ids if t not in listed]
         run.acked = len(run.ids) - len(missing)
         emit("acked_present", "MEASURED" if not missing else "FAIL", B, t0, f"{run.acked}/{a.submit} missing={','.join(missing) or 'none'}")
+        settle_rehearsal(a, run.ids, B)
     run.finish()
+
+
+TERMINAL = {"accepted", "failed", "cancelled", "abandoned"}
+
+
+def settle_rehearsal(a, ids, budget):
+    """Step `rehearsal_settled`: the kill lands mid-attempt on purpose, so recovery correctly leaves
+    some of THIS run's tasks `effect_unknown` (R08). The drill resolves those, and only those (its
+    own acked ids), through task.resolve abandon with reason attempt_failed, then waits until every
+    one of its tasks is terminal. A task it did not submit is never touched. MEASURED only when all
+    are terminal within the budget; a refused resolve or a task still open is FAIL by name."""
+    t0 = time.monotonic()
+    resolved, refused = [], []
+    deadline = t0 + budget
+    phases = {}
+    while True:
+        phases = {t: ((frame(a.socket, "task.get", {"task_id": t}) or {}).get("body") or {}).get("phase") for t in ids}
+        for t, ph in phases.items():
+            if ph == "effect_unknown" and t not in resolved and t not in refused:
+                r = frame(a.socket, "task.resolve", {"task_id": t, "resolution": "abandon", "reason": "attempt_failed"},
+                          key=f"drill-settle-{t}")
+                (resolved if is_result(r) else refused).append(t)
+        if all(ph in TERMINAL for ph in phases.values()) or time.monotonic() >= deadline:
+            break
+        time.sleep(0.5)
+    open_ = [f"{t}:{ph}" for t, ph in phases.items() if ph not in TERMINAL]
+    ok = not open_ and not refused
+    emit("rehearsal_settled", "MEASURED" if ok else "FAIL", budget, t0,
+         f"terminal={len(ids) - len(open_)}/{len(ids)} resolved_effect_unknown={len(resolved)} refused={','.join(refused) or 'none'} open={','.join(open_) or 'none'}")
 
 
 if __name__ == "__main__":
