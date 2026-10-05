@@ -443,6 +443,7 @@ mod tests {
             ReceiptId("r1".into()),
             SpawnScope {
                 programs: programs.iter().map(PathBuf::from).collect(),
+                sockets: vec![],
             },
         );
         let task = NamespaceTask::new("t1".parse()?, &root, needs_model, Duration::from_secs(20))?;

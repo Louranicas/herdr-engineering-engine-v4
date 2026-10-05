@@ -283,7 +283,7 @@ pub fn step(engine: &Engine, cfg: &Config) -> Result<Option<(TaskId, Phase)>, Di
         .collect();
     let permit = Permit::mint(
         spawn::ReceiptId(receipt_id.to_string()),
-        SpawnScope { programs },
+        SpawnScope::of_programs(programs),
     );
 
     let upstream = match Upstream::parse(MODEL_URL) {

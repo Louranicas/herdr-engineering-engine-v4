@@ -22,11 +22,26 @@ pub struct PermitId(pub u64);
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ReceiptId(pub String);
 
-/// Which programs a permit covers (data supplied by the minting caller).
+/// Which programs a permit covers, and which unix sockets it allows bound read-write (data
+/// supplied by the minting caller).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpawnScope {
     /// Absolute program paths the permit allows.
     pub programs: Vec<PathBuf>,
+    /// Absolute unix-socket paths the permit allows a plan to bind read-write (a service probe's
+    /// user bus). A task attempt's permit lists none, so a candidate can never reach a bus.
+    pub sockets: Vec<PathBuf>,
+}
+
+impl SpawnScope {
+    /// The task attempt's shape: these programs and no socket.
+    #[must_use]
+    pub fn of_programs(programs: Vec<PathBuf>) -> Self {
+        Self {
+            programs,
+            sockets: Vec::new(),
+        }
+    }
 }
 
 /// Authority to spawn. Carries the receipt id; fields are private so the only
@@ -87,6 +102,9 @@ pub struct NamespacePlan {
     /// path and named to the candidate as `HEE4_MODEL_SOCKET`. It must be listed, absolute and a
     /// socket when the plan is built. There is no network: the door is the only path out.
     pub model_door: Option<PathBuf>,
+    /// Unix sockets bound read-write at the same path, with no env var: a service probe's user
+    /// bus. Each must be listed, absolute, in the permit's `sockets`, and a socket at plan time.
+    pub sockets: Vec<PathBuf>,
     /// Kill the child after this long.
     pub timeout: Duration,
 }
@@ -100,11 +118,12 @@ pub enum HostRefusal {
     /// A path is not absolute.
     #[error("path not absolute: {0}")]
     RelativePath(PathBuf),
-    /// The permit's scope does not cover the program.
+    /// The permit's scope does not cover the program, or does not list the socket.
     #[error("permit {0:?} does not cover {1}")]
     OutOfScope(PermitId, PathBuf),
-    /// The model door is not a unix socket: binding it would be a second writable tree.
-    #[error("model door is not a socket (a second writable bind): {0}")]
+    /// The model door or a listed socket is not a unix socket: binding it would be a second
+    /// writable tree.
+    #[error("not a socket (a second writable bind): {0}")]
     DoorNotSocket(PathBuf),
 }
 
@@ -128,12 +147,13 @@ pub struct SpawnPlan {
 
 /// Build the bwrap invocation, or refuse.
 ///
-/// The argv always carries `--unshare-all --unshare-net`; there is no `--share-net` path. The
-/// writable binds are the work dir and, when present, the model door, which must be a socket.
+/// The argv always carries `--unshare-all --unshare-net`; no path shares the network. The
+/// writable binds are the work dir, the model door when present, and each listed socket; a door
+/// or socket must be a unix socket at plan time.
 ///
 /// # Errors
-/// [`HostRefusal`] for an out-of-scope command, relative path, unlisted mount, or a model door
-/// that is not a socket.
+/// [`HostRefusal`] for an out-of-scope command or socket, relative path, unlisted mount, or a
+/// door or socket that is not a socket.
 #[expect(
     clippy::needless_pass_by_value,
     reason = "the door takes the plan by value: one plan, one spawn"
@@ -151,6 +171,7 @@ pub fn plan(
             .iter()
             .chain([&ns.work_dir])
             .chain(&ns.model_door)
+            .chain(&ns.sockets)
     };
     for p in mounts().chain([&command.program]) {
         if !p.is_absolute() {
@@ -162,10 +183,15 @@ pub fn plan(
             return Err(HostRefusal::UnlistedMount(p.clone()));
         }
     }
-    if let Some(door) = &ns.model_door {
-        let is_socket = std::fs::symlink_metadata(door).is_ok_and(|m| m.file_type().is_socket());
+    for s in &ns.sockets {
+        if !permit.scope.sockets.contains(s) {
+            return Err(HostRefusal::OutOfScope(permit.id, s.clone()));
+        }
+    }
+    for p in ns.model_door.iter().chain(&ns.sockets) {
+        let is_socket = std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_socket());
         if !is_socket {
-            return Err(HostRefusal::DoorNotSocket(door.clone()));
+            return Err(HostRefusal::DoorNotSocket(p.clone()));
         }
     }
     let s = |p: &Path| p.to_string_lossy().into_owned();
@@ -184,6 +210,9 @@ pub fn plan(
     if let Some(door) = &ns.model_door {
         argv.extend(["--bind".into(), s(door), s(door)]);
         argv.extend(["--setenv".into(), MODEL_SOCKET_ENV.into(), s(door)]);
+    }
+    for sock in &ns.sockets {
+        argv.extend(["--bind".into(), s(sock), s(sock)]);
     }
     argv.extend([
         "--chdir".into(),
@@ -395,9 +424,7 @@ mod tests {
     fn fixture(program: &str, model_door: Option<PathBuf>) -> (Permit, Command, NamespacePlan) {
         let permit = Permit::mint(
             ReceiptId("r-1".into()),
-            SpawnScope {
-                programs: vec![p(program)],
-            },
+            SpawnScope::of_programs(vec![p(program)]),
         );
         let cmd = Command {
             program: p(program),
@@ -410,9 +437,81 @@ mod tests {
             ro_binds: vec![p("/usr"), p("/lib")],
             work_dir: p("/work"),
             model_door,
+            sockets: vec![],
             timeout: Duration::from_secs(5),
         };
         (permit, cmd, ns)
+    }
+
+    /// The no-door fixture with `sock` listed in the plan and, when `permitted`, in the permit.
+    fn socket_fixture(sock: &Path, permitted: bool) -> (Permit, Command, NamespacePlan) {
+        let (_, cmd, mut ns) = fixture("/usr/bin/true", None);
+        let permit = Permit::mint(
+            ReceiptId("r-s".into()),
+            SpawnScope {
+                programs: vec![p("/usr/bin/true")],
+                sockets: if permitted { vec![sock.into()] } else { vec![] },
+            },
+        );
+        ns.listed_mounts.push(sock.into());
+        ns.sockets = vec![sock.into()];
+        (permit, cmd, ns)
+    }
+
+    #[test]
+    fn listed_socket_is_bound_rw() -> R {
+        let (_l, d) = door("sock-rw")?;
+        let (permit, cmd, ns) = socket_fixture(&d, true);
+        let sp = plan(&permit, cmd, ns)?;
+        let d = d.display();
+        let want = format!(
+            "--unshare-all --unshare-net --die-with-parent --new-session --ro-bind /usr /usr \
+             --ro-bind /lib /lib --bind /work /work --bind {d} {d} --chdir /work -- /usr/bin/true --x"
+        );
+        println!("argv: bwrap {}", sp.argv.join(" "));
+        assert_eq!(sp.argv.join(" "), want);
+        assert!(!sp.argv.iter().any(|a| a == "--setenv"));
+        let _ = std::fs::remove_file(d.to_string());
+        Ok(())
+    }
+
+    #[test]
+    fn socket_not_in_permit_is_refused() -> R {
+        let (_l, d) = door("sock-permit")?;
+        let (permit, cmd, ns) = socket_fixture(&d, false);
+        let id = permit.id();
+        assert_eq!(
+            plan(&permit, cmd, ns),
+            Err(HostRefusal::OutOfScope(id, d.clone()))
+        );
+        let _ = std::fs::remove_file(&d);
+        Ok(())
+    }
+
+    #[test]
+    fn socket_that_is_a_directory_is_refused() -> R {
+        let dir = std::env::temp_dir().join(format!("hee4-spawn-{}-sockdir", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let (permit, cmd, ns) = socket_fixture(&dir, true);
+        assert_eq!(
+            plan(&permit, cmd, ns),
+            Err(HostRefusal::DoorNotSocket(dir.clone()))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn socket_not_listed_is_refused() -> R {
+        let (_l, d) = door("sock-unlisted")?;
+        let (permit, cmd, mut ns) = socket_fixture(&d, true);
+        ns.listed_mounts.retain(|m| m != &d);
+        assert_eq!(
+            plan(&permit, cmd, ns),
+            Err(HostRefusal::UnlistedMount(d.clone()))
+        );
+        let _ = std::fs::remove_file(&d);
+        Ok(())
     }
 
     /// A real unix socket at a fresh temp path (the listener must outlive the plan call).
