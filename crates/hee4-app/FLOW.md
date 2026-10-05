@@ -1,14 +1,17 @@
 # hee4-app flow
 
-K6. The `hee4` binary: startup order, the control socket, eight actions (one a stream), the synchronous
-dispatcher, `doctor`. Defines no contract type; every state change is `Store::admit` or
-`Store::apply`, and the only verdict is `hee4_evidence::decide_and_seal`'s.
+K6. The `hee4` binary: startup order, the control socket, the owner registry over the 22-id
+catalogue (eight ids served by three families plus `tools.*`, the rest refused `unavailable` by
+scope), the synchronous dispatcher, `doctor`. Defines no contract type; every state change is
+`Store::admit` or `Store::apply`, and the only verdict is `hee4_evidence::decide_and_seal`'s.
 
 ```
 hee4 serve --socket S --ledger L --work W
   Store::open(L)                      (resets recovery_complete=0)
   probe_workers(store, W)             /proc argv scan: <W>/<task> in a live argv → PidReused (R07), else Absent (R08)
   recovery::reconcile(store, probe)   findings → exit "recovery incomplete", never listens
+  Engine::new                         composed(): Registry::new over the families below (a RegistryFault is ServeError::Compose, never listens)
+  registry.on_serve_start(engine)     every family's hook in registration order; the first Err is ServeError::Start, never listens
   dispatcher thread                   loop { step(); sleep 100 ms when idle }
   socket::bind(S)                     dir 0700 (owner = our uid), stale socket removed only if nothing answers, socket 0600
   socket::serve                       one thread per connection, at most 256 open (the next is refused too_many_connections, no thread); SO_PEERCRED uid ≠ ours → one `forbidden` frame, close;
@@ -17,23 +20,60 @@ hee4 serve --socket S --ledger L --work W
 
 ## Frame
 
-Request (one line): `{"request_id": str, "action": str, "action_version": 1, "idempotency_key": str|null, "body": {}}`.
-Other API Map envelope members are ignored by the skeleton. Reply (one line):
+Request (one line): `{"request_id": str, "action": str, "action_version": 1, "idempotency_key": str|null, "precondition": null|{resource, id, generation}, "body": {}}`.
+Other API Map envelope members are ignored. `precondition` is parsed once in `wire::parse`: absent
+or null is none; an object with exactly `resource` (string), `id` (string) and `generation`
+(unsigned integer) is one; any other shape is `invalid_argument` at `/precondition`. Reply (one line):
 `{"kind":"result","request_id","replayed","body"}` or
-`{"kind":"error","request_id","code","retry","field","message"}`. A line over 1,048,576 bytes or
+`{"kind":"error","request_id","code","retry","field","message"}` plus `because`,
+`current_generation` and `readback` only when set, and `"effect":"unknown"` only for
+`effect_unknown` (the member list is `wire::ERROR_MEMBERS`). A line over 1,048,576 bytes or
 EOF inside a line closes the connection with no reply; a line over the bound is answered
 `frame_too_large` first, then closed (Socket and IPC Map).
+
+## Families
+
+The catalogue is `hee4_contracts::catalogue`; dispatch is `catalogue::find` then
+`Registry::get(owner)`; the registry miss is the one `unavailable` site. Dispatch order, exactly:
+`wire::parse` → `catalogue::find` (else `unknown_action` at `/action`) → `action_version` ≠ 1
+(`unsupported_action_version`) → `Registry::get(entry.owner)` miss (`unavailable` at `/action`,
+`because` = `entry.scope.because()`) → `entry.effect.mutates()`: `idempotency_key` required, then
+`not_ready` while `recovery_complete` is false → `PreconditionRule::Required(resource)` with no
+`precondition` (`invalid_argument` at `/precondition` naming the resource) → the handler.
+`Registry::new` (built once in `Engine::new`, `actions::composed()`) refuses a held owner
+(`Judge`, `Deploy`), a duplicate owner, an id the catalogue does not carry, and an owner mismatch,
+by typed name; so a registered id always has a handler.
+
+| Module | Family | Owner | Scope | Ids | Hook |
+|---|---|---|---|---|---|
+| `actions/task.rs` | `HEALTH` | `App` | v4.0 | `health` | none |
+| `actions/task.rs` | `FAMILY` | `Task` | v4.0 | `task.submit`, `task.get`, `task.list`, `task.cancel`, `task.preview`, `task.resolve` | none |
+| `actions/task.rs` | `EVENTS` | `Notify` | v4.0 | `events.subscribe` | none |
+| `actions/tools.rs` | `FAMILY` | `Actions` | v4.0 | `tools.list`, `tools.inspect` | none |
+
+Unregistered owners (`Roster` v4.1; `Service`, `Cohort`, `Numerical` v4.2; `Judge` held) have no
+module: their ids are catalogued, listed by `tools.list`, inspected by `tools.inspect`, and refused
+`unavailable` on invocation. Wave-2 families add one line to `composed()` and nothing in `lib.rs`.
 
 | Action | Body | Result body | Door |
 |---|---|---|---|
 | `health` | `{}` | `{ok, head_sha, recovery_complete, uptime_s}` | `Store::recovery_complete` |
+| `tools.list` | `{query: null\|string ≤ 256 bytes, page: {limit 1..100, cursor}}` | `{catalogue_revision, page: {items: [{id, version, purpose, effect}], cursor}}`; items = entries whose id or purpose contains `query`, sorted by id, keyset-paged (`actions/page.rs`; cursor `{after_key, boot, filter_sha256}` pinned to `Engine::boot` and the query digest) | `catalogue::CATALOGUE`, `revision()`; no store |
+| `tools.inspect` | `{action, version}` | `{action, version, purpose, effect, request_schema_sha256, result_schema_sha256, error_schema_sha256, max_request_bytes, max_deadline_ms, readback_action}`; the digests are descriptor digests (SHA-256 over canonical `{action, version, fields}`); a held id inspects as a result | `catalogue::find`; no store |
 | `task.submit` | `{brief: "<eleven fields>"}` + `idempotency_key` | `{task_id, phase}`; `replayed` | `Brief::parse` + `check_restatement`, then `Store::admit` |
 | `task.get` | `{task_id}` | `{task_id, phase, events, last_receipt_hash}` | `Store::phase`, `history`, `chain_head` |
 | `task.list` | `{}` | `{tasks: [{task_id, phase}]}` | `Store::task_ids`, `phase` |
 | `task.cancel` | `{task_id}` + `idempotency_key` | `{task_id, phase}` | `Store::apply(Event::Cancel)` |
 | `task.preview` | `{brief}` | `{eligible: true, model}` or `{eligible: false, refusal, message}` | `Brief::parse` + `check_restatement` + `dispatcher::route` (`route::select`); admits nothing |
-| `task.resolve` | `{task_id, resolution: "quarantine"\|"abandon", reason?}` + `idempotency_key` | `{task_id, phase}` | `Store::apply(Event::Resolve(..))`; `reason` is a typed wire string from `actions.rs` `ABANDON_REASONS` / `effect_unknown_permanent_r01..r14` (default `attempt_failed` / `_r10`); an unknown one is `invalid_argument` |
+| `task.resolve` | `{task_id, resolution: "quarantine"\|"abandon", reason?}` + `idempotency_key` | `{task_id, phase}` | `Store::apply(Event::Resolve(..))`; `reason` is a typed wire string from `actions/task.rs` `ABANDON_REASONS` / `effect_unknown_permanent_r01..r14` (default `attempt_failed` / `_r10`); an unknown one is `invalid_argument` |
 | `events.subscribe` | `{since_seq: u64\|null}` | ack `{since_seq, stream:"events"}`, then the stream below | read-only SQLite connection + `Store::history` |
+
+Families notes: `tools.inspect` of an unknown id is `unknown_action` at `/body/action` (Error map
+F-2, the one `catalogue::find` site; `tools.inspect.md` left it UNWRITTEN against API Map A-03
+`not_found`: DC proposal, the feature file edit belongs to drive-completion). The CLI is
+`hee4 <action> [--key K] [--body JSON | --body-file F] [--precondition JSON] [--socket P]` for any
+catalogued id, the five positional forms unchanged; an uncatalogued action is exit 2 naming the
+catalogue. `hee4 --version` prints `hee4 <VERSION> <head12> catalogue=<revision12>`.
 
 `head_sha` is baked by `build.rs`: env `HEE4_HEAD` (40 hex; the gate sets it, its export has no `.git`), else `git rev-parse HEAD`, else `unknown` (the dispatcher refuses to dispatch on `unknown`).
 
@@ -44,8 +84,8 @@ The brief text is written to `<W>/briefs/<task>.brief` under the same ledger loc
 
 | Name | Retry | When | Field |
 |---|---|---|---|
-| `invalid_argument` | never | line not a JSON object; `request_id`/`action`/`action_version`/`body` missing or mistyped; mutating action without `idempotency_key`; brief missing a field, duplicate field, empty RESTATEMENT; bad `task_id`; `resolution` not quarantine/abandon; `reason` not in that resolution's table; `since_seq` not a u64 | the member's pointer (`/`, `/body/brief`, …) |
-| `unknown_action` | never | action not one of the eight | `/action` |
+| `invalid_argument` | never | line not a JSON object; `request_id`/`action`/`action_version`/`body` missing or mistyped; `precondition` of another shape than null or `{resource, id, generation}`; a `Required(resource)` action without one; mutating action without `idempotency_key`; `tools.list` `query` over 256 bytes or not a string, `page` not an object, `page.limit` outside 1..100, a malformed `page.cursor`; `tools.inspect` `action`/`version` missing or mistyped; brief missing a field, duplicate field, empty RESTATEMENT; bad `task_id`; `resolution` not quarantine/abandon; `reason` not in that resolution's table; `since_seq` not a u64 | the member's pointer (`/`, `/precondition`, `/body/brief`, `/body/page/limit`, …) |
+| `unknown_action` | never | action not in `catalogue::CATALOGUE` (`/action`); `tools.inspect` of an uncatalogued id (`/body/action`) | `/action`, `/body/action` |
 | `unsupported_action_version` | never | `action_version` ≠ 1 | `/action_version` |
 | `not_ready` | after_condition | mutating action while the ledger's `recovery_complete` is false | `/action` |
 | `conflict` | after_readback | same idempotency key, other body bytes; `transition` refused the cancel or the resolve | `/idempotency_key`, `/body/task_id` |
@@ -56,6 +96,11 @@ The brief text is written to `<W>/briefs/<task>.brief` under the same ledger loc
 | `slow_consumer` | after_condition | `events.subscribe`: the subscriber is 256 frames behind; `{"kind":"close",…}` frame, then close. Best effort: written with a 200 ms write deadline; if the peer's socket buffer is full the frame is not delivered, the server logs `slow_consumer close frame not delivered`, and the client sees EOF | — |
 | `frame_too_large` | never | a request line over 1,048,576 bytes; error frame, then close | `/` |
 | `too_many_connections` | after_condition | 256 connections already open; error frame written from the accept loop before any thread is spawned, then close | `/` |
+| `unavailable` | after_condition | the registry miss in `dispatch`: the action is catalogued but its owner is not registered in this release; `because` is the scope's text (v4.0 "owner not composed", v4.1 the roster family, v4.2 the service/cohort/numerical families, held "H-8") | `/action` |
+| `stale_generation` | never | no emitter in this release; reserved for the roster/service/task families (`precondition.generation` behind the resource's; `current_generation` set) | `/precondition` |
+| `resync_required` | never | `tools.list`: a page cursor from another `Engine::boot` (`because` "epoch moved") or another query digest ("filter moved"); reserved for the roster/service/task families' listings | `/body/page/cursor` |
+| `resource_exhausted` | same_exact_request | no emitter in this release; reserved for the roster/service/task families (a bound on work or storage reached) | `/` |
+| `effect_unknown` | after_readback | no emitter in this release; reserved for the roster/service/task families (`readback` names the read that settles it; frame carries `effect: "unknown"`) | `/` |
 
 `wire::tests::every_emittable_refusal_has_one_row_in_flow` parses this table and asserts its names
 equal `wire::Code::ALL`, each once. The API Map names the queue overflow `queue_limit` (A-10);
@@ -124,3 +169,10 @@ three threads. Resume with `since_seq` = the last `seq` received: exactly-once b
 - A bwrap child can outlive `kill -9` of `hee4` (re-parented to the user manager; seen in 2 of 7
   runs of `tests/e2e.rs`). The probe names it R07; nothing kills it in-process. Under the unit,
   `KillMode=control-group` kills it before restart.
+- `task.cancel.md:9` and `task.resolve.md:10` say `precondition` is required in the v4 design; the
+  deployed skeleton takes none (`task.cancel.md:49`, `tools/drive` `d_cancel` sends none), so their
+  catalogue `PreconditionRule` is `None` at this release (DC proposal; the feature files are
+  drive-completion's).
+- `Engine::boot` (the page-cursor epoch) is unix nanoseconds drawn once in `Engine::new`;
+  K1-store-foundation's `Store::boot()` replaces the source in a later wave (one line in
+  `actions/mod.rs`, `page.rs` unchanged).
