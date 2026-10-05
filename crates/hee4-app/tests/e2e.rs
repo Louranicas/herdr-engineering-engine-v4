@@ -625,6 +625,49 @@ fn a_budgets_refusal_names_the_field_and_serve_does_not_listen() -> R<()> {
     Ok(())
 }
 
+/// `attempt.deadline_ms` bounds every step: under a 500 ms deadline a brief whose TIMEBOX is
+/// 60 s runs `/usr/bin/sleep 3`, the step is killed at the deadline, and the task ends `failed`
+/// with its attempt settled `not_ready`, well before the sleep would have finished.
+#[test]
+fn a_step_that_outlives_attempt_deadline_ms_is_killed_at_the_deadline() -> R<()> {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("e2e-deadline");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir)?;
+    let file = dir.join("budgets.json");
+    fs::write(&file, r#"{"attempt":{"deadline_ms":500}}"#)?;
+    let mut server = start_with(&dir, "serve.log", false, &[("HEE4_BUDGETS", &file)])?;
+    let t0 = Instant::now();
+    let t = call(
+        &server.sock,
+        "task.submit",
+        Some("key-deadline"),
+        json!({ "brief": brief("/usr/bin/sleep 3") }),
+    )?;
+    assert_eq!(t["kind"], "result", "{t}");
+    let id = t["body"]["task_id"].clone();
+    let task = id.as_str().ok_or("id")?.to_owned();
+    let mut trace = vec!["admitted".to_owned()];
+    let done = poll(&server.sock, &id, |p| TERMINAL.contains(&p), &mut trace)?;
+    let took = t0.elapsed();
+    let log = fs::read_to_string(dir.join("serve.log"))?;
+    println!(
+        "MEASURED deadline task {task} trace {} took={took:?}",
+        trace.join(" -> ")
+    );
+    assert_eq!(done["body"]["phase"], "failed", "{done}\n{log}");
+    assert!(took < Duration::from_millis(2500), "took {took:?}\n{log}");
+    let (_, _, _, state, _, outcome) =
+        attempt_row(&dir.join("ledger.sqlite3"), &format!("a-{task}-1"))?.ok_or("no row")?;
+    assert_eq!(
+        (state.as_str(), outcome.as_deref()),
+        ("settled", Some("not_ready")),
+        "{log}"
+    );
+    server.child.kill()?;
+    server.child.wait()?;
+    Ok(())
+}
+
 /// `true` when the contracts' attempt budget carries `max_generations` (the repair leg's bound).
 fn max_generations_present() -> R<bool> {
     let attempt = serde_json::to_value(Budgets::DEFAULT)?["attempt"].clone();
