@@ -24,7 +24,7 @@ Firstmate is **L1, the outer loop**, and the collaboration layer of the roster. 
   - spawn naming an unrecorded brief → `brief_sha_unknown`.
   - spawn naming a brief of another unit → `brief_sha_unit_mismatch`.
   - a brief missing a `LABEL:` field or with summarised standing orders → `brief_field_missing=`, `standing_not_verbatim` (the shas are computed, never caller-typed); the same brief twice → `brief_already_recorded sha=<12hex> unit=<u>`.
-  - a VERIFY line that cannot fail → `verify_line_cannot_fail line=N shape=S`, in the `VERIFY:` field and in every `VERIFY (...):` section, inside the quoted argument of `bash -c`/`sh -c`/`env ... bash -c`, and in a prose-opener `( ... )` that holds `|`, `;`, `&&` or `||`.
+  - a VERIFY line that cannot fail → `verify_line_cannot_fail line=N shape=S`, in the `VERIFY:` field and in every `VERIFY (...):` section, inside the command string of `bash -c`/`sh -c`/`env [-u NAME] [-C DIR] [VAR=v] bash -c` (words after the string, such as `2>&1` or `_`, do not hide it), and in a prose-opener `( ... )` that holds `|`, `;`, `&&` or `||`.
   - a DB whose `schema_migrations` lacks a `schema/*.sql` file → `schema_behind=<file>` (exit 3) from every verb but `init`, before any write; the captain runs `fm-db init` on each home before a new migration merges.
   - `fm-db close-unit` refuses an open andon or a spawn without an exit (`spawn_without_exit`).
 

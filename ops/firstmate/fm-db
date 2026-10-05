@@ -198,10 +198,12 @@ VERIFY_SWALLOWERS = ("echo", "printf", "true", ":")              # each exits 0 
 VERIFY_DESCRIPTION = re.compile(r"^\(\s*(from|run from|the|each|every|all|in|on|with|expected|note|where|after|before|per|"
                                 r"using|judged|this|these|only)\b", re.IGNORECASE)
 SHELL_OPERATOR = re.compile(r"[|;]|&&")
-# `bash -c '...'`, `sh -lc "..."`, `env [-i] [VAR=v ...] bash -c '...'`, matched on the masked text: group 1 is the one
-# quoted argument (masked to `Q`s), whose raw text is judged as a VERIFY line of its own.
-SHELL_C = re.compile(r"^\s*(?:(?:\S*/)?env(?:\s+(?:-\S+|[A-Za-z_][A-Za-z0-9_]*=\S*))*\s+)?(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*"
-                     r"(?:\S*/)?(?:bash|sh)(?:\s+-[A-Za-z]+)*?\s+-[A-Za-z]*c[A-Za-z]*\s+(Q{2,})\s*$")
+# `bash -c '...'`, `sh -lc "..."`, `env [opts] [VAR=v ...] bash -c '...' [args] [redirections]`: read word by word on the
+# masked text by `_shell_c`. These env options take the next word as their argument (`-u NAME`, `-C DIR`, `-S STRING`).
+ENV_ARG_SHORT = "uCS"
+ENV_ARG_LONG = ("--unset", "--chdir", "--split-string")
+SHELLS = ("bash", "sh")
+ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 PIPEFAIL_ON = re.compile(r"(?:^|\s)-[A-Za-z]*o\s+pipefail\b")
 PIPEFAIL_OFF = re.compile(r"(?:^|\s)\+[A-Za-z]*o\s+pipefail\b")
 PIPESTATUS_READ = re.compile(r"^(exit|test|\[\[?)\s+.*\$\{PIPESTATUS\[[^\]]*\]\}")
@@ -244,12 +246,77 @@ def _description(bare: str, raw: str) -> bool:
     return raw.startswith("(") and raw.endswith(")") and bool(VERIFY_DESCRIPTION.match(raw)) and not SHELL_OPERATOR.search(bare)
 
 
+def _words(bare: str) -> list[tuple[int, int]]:
+    """(start, end) of each whitespace-separated word of the masked text; a quoted word is one word because it is masked."""
+    return [(m.start(), m.end()) for m in re.finditer(r"\S+", bare)]
+
+
+def _unquote(raw: str) -> str:
+    """One shell word's text: a word wholly inside one pair of quotes loses them; any other word is kept as written."""
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "'\"" and raw[0] not in raw[1:-1]:
+        return raw[1:-1]
+    return raw
+
+
 def _shell_c(bare: str, raw: str) -> set[str]:
-    """The shapes of the quoted argument when this command is `bash -c '...'` / `sh -c` / `env ... bash -c`; else none."""
-    m = SHELL_C.match(bare)
-    if not m:
+    """The shapes of the command string when this command is `bash -c '...'` / `sh -c` / `env ... bash -c`; else none.
+
+    Leading `VAR=v` words and an `env` prefix (its options, the argument of `-u`/`-C`/`-S`/`--unset`/`--chdir`, and its
+    `VAR=v` words) are skipped. The shell's first non-option word after a `-c` cluster is the command string; words after
+    it (`2>&1`, `_`, positional arguments) are not part of it. `env -S STRING` is itself a command line and is read the same
+    way. `bash -o pipefail -c '...'` judges the string with pipefail on."""
+    words = [(bare[a:b], raw[a:b]) for a, b in _words(bare)]
+    i = 0
+    while i < len(words) and ASSIGNMENT.match(words[i][0]):
+        i += 1
+    if i < len(words) and os.path.basename(words[i][0]) == "env":
+        i += 1
+        while i < len(words) and words[i][0].startswith("-") and words[i][0] != "-":
+            w, wr = words[i]
+            i += 1
+            if w == "--":
+                break
+            split = None
+            if w.startswith("--"):
+                if w in ENV_ARG_LONG and i < len(words):
+                    split, i = (words[i][1] if w == "--split-string" else None), i + 1
+                elif w.startswith("--split-string="):
+                    split = wr.split("=", 1)[1]
+            else:
+                for k, ch in enumerate(w[1:], start=1):
+                    if ch in ENV_ARG_SHORT:
+                        if k + 1 < len(w):
+                            split = wr[k + 1:]
+                        elif i < len(words):
+                            split, i = words[i][1], i + 1
+                        if ch != "S":
+                            split = None
+                        break
+            if split is not None:                                     # `-S STRING`: the rest of the command is that string
+                inner = _unquote(split) + " " + " ".join(r for _, r in words[i:])
+                return _shell_c(_mask(inner), inner)
+        while i < len(words) and ASSIGNMENT.match(words[i][0]):
+            i += 1
+    if i >= len(words) or os.path.basename(words[i][0]) not in SHELLS:
         return set()
-    return set(verify_cannot_fail(raw[m.start(1) + 1:m.end(1) - 1]))
+    i += 1
+    has_c, pipefail = False, False
+    while i < len(words) and words[i][0][:1] in "-+" and len(words[i][0]) > 1 and words[i][0] != "--":
+        w = words[i][0]
+        i += 1
+        if w.startswith("--"):
+            continue
+        if w[1:].endswith("o") and i < len(words):                    # `-o NAME` / `+o NAME` / `-eo NAME`
+            if words[i][0] == "pipefail":
+                pipefail = w[0] == "-"
+            i += 1
+        has_c = has_c or (w[0] == "-" and "c" in w[1:])
+    if i < len(words) and words[i][0] == "--":
+        i += 1
+    if not has_c or i >= len(words):
+        return set()
+    inner = _unquote(words[i][1])
+    return set(verify_cannot_fail(("set -o pipefail; " if pipefail else "") + inner))
 
 
 def _pipefail(bare: str, on: bool) -> bool:
@@ -299,8 +366,8 @@ def verify_cannot_fail(line: str) -> list[str]:
     What is judged: a markdown bullet (`- `, `* `, `1. `) and a backtick wrapper are stripped; quoted text and `$(..)` are
     masked; an unquoted `#` at the start or after whitespace starts a comment, which is dropped; a whole line `( ... )`
     that opens with a prose word (VERIFY_DESCRIPTION: `(from the worktree root)`) and holds no unquoted `|`, `;`, `&&` or
-    `||` is a description and is not judged, and any other parenthesised text is a subshell, judged as a command. The one
-    quoted argument of `bash -c`, `sh -c` or `env ... bash -c` is judged as a line of its own, recursively. A trailing annotation after two or more spaces,
+    `||` is a description and is not judged, and any other parenthesised text is a subshell, judged as a command. The command
+    string of `bash -c`, `sh -c` or `env [options] [VAR=v] bash -c` is judged as a line of its own, recursively (`_shell_c`). A trailing annotation after two or more spaces,
     `x  (rc=0; ...)`, is cut off, and the line before it and the annotation (unless a description) are judged apart.
 
     How: `a; b` exits with b, so only the last `;` command counts; in it every `&&`/`||` part must carry its status to

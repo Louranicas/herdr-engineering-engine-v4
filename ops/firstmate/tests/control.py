@@ -292,7 +292,14 @@ def main() -> int:
                                      ("described-pipeline", "(from the worktree root; cargo test --offline | tail -1)",
                                       "shape=pipe_into_tail_head"),
                                      ("bash-c", "bash -c 'cargo test --offline | tail -1'", "shape=pipe_into_tail_head"),
-                                     ("env-bash-c", "env RUST_LOG=off bash -c 'cargo test --offline || true'", "shape=or_true")):
+                                     ("env-bash-c", "env RUST_LOG=off bash -c 'cargo test --offline || true'", "shape=or_true"),
+                                     # env options that take the next word, and words after the command string
+                                     ("env-u-bash-c", "env -u FM_DB bash -c 'cargo test --workspace | tail -1'",
+                                      "shape=pipe_into_tail_head"),
+                                     ("env-C-bash-c", "env -C /tmp bash -c 'cargo test --workspace | tail -1'",
+                                      "shape=pipe_into_tail_head"),
+                                     ("bash-c-redirect", "bash -c 'cargo test --offline | tail -1' 2>&1", "shape=pipe_into_tail_head"),
+                                     ("bash-c-positional", "bash -c 'cargo test --offline | tail -1' _", "shape=pipe_into_tail_head")):
                 text = brief_text(verify=["python3 ops/firstmate/tests/control.py", bad])
                 n = text.splitlines().index(bad) + 1
                 p = w.brief_file(text)
@@ -308,7 +315,8 @@ def main() -> int:
                                ("plain", "cargo fmt --all --check"),
                                ("subshell-can-fail", "(cd tools/tests && python3 -m unittest discover -s . -p 'test_*.py')"),
                                ("described", "(from the worktree root, each line judged by its own exit code)"),
-                               ("bash-c-can-fail", "bash -c 'cargo test --offline | grep -q \"test result: ok\"'")):
+                               ("bash-c-can-fail", "bash -c 'cargo test --offline | grep -q \"test result: ok\"'"),
+                               ("bash-o-pipefail-c", "bash -o pipefail -c 'cargo test --offline | tail -1' 2>&1")):
                 p = w.brief_file(brief_text(verify=[good]))
                 rc, j = w.fm("record", "brief", "--unit", "U1", "--path", str(p), "--head-sha", HEAD)
                 case(f"brief-verify-{name}", "quiet", rc, j, 0, None)
