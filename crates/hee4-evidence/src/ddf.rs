@@ -124,7 +124,8 @@ pub enum TaskObservation {
 ///   is `Err(Spawn)`;
 /// - a run past `budget` → `Observed` with [`timeout_observation`] (`Refused(timeout)` in
 ///   `decide`);
-/// - exit 7 → `Observed` with [`Outcome::Refused`]; a pass → `Observed`, bound to
+/// - exit 7 → `Observed` with [`Outcome::Refused`], `advisory: true` (the tool declined to
+///   rank; it does not gate the task); a pass → `Observed`, tier-0, bound to
 ///   `subject.input_sha256`.
 ///
 /// # Errors
@@ -185,7 +186,7 @@ fn on_disk(bin: &Path, path: Option<&std::ffi::OsStr>) -> bool {
 ///
 /// # Errors
 /// [`AdapterError`]; a run past `budget` is [`AdapterError::Timeout`]. Exit 7 is not an error:
-/// it is a tier-0 observation with [`Outcome::Refused`].
+/// it is an advisory observation with [`Outcome::Refused`].
 pub fn observe(
     diff: &[u8],
     subject: &Subject,
@@ -230,9 +231,15 @@ pub fn timeout_observation(
 /// The longest reason kept, below `RefusalText`'s 512-byte cap.
 const REASON_MAX: usize = 500;
 
-/// The tier-0 observation for exit 7: outcome `Refused{reason}` (the first stderr line, control
-/// characters dropped, cut to [`REASON_MAX`] bytes; a fixed sentence when nothing is left), one
-/// evidence item (the digest of all of stderr). `decide` maps it to `Refused(Invalid)`.
+/// The advisory observation for exit 7: outcome `Refused{reason}` (the first stderr line,
+/// control characters dropped, cut to [`REASON_MAX`] bytes; a fixed sentence when nothing is
+/// left), one evidence item (the digest of all of stderr).
+///
+/// Advisory because deep-diff-forge adds evidence, it does not gate: exit 7 is the tool
+/// declining to rank (`--require-files`, `--require-hunks`, an unparsable patch), and a
+/// mode-only, rename-only or binary-add diff is a legitimate candidate it cannot rank
+/// (MEASURED: all three exit 7 "0 hunks in input"). `decide` ignores an advisory row, so the
+/// task's verdict comes from its tier-0 observations; the reason is still sealed in `observed`.
 fn refused_observation(
     stderr_line: &str,
     stderr: &[u8],
@@ -262,7 +269,7 @@ fn refused_observation(
             label: "refusal".parse().map_err(bad)?,
             sha256: Sha256Hex::digest(stderr),
         }],
-        advisory: false,
+        advisory: true,
         elapsed_ms,
         budget_ms: u64::try_from(budget.as_millis()).unwrap_or(u64::MAX),
     })

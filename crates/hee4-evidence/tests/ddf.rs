@@ -289,8 +289,28 @@ fn an_empty_ranking_is_an_error_not_a_skip() {
     assert!(matches!(got, Err(AdapterError::LookedAtNothing)), "{got:?}");
 }
 
+/// The tier-0 Pass the stub produces for `subject()`: the companion that shows an advisory
+/// refusal does not gate.
+fn stub_pass() -> hee4_contracts::Observation {
+    let got = ddf::for_task_with(
+        &stub("ddf-pass.sh"),
+        Diff::Bytes(FIXTURE),
+        &subject(),
+        &TestClock::new(0),
+        BUDGET,
+    );
+    let Ok(TaskObservation::Observed(o)) = got else {
+        panic!("expected Observed, got {got:?}");
+    };
+    assert!(!o.advisory);
+    o
+}
+
+/// Exit 7 is the tool declining to rank, not a defect of the candidate: the observation is
+/// advisory. Alone it is the floor (`Refused(invalid)`: no tier-0 row); beside a tier-0 Pass
+/// it moves nothing.
 #[test]
-fn exit_7_through_the_task_shape_is_observed_refused() {
+fn exit_7_through_the_task_shape_is_an_advisory_refusal_that_does_not_gate() {
     let got = ddf::for_task_with(
         &stub("ddf-exit7-silent.sh"),
         Diff::Bytes(FIXTURE),
@@ -308,46 +328,70 @@ fn exit_7_through_the_task_shape_is_observed_refused() {
         reason.as_str(),
         "deep-diff-forge exited 7 without a message"
     );
-    assert!(!o.advisory);
+    assert!(o.advisory);
+    assert_eq!(labels(&o), ["refusal"]);
+    assert_eq!(
+        decide(&all_wired(), std::slice::from_ref(&o), &subject()).verdict,
+        Verdict::Refused(Reason::Invalid)
+    );
+    assert_eq!(
+        decide(&all_wired(), &[o, stub_pass()], &subject()).verdict,
+        Verdict::Pass
+    );
 }
 
+/// Diffs git emits with files but no hunks (mode-only, rename-only, a binary add) and an
+/// empty or unparsable patch all exit 7 under the real tool (MEASURED, deep-diff-forge 0.2.1):
+/// each is `Observed(Refused)`, advisory, and a task with a tier-0 Pass still passes.
 #[test]
-fn exit_7_is_a_tier0_refused_observation_that_decides_invalid() {
+fn exit_7_on_hunkless_diffs_is_advisory_and_a_tier0_pass_still_passes() {
     if !present() {
         return;
     }
-    let pin = |n: &str| {
-        Identity::Wired(Source {
-            name: n.parse().unwrap(),
-            digest: Sha256Hex::digest(n.as_bytes()),
-        })
-    };
-    let ids = Identities {
-        collector: pin("c"),
-        locks: pin("l"),
-        standards: pin("s"),
-    };
-    for (diff, reason) in [
-        (b"diff --git a/x b/x\n".as_slice(), None),
+    let shapes: [(&str, &[u8], &str); 5] = [
         (
-            b"".as_slice(),
-            Some("refused: 0 files in input (--require-files)"),
+            "mode-only",
+            b"diff --git a/x b/x\nold mode 100644\nnew mode 100755\n",
+            "refused: 0 hunks in input (--require-hunks)",
         ),
-    ] {
-        let mut subject = subject();
-        subject.input_sha256 = Sha256Hex::digest(diff);
-        let o = ddf::observe(diff, &subject, &TestClock::new(0), BUDGET).unwrap();
-        assert!(!o.advisory);
-        let Outcome::Refused { reason: got } = &o.outcome else {
-            panic!("expected Refused, got {:?}", o.outcome);
+        (
+            "rename-only",
+            b"diff --git a/x b/y\nsimilarity index 100%\nrename from x\nrename to y\n",
+            "refused: 0 hunks in input (--require-hunks)",
+        ),
+        (
+            "binary-add",
+            b"diff --git a/i.png b/i.png\nnew file mode 100644\nindex 0000000..1234567\nBinary files /dev/null and b/i.png differ\n",
+            "refused: 0 hunks in input (--require-hunks)",
+        ),
+        (
+            "header-only",
+            b"diff --git a/x b/x\n",
+            "refused: 0 hunks in input (--require-hunks)",
+        ),
+        (
+            "empty",
+            b"",
+            "refused: 0 files in input (--require-files)",
+        ),
+    ];
+    for (name, diff, want) in shapes {
+        let o = ddf::observe(diff, &subject(), &TestClock::new(0), BUDGET).unwrap();
+        assert!(o.advisory, "{name}");
+        let Outcome::Refused { reason } = &o.outcome else {
+            panic!("{name}: expected Refused, got {:?}", o.outcome);
         };
-        match reason {
-            Some(want) => assert_eq!(got.as_str(), want),
-            None => assert!(got.as_str().starts_with("refused: 0"), "{got}"),
-        }
+        assert_eq!(reason.as_str(), want, "{name}");
+        println!("MEASURED exit7 shape={name} reason={reason}");
         assert_eq!(
-            decide(&ids, &[o], &subject).verdict,
-            Verdict::Refused(Reason::Invalid)
+            decide(&all_wired(), std::slice::from_ref(&o), &subject()).verdict,
+            Verdict::Refused(Reason::Invalid),
+            "{name}: alone, the floor"
+        );
+        assert_eq!(
+            decide(&all_wired(), &[o, stub_pass()], &subject()).verdict,
+            Verdict::Pass,
+            "{name}: beside a tier-0 Pass"
         );
     }
 }
@@ -441,5 +485,5 @@ fn a_silent_exit_7_still_carries_a_reason() {
         reason.as_str(),
         "deep-diff-forge exited 7 without a message"
     );
-    assert!(!o.advisory);
+    assert!(o.advisory);
 }
