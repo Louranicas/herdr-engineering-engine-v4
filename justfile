@@ -255,6 +255,8 @@ cut-check:
     root="${HEE4_CUT_ROOT:-$HOME/.cache/hee4-cut}"
     sha=$(git rev-parse --verify -q 'HEAD^{commit}') || { echo "cut-check verdict=REFUSED reason=no_head"; exit 2; }
     s12=${sha:0:12}
+    # every run at this sha voids the earlier record first, a refused one included: no refusal leaves a PASS for `just tag`
+    rm -f "$root/$s12/cut-check.json" || { echo "cut-check verdict=FAIL reason=record_unremovable sha=$s12"; exit 1; }
     # the third field of `hee4 <VERSION> <head12> ...` (crates/hee4-app/src/main.rs), compared whole, never a substring
     bin=$(hee4 --version 2>/dev/null < /dev/null | awk '{print $3}')
     [[ "$bin" =~ ^[0-9a-f]{12}$ ]] || bin="UNMEASURED(hee4_--version)"

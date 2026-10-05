@@ -148,6 +148,33 @@ class TestPrune(unittest.TestCase):
         out = self.apply_with_build_after_plan("touch")
         self.assertIn(f"prune_keep path={os.path.join(self.root, 'hee4-target-busy')} reason=young", out)
 
+    def test_flocked_beyond_keep_gate_target_is_in_use_at_plan(self):
+        busy = os.path.join(self.gt, self.shas[4])
+        lock = os.path.join(busy, "debug", ".cargo-lock")
+        open(lock, "w").close()
+        with open(lock) as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            rc, out, cands = self.prune("--keep", "2", "--apply")
+        self.assertEqual(rc, 0, out)
+        self.assertIn(f"prune_keep path={busy} reason=in_use", out)
+        self.assertNotIn(busy, cands)
+        self.assertTrue(os.path.isdir(busy), out)
+        self.assertIn("removed=2 ", out)  # shas[2], shas[3]
+
+    def test_lock_taken_after_the_plan_keeps_a_beyond_keep_gate_target(self):
+        busy = os.path.join(self.gt, self.shas[4])
+        open(os.path.join(busy, "debug", ".cargo-lock"), "w").close()
+        env = {"HEE4_CACHE_ROOT": self.root, "CARGO_TARGET_DIR": os.path.join(self.root, "hee4-target-mine")}
+        rc, out, err = run(sys.executable, "-c", AFTER_PLAN, PRUNE, busy, "lock", "--repo", self.repo, "--keep", "2", "--apply", env=env)
+        cands = re.findall(r"^prune_candidate path=(\S+) ", out, re.M)
+        self.assertIn(busy, cands, out + err)  # the plan judged it unlocked
+        self.assertIn(f"prune_keep path={busy} reason=in_use", out)
+        self.assertTrue(os.path.isdir(busy), out + err)
+        for s in self.shas[2:4]:
+            self.assertFalse(os.path.exists(os.path.join(self.gt, s)), out + err)
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("removed=2 ", out)
+
 
 if __name__ == "__main__":
     unittest.main()
