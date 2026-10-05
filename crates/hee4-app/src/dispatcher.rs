@@ -473,8 +473,8 @@ enum Pick {
     Stop(TaskId),
 }
 
-/// The first `admitted` task, or `cancellation_requested` task with no open attempt, oldest
-/// id first. The attempt is open by `recovery::Facts`, the one derivation reconcile also reads.
+/// The first `admitted` task, or `cancellation_requested` task with no open attempt, lowest
+/// id first (`Store::task_ids` order; ids are digests, so this is not arrival order). The attempt is open by `recovery::Facts`, the one derivation reconcile also reads.
 fn next_task(engine: &Engine) -> Result<Option<Pick>, StoreError> {
     let store = engine.store();
     for task in store.task_ids()? {
