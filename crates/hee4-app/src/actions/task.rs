@@ -162,6 +162,7 @@ fn health(engine: &Engine) -> Reply {
             "schema_version": schema_version,
             "serve_cgroup": store.serve_cgroup(),
             "budgets": engine.budgets(),
+            "budgets_inert": crate::INERT_BUDGETS,
         }),
     ))
 }
@@ -520,6 +521,22 @@ mod tests {
         let parsed = hee4_contracts::Budgets::parse(&serde_json::to_string(budgets)?)?;
         assert_eq!(parsed, *e.budgets());
         assert_eq!(parsed, hee4_contracts::Budgets::DEFAULT);
+        assert_eq!(
+            health["body"]["budgets_inert"],
+            json!([
+                "attempt.ctx_tokens",
+                "ledger.busy_timeout_ms",
+                "ledger.checkpoint_every"
+            ])
+        );
+        // Each inert name is a real field: a rename in the contracts breaks this test.
+        let rendered = parsed.render();
+        for name in crate::INERT_BUDGETS {
+            assert!(
+                rendered.contains(&format!("{name}=")),
+                "{name} in {rendered}"
+            );
+        }
         Ok(())
     }
 

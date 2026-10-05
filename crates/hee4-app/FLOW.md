@@ -72,7 +72,7 @@ module: their ids are catalogued, listed by `tools.list`, inspected by `tools.in
 
 | Action | Body | Result body | Door |
 |---|---|---|---|
-| `health` | `{}` | `{ok, head_sha, recovery_complete, uptime_s, schema_version, serve_cgroup, budgets}`; `budgets` is `Engine::budgets` serialised, and re-parses through `Budgets::parse` (`hee4 doctor` row `budgets`, `tools/doctor` check `budgets`) | `Store::recovery_complete` |
+| `health` | `{}` | `{ok, head_sha, recovery_complete, uptime_s, schema_version, serve_cgroup, budgets, budgets_inert}`; `budgets` is `Engine::budgets` serialised, and re-parses through `Budgets::parse`; `budgets_inert` is `crate::INERT_BUDGETS`, the loaded fields nothing reads yet (`attempt.ctx_tokens`, `ledger.busy_timeout_ms`, `ledger.checkpoint_every`) (`hee4 doctor` row `budgets`, `tools/doctor` check `budgets`) | `Store::recovery_complete` |
 | `tools.list` | `{query: null\|string ≤ 256 bytes, page: {limit 1..100, cursor}}` | `{catalogue_revision, page: {items: [{id, version, purpose, effect}], cursor}}`; items = entries whose id or purpose contains `query`, sorted by id, keyset-paged (`actions/page.rs`; cursor `{after_key, boot, filter_sha256}` pinned to `Engine::boot` and the query digest) | `catalogue::CATALOGUE`, `revision()`; no store |
 | `tools.inspect` | `{action, version}` | `{action, version, purpose, effect, request_schema_sha256, result_schema_sha256, error_schema_sha256, max_request_bytes, max_deadline_ms, readback_action}`; the digests are descriptor digests (SHA-256 over canonical `{action, version, fields}`); a held id inspects as a result | `catalogue::find`; no store |
 | `task.submit` | `{brief: "<eleven fields>"}` + `idempotency_key` | `{task_id, phase}`; `replayed` | `Brief::parse` + `check_restatement`, then `Store::admit` |
@@ -194,7 +194,8 @@ three threads. Resume with `since_seq` = the last `seq` received: exactly-once b
 - Limits not on `Budgets` (kept by design): polling periods (`spawn.rs` 10 ms, `model_door.rs`
   5 ms), `DOOR_PATH_MAX` 107 (the kernel's), the store `busy_timeout` (K1's), `bounds.rs` token
   limits; the roster default `ctx_tokens: 32_768` lives in `actions/roster.rs` (not this slice's
-  file; `attempt.ctx_tokens` is not yet read).
+  file; `attempt.ctx_tokens` is not yet read). Every loaded field nothing reads is listed in `health`'s
+  `budgets_inert` (`crate::INERT_BUDGETS`), so the reply never reports it as applied.
 - `task.cancel.md:9` and `task.resolve.md:10` say `precondition` is required in the v4 design; the
   deployed skeleton takes none (`task.cancel.md:49`, `tools/drive` `d_cancel` sends none), so their
   catalogue `PreconditionRule` is `None` at this release (DC proposal; the feature files are
