@@ -129,10 +129,20 @@ impl PageIn {
                 match n {
                     Some(n) if (1..=MAX_PAGE_LIMIT).contains(&n) => n,
                     _ => {
+                        // Only an integer is reflected; any other value (a string, a float, an
+                        // object) is named by kind, never echoed (wire.rs `MAX_TEXT_BYTES`).
+                        let message = match v
+                            .as_i64()
+                            .map(i128::from)
+                            .or_else(|| v.as_u64().map(i128::from))
+                        {
+                            Some(n) => format!("limit {n} is not in 1..={MAX_PAGE_LIMIT}"),
+                            None => format!("limit must be an integer in 1..={MAX_PAGE_LIMIT}"),
+                        };
                         return Err(Fault::new(
                             Code::InvalidArgument,
                             "/body/page/limit",
-                            format!("limit {v} is not in 1..={MAX_PAGE_LIMIT}"),
+                            message,
                         ));
                     }
                 }
@@ -218,6 +228,21 @@ mod tests {
         assert_eq!(
             field(json!({"limit": "ten"})),
             Some((Code::InvalidArgument, "/body/page/limit"))
+        );
+        let echo = "x".repeat(1000);
+        let reflected = PageIn::parse(Some(&json!({"limit": echo})))
+            .err()
+            .map(|f| f.message)
+            .unwrap_or_default();
+        assert!(
+            reflected.len() <= hee4_contracts::bounds::MAX_TEXT_BYTES,
+            "{} bytes",
+            reflected.len()
+        );
+        assert!(!reflected.contains("xxx"), "{reflected}");
+        assert!(
+            reflected.contains(&MAX_PAGE_LIMIT.to_string()),
+            "{reflected}"
         );
         assert_eq!(
             field(json!({"cursor": 7})),
