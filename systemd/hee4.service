@@ -8,6 +8,7 @@ Documentation=file://%h/herdr-engineering-engine-v4/crates/hee4-app/FLOW.md
 Type=simple
 Environment=HEE4_LIVE_MODEL=1
 Environment=HEE4_MODEL=qwen2.5:0.5b
+# Environment=HEE4_BUDGETS=%h/.config/hee4/budgets.json
 ExecStart=%h/.local/bin/hee4 serve --socket %t/hee4/control.sock --ledger %h/.local/share/hee4/ledger.sqlite3 --work %h/.local/share/hee4/work
 Restart=on-failure
 RestartSec=2

@@ -1,5 +1,7 @@
 //! The control socket: a 0700 directory, a 0600 socket, one JSON frame per line each way.
 
+use hee4_contracts::Budgets;
+use serde_json::Value;
 use std::fs;
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
@@ -7,12 +9,9 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
-
-use serde_json::Value;
 
 use crate::actions::{Engine, Outcome, answer};
-use crate::wire::{self, Code, Fault, MAX_FRAME_BYTES};
+use crate::wire::{self, Code, Fault};
 
 /// Why the socket could not be bound.
 #[derive(Debug, thiserror::Error)]
@@ -111,9 +110,6 @@ pub fn bind(path: &Path) -> Result<UnixListener, BindError> {
     Ok(listener)
 }
 
-/// Concurrent connections served; the next is refused `too_many_connections`.
-pub const MAX_CONNECTIONS: usize = 256;
-
 /// Frees one connection slot when the serving thread ends, however it ends.
 struct Slot(Arc<AtomicUsize>);
 
@@ -123,18 +119,24 @@ impl Drop for Slot {
     }
 }
 
-/// Serve connections forever, one thread per connection, at most [`MAX_CONNECTIONS`] at once.
+/// Serve connections forever, one thread per connection, at most `socket.max_connections`
+/// (the engine's budgets) at once; the next is refused `too_many_connections`, no thread.
 pub fn serve(listener: &UnixListener, engine: &Arc<Engine>) {
+    let budget = engine.budgets().socket;
+    let cap = usize::try_from(budget.max_connections).unwrap_or(usize::MAX);
     let open = Arc::new(AtomicUsize::new(0));
     for conn in listener.incoming() {
         let Ok(mut stream) = conn else { continue };
-        if open.load(Ordering::Acquire) >= MAX_CONNECTIONS {
+        if open.load(Ordering::Acquire) >= cap {
             let fault = Fault::new(
                 Code::TooManyConnections,
                 "/",
-                format!("{MAX_CONNECTIONS} connections are open"),
+                format!(
+                    "{cap} connections are open (socket.max_connections={})",
+                    budget.max_connections
+                ),
             );
-            let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
+            let _ = stream.set_write_timeout(Some(budget.refusal_write()));
             let _ = stream.write_all(format!("{}\n", wire::error("", &fault)).as_bytes());
             continue;
         }
@@ -162,15 +164,16 @@ pub fn serve(listener: &UnixListener, engine: &Arc<Engine>) {
 }
 
 fn connection(peer: Admitted, engine: &Arc<Engine>) -> std::io::Result<()> {
+    let budget = engine.budgets().socket;
     let stream = peer.stream;
-    stream.set_read_timeout(Some(Duration::from_secs(60)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_read_timeout(Some(budget.read_deadline()))?;
+    stream.set_write_timeout(Some(budget.write_deadline()))?;
     let mut writer = stream.try_clone()?;
     let mut reader = BufReader::new(stream);
     loop {
         let mut line = String::new();
         let n = (&mut reader)
-            .take(MAX_FRAME_BYTES as u64 + 1)
+            .take(budget.frame_bytes.saturating_add(1))
             .read_line(&mut line)?;
         if n == 0 {
             return Ok(());
@@ -178,8 +181,15 @@ fn connection(peer: Admitted, engine: &Arc<Engine>) -> std::io::Result<()> {
         if !line.ends_with('\n') {
             // EOF inside a record closes silently; a full-bound read with no LF is oversize:
             // refuse by name, then close. Neither is dispatched.
-            if n > MAX_FRAME_BYTES {
-                let fault = Fault::new(Code::FrameTooLarge, "/", "request line over 1048576 bytes");
+            if u64::try_from(n).unwrap_or(u64::MAX) > budget.frame_bytes {
+                let fault = Fault::new(
+                    Code::FrameTooLarge,
+                    "/",
+                    format!(
+                        "request line over {} bytes (socket.frame_bytes)",
+                        budget.frame_bytes
+                    ),
+                );
                 writer.write_all(format!("{}\n", wire::error("", &fault)).as_bytes())?;
             }
             return Ok(());
@@ -201,7 +211,8 @@ fn connection(peer: Admitted, engine: &Arc<Engine>) -> std::io::Result<()> {
 /// IO, or a reply that is not JSON (reported as an `internal` fault frame).
 pub fn request(path: &Path, frame: &Value) -> std::io::Result<Value> {
     let mut stream = UnixStream::connect(path)?;
-    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    // The CLI reads no budgets file: the contracts' default client read deadline.
+    stream.set_read_timeout(Some(Budgets::DEFAULT.socket.client_read()))?;
     stream.write_all(format!("{frame}\n").as_bytes())?;
     let mut line = String::new();
     BufReader::new(stream).read_line(&mut line)?;

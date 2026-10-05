@@ -161,6 +161,8 @@ fn health(engine: &Engine) -> Reply {
             "uptime_s": engine.started.elapsed().as_secs(),
             "schema_version": schema_version,
             "serve_cgroup": store.serve_cgroup(),
+            "budgets": engine.budgets(),
+            "budgets_inert": crate::INERT_BUDGETS,
         }),
     ))
 }
@@ -316,6 +318,7 @@ fn preview(engine: &Engine, body: &Value) -> Reply {
         &client,
         wants_model && engine.cfg.live,
         &roster,
+        engine.budgets().model.tags_timeout(),
     ) {
         Ok(sel) => Ok((false, json!({"eligible": true, "model": sel.model}))),
         Err(r) => Ok((
@@ -502,6 +505,38 @@ mod tests {
             body["serve_cgroup"].as_str().is_some_and(|s| !s.is_empty()),
             "{body}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn health_carries_the_engine_budgets_and_they_re_parse_through_the_contracts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let e = engine("health-budgets")?;
+        let health = handle(
+            &e,
+            &wire::request("r", "health", None, json!({})).to_string(),
+        );
+        let budgets = &health["body"]["budgets"];
+        assert!(budgets.is_object(), "{health}");
+        let parsed = hee4_contracts::Budgets::parse(&serde_json::to_string(budgets)?)?;
+        assert_eq!(parsed, *e.budgets());
+        assert_eq!(parsed, hee4_contracts::Budgets::DEFAULT);
+        assert_eq!(
+            health["body"]["budgets_inert"],
+            json!([
+                "attempt.ctx_tokens",
+                "ledger.busy_timeout_ms",
+                "ledger.checkpoint_every"
+            ])
+        );
+        // Each inert name is a real field: a rename in the contracts breaks this test.
+        let rendered = parsed.render();
+        for name in crate::INERT_BUDGETS {
+            assert!(
+                rendered.contains(&format!("{name}=")),
+                "{name} in {rendered}"
+            );
+        }
         Ok(())
     }
 

@@ -8,9 +8,6 @@
 
 use serde_json::{Value, json};
 
-/// The longest frame read, in bytes (Socket and IPC Map "Bound").
-pub const MAX_FRAME_BYTES: usize = 1_048_576;
-
 /// Every member an error frame may carry, in emission order: what `tools.inspect` digests as the
 /// error schema descriptor.
 pub const ERROR_MEMBERS: [&str; 10] = [
@@ -50,7 +47,8 @@ pub enum Code {
     NoRoute,
     /// `events.subscribe`: the subscriber fell a full queue behind; the stream closes.
     SlowConsumer,
-    /// A request line was longer than [`MAX_FRAME_BYTES`]; the connection closes after this frame.
+    /// A request line was longer than the `socket.frame_bytes` budget; the connection closes after
+    /// this frame.
     FrameTooLarge,
     /// The server already holds its cap of concurrent connections.
     TooManyConnections,

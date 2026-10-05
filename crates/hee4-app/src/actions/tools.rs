@@ -94,7 +94,7 @@ fn list(engine: &Engine, req: &Request) -> Result<Answer, Fault> {
 /// `{action, version}` -> the entry in full. An unknown id is `unknown_action` at
 /// `/body/action` (Error map F-2; DC proposal in FLOW.md); a known id at another version is
 /// `unsupported_action_version` at `/body/version`.
-fn inspect(_engine: &Engine, req: &Request) -> Result<Answer, Fault> {
+fn inspect(engine: &Engine, req: &Request) -> Result<Answer, Fault> {
     let action = req
         .body
         .get("action")
@@ -130,7 +130,7 @@ fn inspect(_engine: &Engine, req: &Request) -> Result<Answer, Fault> {
             "request_schema_sha256": descriptor(entry.id, entry.request_fields),
             "result_schema_sha256": descriptor(entry.id, entry.result_fields),
             "error_schema_sha256": descriptor(entry.id, &wire::ERROR_MEMBERS),
-            "max_request_bytes": wire::MAX_FRAME_BYTES,
+            "max_request_bytes": engine.budgets().socket.frame_bytes,
             "max_deadline_ms": MAX_DEADLINE_MS,
             "readback_action": entry.readback_action,
         }),
@@ -275,7 +275,10 @@ mod tests {
         assert_eq!(reply["kind"], "result", "{reply}");
         assert_eq!(reply["body"]["effect"], "durable_admission");
         assert_eq!(reply["body"]["readback_action"], "task.get");
-        assert_eq!(reply["body"]["max_request_bytes"], wire::MAX_FRAME_BYTES);
+        assert_eq!(
+            reply["body"]["max_request_bytes"],
+            hee4_contracts::Budgets::DEFAULT.socket.frame_bytes
+        );
         assert_eq!(
             reply["body"]["max_deadline_ms"],
             hee4_contracts::bounds::MAX_DEADLINE_MS
