@@ -13,6 +13,8 @@ Rules (one finding line each, `finding rule=<R> path=<p> detail=<d>`):
                lint, or of `warnings`, outside crates/*/tests/** (test files may unwrap)
   R4 unreasoned  `#[allow(...)]` outside tests counted against [allows] src_unreasoned_max
   R5 flags     no .cargo/config(.toml) passing `--cap-lints` or `-A`
+  R6 gate      gate.toml's commit tier keeps every step in the floor's [gate] commit_steps, each
+               step is defined, and the clippy step keeps `-D warnings`
 Last line: `lint-ratchet verdict=PASS|FAIL lints=k/n crates_inherit=a/b deny_off=d src_unreasoned=u/max findings=f`
 Exit 0 PASS, 1 FAIL, 2 refused (no Cargo.toml, no crates, unreadable floor, unknown level).
 --control: plants one weakening per rule into an in-memory copy of the live tree; each must be
@@ -39,6 +41,8 @@ def load_world(repo):
     if not os.path.isfile(os.path.join(repo, "Cargo.toml")):
         die(f"no Cargo.toml under {repo}")
     take("Cargo.toml")
+    if os.path.isfile(os.path.join(repo, "gate.toml")):
+        take("gate.toml")
     for name in (".cargo/config.toml", ".cargo/config"):
         if os.path.isfile(os.path.join(repo, name)):
             take(name)
@@ -123,6 +127,18 @@ def check(world, floor):
     for name in (".cargo/config.toml", ".cargo/config"):
         if name in world and re.search(r"--cap-lints|[\"']-A", world[name]):
             findings.append(("R5", name, "rustflags weaken lints"))
+    want = list((floor.get("gate") or {}).get("commit_steps") or [])
+    if want:
+        gate = tomllib.loads(world.get("gate.toml", ""))
+        have = ((gate.get("tier") or {}).get("commit") or {}).get("steps") or []
+        steps = gate.get("step") or {}
+        for name in want:
+            if name not in have:
+                findings.append(("R6", "gate.toml", f"commit tier lacks step={name}"))
+            elif name not in steps:
+                findings.append(("R6", "gate.toml", f"step={name} undefined"))
+        if "clippy" in want and "-D warnings" not in (steps.get("clippy") or {}).get("cmd", ""):
+            findings.append(("R6", "gate.toml", "clippy step without -D warnings"))
     summary = dict(lints=f"{met}/{total}", crates_inherit=f"{inherit}/{len(manifests)}",
                    deny_off=deny_off, src_unreasoned=f"{unreasoned}/{cap}")
     return findings, summary
@@ -160,6 +176,13 @@ def plants(world):
     w = dict(world)
     w[".cargo/config.toml"] = '[build]\nrustflags = ["--cap-lints", "warn"]\n'
     out.append(("cap-lints in .cargo/config.toml", "R5", w))
+    if "gate.toml" in world:
+        w = dict(world)
+        w["gate.toml"] = re.sub(r'"deps",\s*', "", w["gate.toml"], count=1)
+        out.append(("commit tier drops the deps step", "R6", w))
+        w = dict(world)
+        w["gate.toml"] = w["gate.toml"].replace(" -- -D warnings", "", 1)
+        out.append(("clippy step loses -D warnings", "R6", w))
     return out
 
 
@@ -193,6 +216,9 @@ def main():
     findings, s = check(world, floor)
     for rule, path, detail in findings:
         print(f"finding rule={rule} path={path} detail={detail}")
+    used, cap = (int(x) for x in s["src_unreasoned"].split("/"))
+    if used < cap:
+        print(f"hint src_unreasoned={used} below max={cap}: lower [allows] src_unreasoned_max in tools/lint-floor.toml to {used}")
     v = "FAIL" if findings else "PASS"
     print(f"lint-ratchet verdict={v} lints={s['lints']} crates_inherit={s['crates_inherit']} "
           f"deny_off={s['deny_off']} src_unreasoned={s['src_unreasoned']} findings={len(findings)}")

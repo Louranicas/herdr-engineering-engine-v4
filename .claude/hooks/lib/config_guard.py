@@ -20,9 +20,10 @@ from hee4_paths import edited_paths, emit, tree_of  # noqa: E402
 
 DOORS: tuple[tuple[str, str], ...] = (
     ("tools/lint-floor.toml", "the lint floor: lowering a row is the only way to weaken a lint (tools/lint-ratchet)"),
-    ("Cargo.toml", "workspace lints are checked against tools/lint-floor.toml by `tools/lint-ratchet`"),
+    ("Cargo.toml", "workspace lints and `publish = false` (checked by `tools/lint-ratchet` and the `deps` step)"),
     ("crates/*/Cargo.toml", "a crate must keep `[lints] workspace = true` (lint-ratchet R2)"),
-    ("gate.toml", "the gate, declared once: every tier and step (`tools/gate` is its only runner)"),
+    ("deny.toml", "the dependency policy of the `deps` step (cargo-deny: licenses, bans, sources)"),
+    ("gate.toml", "the gate, declared once; the commit tier keeps the floor's steps (lint-ratchet R6)"),
     ("layers.toml", "the layer classification read by `tools/layers` (apparatus_ratio)"),
     (".cargo/**", "rustflags here can cap or allow lints (lint-ratchet R5)"),
     ("rust-toolchain*", "the toolchain pin every gate step builds with"),

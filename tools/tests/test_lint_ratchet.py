@@ -90,6 +90,28 @@ class LintRatchetTests(unittest.TestCase):
         rc, _, err = ratchet(world({"crates/a/Cargo.toml": None}))
         self.assertEqual(rc, 2)
 
+    def test_gate_floor_steps_and_clippy_flag(self):
+        floor = FLOOR + '[gate]\ncommit_steps = ["lints", "clippy"]\n'
+        good = ('[tier.commit]\nsteps = ["lints", "fmt", "clippy"]\n[step.lints]\ncmd = "x"\n'
+                '[step.fmt]\ncmd = "y"\n[step.clippy]\ncmd = "cargo clippy -- -D warnings"\n')
+        rc, out, _ = ratchet(world({"tools/lint-floor.toml": floor, "gate.toml": good}))
+        self.assertEqual(rc, 0, out)
+        cases = {"commit tier lacks step=lints": good.replace('"lints", ', ""),
+                 "step=lints undefined": good.replace('[step.lints]\ncmd = "x"\n', ""),
+                 "clippy step without -D warnings": good.replace(" -- -D warnings", "")}
+        for detail, body in cases.items():
+            rc, out, _ = ratchet(world({"tools/lint-floor.toml": floor, "gate.toml": body}))
+            self.assertEqual(rc, 1, detail)
+            self.assertIn(f"finding rule=R6 path=gate.toml detail={detail}", out)
+        rc, out, _ = ratchet(world({"tools/lint-floor.toml": floor}))
+        self.assertIn("detail=commit tier lacks step=lints", out)
+
+    def test_slack_under_the_cap_prints_the_lower_value(self):
+        rc, out, _ = ratchet(world({"tools/lint-floor.toml": FLOOR.replace("src_unreasoned_max = 1", "src_unreasoned_max = 3"),
+                                    "crates/a/src/lib.rs": "#[allow(dead_code)]\nfn f() {}\n"}))
+        self.assertEqual(rc, 0)
+        self.assertIn("hint src_unreasoned=1 below max=3: lower [allows] src_unreasoned_max in tools/lint-floor.toml to 1", out)
+
     def test_control_catches_every_plant_on_the_live_repo(self):
         rc, out, _ = run(RATCHET, "--control")
         self.assertEqual(rc, 0, out)

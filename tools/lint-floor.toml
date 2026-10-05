@@ -12,8 +12,17 @@ pedantic = "warn"
 unwrap_used = "deny"
 expect_used = "deny"
 panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+dbg_macro = "deny"
+
+[gate]
+# The commit tier of gate.toml keeps every one of these steps (lint-ratchet R6), and the clippy
+# step keeps `-D warnings`. Removing a step from the gate means removing it here first.
+commit_steps = ["features", "lints", "deps", "fmt", "clippy", "test"]
 
 [allows]
 # Unreasoned `#[allow(...)]` attributes outside test files (crates/*/tests/**). `#[expect(.., reason = ..)]`
 # does not count: the compiler re-checks it and the reason travels with it. Lower this as allows are removed.
-src_unreasoned_max = 4
+src_unreasoned_max = 2

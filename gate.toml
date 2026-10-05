@@ -11,7 +11,7 @@
 base = "HEAD~1"            # `stack` diffs <base>..<subject>; override with --base
 
 [tier.commit]
-steps = ["features", "lints", "fmt", "clippy", "test"]
+steps = ["features", "lints", "deps", "fmt", "clippy", "test"]
 
 [tier.stack]
 includes = "commit"
@@ -31,6 +31,13 @@ expect = "tool_rc"
 cmd = "tools/lint-ratchet"
 budget_s = 30
 expect = "tool_rc"
+
+[step.deps]
+# cargo-deny, offline: licenses (deny.toml allow-list), bans (no duplicate versions, no wildcards),
+# sources (crates.io only). Advisories need a live database: not a commit-tier fact.
+cmd = "cargo-deny --offline check bans licenses sources"
+budget_s = 60
+expect = "none"
 
 [step.fmt]
 cmd = "cargo fmt --all -- --check"

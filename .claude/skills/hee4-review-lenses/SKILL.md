@@ -18,7 +18,9 @@ or `ops/checks/`), and whether a real past instance exists to prove that door fa
 | Class | Door |
 |---|---|
 | `unsafe` | `unsafe_code = "forbid"` (rung 1) |
-| `unwrap`/`expect`/`panic!` outside `crates/*/tests/` | clippy deny + `tools/lint-ratchet` R3 (rung 3) |
+| `unwrap`/`expect`/`panic!`/`todo!`/`unimplemented!`/`unreachable!`/`dbg!` outside `crates/*/tests/` | clippy deny + `tools/lint-ratchet` R1/R3 (rung 3) |
+| a gate step dropped, clippy without `-D warnings` | `tools/lint-ratchet` R6 (rung 3) |
+| a new licence, a duplicate crate version, a wildcard or non-crates.io dependency | `deps` step, `cargo-deny` + `deny.toml` (rung 3) |
 | a lint switched off by `allow`, `cfg_attr`, a crate opt-out, rustflags | `tools/lint-ratchet` R1–R5 (rung 3) |
 | pedantic style, formatting, missing docs on `pub` | clippy pedantic, `cargo fmt --check`, `missing_docs` (rung 3) |
 | a gate step that looked at nothing | `gate.toml` `expect`, the drive's UNMEASURED exit (rung 3) |
@@ -54,8 +56,8 @@ or `ops/checks/`), and whether a real past instance exists to prove that door fa
   SQL built by `format!` instead of parameters, or a ledger write outside `transition`/`Store::operate`;
   paths from input without canonicalising under the allowed root; deserialising untrusted input without
   a size bound.
-- Errors: `Box<dyn Error>` in a library crate (use the typed refusal); `todo!()`/`unreachable!()`
-  in a production path (clippy `panic` does not cover these two).
+- Errors: `Box<dyn Error>` in a library crate (use the typed refusal); an error type that loses
+  which door refused.
 - Tests (`principle-test-behavior-not-implementation`): a test that would pass if the function
   returned the default; a plant or mutant missing for a new door.
 

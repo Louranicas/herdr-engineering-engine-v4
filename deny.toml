@@ -1,0 +1,26 @@
+# cargo-deny policy (the `deps` step of the commit tier). Offline and deterministic: bans, licenses
+# and sources only; advisories need a live database and are not a commit-tier fact.
+# Assimilated from ECC's pointer to cargo-deny (2026-10-05); the allow-list is the measured graph.
+
+[graph]
+targets = ["x86_64-unknown-linux-gnu"]
+all-features = true
+
+[licenses]
+# Exactly the licenses in the graph on 2026-10-05; a new one is a reviewed edit here.
+allow = ["0BSD", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-3-Clause", "CDLA-Permissive-2.0",
+         "ISC", "MIT", "Unicode-3.0", "Unlicense", "Zlib"]
+confidence-threshold = 0.93
+
+[licenses.private]
+ignore = true   # the hee4-* workspace crates are publish = false and UNLICENSED by design
+
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
