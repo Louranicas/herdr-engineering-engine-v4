@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -35,14 +36,51 @@ REAL = {
 WORLD = {  # every file the ingest world reads (copied, never linked; a matched directory is created empty)
     "repo": ["plan/DECISIONS.md", "docs/*.md", "modules/MODULES.toml", "modules/*/*/MODULE.md",
              ".claude/agents/*.md", ".claude/skills/*/SKILL.md", ".claude/skills/*/reference", ".claude/settings.json",
-             ".claude/hooks/*.sh", "ops/roster/*/modes.conf"],
+             ".claude/hooks/*.sh", "ops/roster/*/modes.conf",
+             "crates/**/*.rs"],   # readiness counts .rs files (the "is there code" fact); since V4-89 the repo has code
     "evidence": ["design/*.md", "learnings/PROCESS-LEARNINGS.md", "verification/V*.md"],
     "vault": ["15 Module Design/*.md", "16 System Maps/*.md", "00 Hub/Module Readiness 2026-10-01.md", "50 Jev/Jev Fit Map.md"],
     "claude": ["skills/*/SKILL.md", "skills/*/reference", "hooks/*.sh", "settings.json"],
 }
 ENV_OF = {"claude": "HEE4DB_CLAUDE_HOME"}   # other roots are HEE4DB_<ROOT>
-CRONTAB_SNAP: Path | None = None          # the host crontab, read once (`crontab -l`) and frozen for every case world
 HABITAT_DB = HOME / "firstmate/data/habitat-ops.db"
+
+# The schedule fixture (rev 2026-10-05 schedule). The control plants its own precondition instead of depending on
+# the host: it never reads the host crontab (this host has none) or the host's systemd user unit directory. Every case world gets a
+# synthetic crontab in the shape of hee4-evidence/roster/crontab.txt, a planted agent definition + modes.conf, and a
+# timers directory (one daily timer, one roster timer) reached through the HEE4DB_TIMERS_DIR seam. The command paths
+# are the same in every world so a case world's bytes equal the frozen baseline's (a differing byte reads as stale).
+PLANTED = "hee4-planted"
+RUNNER = REAL["repo"] / "ops/roster/run-agent.sh"
+DAILY = REAL["repo"] / "ops/db/daily.sh"
+CRONTAB_FIXTURE = (
+    "# HEE v4 agent roster: the control's synthetic crontab (never the host's), in the shape of hee4-evidence/roster/crontab.txt\n"
+    "XDG_RUNTIME_DIR=/run/user/1000\n"
+    f"17 */6 * * * /usr/bin/bash {RUNNER} {PLANTED} light\n"
+    f"40 2 * * *   /usr/bin/bash {RUNNER} {PLANTED} deep\n"
+)
+AGENT_FIXTURE = f"---\nname: {PLANTED}\ndescription: planted control agent\nmodel: sonnet\ntools: Read, Bash\n---\nA planted agent definition; the control's fixture, never run.\n"
+MODES_FIXTURE = "light|1.00|planted\ndeep|4.00|planted\n"
+
+
+def timer_unit(on_calendar: str, service: str) -> str:
+    return f"[Unit]\nDescription=planted control timer\n\n[Timer]\nOnCalendar={on_calendar}\nPersistent=true\nUnit={service}\n\n[Install]\nWantedBy=timers.target\n"
+
+
+def service_unit(exec_start: str) -> str:
+    return f"[Unit]\nDescription=planted control service\n\n[Service]\nType=oneshot\nExecStart={exec_start}\n"
+
+
+HOOKS_FIXTURE = {
+    "jev-recall-guard.sh": "#!/bin/bash\n# planted control hook: a Jev sender by name (the jev_sender rule), unwired\nexit 0\n",
+    "pipe-verdict-guard.sh": "#!/bin/bash\n# planted control hook: not a Jev sender, unwired\nexit 0\n",
+}
+TIMERS_FIXTURE = {
+    f"{PLANTED}-daily.timer": timer_unit("*-*-* 02:30:00", f"{PLANTED}-daily.service"),
+    f"{PLANTED}-daily.service": service_unit(f"/usr/bin/bash {DAILY}"),
+    f"{PLANTED}-roster.timer": timer_unit("*-*-* 03:10:00", f"{PLANTED}-roster.service"),
+    f"{PLANTED}-roster.service": service_unit(f"/usr/bin/bash {RUNNER} {PLANTED} light"),
+}
 
 
 def sha(p: Path) -> str:
@@ -67,9 +105,32 @@ class World:
                     shutil.copyfile(src, d)
             dst.mkdir(parents=True, exist_ok=True)
             self.env[ENV_OF.get(k, f"HEE4DB_{k.upper()}")] = str(dst)
-        if CRONTAB_SNAP is not None:
-            shutil.copyfile(CRONTAB_SNAP, self.root / "crontab.txt")
+        # the schedule fixture: written into every world (the frozen baseline carries the agent and modes files
+        # under repo/, the crontab and timers are re-planted per world; identical bytes everywhere)
+        (self.root / "crontab.txt").write_text(CRONTAB_FIXTURE)
         self.env["HEE4DB_CRONTAB_FILE"] = str(self.root / "crontab.txt")
+        agent = self.root / "repo/.claude/agents" / f"{PLANTED}.md"
+        agent.parent.mkdir(parents=True, exist_ok=True)
+        agent.write_text(AGENT_FIXTURE)
+        modes = self.root / "repo/ops/roster" / PLANTED / "modes.conf"
+        modes.parent.mkdir(parents=True, exist_ok=True)
+        modes.write_text(MODES_FIXTURE)
+        timers = self.root / "timers"
+        timers.mkdir()
+        for name, text in TIMERS_FIXTURE.items():
+            (timers / name).write_text(text)
+        self.env["HEE4DB_TIMERS_DIR"] = str(timers)
+        # host preconditions the registry and restart cases need, planted rather than assumed (this host has no
+        # ~/.claude/hooks and no HEE4_HANDOVER_* note): two unwired hook scripts (one a Jev sender by name) and a handover
+        hooks = self.root / "claude/hooks"
+        hooks.mkdir(parents=True, exist_ok=True)
+        for name, text in HOOKS_FIXTURE.items():
+            (hooks / name).write_text(text)
+        handoffs = self.root / "handoffs"
+        handoffs.mkdir()
+        (handoffs / "HEE4_HANDOVER_planted.md").write_text("# HEE4 handover (planted control fixture)\n\nverdict=PASS planted\n")
+        (handoffs / "HEE4_RESTART.md").write_text("# HEE4 restart (planted control fixture)\n")
+        self.env["HEE4DB_HANDOFFS"] = str(handoffs)
         self.db = self.root / "db" / "hee4-ops.db"
         self.db.parent.mkdir()
         self.env["HEE4DB_PATH"] = str(self.db)
@@ -130,15 +191,6 @@ def main() -> int:
         if r.returncode != 0 or hs.returncode != 0:
             print(f"setup: snapshot failed rc={r.returncode}/{hs.returncode} {r.stderr[:200]} {hs.stderr[:200]}")
             return 3
-        # the host crontab, read-only, once (rev 2026-10-01 registry); every case world gets this frozen copy
-        global CRONTAB_SNAP
-        cargv = ["flatpak-spawn", "--host", "crontab", "-l"] if shutil.which("flatpak-spawn") else ["crontab", "-l"]
-        cr = subprocess.run(cargv, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
-        if cr.returncode != 0 or "run-agent.sh" not in cr.stdout:
-            print(f"setup: crontab read rc={cr.returncode} roster_lines={'run-agent.sh' in cr.stdout} {cr.stderr[:200]}")
-            return 3
-        CRONTAB_SNAP = base / "crontab-snap.txt"
-        CRONTAB_SNAP.write_text(cr.stdout)
         # Freeze ONE world: copy the live sources once, re-ingest that copy into the snapshot, and derive
         # every case from it. The live sources are being edited by other agents; a case world copied
         # later than the snapshot would read as stale for reasons the control did not plant.
@@ -185,10 +237,13 @@ def main() -> int:
         case("quiet-ingest", "quiet", None, ["ingest"], 0, ["changed=0", "unexplained=0"])
         case("quiet-recipes", "quiet", None, ["recipe", "blocks-phase", "P0"], 0, ["verdict=PASS"])
 
+        def red_checks(out: str) -> list[str]:   # the check lines sit inside the JSON doc, so match the token, not a line start
+            return sorted({m.group(0) for m in re.finditer(r"check=\w+ verdict=(?:FAIL|UNMEASURED)", out)})
+
         def quiet_check(w):
             rc, out = w.run("check")
-            bad = [ln for ln in out.splitlines() if ln.startswith("check=") and ("verdict=FAIL" in ln or "verdict=UNMEASURED" in ln)]
-            return rc in (0, 10) and not bad, f"rc={rc} red_lines={len(bad)}"
+            bad = red_checks(out)
+            return rc in (0, 10) and not bad, f"rc={rc} red_lines={len(bad)}" + (f" red={','.join(bad)}" if bad else "")
         n += 1
         w = World(base, f"c{n:02d}", frozen)
         w.copy_db_from(snap)
@@ -408,7 +463,7 @@ def main() -> int:
              ['"name": "hee-v4-corpus", "scope": "user", "v4_reason": "rule:v4"', '"name": "claim-discipline", "scope": "user", "v4_reason": "curated:',
               "rule v4_relevant ="], absent_from(["recipe", "skills"], '"name": "hee-v3-corpus"'))
         case("quiet-recipe-agents", "quiet", None, ["recipe", "agents"], 0,
-             ['"agent": "hee4-curator", "definition": "project:', '"schedule": "light@', '"spend_24h_usd"'])
+             [f'"agent": "{PLANTED}", "definition": "project:', '"schedule": "light@', '"spend_24h_usd"'])
         case("quiet-recipe-reflexes", "quiet", None, ["recipe", "reflexes"], 0,
              ['"name": "jev-recall-guard.sh", "jev_sender": 1', '"name": "pipe-verdict-guard.sh", "jev_sender": 0', "jev_senders="])
         case("quiet-recipe-restart", "quiet", None, ["recipe", "restart"], 0,
@@ -425,28 +480,72 @@ def main() -> int:
              ["check"], 20, ["check=registry_skills verdict=FAIL", "registry_skill_unparsed skill=user:claim-discipline error=frontmatter_absent"])
         case("registry-skill-curated-unknown", "fault", then_ingest(unlink("claude/skills/handoff/SKILL.md")), ["check"], 20,
              ["check=registry_skills verdict=FAIL", "registry_skill_curated_unknown name=handoff"])
-        case("registry-agent-undefined", "fault", then_ingest(unlink("repo/.claude/agents/hee4-workflow-curator.md")), ["check"], 20,
-             ["check=registry_agents verdict=FAIL", "registry_agent_undefined agent=hee4-workflow-curator"])
+        AGENT_MD, MODES = f"repo/.claude/agents/{PLANTED}.md", f"repo/ops/roster/{PLANTED}/modes.conf"
+        case("registry-agent-undefined", "fault", then_ingest(unlink(AGENT_MD)), ["check"], 20,
+             ["check=registry_agents verdict=FAIL", f"registry_agent_undefined agent={PLANTED}"])
         case("registry-agent-unparsed", "fault",
-             then_ingest(edit("repo/.claude/agents/hee4-curator.md", "\ndescription:", "\nsummary:")), ["check"], 20,
-             ["check=registry_agents verdict=FAIL", "registry_agent_definition_unparsed agent=hee4-curator error=frontmatter_missing description"])
-        case("registry-agent-no-modes", "fault", then_ingest(unlink("repo/ops/roster/hee4-curator/modes.conf")), ["check"], 20,
-             ["check=registry_agents verdict=FAIL", "registry_agent_no_modes agent=hee4-curator"])
-        case("registry-agent-mode-unknown", "fault", then_ingest(edit("crontab.txt", "run-agent.sh hee4-curator deep", "run-agent.sh hee4-curator turbo")),
-             ["check"], 20, ["check=registry_agents verdict=FAIL", "registry_agent_mode_unknown agent=hee4-curator mode=turbo"])
-        case("registry-crontab-unmeasured", "fault", then_ingest(unlink("crontab.txt")), ["check"], 30,
-             ["check=registry_agents verdict=UNMEASURED", "registry_crontab_unmeasured"])
+             then_ingest(edit(AGENT_MD, "\ndescription:", "\nsummary:")), ["check"], 20,
+             ["check=registry_agents verdict=FAIL", f"registry_agent_definition_unparsed agent={PLANTED} error=frontmatter_missing description"])
+        case("registry-agent-no-modes", "fault", then_ingest(unlink(MODES)), ["check"], 20,
+             ["check=registry_agents verdict=FAIL", f"registry_agent_no_modes agent={PLANTED}"])
+        case("registry-agent-mode-unknown", "fault", then_ingest(edit("crontab.txt", f"run-agent.sh {PLANTED} deep", f"run-agent.sh {PLANTED} turbo")),
+             ["check"], 20, ["check=registry_agents verdict=FAIL", f"registry_agent_mode_unknown agent={PLANTED} mode=turbo"])
+
+        def timers_absent(w):   # the seam points at a path that does not exist: an absent source, never a zero
+            w.env["HEE4DB_TIMERS_DIR"] = str(w.root / "no-such-timers")
+        # (rev 2026-10-05 schedule) no readable schedule source at all is UNMEASURED, never PASS
+        case("registry-schedule-unmeasured", "fault", then_ingest(unlink("crontab.txt"), timers_absent), ["check"], 30,
+             ["check=registry_agents verdict=UNMEASURED", "registry_schedule_unmeasured"])
         case("registry-stale-skill", "fault",
              lambda w: (w.root / "claude/skills/hee-v4-corpus/SKILL.md").write_text((w.root / "claude/skills/hee-v4-corpus/SKILL.md").read_text() + "\n"),
              ["stale"], 20, ["stale_registry path=claude:skills/hee-v4-corpus/SKILL.md state=changed"])
         case("registry-modes-malformed", "fault",
-             lambda w: (w.root / "repo/ops/roster/hee4-curator/modes.conf").write_text("broken line without pipes\n"), ["ingest"], 20,
+             lambda w: (w.root / MODES).write_text("broken line without pipes\n"), ["ingest"], 20,
              ["ingest_malformed", "modes.conf wants `mode|budget_usd|prompt`"])
         case("registry-modes-empty-mode", "fault",
-             lambda w: (w.root / "repo/ops/roster/hee4-curator/modes.conf").write_text(" |1.00|a mode line with no mode name\n"), ["ingest"], 20,
+             lambda w: (w.root / MODES).write_text(" |1.00|a mode line with no mode name\n"), ["ingest"], 20,
              ["ingest_malformed", "modes.conf wants `mode|budget_usd|prompt`"])
-        case("registry-crontab-malformed", "fault", edit("crontab.txt", "run-agent.sh hee4-curator deep", "run-agent.sh"), ["ingest"], 20,
+        case("registry-crontab-malformed", "fault", edit("crontab.txt", f"run-agent.sh {PLANTED} deep", "run-agent.sh"), ["ingest"], 20,
              ["ingest_malformed", "run-agent.sh without <agent> <mode>"])
+
+        # ── systemd user timers as a schedule source (rev 2026-10-05 schedule): one plant per refusal site ──
+        def plant_timer(w, stem: str, exec_start: str, timer_text: str | None = None) -> None:
+            d = w.root / "timers"
+            (d / f"{stem}.timer").write_text(timer_text if timer_text is not None else timer_unit("*-*-* 04:00:00", f"{stem}.service"))
+            (d / f"{stem}.service").write_text(service_unit(exec_start))
+        case("timers-roster-undefined", "fault",
+             then_ingest(lambda w: plant_timer(w, "hee4-ghost-roster", f"/usr/bin/bash {RUNNER} hee4-ghost light")), ["check"], 20,
+             ["check=registry_agents verdict=FAIL", "registry_agent_undefined agent=hee4-ghost", "hee4-ghost-roster.timer line="])
+        case("timers-malformed", "fault",
+             lambda w: plant_timer(w, "hee4-broken", "/usr/bin/true", "[Unit]\nDescription=no timer section\n\n[Install]\nWantedBy=timers.target\n"),
+             ["ingest"], 20, ["ingest_malformed", "hee4-broken.timer no [Timer] section"])
+        case("crontab-absent-timers-ok", "quiet", unlink("crontab.txt"), ["ingest"], 0,
+             ["registry_crontab_absent", "registry_unreadable=0"], absent_from(["ingest"], "registry_crontab_unmeasured"))
+        case("timers-stale", "fault",
+             lambda w: (w.root / "timers" / f"{PLANTED}-daily.timer").write_text((w.root / "timers" / f"{PLANTED}-daily.timer").read_text() + "\n"), ["stale"], 20,
+             ["stale_registry path=", "/timers state=changed"])
+        case("timers-daily-kind", "quiet", None, ["q", "SELECT kind, agent FROM agent_schedules WHERE kind='daily'"], 0,
+             ['"rows": [{"kind": "daily", "agent": null}]'])
+
+        def sources_present_no_roster(w):   # an empty present source is a measured zero, never UNMEASURED
+            shutil.rmtree(w.root / "repo/ops/roster" / PLANTED)
+            (w.root / "crontab.txt").write_text("".join(ln + "\n" for ln in CRONTAB_FIXTURE.splitlines() if "run-agent.sh" not in ln))
+            for name in (f"{PLANTED}-roster.timer", f"{PLANTED}-roster.service"):
+                (w.root / "timers" / name).unlink()
+            rc, out = w.run("ingest")
+            assert rc == 0, f"plant ingest rc={rc} {out[-300:]}"
+        n += 1
+        w = World(base, f"c{n:02d}", frozen)
+        w.copy_db_from(snap)
+        try:
+            sources_present_no_roster(w)
+            rc, out = w.run("check")
+            want = ["check=world verdict=PASS", "measured_empty=agent_modes", "check=registry_agents verdict=PASS", "roster_jobs=0", "sources=present"]
+            missing = [x for x in want if x not in out]
+            ok = rc in (0, 10) and not missing
+            results.append(("quiet", "empty-world-sources-present", ok, f"rc={rc} want=0|10" + (f" missing={missing}" if missing else " needles=" + ",".join(want))))
+        except Exception as e:
+            results.append(("quiet", "empty-world-sources-present", False, f"setup_error {type(e).__name__}: {str(e)[:200]}"))
 
         # ── roster run logs (CN-20, CN-04): planted in the case world's evidence root ──
         def plant_log(w, agent: str, stamp: str, exit_line: bool) -> Path:
@@ -563,11 +662,17 @@ NEUTERS += [  # rev 2026-10-01 registry (V4-70): one per refusal site and per ru
     ("registry-skill-absent", 'bad.append(f"registry_skill_absent skill={scope}:{dname} path={root}:{rp}")', "pass"),
     ("registry-skill-unparsed", 'bad.append(f"registry_skill_unparsed skill={scope}:{dname} error={err}")', "pass"),
     ("registry-skill-curated", 'bad += [f"registry_skill_curated_unknown name={c}" for c in sorted(SKILL_V4_CURATED) if c not in names]', "bad += []"),
-    ("registry-agent-undefined", 'bad.append(f"registry_agent_undefined agent={ag} crontab_line={ln}")', "pass"),
+    ("registry-agent-undefined", 'bad.append(f"registry_agent_undefined agent={ag} {loc}")', "pass"),
     ("registry-agent-unparsed", 'bad.append(f"registry_agent_definition_unparsed agent={ag} error={defs[ag]}")', "pass"),
-    ("registry-agent-no-modes", 'bad.append(f"registry_agent_no_modes agent={ag} crontab_line={ln}")', "pass"),
-    ("registry-agent-mode", 'bad.append(f"registry_agent_mode_unknown agent={ag} mode={md} crontab_line={ln}")', "pass"),
-    ("registry-crontab-unmeasured", '        if not cron or cron[0] != "ok":\n', "        if False:\n"),
+    ("registry-agent-no-modes", 'bad.append(f"registry_agent_no_modes agent={ag} {loc}")', "pass"),
+    ("registry-agent-mode", 'bad.append(f"registry_agent_mode_unknown agent={ag} mode={md} {loc}")', "pass"),
+    # rev 2026-10-05 schedule: the timers source and the two measured-zero rules
+    ("registry-schedule-unmeasured", "        if not sources_ok:\n", "        if False:\n"),
+    ("timers-roster-kind", '        at = [j for j, x in enumerate(toks) if Path(x).name == "run-agent.sh"]\n', "        at = []\n"),
+    ("timers-section", '        if "Timer" not in sections:\n', "        if False:\n"),
+    ("timers-stale-changed", '        elif tstatus == "ok" and tsha != row[0]:\n', "        elif False:\n"),
+    ("crontab-absent-word", '        return "absent", None, f"HEE4DB_CRONTAB_FILE={p} absent"\n', '        return "unreadable", None, f"HEE4DB_CRONTAB_FILE={p} absent"\n'),
+    ("world-measured-empty", "            if ok_kinds:\n", "            if True:\n"),
     ("registry-stale-changed", '        elif sha256_bytes(reg_read(fp)) != sha:\n', "        elif False:\n"),
     ("registry-modes-shape", "        if len(parts) != 3 or not parts[0].strip():\n", "        if len(parts) != 3:\n"),
     ("registry-crontab-args", "            if len(toks) < j + 3:\n", "            if False:\n"),
