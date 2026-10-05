@@ -15,24 +15,44 @@ A-10. The only streaming action: a subscriber gives a cursor and topics, receive
 
 ## How to get to it (user POV)
 
-`hee4 events.subscribe` (binary; prints frames until close), `hee4-sh events.subscribe cursor:=null topics:=JSON resource_ids:=JSON bootstrap_limit:=…`. No Pi tool (v3 `tool: None`). A caller usually starts from the `engine_cursor` a `task.submit` reply carried, or from `null` for a bootstrap.
+`hee4 events.subscribe` (binary; prints frames until close), `hee4-sh events.subscribe cursor:=null topics:=JSON resource_ids:=JSON bootstrap_limit:=…`. No Pi tool (v3 `tool: None`). A caller usually starts from the `engine_cursor` a `task.submit` reply carried, or from `null` for a bootstrap. (UNMEASURED: hee4-sh exists in no crate)
 
 Not reachable before P5: the `Reply::Stream` arm does not exist until then; at P1–P4 the action is catalogued and refused `unavailable` by name.
 
 ## Driving it with hee4
 
+Concrete, deployed frame (rev 2026-10-05 drive) (run all of it with `tools/drive`):
+
+```bash
+hee4 events.subscribe --body '{"since_seq":0,"epoch":null}'
+# raw: {"request_id":"r","action":"events.subscribe","action_version":1,"idempotency_key":null,"body":{"since_seq":0,"epoch":"<epoch>"}}
+# ack: {"kind":"result",…,"body":{"since_seq":0,"epoch":"<epoch>","high_water":<n>,"stream":"events"}}
+# then: {"kind":"event","seq":<n>,"task_id":"t-…","event":…,"phase_after":"admitted","ts":…}
+```
+
+The deployed body is `{since_seq: u64|null, epoch: string|null}` (not `EventCursorV1`; the UNWRITTEN stream shape below is resolved by the frames above). Paths (`d_subscribe`; the stream helper keeps one socket open, every read times out at 10 s or less, and it prints `elapsed_s=`):
+
+- `ack`: `stream` `events`, `epoch` a non-empty string, `high_water` an int ≥ 0, `since_seq` 0.
+- `replay`: since_seq 0 with the epoch, frames until `seq ≥ high_water`, each `kind`, `seq`, `task_id`, `event`, `phase_after`, `ts`, `seq` strictly ascending; `replay_submit_admitted` (task.submit's task first shows `admitted`); `replay_resolve_producer` (task.resolve's cancelled task shows `cancelled`).
+- `live_follow`: open at `high_water`, submit a fresh brief, its `admitted` frame arrives within 10 s.
+- `resume_exactly_once`: since_seq = the last seq seen; no frame at or below it within 1 s.
+- `bad_since_seq`: `-1` → `invalid_argument` at `/body/since_seq`.
+- `resync_wrong_epoch`: epoch `not-the-epoch` → `resync_required` at `/body/epoch`.
+- `resync_future_seq`: `high_water + 1000` → `resync_required` at `/body/since_seq`.
+- `slot_freed`: `health` answers a result after every stream is closed.
+
 Preconditions: README shared preconditions; a `ReadStream` grant; at least one task that will reach accept or stop during the run (so the outbox gains a row).
 
 ```bash
 hee4 events.subscribe
-hee4-sh events.subscribe cursor:=null 'topics:=["task","delivery"]' 'resource_ids:=[]' bootstrap_limit:=256
+hee4-sh events.subscribe cursor:=null 'topics:=["task","delivery"]' 'resource_ids:=[]' bootstrap_limit:=256  # UNMEASURED: hee4-sh exists in no crate
 # in another shell, while the stream is parked:
-hee4-sh task.submit 'spec:={…}' @idempotency_key=$(uuidgen)      # then let it accept, or task.cancel + Stop
+hee4-sh task.submit 'spec:={…}' @idempotency_key=$(uuidgen)      # then let it accept, or task.cancel + Stop  # UNMEASURED: hee4-sh exists in no crate
 # resume from the final frame's cursor after an idle close:
-hee4-sh events.subscribe 'cursor:={"epoch":"…","sequence":"…","filter_sha256":"…","visibility_revision":"…","issued_unix_ms":"…","expires_unix_ms":"…"}' 'topics:=["task"]' 'resource_ids:=[]' bootstrap_limit:=1
+hee4-sh events.subscribe 'cursor:={"epoch":"…","sequence":"…","filter_sha256":"…","visibility_revision":"…","issued_unix_ms":"…","expires_unix_ms":"…"}' 'topics:=["task"]' 'resource_ids:=[]' bootstrap_limit:=1  # UNMEASURED: hee4-sh exists in no crate
 ```
 
-Socket: request `body` `{cursor: EventCursorV1|null, topics[], resource_ids[], bootstrap_limit}` (FACT required all four; `EventCursorV1{epoch, sequence, filter_sha256, visibility_revision, issued_unix_ms, expires_unix_ms}`); reply **Stream**: bootstrap frame, then `ControlEventV1` frames, `StreamStatusV1` on the three conditions (API Map A-10). The handshake obeys the 60 s deadline; after it the stream follows cursor and queue policy, not the envelope deadline (CD RC03 §6). `UNWRITTEN: the ControlEventV1 and StreamStatusV1 field lists and the stream wire shape (card contracts §10: undecided).`
+Socket: request `body` `{cursor: EventCursorV1|null, topics[], resource_ids[], bootstrap_limit}` (FACT required all four; `EventCursorV1{epoch, sequence, filter_sha256, visibility_revision, issued_unix_ms, expires_unix_ms}`); reply **Stream**: bootstrap frame, then `ControlEventV1` frames, `StreamStatusV1` on the three conditions (API Map A-10). The handshake obeys the 60 s deadline; after it the stream follows cursor and queue policy, not the envelope deadline (CD RC03 §6). `RESOLVED (rev 2026-10-05 drive: the deployed stream frame is {kind, seq, task_id, event, phase_after, ts}), was UNWRITTEN: the ControlEventV1 and StreamStatusV1 field lists and the stream wire shape (card contracts §10: undecided).`
 
 - Success: bootstrap frame, then after an accept in the other shell exactly one event frame for it; host `mode=ro` shows `outbox.delivered` advanced for that row and `task.get.delivery=1`.
 - Parked-subscriber test (ATLAS P5): N subscribers park before the outbox fold, the fold lands, every one is woken: `parked_forever=0/N`.

@@ -13,16 +13,32 @@ A-04. Read-only planning: for a `TaskSpecV1` at a given brief and catalogue revi
 
 ## How to get to it (user POV)
 
-`hee4 task.preview` (binary), `hee4-sh task.preview spec:=JSON brief_revision=… catalogue_revision=…`, Pi `hee4_task_preview` (PROPOSAL). A caller previews before `task.submit` to learn whether a spec would dispatch and under what cost mode; nothing is written.
+`hee4 task.preview` (binary), `hee4-sh task.preview spec:=JSON brief_revision=… catalogue_revision=…`, Pi `hee4_task_preview` (PROPOSAL). A caller previews before `task.submit` to learn whether a spec would dispatch and under what cost mode; nothing is written. (UNMEASURED: hee4-sh exists in no crate)
 
 ## Driving it with hee4
 
-Preconditions: README shared preconditions; a `ReadOnlyPlanning` grant; a `catalogue_revision` from `tools.list`; a `brief_revision` (`UNWRITTEN: where a caller obtains brief_revision; no v4.0 action returns it`).
+Concrete, deployed frame (rev 2026-10-05 drive) (run all of it with `tools/drive`):
+
+```bash
+hee4 task.preview --body '{"brief":"GOAL: …\n…RESTATEMENT: …\n"}'
+# raw: {"request_id":"r","action":"task.preview","action_version":1,"idempotency_key":null,"body":{"brief":"GOAL: …"}}
+```
+
+The deployed body is `{brief}` (no `spec`, `brief_revision` or `catalogue_revision`: the UNWRITTEN brief_revision below is resolved by its absence); the result is `{eligible: true, model}` or `{eligible: false, refusal, message}` (`no_route` adds `exclusions`). Paths (`tools/drive.d/task.py` `d_preview`):
+
+- `success`: result, `eligible` true, `model` a non-empty string. UNMEASURED (named) when roster.disable earlier in the same run left no eligible model.
+- `missing_restatement`: result, `eligible` false, `refusal` `invalid_argument`, message names `RESTATEMENT`.
+- `preview_vacuous_sh_true` (`VERIFY: sh: true`), `preview_vacuous_abs_true` (`VERIFY: /usr/bin/true`), `preview_vacuous_nothing_runs` (`VERIFY: model: hi`): result, `eligible` false, `refusal` `invalid_argument`, message names `VERIFY`.
+- `brief_not_string`: `{"brief": 5}` → error `invalid_argument` at `/body/brief`.
+- `no_admission`: `task.list` row count equal before and after every preview.
+- `no_operations_row`: with `--ledger`, `select count(*) from operations` equal before and after; without it UNMEASURED `--ledger not passed`.
+
+Preconditions: README shared preconditions; a `ReadOnlyPlanning` grant; a `catalogue_revision` from `tools.list`; a `brief_revision` (`RESOLVED (rev 2026-10-05 drive: the deployed body has no brief_revision), was UNWRITTEN: where a caller obtains brief_revision; no v4.0 action returns it`).
 
 ```bash
 hee4 task.preview
-hee4-sh task.preview 'spec:={"task_class":"…","intent":"…","criteria":[…],"privacy":"…","workspace_id":"…","budget":{"mode":"…","wall_ms":"…","tokens":"…","currency_microunits":"0"},"parent":null}' brief_revision=<r> catalogue_revision=<digest>
-hee4-sh --check task.preview spec:=… brief_revision=… catalogue_revision=…
+hee4-sh task.preview 'spec:={"task_class":"…","intent":"…","criteria":[…],"privacy":"…","workspace_id":"…","budget":{"mode":"…","wall_ms":"…","tokens":"…","currency_microunits":"0"},"parent":null}' brief_revision=<r> catalogue_revision=<digest>  # UNMEASURED: hee4-sh exists in no crate
+hee4-sh --check task.preview spec:=… brief_revision=… catalogue_revision=…  # UNMEASURED: hee4-sh exists in no crate
 ```
 
 Socket: request `body` `{spec: TaskSpecV1, brief_revision, catalogue_revision}`; result `body` `{eligible[], exclusions[{recipe_id, code}], cost_mode, observations_cutoff_unix_ms}` (API Map A-04). `TaskSpecV1` required fields: `task_class, intent, criteria, privacy, workspace_id, budget{mode, wall_ms, tokens, currency_microunits}, parent` (FACT v3 schema; `UNWRITTEN: the value domains of task_class, privacy, budget.mode and the criteria element shape in v4`).
