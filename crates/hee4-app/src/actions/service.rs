@@ -21,11 +21,27 @@ use crate::service_runner::{
 use crate::wire::{Code, Fault, Request};
 
 /// The managed services, seeded into `service_facts` at serve start: the one list of service
-/// ids. `owner_id` is `deploy` for all three (the installer record's sense).
+/// ids. `owner_id` is `deploy` for all three (the installer record's sense). Only `drive` is
+/// actable: `service.action` on the engine itself or the model is refused server-side.
 pub const SEEDS: &[Seed<'static>] = &[
-    ("self", "deploy", "hee4.service"),
-    ("model", "deploy", "ollama.service"),
-    ("drive", "deploy", "hee4-drive.service"),
+    Seed {
+        service_id: "self",
+        owner_id: "deploy",
+        unit_id: "hee4.service",
+        actable: false,
+    },
+    Seed {
+        service_id: "model",
+        owner_id: "deploy",
+        unit_id: "ollama.service",
+        actable: false,
+    },
+    Seed {
+        service_id: "drive",
+        owner_id: "deploy",
+        unit_id: "hee4-drive.service",
+        actable: true,
+    },
 ];
 
 /// One lock per seed, in [`SEEDS`] order: `service.action` holds its service's lock across the
@@ -186,8 +202,18 @@ fn owner_conflict() -> Fault {
     )
 }
 
+fn not_actable() -> Fault {
+    Fault::new(
+        Code::Forbidden,
+        "/body/service_id",
+        "this service is seeded not actable",
+    )
+    .with_because("service not actable")
+}
+
 fn service_fault(e: ServiceError) -> Fault {
     match e {
+        ServiceError::NotActable(_) => not_actable(),
         ServiceError::Store(e) => store_fault(e),
         ServiceError::UnknownService(_) => not_found(),
         ServiceError::StaleGeneration { current } => stale(current),
@@ -351,7 +377,7 @@ fn action(engine: &Engine, req: &Request, runner: Option<&dyn ServiceRunner>) ->
     let (service_id, unit_id, act, owner) = action_body(&req.body)?;
     let lock = SEEDS
         .iter()
-        .position(|(id, _, _)| *id == service_id)
+        .position(|seed| seed.service_id == service_id)
         .and_then(|i| ACT_LOCKS.get(i))
         .ok_or_else(not_found)?;
     let _held = lock.lock().unwrap_or_else(PoisonError::into_inner);
@@ -367,6 +393,9 @@ fn action(engine: &Engine, req: &Request, runner: Option<&dyn ServiceRunner>) ->
     let fact = fact_of(engine, service_id)?;
     if unit_id != fact.unit_id {
         return Err(bad("/body/unit_id", "not this service's unit"));
+    }
+    if !fact.actable {
+        return Err(not_actable());
     }
     let pre = req
         .precondition
@@ -815,6 +844,40 @@ mod tests {
             "{replies:?}"
         );
         assert_eq!(replies[0]["body"], replies[1]["body"]);
+        Ok(())
+    }
+
+    #[test]
+    fn service_action_on_self_or_model_is_forbidden_server_side() -> R {
+        let e = ready("svc-held")?;
+        let s = ok_stub()?;
+        for (id, unit) in [("self", "hee4.service"), ("model", "ollama.service")] {
+            let r = req(
+                "service.action",
+                Some(&format!("held-{id}")),
+                action_body(json!({"service_id": id, "unit_id": unit})),
+                Some(json!({"resource": "service", "id": id, "generation": 1})),
+            )?;
+            let f = err(action(&e, &r, Some(&s)));
+            assert_eq!(
+                (
+                    f["code"].as_str(),
+                    f["field"].as_str(),
+                    f["because"].as_str()
+                ),
+                (
+                    Some("forbidden"),
+                    Some("/body/service_id"),
+                    Some("service not actable")
+                ),
+                "{f}"
+            );
+        }
+        assert_eq!(
+            s.calls.load(Ordering::SeqCst),
+            0,
+            "a held service never reaches the manager"
+        );
         Ok(())
     }
 

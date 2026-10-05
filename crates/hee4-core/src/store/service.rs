@@ -12,7 +12,8 @@ use super::{Operation, OperationKey, RawOperation, Store, StoreError, now_ms, op
 
 /// `m005_service_facts`: one row per managed service, keyed by its service id. `generation`
 /// starts at 1 and moves only through [`Store::service_action_commit`]; `owner_sha256` is the
-/// digest of `owner_id`, the CAS guard an action names.
+/// digest of `owner_id`, the CAS guard an action names. `actable` is 0 for a service no
+/// `service.action` may start or stop (the engine itself, the model): the refusal is data.
 const SCHEMA_M005: &str = "
 CREATE TABLE service_facts(
   service_id TEXT PRIMARY KEY NOT NULL,
@@ -20,6 +21,7 @@ CREATE TABLE service_facts(
   unit_id TEXT NOT NULL,
   owner_sha256 TEXT NOT NULL CHECK (length(owner_sha256) = 64),
   generation INTEGER NOT NULL CHECK (generation >= 1),
+  actable INTEGER NOT NULL CHECK (actable IN (0, 1)),
   cached_health_json TEXT NULL,
   updated_ts INTEGER NOT NULL
 ) STRICT;
@@ -49,6 +51,8 @@ pub struct ServiceFact {
     pub owner_sha256: Sha256Hex,
     /// Bumped by every committed action; the precondition a caller reads from inspect.
     pub generation: u64,
+    /// Whether `service.action` may act on this service (seeded; false for `self`, `model`).
+    pub actable: bool,
     /// The last committed probe or action health, if any.
     pub cached_health: Option<Observation>,
     /// When the row last changed (ms since the Unix epoch).
@@ -73,13 +77,25 @@ pub enum ServiceError {
     /// The caller's expected owner digest is not the row's.
     #[error("owner digest mismatch")]
     OwnerMismatch,
+    /// The row is seeded not actable (the engine itself, the model).
+    #[error("service {0} is not actable")]
+    NotActable(String),
 }
 
 /// A row read back, before its digest and JSON are parsed.
-type RawFact = (String, String, String, String, i64, Option<String>, i64);
+type RawFact = (
+    String,
+    String,
+    String,
+    String,
+    i64,
+    bool,
+    Option<String>,
+    i64,
+);
 
 fn parse_fact(raw: RawFact) -> Result<ServiceFact, StoreError> {
-    let (service_id, owner_id, unit_id, sha, generation, health, updated_ts) = raw;
+    let (service_id, owner_id, unit_id, sha, generation, actable, health, updated_ts) = raw;
     let corrupt = |detail: String| StoreError::Corrupt {
         task: service_id.clone(),
         detail,
@@ -98,6 +114,7 @@ fn parse_fact(raw: RawFact) -> Result<ServiceFact, StoreError> {
         unit_id,
         owner_sha256,
         generation,
+        actable,
         cached_health,
         updated_ts,
     })
@@ -105,8 +122,8 @@ fn parse_fact(raw: RawFact) -> Result<ServiceFact, StoreError> {
 
 fn fact_row(conn: &Connection, service_id: &str) -> Result<Option<ServiceFact>, StoreError> {
     conn.query_row(
-        "SELECT service_id, owner_id, unit_id, owner_sha256, generation, cached_health_json,
-                updated_ts
+        "SELECT service_id, owner_id, unit_id, owner_sha256, generation, actable,
+                cached_health_json, updated_ts
          FROM service_facts WHERE service_id = ?1",
         [service_id],
         |r| {
@@ -118,6 +135,7 @@ fn fact_row(conn: &Connection, service_id: &str) -> Result<Option<ServiceFact>, 
                 r.get(4)?,
                 r.get(5)?,
                 r.get(6)?,
+                r.get(7)?,
             ))
         },
     )
@@ -135,8 +153,18 @@ pub struct Expected {
     pub owner_sha256: Sha256Hex,
 }
 
-/// A `(service_id, owner_id, unit_id)` seed row.
-pub type Seed<'a> = (&'a str, &'a str, &'a str);
+/// One seed row of `service_facts`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Seed<'a> {
+    /// The service id.
+    pub service_id: &'a str,
+    /// Who owns the service.
+    pub owner_id: &'a str,
+    /// The systemd user unit.
+    pub unit_id: &'a str,
+    /// Whether `service.action` may act on it.
+    pub actable: bool,
+}
 
 impl Store {
     /// The `service_facts` row for `service_id`, if any.
@@ -157,16 +185,17 @@ impl Store {
     pub fn service_seed(&self, seeds: &[Seed<'_>]) -> Result<usize, StoreError> {
         let tx = self.begin()?;
         let mut inserted = 0;
-        for (service_id, owner_id, unit_id) in seeds {
+        for seed in seeds {
             inserted += tx.execute(
                 "INSERT OR IGNORE INTO service_facts(service_id, owner_id, unit_id, owner_sha256,
-                   generation, cached_health_json, updated_ts)
-                 VALUES (?1, ?2, ?3, ?4, 1, NULL, ?5)",
+                   generation, actable, cached_health_json, updated_ts)
+                 VALUES (?1, ?2, ?3, ?4, 1, ?5, NULL, ?6)",
                 params![
-                    service_id,
-                    owner_id,
-                    unit_id,
-                    Sha256Hex::digest(owner_id.as_bytes()).to_string(),
+                    seed.service_id,
+                    seed.owner_id,
+                    seed.unit_id,
+                    Sha256Hex::digest(seed.owner_id.as_bytes()).to_string(),
+                    seed.actable,
                     now_ms()
                 ],
             )?;
@@ -281,6 +310,9 @@ impl Store {
             if fact.owner_sha256 != expected.owner_sha256 {
                 return Err(ServiceError::OwnerMismatch);
             }
+            if !fact.actable {
+                return Err(ServiceError::NotActable(fact.service_id));
+            }
         }
         let health = serde_json::to_string(health).map_err(StoreError::Json)?;
         let generation = i64::try_from(expected.generation).map_err(|_| StoreError::Corrupt {
@@ -291,7 +323,7 @@ impl Store {
             let changed = tx.execute(
                 "UPDATE service_facts
                  SET generation = generation + 1, cached_health_json = ?2, updated_ts = ?3
-                 WHERE service_id = ?1 AND generation = ?4 AND owner_sha256 = ?5",
+                 WHERE service_id = ?1 AND generation = ?4 AND owner_sha256 = ?5 AND actable = 1",
                 params![
                     service_id,
                     health,
@@ -356,18 +388,33 @@ mod tests {
         }
     }
 
-    const SEEDS: &[Seed<'static>] = &[("drive", "deploy", "hee4-drive.service")];
+    const SEEDS: &[Seed<'static>] = &[
+        Seed {
+            service_id: "drive",
+            owner_id: "deploy",
+            unit_id: "hee4-drive.service",
+            actable: true,
+        },
+        Seed {
+            service_id: "self",
+            owner_id: "deploy",
+            unit_id: "hee4.service",
+            actable: false,
+        },
+    ];
 
     #[test]
     fn service_seed_is_idempotent_and_digests_the_owner() -> R {
         let store = open("seed")?;
-        assert_eq!(store.service_seed(SEEDS)?, 1);
+        assert_eq!(store.service_seed(SEEDS)?, 2);
         assert_eq!(store.service_seed(SEEDS)?, 0);
         let fact = store.service_get("drive")?.ok_or("no row")?;
         assert_eq!(fact.generation, 1);
         assert_eq!(fact.unit_id, "hee4-drive.service");
         assert_eq!(fact.owner_sha256, Sha256Hex::digest(b"deploy"));
         assert_eq!(fact.cached_health, None);
+        assert!(fact.actable);
+        assert_eq!(store.service_get("self")?.map(|f| f.actable), Some(false));
         assert_eq!(store.service_get("nope")?, None);
         Ok(())
     }
@@ -447,6 +494,19 @@ mod tests {
             |_| json!(null),
         );
         assert!(matches!(mismatch, Err(ServiceError::OwnerMismatch)));
+        let held = store.service_action_commit(
+            &key("service.action", "s0"),
+            b"{}",
+            "self",
+            Expected {
+                generation: 1,
+                owner_sha256: owner,
+            },
+            &obs,
+            |_| json!(null),
+        );
+        assert!(matches!(held, Err(ServiceError::NotActable(id)) if id == "self"));
+        assert_eq!(store.service_get("self")?.map(|f| f.generation), Some(1));
         assert_eq!(store.service_get("drive")?.map(|f| f.generation), Some(1));
         let k = key("service.action", "a1");
         let done = store.service_action_commit(
