@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
+import os
 import re
 import shutil
 import sys
@@ -35,15 +36,15 @@ SKILL = Path(__file__).resolve().parents[1]
 REPO = SKILL.parents[2]
 HOME = Path.home()
 EV = HOME / "hee4-evidence"
-VAULTS = Path("/var/mnt/STORAGE-10TB/fedora-obsidian-vaults")
+VAULTS = Path(os.environ.get("HEE4_VAULTS") or "/mnt/storage-10tb/fedora-obsidian-vaults")  # Omarchy; Fedora was /var/mnt/STORAGE-10TB
 DIARY = VAULTS / "my-diary.vault"
-MEMORY = HOME / ".claude/projects/-var-home-Louranicas/memory"
+MEMORY = Path(os.environ.get("HEE4_MEMORY_DIR") or HOME / ".claude/projects/-home-louranicas/memory")  # Omarchy; Fedora was -var-home-Louranicas
 PL = EV / "learnings/PROCESS-LEARNINGS.md"
 FLR = EV / "learnings/FINAL-LESSONS-REVIEW.md"
 MISTAKES = DIARY / "Reflections/Mistakes I Made.md"
 PRINCIPLES = DIARY / "Principles/00 - Principles.md"
 SPELLBOOK = DIARY / "Reflections/The Spellbook and the Ember.md"
-STANDARD = HOME / "CLAUDE.md"
+STANDARD = Path(os.environ.get("HEE4_STANDARD_MD") or HOME / "CLAUDE.md")  # absent on Omarchy (not migrated): UNMEASURED until it returns
 MAX_LESSON_WORDS = 15
 
 
