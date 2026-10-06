@@ -1,6 +1,7 @@
 # Brain
 
 ## Other
+- [[a-door-has-one-constructor]]
 - [[a-guard-keyed-on-cwd-fails-open-at-home]]
 - [[a-status-line-carries-one-label]]
 - [[compile-time-paths-break-in-cached-exports]]
@@ -8,7 +9,10 @@
 - [[contradictions-2026-10-04]]
 - [[gate-base-is-relative-to-the-subject]]
 - [[generated-briefs-must-pass-the-brief-door]]
+- [[input-paths-stay-under-their-root]]
 - [[meta-goal-rungs]]
+- [[out-of-scope-is-a-report-line]]
+- [[parallel-slices-share-no-path-or-process]]
 - [[pinned-lines-append-only]]
 - [[prose-that-restates-a-regex-drifts]]
 - [[README]]
@@ -16,7 +20,9 @@
 - [[resume-a-workflow-without-reattributing]]
 - [[shared-target-dir-leaks-build-rs]]
 - [[stack-thesis]]
+- [[tests-run-in-a-temp-home]]
 - [[tmp-is-ram-keep-builds-in-cache]]
 - [[unix-socket-paths-have-a-107-byte-limit]]
 - [[verification-spine]]
+- [[verify-lines-exit-with-the-check]]
 
