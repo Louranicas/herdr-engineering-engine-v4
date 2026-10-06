@@ -34,7 +34,7 @@
 - Same card, `:18`: "Owned state: none; durable rows `cohort_threads`, `cohort_reports`, `dissent_log` (append-only) owned by K1 via app". `:28`: v3 was "in-memory refusals only; no allocation, lifecycle, persistence, paging or caller … thread identity ≠ store attempt identity". `:31`: "Re-key threads onto attempt identity". `:67`: done criterion #1, "Threads keyed by attempt identity; restore from store". MEASURED.
 - Vault `15 Module Design/K3 hee4-cohesion.md:301`: "Threads are keyed by **attempt identity**". The design bounds are 64 threads and 8 rebriefs (`:291-296`). MEASURED.
 - Catalogue `crates/hee4-contracts/src/catalogue.rs:491`: "One cohort thread: its task, brief revision, state, obligations, children and artifacts, read against an expected brief revision." `:511`: "Paged thread heads under a task, filtered by state." MEASURED.
-- ULTRAMAP `hee4-evidence/design/ULTRAMAP.md:162`: "thread.get, thread.list | refused (C06) | v4.2 | MA:18 cohort NOT FINISHED; needs K1 durable owner (migration)". MEASURED.
+- ULTRAMAP `hee4-evidence/design/ULTRAMAP.md:162`: "thread.get, thread.list | refused (C06) | v4.2 | module-audit-b5367bc.md:18 cohort NOT FINISHED; needs K1 durable owner (migration)". MEASURED.
 - STACK-MAP principle 8 (`plan/STACK-MAP-2026-10-04.md:116`): "Parallel workers, one aggregate". This is the use a cohort would serve (INFERRED). STACK-MAP I2 (`:62`) and INTEGRATION-MAP `:36` defer the outer loop (orders file with parallel `group`) to P9, K3. MEASURED.
 
 ### Numerical (`Owner::Numerical`, K4 `hee4-evidence`)
@@ -130,7 +130,7 @@ MEASURED.
 ## 4 · Cohort design
 
 ### 4.1 Options
-- **C1, thread view over attempts (recommended).** A thread is an attempt (`thread_id` = attempt id, AR:12). `thread.list` lists a task's attempts and `thread.get` reads one. Everything is computed from `attempts`, `tasks` and `receipts` at read time. No migration, no new writer, no second home for attempt state (AP-01).
+- **C1, thread view over attempts (recommended).** A thread is an attempt (`thread_id` = attempt id, architecture-review-b5367bc.md:12). `thread.list` lists a task's attempts and `thread.get` reads one. Everything is computed from `attempts`, `tasks` and `receipts` at read time. No migration, no new writer, no second home for attempt state (AP-01).
 - **C2, full T-12.** `m007_cohort` adds `cohort_threads`, append-only `cohort_reports` and append-only `dissent_log`, plus a K3 crate with the assign (≤ 64), rebrief (≤ 8), conflicts and join policy. It also needs a **writer that the 22-id catalogue does not have** (a new action or a submit-side field; the catalogue count is fixed by DC-09, `DECISIONS.md:167`) and concurrent attempts per task (today `UNIQUE (task_id, generation)` and a one-task dispatcher; `attempts.rs:96`, `FLOW.md:134-138`). This is the P9 outer loop (V4-79).
 - **C3, park.** Keep the scope refusal, which already passes the cut (F16).
 
@@ -252,7 +252,7 @@ The closed `AnalysisError` set:
 - the engine codes `wall_exceeded output_over_bound memory_exceeded nonzero_exit diagnostic unsettled decode_refused binding_mismatch statistics_mismatch limits_unverified`.
 
 ### 5.5 The julia child under the K0h spawn door (S-7)
-**Who calls what.** K4 `hee4-evidence::numerical::run(profile, dataset_file, limits) -> Exchange` is the caller (card `:73`; UM:174). It builds the plan and goes through `spawn::plan` and `spawn::start`, nothing else. The K6 runner thread commits through K1. This is the `service_runner` shape: the runner returns values and the actions commit (`service_runner.rs:1-4`).
+**Who calls what.** K4 `hee4-evidence::numerical::run(profile, dataset_file, limits) -> Exchange` is the caller (card `:73`; ULTRAMAP.md:174). It builds the plan and goes through `spawn::plan` and `spawn::start`, nothing else. The K6 runner thread commits through K1. This is the `service_runner` shape: the runner returns values and the actions commit (`service_runner.rs:1-4`).
 
 **Plan, as a sketch.** INFERRED; it needs the S2 door additions:
 ```
@@ -298,7 +298,7 @@ Sources: the environment list and flags are v3's (`process.rs:203-243`). `--proc
 `~/.config/hee4/runtimes/<runtime_id>.json` (0600; JSON, F13) holds:
 - `{version, runtime_id, executable, executable_sha256, julia_version, project, project_files{path: sha}, depot, depot_sha256, schema_sha256, granted{decision:"H-14", by, at_unix_ms}}`.
 
-Luke writes it with a local verb, `hee4 runtime pin …`, which measures every digest. The v4 file set drops `Cohesion.jl`, per UM:262. The profile is checked at serve start, with one line `numerical runtime=<id> pin=PASS|FAIL reason=`, and again before and after each run. When it is absent or fails, `analysis.request` answers `unavailable`, `field /body/runtime_id`, with one of these `because` constants, each from one site:
+Luke writes it with a local verb, `hee4 runtime pin …`, which measures every digest. The v4 file set drops `Cohesion.jl`, per ULTRAMAP.md:262. The profile is checked at serve start, with one line `numerical runtime=<id> pin=PASS|FAIL reason=`, and again before and after each run. When it is absent or fails, `analysis.request` answers `unavailable`, `field /body/runtime_id`, with one of these `because` constants, each from one site:
 - `"numerical runtime not granted (O-15/H-14)"`;
 - `"julia digest"`;
 - `"julia depot not pinned"`.
@@ -411,7 +411,7 @@ Tests:
 - `reconcile_moves_running_to_unknown_and_keeps_queued`;
 - `dataset_bytes_are_identical_for_two_builds_at_one_cutoff`;
 - a mapping-table test, one case per row of §5.3;
-- K4 pure tests: a plan argv test (`--unshare-net`, `--clearenv`, the exact environment list, `--threads=1`, no socket bind); the classify table carried from v3 `process.rs:143-180`; a decoder planted with an unknown code is refused by name; J01–J05 (CD `:458-466`) from a **recording** (AT:138); tolerance boundaries J05; a planted `use hee4_core` in K4 fails `cargo check` (card done #1);
+- K4 pure tests: a plan argv test (`--unshare-net`, `--clearenv`, the exact environment list, `--threads=1`, no socket bind); the classify table carried from v3 `process.rs:143-180`; a decoder planted with an unknown code is refused by name; J01–J05 (CD `:458-466`) from a **recording** (DEPLOYMENT_ATLAS.md:138); tolerance boundaries J05; a planted `use hee4_core` in K4 fails `cargo check` (card done #1);
 - door tests (S2): `planted_env_var_does_not_reach_the_child`; `stdout_over_bound_kills_the_child_and_names_both_numbers`; existing e2e and live-model tests stay green;
 - live, gated by `HEE4_LIVE_JULIA=1` (else an `UNMEASURED` line): J01 through the socket to `validated`; a memory hog becomes `failed(memory_exceeded)` with the `oom_kill` read back; kill -9 mid-run, then a restart, gives `unknown` and no surviving `hee4-analysis-*` scope;
 - `tools/drive.d/analysis.py`, live: the `forbidden` and production-`unavailable` paths. On a disposable serve with a test grant: the success paths, or UNMEASURED by name with no julia.
@@ -458,7 +458,7 @@ Eighteen decisions are Luke's. Each carries a recommended default. (Copied verba
 14. OD-14 Catalogue change (K1). RECOMMENDED DEFAULT: add task_id, attempt_id and generation to analysis.get result_fields in S4 (CD :355). This moves catalogue.rs revision(), so Poteto Weave's catalogue_contract_changed door needs requalifying by its owner.
 15. OD-15 Memory bound for the julia child. Options: M1, a transient user scope via systemd-run with MemoryMax, MemorySwapMax=0, TasksMax and CPUQuota, read back from the child's cgroup while it runs (fail closed as limits_unverified); M2, declare the memory bound absent; M3, RLIMIT_AS (INFERRED to break julia's address-space reservations). RECOMMENDED DEFAULT: M1, with a kill -9 e2e proving that --die-with-parent removes the scope.
 16. OD-16 Production gate and host acts (O-15/H-14). RECOMMENDED DEFAULT: the runtime profile ~/.config/hee4/runtimes/<id>.json, written by 'hee4 runtime pin' run by Luke, IS the production grant; when it is absent, analysis.request answers unavailable with because 'numerical runtime not granted (O-15/H-14)'. Installing julia (none on this host today) is Luke's host act; recommended: an official release tarball, pinned by digest in a read-only directory, depot offline and pinned, no Cohesion.jl.
-17. OD-17 Fixture provenance (AP-21, AT:138). The v3 J01 fixture was not migrated (MIG:25), and agents must not read HEE v3 paths. RECOMMENDED DEFAULT: re-record J01-J05 with the pinned v4 runtime, and accept them only when the independent Rust reference reproduces CD :458-466's stated values (total 5, accepted 1, unknown usage 3, known usage 4, fraction 0.2, mean 30 ms).
+17. OD-17 Fixture provenance (AP-21, DEPLOYMENT_ATLAS.md:138). The v3 J01 fixture was not migrated (migrated/v3-b5367bc/MIGRATION.md:25), and agents must not read HEE v3 paths. RECOMMENDED DEFAULT: re-record J01-J05 with the pinned v4 runtime, and accept them only when the independent Rust reference reproduces CD :458-466's stated values (total 5, accepted 1, unknown usage 3, known usage 4, fraction 0.2, mean 30 ms).
 18. OD-18 Numerical budgets. RECOMMENDED DEFAULT: a new Budgets 'numerical' section: wall_ms_max 50,000 (ceiling 50,000 = 60 s minus NUMERICAL_CLEANUP_RESERVE 10 s), memory_bytes_max 2 GiB (ceiling 8 GiB, CD :64), queue_max 4 (ceiling 16), tasks_max 64 (ceiling 256), idle_ms as dispatcher.idle_ms. output_bytes 65,536, rows 4,096 and dataset 1 MiB stay K0 constants. Revisit memory and wall after the first live measurement of julia's cold start.
 
 ## 10 · Evidence index (commands run, all read-only)
