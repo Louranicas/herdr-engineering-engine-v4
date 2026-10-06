@@ -1,9 +1,31 @@
 #!/usr/bin/env bash
-# The tests runner: `tools/tests/run`. Last line `tools-tests verdict=PASS|FAIL`; refuses zero tests.
-# HEE4_TOOLS_TESTS_DIR names another test directory (default: this one). The full output always goes
-# to $HOME/.cache/hee4-tools-tests/<UTC stamp>-<pid>.log (newest 20 kept); on FAIL every unittest
-# FAIL:/ERROR: header and its traceback is printed (at most 200 lines) with the log's path.
-cd "${HEE4_TOOLS_TESTS_DIR:-$(dirname "$0")}" || exit 2
+# The tests runner: `tools/tests/run [DIR]` or `tools/tests/run --checkout REPO REV`.
+# Last line `tools-tests verdict=PASS ran=N` or `tools-tests verdict=FAIL rc=R ran=N|none`; exit 0 on
+# PASS, 1 on FAIL, 2 on a usage or setup error; zero tests are refused.
+# DIR names another test directory (default: this one). --checkout runs REV's suite in a throwaway
+# shared clone of REPO, removed on exit: the gate's subject export has no .git, and several tests
+# read the checkout they live in. The suite never sees the caller's HEE4_HEAD or HEE4_GATE_*
+# (a test that wants one passes it). The full output always goes to
+# $HOME/.cache/hee4-tools-tests/<UTC stamp>-<pid>.log (newest 20 kept); on FAIL every unittest
+# FAIL:/ERROR: block is printed (at most 200 lines) with the log's path.
+setup_fail() { echo "tools-tests setup: $*" >&2; echo "tools-tests verdict=FAIL rc=2 ran=none"; exit 2; }
+usage="usage: tools/tests/run [DIR] | tools/tests/run --checkout REPO REV"
+case "${1-}" in
+  --checkout)
+    [ $# -eq 3 ] || setup_fail "$usage"
+    tmp=$(mktemp -d -t hee4-tools-tests-checkout.XXXXXX) || setup_fail "mktemp failed"
+    trap 'rm -rf -- "$tmp"' EXIT
+    git clone -q --shared --no-checkout -- "$2" "$tmp/subject" ||
+      setup_fail "cannot clone $2"
+    git -C "$tmp/subject" -c advice.detachedHead=false checkout -q --detach "$3" ||
+      setup_fail "cannot check out $3 from $2"
+    echo "tools-tests checkout=$(git -C "$tmp/subject" rev-parse HEAD) repo=$2"
+    dir="$tmp/subject/tools/tests" ;;
+  "") [ $# -le 1 ] || setup_fail "$usage"; dir=$(dirname "$0") ;;
+  *) [ $# -eq 1 ] || setup_fail "$usage"; dir=$1 ;;
+esac
+cd "$dir" || setup_fail "cannot enter $dir"
+unset HEE4_HEAD "${!HEE4_GATE_@}"
 out=$(python3 -m unittest discover -s . -p 'test_*.py' 2>&1); rc=$?
 logdir="$HOME/.cache/hee4-tools-tests"
 log="$logdir/$(date -u +%Y%m%dT%H%M%S.%NZ)-$$.log"
@@ -14,19 +36,33 @@ if mkdir -p "$logdir" && printf '%s\n' "$out" > "$log"; then
 else
   log=none
 fi
-ran=$(printf '%s\n' "$out" | sed -n 's/^Ran \([0-9]*\) test.*/\1/p')
+# unittest's own summary: the last `Ran N test(s) in` line whose second line after is its outcome
+# (OK, FAILED or NO TESTS RAN); a `Ran` line inside a test's output or message is not it
+summary=$(printf '%s\n' "$out" | awk '
+  /^Ran [0-9]+ tests? in / { c = NR }
+  c && NR == c + 2 && /^(OK|FAILED|NO TESTS RAN)/ { s = c }
+  END { print s + 0 }')
+ran=
+[ "$summary" -gt 0 ] && ran=$(printf '%s\n' "$out" | sed -n "${summary}s/^Ran \([0-9]*\) test.*/\1/p")
 if [ "$rc" -eq 0 ] && [ "${ran:-0}" -gt 0 ]; then
   printf '%s\n' "$out" | tail -n 4
   echo "tools-tests verdict=PASS ran=$ran"; exit 0
 fi
-# a failure block is its FAIL:/ERROR: header, a ----- rule and the traceback, up to the next rule
-# (===== before the next block, ----- before the Ran line) or the Ran line
-printf '%s\n' "$out" | awk -v cap=200 '
-  /^(FAIL|ERROR): / { inb = 1; rules = 0 }
-  inb && /^-+$/ && ++rules == 2 { inb = 0 }
-  inb && (/^=+$/ || /^Ran [0-9]+ test/) { inb = 0 }
-  inb { if (n < cap) print; else cut++; n++ }
-  END { if (cut) printf "tools-tests failures truncated: %d more lines in the log\n", cut }'
+# unittest prints its failure blocks together after the run: from the first `=====` rule followed
+# by a FAIL:/ERROR: header up to the `-----` rule before the summary (the end when there is none).
+# Only those two separators delimit; rules or `Ran` lines inside a block are printed as its text.
+printf '%s\n' "$out" | awk -v cap=200 -v s="$summary" '
+  { L[NR] = $0 }
+  END {
+    stop = s > 1 ? s - 1 : NR + 1
+    for (i = 2; i < stop; i++) if (L[i] ~ /^(FAIL|ERROR): / && L[i - 1] ~ /^=+$/) { start = i; break }
+    for (i = start; start && i < stop; i++) {
+      if (L[i] ~ /^=+$/ && L[i + 1] ~ /^(FAIL|ERROR): /) continue
+      if (n < cap) print L[i]; else cut++
+      n++
+    }
+    if (cut) printf "tools-tests failures truncated: %d more lines in the log\n", cut
+  }'
 printf '%s\n' "$out" | tail -n 4
 echo "tools-tests log=$log"
 echo "tools-tests verdict=FAIL rc=$rc ran=${ran:-none}"; exit 1
