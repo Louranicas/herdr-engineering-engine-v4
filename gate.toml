@@ -15,7 +15,7 @@ steps = ["features", "lints", "deps", "fmt", "clippy", "test"]
 
 [tier.stack]
 includes = "commit"
-steps = ["ddf"]
+steps = ["ddf", "tools-tests"]
 
 [tier.cut]
 includes = "stack"
@@ -59,6 +59,13 @@ expect = "tests_ran"
 cmd = "deep-diff-forge --stdin-patch --rank --json --require-files --require-hunks"
 budget_s = 60
 expect = "ddf_sealed"
+
+[step.tools-tests]
+# the python tools suite (about 251 s), run in a git clone of the subject: the export has no .git
+# and some tests read their checkout; a failure prints its FAIL:/ERROR: blocks and log path
+cmd = "tools/tests/run --checkout \"$HEE4_GATE_REPO\" \"$HEE4_GATE_SUBJECT\""
+budget_s = 600
+expect = "tool_rc"
 
 [step.drill]
 cmd = "tools/drill --submit 3"

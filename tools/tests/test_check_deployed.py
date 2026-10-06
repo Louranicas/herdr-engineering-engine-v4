@@ -22,6 +22,16 @@ def row(out, name):
     return [l for l in out.splitlines() if l.startswith(name + " ")]
 
 
+def control_root(test):
+    """A private HEE4_CONTROL_ROOT under ~/.cache, removed after the test. Every --control run in
+    this file takes one: in the shared ~/.cache/hee4-host a concurrent suite's control sweeps a
+    cd-control-* dir whose pid file is not yet written, which failed these tests under 3 parallel
+    runs (2026-10-06, U-harden-05 h5-tools-tests-runner)."""
+    root = tempfile.mkdtemp(prefix="cd-test-root-", dir=os.path.expanduser("~/.cache"))
+    test.addCleanup(shutil.rmtree, root, True)
+    return root
+
+
 class CheckDeployedTests(unittest.TestCase):
     def test_help(self):
         rc, out, _ = run(CD, "--help"); self.assertEqual(rc, 0); self.assertIn("deployed=", out)
@@ -34,7 +44,7 @@ class CheckDeployedTests(unittest.TestCase):
         self.assertEqual(m.parse_environment("HEE4_LIVE_MODEL=1 HEE4_MODEL=qwen2.5:0.5b"), {"HEE4_LIVE_MODEL": "1", "HEE4_MODEL": "qwen2.5:0.5b"})
 
     def test_quiet_control_every_plant_detected(self):
-        rc, out, err = run(CD, "--control", timeout=180)
+        rc, out, err = run(CD, "--control", timeout=180, env={"HEE4_CONTROL_ROOT": control_root(self)})
         self.assertEqual(rc, 0, out + err)
         self.assertEqual(out.strip().splitlines()[-1], "check-deployed control cases=9/9 verdict=PASS")
         for n in ROWS:
@@ -47,8 +57,7 @@ class CheckDeployedTests(unittest.TestCase):
 
     def test_fire_killed_control_leaves_no_listener_and_is_swept(self):
         # A private root under ~/.cache (never /tmp): no other control on the host can sweep it.
-        root = tempfile.mkdtemp(prefix="cd-test-root-", dir=os.path.expanduser("~/.cache"))
-        self.addCleanup(shutil.rmtree, root, True)
+        root = control_root(self)
         env = {**os.environ, "HEE4_CONTROL_ROOT": root}
         before = set(os.listdir(root))
         ctl = subprocess.Popen([CD, "--control"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
@@ -60,7 +69,8 @@ class CheckDeployedTests(unittest.TestCase):
                         argv = open(f"/proc/{d}/cmdline", "rb").read().split(b"\0")
                     except OSError:
                         continue
-                    if len(argv) > 2 and b"cd-control-" in argv[1] and argv[1].endswith(b"server.py"):
+                    # only this test's control: another suite's control server lives under another root
+                    if len(argv) > 2 and argv[1].startswith(os.path.join(root, "cd-control-").encode()) and argv[1].endswith(b"server.py"):
                         server = (int(d), argv[1].decode()); break
             time.sleep(0.02)
         self.assertIsNotNone(server, "the control never started its server child")
@@ -80,8 +90,9 @@ class CheckDeployedTests(unittest.TestCase):
         self.assertEqual(set(os.listdir(root)) - before, set())
 
     def test_fire_control_skip_removes_exactly_one_case(self):
+        env = {"HEE4_CONTROL_ROOT": control_root(self)}
         for n in ROWS:
-            rc, out, err = run(CD, "--control", "--control-skip", n, timeout=180)
+            rc, out, err = run(CD, "--control", "--control-skip", n, timeout=180, env=env)
             self.assertEqual(rc, 1, n + out + err)
             self.assertEqual(out.strip().splitlines()[-1], "check-deployed control cases=8/9 verdict=FAIL", n)
             line = row(out, "control " + n)[0]

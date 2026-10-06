@@ -1,4 +1,4 @@
-import atexit, os, shutil, subprocess, tempfile, textwrap
+import atexit, os, shutil, subprocess, tempfile, textwrap, uuid
 TOOLS = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # Every tempfile.mkdtemp() without an explicit dir= lands in one directory per test run, removed
@@ -20,7 +20,9 @@ def make_repo(gate_toml, files=None):
         with open(os.path.join(d, name), "w") as f:
             f.write(body)
     g = lambda *a: subprocess.run(["git", "-C", d, "-c", "user.name=t", "-c", "user.email=t@t", *a], check=True, capture_output=True, text=True)
-    g("init", "-q"); g("add", "-A"); g("commit", "-qm", "one")
+    # a per-fixture nonce in the message: two suites at once made the same sha in the same second,
+    # and tools/gate's per-sha log dir (~/.cache/hee4-gate/<stamp>-<sha12>) then raced (FileExistsError)
+    g("init", "-q"); g("add", "-A"); g("commit", "-qm", f"one {os.getpid()}-{uuid.uuid4().hex}")
     with open(os.path.join(d, "x.txt"), "w") as f:
         f.write("two\n")
     g("add", "-A"); g("commit", "-qm", "two")
