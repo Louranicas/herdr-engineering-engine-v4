@@ -33,7 +33,7 @@ Prompt spec:
 
 ## Reviewer
 
-**Inputs:** brain snapshot, skills snapshot (`/tmp/skills-snapshot.md`), auditor report, `brain/principles.md`.
+**Inputs:** brain snapshot, skills snapshot (`/tmp/skills-snapshot.md`), auditor report, the principles in `.claude/skills/principle-*/SKILL.md` (HEE v4 keeps them as pstack skills).
 
 Single agent that combines synthesis, distillation, and skill review in one pass. Produces three report sections.
 
@@ -52,7 +52,7 @@ Prompt spec:
 - Look for recurring patterns that reveal unstated engineering principles
 - A valid new principle must be: (1) genuinely independent — not derivable from existing principles, (2) evidenced by 2+ separate notes, (3) actionable — changes how you'd approach future work
 - Do NOT propose restatements of existing principles applied to a new domain
-- Each proposed principle: insight, evidence (which notes), why independent, suggested path under `brain/principles/`
+- Each proposed principle: insight, evidence (which notes), why independent, suggested name for a new `.claude/skills/principle-<name>/` skill
 
 **Section 3 — Skill review:**
 - For each skill, check against brain principles:

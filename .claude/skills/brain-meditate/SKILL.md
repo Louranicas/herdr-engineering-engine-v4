@@ -31,7 +31,7 @@ Audits brain notes, CLAUDE.md, and auto-memory for staleness, redundancy, low-va
 
 ### 3. Reviewer (after auditor completes)
 
-Spawn one `Agent` (`subagent_type: general-purpose`). See `references/agents.md` for the full prompt spec. Inputs: brain snapshot, skills snapshot, auditor report, `brain/principles.md`. Also the curator's failure-mode table ([playbook.md](/mnt/storage-10tb/workflow-curator/data/playbook.md)): a family with n of 5 or more and no brain note is distillation evidence.
+Spawn one `Agent` (`subagent_type: general-purpose`). See `references/agents.md` for the full prompt spec. Inputs: brain snapshot, skills snapshot, auditor report, and the principles in `.claude/skills/principle-*/SKILL.md` (in HEE v4 they are pstack skills, not a `brain/principles.md`; see `.claude/skills/pstack/PROVENANCE.md`). Also the curator's failure-mode table ([playbook.md](/mnt/storage-10tb/workflow-curator/data/playbook.md)): a family with n of 5 or more and no brain note is distillation evidence.
 
 Combines three concerns in a single pass:
 - **Synthesis**: Proposes missing wikilinks, flags principle tensions, suggests clarifications.
@@ -56,7 +56,7 @@ Apply all changes directly. The user reviews the diff.
 - **Verbose notes**: Condense in place
 - **New connections**: Add `[[wikilinks]]`
 - **Tensions**: Reword to clarify boundaries
-- **New principles**: Only from the distillation section, only if genuinely independent. Write brain files and update `brain/principles.md`
+- **New principles**: Only from the distillation section, only if genuinely independent. Propose each as a new `principle-*` skill (a skill edit, outside `brain/`'s one writer); record the evidence notes in `brain/`
 - **Merge principles**: Look for principles that are subsets or specific applications of each other — merge the narrower into the broader
 - **CLAUDE.md issues**: Rewrite or delete
 - **Stale memories**: Delete or rewrite
