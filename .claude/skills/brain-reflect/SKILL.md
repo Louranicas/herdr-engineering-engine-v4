@@ -35,6 +35,8 @@ Before routing a learning to `brain/`, ask: can this be a lint rule, script, met
 
 ### Brain files (`brain/`)
 
+In HEE v4, `brain/` has one writer, [hee4-scribe](../../agents/hee4-scribe.md) (PROTOCOL §4). Recurring workflow failures are already measured: `workflow-curator q "SELECT family, n FROM failure_modes WHERE brain_note IS NULL"` ([handoff](/mnt/storage-10tb/workflow-curator/docs/WORKFLOW_CURATOR_20261005.md)).
+
 Codebase knowledge, principles, gotchas — anything that informs future sessions. This is the default destination. Writing conventions are in `brain/README.md`.
 
 - One topic per file. File name = topic slug.

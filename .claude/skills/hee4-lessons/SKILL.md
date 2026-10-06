@@ -43,7 +43,7 @@ procedure is **`hee4-module-slice`**; subagent law lines are **`hee4-brief`**.
 - `~/CLAUDE.md` §3–§5: indexed by F-number in `triggers.md` only (always loaded; never copied).
 
 ## Five that bite most in v4 coding (from the counts in the homes)
-- a verdict from a pipe or a caption → `L23`, `AP-29` (six recurrences, MM#11…#48)
+- a verdict from a pipe or a caption → `L23`, `AP-29` (six recurrences, MM#11…#48); measured across workflows as `verify_cannot_fail` and `pipe_exit_code` ([playbook](/mnt/storage-10tb/workflow-curator/data/playbook.md))
 - one rule in two places → `AP-01`, `L16` (v3: grace and frame bound re-spelt; scratch gate vs repo gate)
 - a limit after acquisition → `AP-04`, `EX-01`, `EX-13`
 - a test double that discards its arguments → `AP-18`, `MM#54`

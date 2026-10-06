@@ -98,3 +98,6 @@ Claude Code discovers project skills only at `.claude/skills/<name>/SKILL.md` (d
 
 ## 2026-10-05 · model invocation
 `disable-model-invocation: true` removed from the workflow and principle skills so the model can load them through the Skill tool as poteto-mode's triggers intend (Cursor invoked them through the mode; Claude Code needs the flag off). Kept on `poteto-mode`, `automate-me`, `setup-pstack`, `make-bot-ui`, which are user-invoked modes/configurators. Luke, 2026-10-05: "make sure you can use the full array of p-stack skills".
+
+## 2026-10-06 · habitat links
+Local additions to the ported brain skills: brain-reflect names `hee4-scribe` as the one writer of `brain/` and points at the curator's measured failure families; brain-meditate and brain-ruminate read the curator's `playbook.md`. A re-port keeps these lines. Source: the workflow curator's link map, applied by the captain (Luke, 2026-10-06: "include bi directional links to the pstack brain skill").

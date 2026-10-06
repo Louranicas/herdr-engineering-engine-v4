@@ -31,7 +31,7 @@ Audits brain notes, CLAUDE.md, and auto-memory for staleness, redundancy, low-va
 
 ### 3. Reviewer (after auditor completes)
 
-Spawn one `Agent` (`subagent_type: general-purpose`). See `references/agents.md` for the full prompt spec. Inputs: brain snapshot, skills snapshot, auditor report, `brain/principles.md`.
+Spawn one `Agent` (`subagent_type: general-purpose`). See `references/agents.md` for the full prompt spec. Inputs: brain snapshot, skills snapshot, auditor report, `brain/principles.md`. Also the curator's failure-mode table ([playbook.md](/mnt/storage-10tb/workflow-curator/data/playbook.md)): a family with n of 5 or more and no brain note is distillation evidence.
 
 Combines three concerns in a single pass:
 - **Synthesis**: Proposes missing wikilinks, flags principle tensions, suggests clarifications.

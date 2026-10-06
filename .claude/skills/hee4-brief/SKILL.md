@@ -48,3 +48,6 @@ RETURN   <≤ 15-line pointer return: verdict line, report path, top findings by
 - Every LAW line present? (A brief missing LAW 7 once cost another session's mutation run, #35.)
 - WRITE names paths, not "the repo". RETURN names the exact verdict token the reader greps for (L28).
 - Same-lineage review ends PASS_WITH_GAPS at best; say so rather than overstate it (L29).
+
+## See also
+[PROTOCOL.md §2](../../agents/PROTOCOL.md) (the eleven fields) · [hee4-roster](../hee4-roster/SKILL.md) (the skeleton; STANDING is the standing orders plus this LAW block)

@@ -60,6 +60,8 @@ RECON        <empty; the receiver fills with read-only findings before any mutat
 RESTATEMENT  <empty; the receiver's own-words GOAL, checked against ACCEPTANCE; a conflict is refused back>
 ```
 
+Captain-only drafting aid (shadow; its text never reaches a subagent while the curator is at shadow): `workflow-curator brief --kind <kind> --goal "..."` ([handoff](/mnt/storage-10tb/workflow-curator/docs/WORKFLOW_CURATOR_20261005.md)).
+
 ## Worked routes
 
 - "Add `hash_prev` to the receipt and store it" → `hee4-receipts-chain` (design note, DC-nn), `hee4-contracts-architect` (field type), `hee4-store-recovery` (ledger column) + `hee4-coordinator`; watchers evidence, fence, budget, recovery, contradiction; refuter; scribe. Three briefs, never one.

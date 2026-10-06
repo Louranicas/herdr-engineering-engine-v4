@@ -59,3 +59,5 @@ decision. Non-negotiables route to `how`, `architect`, `swarm`/`arena`, `interro
 pstack's rigor (prove it works, name the data shape first, verify before declaring done) matches the
 repo's law in `hee4-brief`; where they differ, `CLAUDE.md`, `CHARTER.md` and the HOLD win. The brain
 (`brain/`) is build memory only; decisions and design stay in `plan/`, `docs/` and the vault.
+
+Brain loop: [brain/README.md](../../../brain/README.md) · writer [hee4-scribe](../../agents/hee4-scribe.md) · measured failure families: [workflow-curator](/mnt/storage-10tb/workflow-curator/docs/WORKFLOW_CURATOR_20261005.md) · design vault [HEE v4 Master Index](</mnt/storage-10tb/fedora-obsidian-vaults/herdr-engineering-engine-v4.vault/00 Hub/00 - HEE v4 Master Index.md>) · habitat memory nexus [herdr habitat](</mnt/storage-10tb/fedora-obsidian-vaults/herdr.habitat.vault/Home.md>)

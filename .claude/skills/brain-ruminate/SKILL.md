@@ -42,7 +42,7 @@ Each agent's prompt should include:
 
 - The batch manifest path (`$OUT_DIR/batches/batch_N.txt`)
 - The output path (`$OUT_DIR/findings_N.md`)
-- The list of topics **already captured** in the brain (compiled from step 1) — so agents skip known knowledge
+- The list of topics **already captured** in the brain (compiled from step 1) (include the workflow curator's failure families in [playbook.md](/mnt/storage-10tb/workflow-curator/data/playbook.md); both mine `~/.claude/projects/`) — so agents skip known knowledge
 - Instructions to extract from each conversation:
   - **User corrections**: times the user corrected the assistant's approach, code, or understanding
   - **Recurring preferences**: things the user explicitly asked for or pushed back on repeatedly

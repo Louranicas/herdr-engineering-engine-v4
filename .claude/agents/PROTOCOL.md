@@ -54,3 +54,6 @@ Two agents disagreeing on a fact run the witness command again, together, and re
 
 ## 8 · What a watcher may do
 Read, measure, report, raise STOP. Never edit, never fix, never spawn a builder. A watcher that finds the same class twice proposes the next rung up (`/correct` ladder) in its report, with the past instance named so the new door can be proven against it.
+
+## See also
+[hee4-brief LAW block](../skills/hee4-brief/SKILL.md) · [brain/README.md](../../brain/README.md) (the §4 brain row) · Poteto Weave re-qualification and contract-pin patch (until the original's owner applies it, §2's default root refuses `stale_source`): [PATCH.md](/mnt/storage-10tb/for-new-linux-install/advanced-claude-workspace/the-arena/poteto-weave-requal-20261006/docs/PATCH.md), newest rebuild [REBUILD-w12-a52e2e4.md](/mnt/storage-10tb/for-new-linux-install/advanced-claude-workspace/the-arena/poteto-weave-requal-20261006/receipts/REBUILD-w12-a52e2e4.md)

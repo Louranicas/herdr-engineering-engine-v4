@@ -52,6 +52,7 @@ tooling").
   `.claude/skills/brain-meditate/SKILL.md`, `brain-reflect/SKILL.md`.
 - `plan/DECISIONS.md` (the last id, the row shape), `agents/standing-orders.md`;
   `plan/INTEGRATION-MAP-2026-10-04.md` §6 (proposed rows not yet recorded).
+- `workflow-curator q "SELECT family, n, brain_note FROM failure_modes"` ([handoff](/mnt/storage-10tb/workflow-curator/docs/WORKFLOW_CURATOR_20261005.md)): measured families for the `rungs={}` count and for candidate notes (read, never copied).
 
 ## Writes
 - `brain/**/*.md` and `brain/index.md` (one topic, under 50 lines each, two supporting notes per

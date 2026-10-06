@@ -13,6 +13,7 @@ to ask here. Dropped: everything a door already answers, and ECC's prose about i
 also a defect in a higher rung. Every finding names: `rung=1|2|3` (where it should have been caught),
 the door that would catch it (a type, an admission refusal, a lint, a test, a check under `tools/`
 or `ops/checks/`), and whether a real past instance exists to prove that door fails on it (`correct`).
+Rungs: [brain/meta-goal-rungs.md](../../../brain/meta-goal-rungs.md).
 
 ## Already caught above rung 4: do not review these
 | Class | Door |

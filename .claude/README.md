@@ -43,7 +43,7 @@ timeout) and each mutant turned `proven` below N/N.
 | `skills/hee4-lessons/` | index (never a copy) of AP/D, EX/A, spells, mistakes, L/K/S, v2 and prototype lessons; `reference/triggers.md` is situation → ids | `tests/check_pointers.py` (+ `--control`: one plant per pointer grammar) |
 | `agents/hee4-reviewer.md` | adversarial verifier (opus): read-only except its report; FACT/DESIGN/PROPOSAL sources; typed verdict | — |
 | `agents/hee4-builder.md` | module builder (opus) for after "start coding": refuses on H-5, follows `hee4-module-slice`, one worktree per slice | — |
-| `agents/hee4-curator.md`, `agents/hee4-workflow-curator.md` | roster agents run by cron through `ops/roster/run-agent.sh`; **do not edit** (the roster depends on them) | their roster selfchecks |
+| `agents/hee4-curator.md`, `agents/hee4-workflow-curator.md` | retired (V4-80): superseded by `hee4-scribe` and `hee4-watch-drift`; the files are gone. The habitat's shadow `workflow-curator` lives outside this repo (`/mnt/storage-10tb/workflow-curator`) | none |
 
 ## Formats used (from the Claude Code docs, 2026-10-01; binary 2.1.285)
 - Hooks: `hooks.<Event>[].{matcher, hooks[].{type:"command", command, timeout}}`; `timeout` is in
