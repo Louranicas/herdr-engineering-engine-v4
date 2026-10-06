@@ -18,9 +18,66 @@ use serde_json::{Value, json};
 use crate::recovery::{Observations, reconcile};
 use crate::store::{Store, StoreError};
 
-/// The declared bound on objects in one backup. Over it, [`backup_to`] refuses rather than
-/// writing a backup it would not verify in bounded time.
-pub const MAX_BACKUP_OBJECTS: usize = 1024;
+/// The declared bound on objects (brief files) in one backup. Over it, [`backup_to`] refuses
+/// ([`BackupError::ObjectsOverBound`]) rather than writing a backup it would not verify in
+/// bounded time. MEASURED (U-harden-06 h6-backup-bytes-bound, 2026-10-06): the largest of
+/// N = 1024, 16384, 65536 synthetic 4 KiB briefs whose `backup_to` on the 10 TB drive stayed
+/// under 30 s (two release runs, ledger and briefs under `/home`, destination on the 10 TB
+/// drive: 1024 in 0.57/0.55 s, 16384 in 10.2/7.7 s, 65536 in 18.3/16.9 s); the 30 s target is
+/// INFERRED (a start backup delays `serve`'s listen, DC-22).
+pub const MAX_BACKUP_OBJECTS: usize = 65_536;
+
+/// The declared bound on the total bytes of the briefs in one backup (the sum of their sizes).
+/// Over it, [`backup_to`] refuses ([`BackupError::BytesOverBound`]). UNMEASURED-chosen:
+/// 256 MiB, about 75 times the live work dir's 3.4 MiB of briefs measured 2026-10-06, so it
+/// bounds a backup's size and copy time without bounding how many tasks the unit may run.
+pub const MAX_BACKUP_BYTES: u64 = 256 * 1024 * 1024;
+
+/// The bounds one backup is held to. Built only by [`Bounds::DECLARED`] or [`Bounds::at_most`],
+/// which never exceed [`MAX_BACKUP_OBJECTS`] and [`MAX_BACKUP_BYTES`], so no caller of
+/// [`backup_to_bounded`] can widen the declared bounds; it can only narrow them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Bounds {
+    objects: usize,
+    bytes: u64,
+}
+
+impl Bounds {
+    /// The declared bounds: [`MAX_BACKUP_OBJECTS`] and [`MAX_BACKUP_BYTES`].
+    pub const DECLARED: Self = Self {
+        objects: MAX_BACKUP_OBJECTS,
+        bytes: MAX_BACKUP_BYTES,
+    };
+
+    /// Bounds no wider than the declared ones: each value is clamped to its declared maximum.
+    #[must_use]
+    pub const fn at_most(objects: usize, bytes: u64) -> Self {
+        Self {
+            objects: if objects < MAX_BACKUP_OBJECTS {
+                objects
+            } else {
+                MAX_BACKUP_OBJECTS
+            },
+            bytes: if bytes < MAX_BACKUP_BYTES {
+                bytes
+            } else {
+                MAX_BACKUP_BYTES
+            },
+        }
+    }
+
+    /// The bound on objects (brief files).
+    #[must_use]
+    pub const fn objects(self) -> usize {
+        self.objects
+    }
+
+    /// The bound on the briefs' total bytes.
+    #[must_use]
+    pub const fn bytes(self) -> u64 {
+        self.bytes
+    }
+}
 
 /// How many complete backups [`backup_to`] keeps under its root, the one it just wrote
 /// included. UNMEASURED: INFERRED from the habitat backup's `--keep 14`; a K0 field
@@ -70,13 +127,21 @@ pub enum BackupError {
         /// The field that failed.
         field: &'static str,
     },
-    /// More briefs than [`MAX_BACKUP_OBJECTS`].
+    /// More briefs than the object bound ([`MAX_BACKUP_OBJECTS`] for [`backup_to`]).
     #[error("{found} objects exceed the backup bound {bound}")]
     ObjectsOverBound {
         /// Briefs found.
         found: usize,
         /// The bound.
         bound: usize,
+    },
+    /// The briefs' total size exceeds the byte bound ([`MAX_BACKUP_BYTES`] for [`backup_to`]).
+    #[error("{found} bytes of briefs exceed the backup bound {bound}")]
+    BytesOverBound {
+        /// Total bytes of the briefs found (or copied, when a brief grew during the copy).
+        found: u64,
+        /// The bound.
+        bound: u64,
     },
     /// The destination shares a device with the ledger (`SameDisk::Refuse`).
     #[error("destination is on the ledger's device (ledger dev {ledger_dev}, dest dev {dest_dev})")]
@@ -140,6 +205,8 @@ pub struct BackupReport {
     pub task_count: usize,
     /// Objects copied.
     pub objects_n: usize,
+    /// Total bytes of the objects copied (the manifest's `bytes_n`).
+    pub bytes_n: u64,
     /// sha256 of the snapshot.
     pub ledger_sha256: String,
     /// Ids of the complete backups retention removed after this one's manifest landed
@@ -211,9 +278,9 @@ fn sha256_of(path: &Path) -> Result<String, BackupError> {
     Ok(Sha256Hex::digest(&bytes).to_string())
 }
 
-fn copy(from: &Path, to: &Path) -> Result<(), BackupError> {
-    std::fs::copy(from, to).map_err(|e| io_at(to, e))?;
-    Ok(())
+/// Copy `from` to `to`; the bytes copied.
+fn copy(from: &Path, to: &Path) -> Result<u64, BackupError> {
+    std::fs::copy(from, to).map_err(|e| io_at(to, e))
 }
 
 /// Open `<backup_dir>/<rel>` only if it is a regular file of its own: `symlink_metadata`
@@ -278,8 +345,9 @@ fn is_backup_id(id: &str) -> bool {
         .is_some_and(|(ts, boot)| hex(ts, 12) && hex(boot, 8))
 }
 
-/// Every `*.brief` under `<work>/briefs`, by file name; none when the dir is absent.
-fn briefs(work: &Path) -> Result<Vec<PathBuf>, BackupError> {
+/// Every regular `*.brief` under `<work>/briefs` (by `symlink_metadata`: a symlink is not
+/// followed and not listed) with its size, by file name; none when the dir is absent.
+fn briefs(work: &Path) -> Result<Vec<(PathBuf, u64)>, BackupError> {
     let dir = work.join(BRIEFS_DIR);
     let entries = match std::fs::read_dir(&dir) {
         Ok(entries) => entries,
@@ -289,8 +357,17 @@ fn briefs(work: &Path) -> Result<Vec<PathBuf>, BackupError> {
     let mut out = Vec::new();
     for entry in entries {
         let path = entry.map_err(|e| io_at(&dir, e))?.path();
-        if path.is_file() && path.extension().is_some_and(|e| e == BRIEF_EXT) {
-            out.push(path);
+        if path.extension().is_none_or(|e| e != BRIEF_EXT) {
+            continue;
+        }
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            // Removed between the listing and the stat: not a brief of this backup.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(io_at(&path, e)),
+        };
+        if meta.file_type().is_file() {
+            out.push((path, meta.len()));
         }
     }
     out.sort();
@@ -313,16 +390,38 @@ fn file_name(path: &Path) -> Result<String, BackupError> {
 /// `<dest_root>/<id>/`, then write `manifest.json` last (renamed into place). Only after that
 /// rename succeeds, retention ([`retain`], [`BACKUP_KEEP`]) removes the older complete `b-*`
 /// backups under `dest_root`, never the one just written; the removed ids are
-/// `report.pruned`. Returns the report; the backup dir is `report.dir`.
+/// `report.pruned`. Returns the report; the backup dir is `report.dir`. Held to
+/// [`Bounds::DECLARED`] ([`backup_to_bounded`]).
 ///
 /// # Errors
 /// [`BackupError::SameDevice`] under [`SameDisk::Refuse`] when `dest_root` is on the
-/// ledger's device; [`BackupError::ObjectsOverBound`]; IO and store errors.
+/// ledger's device; [`BackupError::ObjectsOverBound`]; [`BackupError::BytesOverBound`]; IO
+/// and store errors.
 pub fn backup_to(
     store: &Store,
     work_briefs: &Path,
     dest_root: &Path,
     same_disk: SameDisk,
+) -> Result<BackupReport, BackupError> {
+    backup_to_bounded(store, work_briefs, dest_root, same_disk, Bounds::DECLARED)
+}
+
+/// [`backup_to`] held to `bounds`, which are never wider than the declared ones (see
+/// [`Bounds`]). Both bounds are checked before anything is written under `dest_root`: more
+/// briefs than `bounds.objects()` is [`BackupError::ObjectsOverBound`], a total size over
+/// `bounds.bytes()` is [`BackupError::BytesOverBound`]. The bytes actually copied are checked
+/// again before the manifest, so a brief that grew during the copy cannot carry a backup past
+/// the bound; that refusal removes the backup dir it began. The manifest records `objects_n`,
+/// `objects_bound`, `bytes_n` (the bytes copied) and `bytes_bound`.
+///
+/// # Errors
+/// As [`backup_to`].
+pub fn backup_to_bounded(
+    store: &Store,
+    work_briefs: &Path,
+    dest_root: &Path,
+    same_disk: SameDisk,
+    bounds: Bounds,
 ) -> Result<BackupReport, BackupError> {
     std::fs::create_dir_all(dest_root).map_err(|e| io_at(dest_root, e))?;
     let ledger_dev = std::fs::metadata(store.path())
@@ -338,10 +437,19 @@ pub fn backup_to(
         });
     }
     let objects = briefs(work_briefs)?;
-    if objects.len() > MAX_BACKUP_OBJECTS {
+    if objects.len() > bounds.objects {
         return Err(BackupError::ObjectsOverBound {
             found: objects.len(),
-            bound: MAX_BACKUP_OBJECTS,
+            bound: bounds.objects,
+        });
+    }
+    let listed_bytes = objects
+        .iter()
+        .fold(0_u64, |sum, (_, len)| sum.saturating_add(*len));
+    if listed_bytes > bounds.bytes {
+        return Err(BackupError::BytesOverBound {
+            found: listed_bytes,
+            bound: bounds.bytes,
         });
     }
     let ts_ms = crate::store::now_ms();
@@ -358,11 +466,19 @@ pub fn backup_to(
     let mut files: BTreeMap<String, String> = BTreeMap::new();
     let ledger_sha256 = sha256_of(&ledger)?;
     files.insert(LEDGER_FILE.to_owned(), ledger_sha256.clone());
-    for src in &objects {
+    let mut bytes_n = 0_u64;
+    for (src, _) in &objects {
         let name = file_name(src)?;
         let dest = objects_dir.join(&name);
-        copy(src, &dest)?;
+        bytes_n = bytes_n.saturating_add(copy(src, &dest)?);
         files.insert(format!("{OBJECTS_DIR}/{name}"), sha256_of(&dest)?);
+    }
+    if bytes_n > bounds.bytes {
+        std::fs::remove_dir_all(&dir).map_err(|e| io_at(&dir, e))?;
+        return Err(BackupError::BytesOverBound {
+            found: bytes_n,
+            bound: bounds.bytes,
+        });
     }
     let task_count = store.task_ids()?.len();
     let manifest = json!({
@@ -372,7 +488,9 @@ pub fn backup_to(
         "boot": boot,
         "task_count": task_count,
         "objects_n": objects.len(),
-        "objects_bound": MAX_BACKUP_OBJECTS,
+        "objects_bound": bounds.objects,
+        "bytes_n": bytes_n,
+        "bytes_bound": bounds.bytes,
         "files": files,
     });
     write_manifest_last(&dir, &manifest)?;
@@ -385,6 +503,7 @@ pub fn backup_to(
         boot,
         task_count,
         objects_n: objects.len(),
+        bytes_n,
         ledger_sha256,
         pruned,
         prune_failed,
