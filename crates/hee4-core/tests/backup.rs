@@ -9,7 +9,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use hee4_contracts::{Event, Sha256Hex};
-use hee4_core::backup::{BACKUP_KEEP, BackupMeta, backup_to, restore, retain};
+use hee4_core::backup::{
+    BACKUP_KEEP, BackupMeta, Bounds, MAX_BACKUP_BYTES, MAX_BACKUP_OBJECTS, backup_to,
+    backup_to_bounded, restore, retain,
+};
 use hee4_core::{BackupError, CursorVerdict, Observations, SameDisk, Store, StoreError, reconcile};
 use serde_json::Value;
 
@@ -691,4 +694,171 @@ fn retain_never_returns_the_just_written() {
         retain(&metas, 2, "b-0"),
         vec!["b-2".to_owned(), "b-1".to_owned()]
     );
+}
+
+/// The sum of the sizes of every `*.brief` under `<work>/briefs`.
+fn brief_bytes(work: &Path) -> Result<u64, Box<dyn Error>> {
+    let mut sum = 0;
+    for entry in std::fs::read_dir(work.join("briefs"))? {
+        sum += entry?.metadata()?.len();
+    }
+    Ok(sum)
+}
+
+/// The entries directly under `dir` (none when it is absent).
+fn entries(dir: &Path) -> Result<Vec<String>, Box<dyn Error>> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        out.push(entry?.file_name().to_string_lossy().into_owned());
+    }
+    Ok(out)
+}
+
+/// The outage of 2026-10-06: a work dir past the old 1024-object bound refused every backup,
+/// so `serve` refused to listen. 1025 briefs now back up, and the manifest carries both
+/// bounds: `objects_n`/`objects_bound` with their meaning, `bytes_n` (the briefs' total size)
+/// and `bytes_bound`.
+#[test]
+fn a_work_dir_past_the_old_bound_backs_up() -> R {
+    let base = scratch("past-old-bound")?;
+    let (ledger, work) = seed(&base, 1025)?;
+    let store = Store::open(&ledger)?;
+    let report = backup_to(&store, &work, &base.join("backups"), SameDisk::Allow)?;
+    assert_eq!(report.objects_n, 1025);
+    let bytes = brief_bytes(&work)?;
+    assert_eq!(report.bytes_n, bytes);
+    let m = manifest(&report.dir)?;
+    assert_eq!(m["objects_n"], 1025);
+    assert_eq!(m["objects_bound"], MAX_BACKUP_OBJECTS);
+    assert_eq!(m["bytes_n"], bytes);
+    assert_eq!(m["bytes_bound"], MAX_BACKUP_BYTES);
+    Ok(())
+}
+
+/// Briefs whose total size exceeds the byte bound are refused by name with both numbers, and
+/// nothing is written under the destination root.
+#[test]
+fn briefs_over_the_byte_bound_are_refused_by_name() -> R {
+    let base = scratch("bytes-over")?;
+    let (ledger, work) = seed(&base, 3)?;
+    let store = Store::open(&ledger)?;
+    let bytes = brief_bytes(&work)?;
+    let dest = base.join("backups");
+    let err = backup_to_bounded(
+        &store,
+        &work,
+        &dest,
+        SameDisk::Allow,
+        Bounds::at_most(MAX_BACKUP_OBJECTS, bytes - 1),
+    );
+    assert!(
+        matches!(&err, Err(BackupError::BytesOverBound { found, bound }) if *found == bytes && *bound == bytes - 1),
+        "{err:?}"
+    );
+    assert_eq!(
+        entries(&dest)?,
+        Vec::<String>::new(),
+        "no partial backup dir"
+    );
+    // At the bound exactly, the same briefs back up.
+    let report = backup_to_bounded(
+        &store,
+        &work,
+        &dest,
+        SameDisk::Allow,
+        Bounds::at_most(MAX_BACKUP_OBJECTS, bytes),
+    )?;
+    assert_eq!(manifest(&report.dir)?["bytes_bound"], bytes);
+    Ok(())
+}
+
+/// The object bound still refuses by name, before anything is written.
+#[test]
+fn more_objects_than_the_bound_are_still_refused_by_name() -> R {
+    let base = scratch("objects-over")?;
+    let (ledger, work) = seed(&base, 3)?;
+    let store = Store::open(&ledger)?;
+    let dest = base.join("backups");
+    let err = backup_to_bounded(
+        &store,
+        &work,
+        &dest,
+        SameDisk::Allow,
+        Bounds::at_most(2, MAX_BACKUP_BYTES),
+    );
+    assert!(
+        matches!(
+            &err,
+            Err(BackupError::ObjectsOverBound { found: 3, bound: 2 })
+        ),
+        "{err:?}"
+    );
+    assert_eq!(
+        entries(&dest)?,
+        Vec::<String>::new(),
+        "no partial backup dir"
+    );
+    Ok(())
+}
+
+/// No caller can widen the declared bounds: `Bounds::at_most` clamps each value.
+#[test]
+fn bounds_never_widen_past_the_declared() {
+    assert_eq!(Bounds::at_most(usize::MAX, u64::MAX), Bounds::DECLARED);
+    assert_eq!(Bounds::DECLARED.objects(), MAX_BACKUP_OBJECTS);
+    assert_eq!(Bounds::DECLARED.bytes(), MAX_BACKUP_BYTES);
+    let narrow = Bounds::at_most(2, 3);
+    assert_eq!((narrow.objects(), narrow.bytes()), (2, 3));
+}
+
+/// A brief that is a symlink is neither followed nor sized nor copied: only regular files
+/// under `<work>/briefs` are objects.
+#[test]
+fn a_symlinked_brief_is_not_backed_up() -> R {
+    let base = scratch("symlinked-brief")?;
+    let (ledger, work) = seed(&base, 2)?;
+    let outside = base.join("outside.brief");
+    std::fs::write(&outside, vec![b'x'; 4096])?;
+    let regular = brief_bytes(&work)?;
+    std::os::unix::fs::symlink(&outside, work.join("briefs").join("t-link.brief"))?;
+    let store = Store::open(&ledger)?;
+    let report = backup_to(&store, &work, &base.join("backups"), SameDisk::Allow)?;
+    assert_eq!(report.objects_n, 2);
+    assert_eq!(report.bytes_n, regular);
+    assert!(!report.dir.join("objects").join("t-link.brief").exists());
+    Ok(())
+}
+
+/// A backup written before the byte bound (manifest `objects_bound` 1024, no `bytes_n` or
+/// `bytes_bound`) still restores with every object.
+#[test]
+fn an_old_format_manifest_still_restores() -> R {
+    let base = scratch("old-format")?;
+    let (ledger, work) = seed(&base, 3)?;
+    let store = Store::open(&ledger)?;
+    store.apply(&"t-000".parse()?, Event::Admit)?;
+    let backup = backup_to(&store, &work, &base.join("backups"), SameDisk::Allow)?;
+    let old = base.join("old");
+    copy_tree(&backup.dir, &old)?;
+    let mut m = manifest(&old)?;
+    let obj = m.as_object_mut().ok_or("manifest object")?;
+    obj.insert("objects_bound".into(), 1024.into());
+    obj.remove("bytes_n").ok_or("bytes_n")?;
+    obj.remove("bytes_bound").ok_or("bytes_bound")?;
+    std::fs::write(old.join("manifest.json"), serde_json::to_vec_pretty(&m)?)?;
+
+    let into = base.join("into");
+    let report = restore(&old, &into)?;
+    assert_eq!(report.objects_total, backup.objects_n);
+    assert_eq!(report.objects_n, backup.objects_n);
+    let mut restored = entries(&into.join("work").join("briefs"))?;
+    restored.sort();
+    let mut seeded = entries(&work.join("briefs"))?;
+    seeded.sort();
+    assert_eq!(restored, seeded);
+    assert!(into.join("ledger.sqlite3").exists());
+    Ok(())
 }

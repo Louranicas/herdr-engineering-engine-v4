@@ -284,6 +284,7 @@ pub const fn backup_error_name(e: &BackupError) -> &'static str {
         BackupError::Json(_) => "manifest_json",
         BackupError::Manifest { .. } => "manifest",
         BackupError::ObjectsOverBound { .. } => "objects_over_bound",
+        BackupError::BytesOverBound { .. } => "bytes_over_bound",
         BackupError::SameDevice { .. } => "same_device",
         BackupError::Incomplete { .. } => "incomplete",
         BackupError::TargetOccupied { .. } => "target_occupied",
@@ -1612,6 +1613,13 @@ mod tests {
             file: "manifest.json".into(),
         };
         assert_eq!(backup_error_name(&e), "not_regular");
+    }
+
+    /// The byte bound's refusal is named, not reported as the catch-all.
+    #[test]
+    fn a_bytes_over_bound_backup_is_named_bytes_over_bound() {
+        let e = BackupError::BytesOverBound { found: 2, bound: 1 };
+        assert_eq!(backup_error_name(&e), "bytes_over_bound");
     }
 
     #[test]

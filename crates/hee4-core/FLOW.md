@@ -91,12 +91,22 @@ transaction; `Store::cache_heals()` reads them.
 
 ## Backup (`src/backup.rs` + `Store::snapshot_into`)
 
-`backup_to(store, work, dest_root, SameDisk)` writes `<dest_root>/<id>/ledger.sqlite3` (by
-`snapshot_into`), `objects/<name>.brief` for every `<work>/briefs/*.brief` (at most
-`MAX_BACKUP_OBJECTS`, else `ObjectsOverBound`), and `manifest.json` LAST, renamed into place
-(`id`, `ts_ms`, `epoch`, `boot`, `task_count`, `objects_n`, `objects_bound`, `files: {path:
-sha256}`); `id` is `b-<ts_ms 12 hex>-<boot 8 hex>`, lexically sortable. A dir without a
-manifest is incomplete by construction and `restore` refuses it (`Incomplete`).
+`backup_to(store, work, dest_root, SameDisk)` is `backup_to_bounded(.., Bounds::DECLARED)`; it
+writes `<dest_root>/<id>/ledger.sqlite3` (by `snapshot_into`), `objects/<name>.brief` for every
+regular `<work>/briefs/*.brief` (sized by `symlink_metadata`; a symlink is not followed or
+copied), and `manifest.json` LAST, renamed into place (`id`, `ts_ms`, `epoch`, `boot`,
+`task_count`, `objects_n`, `objects_bound`, `bytes_n`, `bytes_bound`, `files: {path: sha256}`);
+`id` is `b-<ts_ms 12 hex>-<boot 8 hex>`, lexically sortable. Two bounds, both checked before
+anything is written under `dest_root`: at most `MAX_BACKUP_OBJECTS` briefs (65536, MEASURED: the
+largest of 1024/16384/65536 4 KiB briefs backed up under 30 s on the 10 TB drive, 16.9-18.3 s),
+else `ObjectsOverBound{found, bound}`; at most `MAX_BACKUP_BYTES` of briefs in total (256 MiB,
+UNMEASURED-chosen), else `BytesOverBound{found, bound}`. The bytes actually copied are checked
+again before the manifest; a brief that grew past the bound during the copy is
+`BytesOverBound` and the begun backup dir is removed. `Bounds::at_most` clamps to the declared
+consts, so a caller can narrow the bounds (tests) and never widen them. A dir without a
+manifest is incomplete by construction and `restore` refuses it (`Incomplete`). `restore` reads
+`files` only, never `objects_bound` or the bytes fields, so a manifest from before the byte
+bound (`objects_bound` 1024, no `bytes_n`/`bytes_bound`) restores unchanged.
 Retention runs inside `backup_to` only after the manifest rename succeeds: the pure
 `retain(metas, keep, just_written)` orders the complete `b-*` backups under `dest_root` (a real
 dir whose manifest `id` equals its name, with an integer `ts_ms`) by manifest `ts_ms`, never by
