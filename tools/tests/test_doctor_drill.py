@@ -94,8 +94,7 @@ class World:
         if self.proc: self.proc.kill()
 
 def head_of(repo):
-    # the tools' own rule (doctor, drill): HEE4_HEAD wins, since the gate's export has no .git
-    return (os.environ.get("HEE4_HEAD", "").strip() or run("git", "-C", repo, "rev-parse", "HEAD")[1].strip())[:12]
+    return run("git", "-C", repo, "rev-parse", "HEAD")[1].strip()[:12]
 
 def healthy_doctor(w, *extra):
     head = head_of(TOOLS)
