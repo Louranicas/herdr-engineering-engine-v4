@@ -3663,7 +3663,7 @@ def readiness_md(rows: list[dict], s: dict, w: dict) -> str:
         "- *ARCH REVIEW*: a PROPOSED or PARTIAL design conflict lands in a phase the module is built in. The recommendation ratifies "
         "the non-P3 conflicts before the earliest of their phases, and leaves the P3 ones to the P3 flow contract.",
         "- Otherwise *READY TO BUILD* at \"start coding\".",
-        f"- The universal P0 holds ({', '.join(s['universal_p0_holds'])}: every open ATLAS §5 row that blocks P0) gate **every** "
+        f"- The universal P0 holds ({', '.join(s['universal_p0_holds']) or 'none open'}: every open ATLAS §5 row that blocks P0) gate **every** "
         "module and are listed once, here, not per row.",
         f"- Conflicts scoped to all modules are listed once, here, not per row: {alldc}.",
         "",
