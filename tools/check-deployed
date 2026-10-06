@@ -20,7 +20,8 @@ Every `--version` and `health` read-back runs the unit's own binary (ExecStart a
 hee4 on PATH, a real AF_UNIX listener held by a fake MainPID, a fake /api/ps, a synthetic ledger,
 a stub drive and a rehearsal record; one fault planted per row, each asserted by its row's own
 diagnostic text; case D5h reruns the rows against a second backup dir whose newest manifest sits at 90%
-of its bound (D5 must fail on headroom). Prints `check-deployed control cases=k/10 verdict=PASS|FAIL`
+of its bound, and counts only when headroom_objects is among the keys D5 failed (`--failed-keys`, which
+prints `failed D<n> keys=...` after each row; the near world's D5 also fails on timer and habitat). Prints `check-deployed control cases=k/10 verdict=PASS|FAIL`
 (one case per PLANTS entry). The control's children die with it (PR_SET_PDEATHSIG) and a control
 start sweeps cd-control-* dirs whose pid is dead.
 --control-skip <case> (test only) removes that one plant: the control must then print cases=9/10.
@@ -48,7 +49,7 @@ def sh(*cmd, timeout=60, env=None):
 class Row:
     """One D row: fields in order, the verdict from what was measured."""
     def __init__(self, name):
-        self.name, self.parts, self.failed, self.unmeasured = name, [], False, False
+        self.name, self.parts, self.failed, self.unmeasured, self.failed_keys = name, [], False, False, []
 
     def val(self, key, value):
         self.parts.append(f"{key}={value}")
@@ -57,6 +58,7 @@ class Row:
         self.parts.append(f"{key}={value}")
         if not ok:
             self.failed = True
+            self.failed_keys.append(key)
 
     def unm(self, key, why):
         self.parts.append(f"{key}=UNMEASURED({why})")
@@ -693,6 +695,8 @@ def main_rows(a):
     rows, ctx = run_rows(a)
     for r in rows:
         print(r.line())
+        if a.failed_keys:
+            print(f"failed {r.name} keys={','.join(r.failed_keys) or 'none'}")
     rc, out, _ = sh("git", "-C", a.repo, "status", "--porcelain")
     dirty = len(out.splitlines()) if rc == 0 else None
     vs = [r.verdict() for r in rows]
@@ -962,7 +966,7 @@ esac
         env = dict(os.environ)
         env.update({"HOME": ctl, "PATH": bindir + ":" + os.environ.get("PATH", ""), "HEE4_HEAD": head40, "USER": os.environ.get("USER", "ctl")})
         env.pop("HEE4_MODEL", None)
-        run_world = lambda bdir: sh(sys.executable, os.path.abspath(__file__), "--unit", unit, "--repo", repo, "--proc", proc,
+        run_world = lambda bdir: sh(sys.executable, os.path.abspath(__file__), "--failed-keys", "--unit", unit, "--repo", repo, "--proc", proc,
                                     "--backups", bdir, "--drive-cmd", drive_stub, "--model-url", f"http://127.0.0.1:{httpd.server_port}",
                                     "--evidence-root", ev_root, "--drill-root", drill_root, env=env, timeout=120)
         rc, out, err = run_world(backups)
@@ -977,6 +981,10 @@ esac
         parse_rows = lambda text: {l.split(" ", 1)[0]: l for l in text.splitlines() if l.split(" ", 1)[0] in ROWS}
         rows = parse_rows(out)
         rows["D5h"] = parse_rows(out_near).get("D5", "")
+        # D5 in this world also FAILs on timer, habitat and other_device, so a FAIL line proves nothing about
+        # headroom: the plant counts only when headroom_objects is among the keys the row itself failed.
+        near_failed = {t[1]: t[2].split("=", 1)[1].split(",") for t in (l.split() for l in out_near.splitlines())
+                       if len(t) == 3 and t[0] == "failed" and t[2].startswith("keys=")}
         print(f"control home={ctl} rows_rc={rc} control_ledger=synthetic swept_dead_controls={swept}")
         if err:
             print(f"control stderr={err.splitlines()[-1]}")
@@ -984,15 +992,18 @@ esac
         for n in PLANTS:
             line = rows.get(n, "")
             what, diag = PLANTS[n]
+            failed = f" failed={','.join(near_failed.get('D5', [])) or 'none'}" if n == "D5h" else ""
             if n in skip:
-                print(f"control {n} plant=skipped line={line or 'MISSING'}")
+                print(f"control {n} plant=skipped{failed} line={line or 'MISSING'}")
                 continue
             hit = diag in line and not line.endswith(" PASS")
+            if n == "D5h":
+                hit = hit and "headroom_objects" in near_failed.get("D5", [])
             if n == "D1" and hit:  # the PATH stub reports the tree; the row must have asked the unit's binary instead
                 kv = dict(t.split("=", 1) for t in line.split() if "=" in t)
                 hit = kv.get("binary", "") != kv.get("head", "?") and kv.get("binary", "") not in ("", "mismatch")
             met += hit
-            print(f"control {n} plant={what!r} detected={'yes' if hit else 'no'} line={line or 'MISSING'}")
+            print(f"control {n} plant={what!r} detected={'yes' if hit else 'no'}{failed} line={line or 'MISSING'}")
         v = "PASS" if met == len(PLANTS) else "FAIL"
         print(f"check-deployed control cases={met}/{len(PLANTS)} verdict={v}")
         sys.exit(0 if v == "PASS" else 1)
@@ -1020,6 +1031,8 @@ def main():
     ap.add_argument("--proc", default="/proc", help="the proc root (the control points it at a fake)")
     ap.add_argument("--control", action="store_true")
     ap.add_argument("--control-skip", action="append", metavar="CASE", help="test only: remove one plant")
+    ap.add_argument("--failed-keys", action="store_true",
+                    help="after each row print `failed D<n> keys=k1,k2|none`, the checks that failed it (the control reads it)")
     a = ap.parse_args()
     if a.control:
         control(a)

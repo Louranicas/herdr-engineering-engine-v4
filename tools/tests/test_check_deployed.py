@@ -54,6 +54,7 @@ class CheckDeployedTests(unittest.TestCase):
             self.assertIn("detected=yes", row(out, "control " + n)[0])
         self.assertIn("control_ledger=synthetic", out)
         self.assertIn("headroom_objects=-103", row(out, "control D5h")[0]); self.assertTrue(row(out, "control D5h")[0].endswith(" FAIL"))
+        self.assertIn("headroom_objects", row(out, "control D5h")[0].split(" failed=", 1)[1].split(" ", 1)[0].split(","))
         self.assertIn("in_mainpid_fds=no", row(out, "control D3")[0]); self.assertIn("held_by=", row(out, "control D3")[0])
         d1 = dict(t.split("=", 1) for t in row(out, "control D1")[0].split() if "=" in t)  # the PATH stub says the tree; D1 asked the unit's binary
         self.assertNotEqual(d1["binary"], d1["head"]); self.assertIn("exe_head", d1); self.assertNotEqual(d1["exe_head"], d1["binary"])
@@ -102,10 +103,35 @@ class CheckDeployedTests(unittest.TestCase):
             self.assertIn("plant=skipped", line)
             if n == "D5h":  # 512/1024 is inside the headroom; the row still fails on the control world's absent habitat run
                 self.assertIn("objects=512 objects_bound=1024 headroom_objects=307 ", line); self.assertNotIn("headroom_objects=-", line)
+                self.assertNotIn("headroom_objects", line.split(" failed=", 1)[1].split(" ", 1)[0].split(","))
             elif n == "D5":
                 self.assertIn("UNMEASURED(no backup dir at", line); self.assertTrue(line.endswith(" UNMEASURED"), line)
             else:
                 self.assertTrue(line.endswith(" PASS"), line)
+
+    def test_fire_control_misses_a_headroom_that_never_fails_the_row(self):
+        # The refuter's mutant (2026-10-06): headroom_objects printed by r.val instead of r.check. The near
+        # world's D5 still FAILs on timer and habitat, so only the failed-keys read can tell; D5h must be missed.
+        d = tempfile.mkdtemp(prefix="cd-mutant-", dir=os.path.expanduser("~/.cache"))
+        self.addCleanup(shutil.rmtree, d, True)
+        with open(CD) as f:
+            src = f.read()
+        real = 'r.check("headroom_objects", h, h >= 0)'
+        self.assertEqual(src.count(real), 1)
+        with open(os.path.join(d, "check-deployed"), "w") as f:
+            f.write(src.replace(real, 'r.val("headroom_objects", h)'))
+        os.chmod(os.path.join(d, "check-deployed"), 0o755)
+        shutil.copy2(os.path.join(TOOLS, "habitat-backup"), os.path.join(d, "habitat-backup"))
+        rc, out, err = run(os.path.join(d, "check-deployed"), "--control", timeout=180, env={"HEE4_CONTROL_ROOT": control_root(self)})
+        self.assertEqual(rc, 1, out + err)
+        self.assertEqual(out.strip().splitlines()[-1], f"check-deployed control cases={len(CASES) - 1}/{len(CASES)} verdict=FAIL")
+        line = row(out, "control D5h")[0]
+        self.assertIn("detected=no", line); self.assertIn("headroom_objects=-103", line); self.assertTrue(line.endswith(" FAIL"), line)
+
+    def test_failed_keys_names_each_failing_check_after_its_row(self):
+        m = load()
+        r = m.Row("D5"); r.check("a", 1, True); r.check("b", 2, False); r.val("c", 3); r.check("d", 4, False)
+        self.assertEqual((r.failed_keys, r.verdict()), (["b", "d"], "FAIL"))
 
     def test_fire_control_skip_unknown_row_refused(self):
         rc, out, _ = run(CD, "--control", "--control-skip", "D10")
