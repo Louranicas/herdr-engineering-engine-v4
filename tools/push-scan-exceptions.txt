@@ -6,6 +6,9 @@
 # reason is refused, not skipped; a secret-class rule is refused (a secret is fixed or rotated).
 # push-scan reads these rows as committed at the scanned head, so an uncommitted row covers nothing.
 # Reviewed 2026-10-05 (U-stack-04 c5-push-scan-reasoned) against github/main..HEAD at main d0bebb2.
+# Re-reviewed 2026-10-06 (U-harden-06): the three tools/check-deployed rows moved from lines 31-32 to 34-35 when
+# h6-d5-bound-warning added the D5 headroom constant above them; the lines' content and digests are unchanged, and the
+# same reason holds (the D1 v3_refs census must name the fence's paths to count them).
 .claude/hooks/lib/v3_guard.py | 6 | home_path | 5d3f8bbdea7e | The fence's docstring names the previous machine's home because the guard reads the deny rules written under it as $HOME.
 .claude/hooks/lib/v3_guard.py | 37 | home_path | 79a80221f9ac | OLD_HOME is the literal the guard rewrites to $HOME so the settings.json deny rules still fence v3; it is data the fence needs.
 .claude/hooks/lib/v3_guard.py | 38 | deny_root | 9f17eac2c65c | LOCAL_V3_ROOTS is the fence's own deny list of this machine's v3 copies; naming them is how the guard forbids them.
@@ -17,9 +20,9 @@
 .claude/hooks/tests/test_hee4-v3-guard.py | 34 | deny_root | e3c254e17838 | A fence test case naming the local v3 vault so the guard is proven to flag a redirect into it.
 .claude/hooks/tests/test_hee4-v3-guard.py | 52 | deny_root | 0657471fb378 | A fence test case proving a read-only cat of a local v3 copy is not flagged as a write.
 .claude/hooks/tests/test_hee4-v3-guard.py | 76 | deny_root | da335c1f3821 | The hook test feeds a v3 path to prove the settings override replaces the default roots.
-tools/check-deployed | 31 | fence | 277c82274422 | V3_PATTERNS is the D1 v3_refs census pattern: the check must name the fence's paths to count references to them.
-tools/check-deployed | 31 | deny_root | 277c82274422 | Same census line as the fence row: one of the D1 patterns is also a v3 deny root, named to be counted.
-tools/check-deployed | 32 | fence | 0760a422fa0c | Second line of the D1 v3_refs census pattern list, named on purpose to count v3 references.
+tools/check-deployed | 34 | fence | 277c82274422 | V3_PATTERNS is the D1 v3_refs census pattern: the check must name the fence's paths to count references to them.
+tools/check-deployed | 34 | deny_root | 277c82274422 | Same census line as the fence row: one of the D1 patterns is also a v3 deny root, named to be counted.
+tools/check-deployed | 35 | fence | 0760a422fa0c | Second line of the D1 v3_refs census pattern list, named on purpose to count v3 references.
 ops/checks/funnel_trace.py | 40 | home_path | 95ea6fe5c462 | The comment documents the previous-home prefix the vault's card links were written under, which line 42 must read.
 ops/checks/funnel_trace.py | 42 | home_path | 03fa531a1c10 | LINK_ROOTS must hold the previous-home prefix to translate the vault's existing file:// links through this machine's root without rewriting the vault.
 commit:2ab6a90eaf8f | 4 | home_path | 8b49089f1a8d | A merged commit message records the Fedora paths it removed; history is not rewritten, so the hit is kept and reasoned.
