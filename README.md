@@ -20,11 +20,11 @@ Every claim here is labelled. MEASURED means a command ran on this machine and i
 | Gate | cut tier **11/11** at `da3bc8f` (features, lints, deps, fmt, clippy, 354 tests, sealed diff, drill, drive, doctor, advisories); tools suite 247/247 | `just gate commit`, `just gate cut` |
 | Model | user-space ollama 0.35.1 on `127.0.0.1:11434`, `qwen2.5:0.5b`, GPU via Vulkan; the engine reaches it only through the door | `systemctl --user is-active ollama.service`, `hee4 doctor --repo .` |
 | First live Pass | one task through the deployed unit: `admitted -> accepted` in 0.2 s, receipt `71a15c2b…`, `command` and `model-door` observations, one `model_request` row | `plan/DECISIONS.md` V4-94 |
-| Version cut | **`just cut-check` PASS** at `da3bc8f`: `deployed=9/9`, cold-clone 6/6, push-scan hits=0 over 313 commits, watchers 6/6, `dirty=0`. The tag is not laid: a human names the first cut (ATLAS D10, S01). | `just cut-check`, then `just tag <NAME> confirm` |
+| Version cut | **`v4.0.0`** laid at `5ad196c` (2026-10-06, local, not pushed) from that sha's `just cut-check` PASS: `deployed=9/9`, gate cut 12/12, cold-clone 6/6, push-scan hits=0 over 386 commits, watchers 6/6, `dirty=0`. A 30-minute wall-clock soak passed every invariant at the same sha (V4-106). | `git tag -n v4.0.0`; `just cut-check` |
 | Backups | ledger: online at serve start and every 8 dispatches to `/mnt/storage-10tb/hee4-backups`, restore drill PASS; habitat: `hee4-backup.timer` daily, codebase bundle + evidence + handoffs to the home disk | `hee4 restore`, `systemctl --user list-timers` |
-| Tags | `skeleton-deployed-2026-10-05`, `hardened-deployed-2026-10-05`, `live-model-deployed-2026-10-05` | `git tag -n` |
+| Tags | `v4.0.0` (the first version cut), `skeleton-deployed-2026-10-05`, `hardened-deployed-2026-10-05`, `live-model-deployed-2026-10-05` | `git tag -n` |
 
-The engine has run a real model attempt: a `sh:` VERIFY step inside the sandbox curled the model door, the door forwarded one request to ollama on loopback, and `decide` sealed `Pass` over two observations bound to the brief's VERIFY digest. Before the model existed, the same path ended in a refusal, not a Pass; that refusal is the design, and the Pass is the same code with a model behind the door. This is still not the ATLAS D10 version cut: that tag has its own field list (`tools/check-deployed` over D1–D9, a cold clone, `push-scan`, `apparatus_ratio=`), composed by `just cut-check` only from the lines those tools print in one run, and laid by `just tag NAME confirm`; no such tag exists yet.
+The engine has run a real model attempt: a `sh:` VERIFY step inside the sandbox curled the model door, the door forwarded one request to ollama on loopback, and `decide` sealed `Pass` over two observations bound to the brief's VERIFY digest. Before the model existed, the same path ended in a refusal, not a Pass; that refusal is the design, and the Pass is the same code with a model behind the door. This is still not the ATLAS D10 version cut: that tag has its own field list (`tools/check-deployed` over D1–D9, a cold clone, `push-scan`, `apparatus_ratio=`), composed by `just cut-check` only from the lines those tools print in one run, and laid by `just tag NAME confirm`. The first, `v4.0.0`, was laid at `5ad196c` on 2026-10-06.
 
 ## The one rule
 
@@ -157,7 +157,7 @@ Recorded because each is now an instance a future door must fail on:
 
 ## Not yet
 
-- **Naming the first cut.** `just cut-check` passes; the plan proposes `v4.0.0` and leaves the name to the owner. At the tagged sha: `just deploy && just cut-check && just tag v4.0.0` (prints the message), then `just tag v4.0.0 confirm` (local only, never pushed). GitHub needs a credential on this host before the push.
+- **Pushing the first cut.** `v4.0.0` is laid locally at `5ad196c` (V4-106). GitHub needs a credential on this host before Luke's push.
 - **v4.2 families.** `thread.*` (cohort) and `analysis.*` (numerical) are catalogued for v4.2 and refused by scope today; serving them needs their design (and the grants file format, PT-06, for `analysis.request`).
 - **Named gaps carried in the unit evidence** (`hee4-evidence/roster/U-stack-04/`), each with its fix proposed.
 - **Poteto Weave** (the habitat's context layer) refuses until its owner re-qualifies it against the current catalogue; briefs record it UNMEASURED meanwhile.
