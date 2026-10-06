@@ -523,11 +523,7 @@ mod tests {
         assert_eq!(parsed, hee4_contracts::Budgets::DEFAULT);
         assert_eq!(
             health["body"]["budgets_inert"],
-            json!([
-                "attempt.ctx_tokens",
-                "ledger.busy_timeout_ms",
-                "ledger.checkpoint_every"
-            ])
+            json!(["attempt.ctx_tokens", "ledger.busy_timeout_ms"])
         );
         // Each inert name is a real field: a rename in the contracts breaks this test.
         let rendered = parsed.render();

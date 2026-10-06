@@ -6,6 +6,7 @@
 //! message, field}` plus `because`, `current_generation`, `readback` when set and
 //! `effect:"unknown"` for `effect_unknown`.
 
+use hee4_contracts::bounds::MAX_TOKEN_BYTES;
 use serde_json::{Value, json};
 
 /// Every member an error frame may carry, in emission order: what `tools.inspect` digests as the
@@ -52,8 +53,9 @@ pub enum Code {
     FrameTooLarge,
     /// The server already holds its cap of concurrent connections.
     TooManyConnections,
-    /// The action is catalogued but its owner is not registered in this release (`because`
-    /// names the scope). The one emission site is the registry miss in dispatch.
+    /// The action is catalogued but its owner is not registered in this release (the registry
+    /// miss in dispatch, `because` names the scope), or `service.*` cannot make its call
+    /// (`because` names why).
     Unavailable,
     /// The precondition's generation is behind the resource's (`current_generation` is set).
     StaleGeneration,
@@ -241,24 +243,44 @@ pub struct Request {
     pub body: Value,
 }
 
+/// A token member: non-empty and at most [`MAX_TOKEN_BYTES`] bytes.
+fn is_token(s: &str) -> bool {
+    !s.is_empty() && s.len() <= MAX_TOKEN_BYTES
+}
+
+/// The refusal message for a token member.
+fn token_refusal() -> String {
+    format!("non-empty string of at most {MAX_TOKEN_BYTES} bytes")
+}
+
 /// `/precondition`: absent or null is `None`; an object with exactly `resource` (string), `id`
-/// (string) and `generation` (unsigned integer) is `Some`; any other shape is refused.
-fn precondition_of(v: Option<&Value>) -> Result<Option<Precondition>, &'static str> {
+/// (string) and `generation` (unsigned integer) is `Some`; any other shape is refused at
+/// `/precondition`, and a `resource` or `id` that is not a token at its own pointer.
+fn precondition_of(v: Option<&Value>) -> Result<Option<Precondition>, (&'static str, String)> {
+    let shape = |msg: &str| ("/precondition", msg.to_owned());
     let obj = match v {
         None | Some(Value::Null) => return Ok(None),
         Some(Value::Object(obj)) => obj,
-        Some(_) => return Err("object or null"),
+        Some(_) => return Err(shape("object or null")),
     };
     if obj.len() != 3 {
-        return Err("exactly resource, id and generation");
+        return Err(shape("exactly resource, id and generation"));
     }
     let (Some(Value::String(resource)), Some(Value::String(id)), Some(generation)) = (
         obj.get("resource"),
         obj.get("id"),
         obj.get("generation").and_then(Value::as_u64),
     ) else {
-        return Err("resource: string, id: string, generation: unsigned integer");
+        return Err(shape(
+            "resource: string, id: string, generation: unsigned integer",
+        ));
     };
+    if !is_token(resource) {
+        return Err(("/precondition/resource", token_refusal()));
+    }
+    if !is_token(id) {
+        return Err(("/precondition/id", token_refusal()));
+    }
     Ok(Some(Precondition {
         resource: resource.clone(),
         id: id.clone(),
@@ -303,11 +325,11 @@ pub fn parse(line: &str) -> Result<Request, (String, Fault)> {
         .ok_or_else(|| bad("/action_version", "unsigned integer required"))?;
     let idempotency_key = match obj.get("idempotency_key") {
         None | Some(Value::Null) => None,
-        Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
-        Some(_) => return Err(bad("/idempotency_key", "non-empty string or null")),
+        Some(Value::String(s)) if is_token(s) => Some(s.clone()),
+        Some(_) => return Err(bad("/idempotency_key", &token_refusal())),
     };
     let precondition =
-        precondition_of(obj.get("precondition")).map_err(|msg| bad("/precondition", msg))?;
+        precondition_of(obj.get("precondition")).map_err(|(field, msg)| bad(field, &msg))?;
     let body = match obj.remove("body") {
         None | Some(Value::Null) => json!({}),
         Some(b @ Value::Object(_)) => b,
@@ -399,7 +421,9 @@ pub fn request_with(
 
 #[cfg(test)]
 mod tests {
-    use super::{Code, ERROR_MEMBERS, Fault, Precondition, error, parse, request_with};
+    use super::{
+        Code, ERROR_MEMBERS, Fault, MAX_TOKEN_BYTES, Precondition, error, parse, request_with,
+    };
     use serde_json::json;
     use std::collections::BTreeSet;
 
@@ -430,6 +454,380 @@ mod tests {
         assert_eq!(rows.len(), table.len(), "a name appears twice: {table:?}");
         assert_eq!(code.len(), Code::ALL.len(), "two variants share a name");
         assert_eq!(rows, code);
+    }
+
+    /// One refusal the source emits: the code's wire name, its field and its `because` when
+    /// each is a literal at the `Fault::new` site or at a caller of the one helper around it.
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+    struct Emission {
+        code: String,
+        field: Option<String>,
+        because: Option<String>,
+    }
+
+    /// Every `.rs` file under `src/`, cut at its `#[cfg(test)]`, doc and line comments dropped;
+    /// none without `CARGO_MANIFEST_DIR` (the caller's resync guard then fails).
+    fn crate_sources() -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        // Read at run time: a baked manifest path names a deleted export (no_baked_paths).
+        let Some(root) = std::env::var_os("CARGO_MANIFEST_DIR") else {
+            return out;
+        };
+        let mut dirs = vec![std::path::PathBuf::from(root).join("src")];
+        while let Some(dir) = dirs.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for path in entries.filter_map(Result::ok).map(|e| e.path()) {
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path.extension().is_some_and(|x| x == "rs")
+                    && let Ok(text) = std::fs::read_to_string(&path)
+                {
+                    let live = text.split("#[cfg(test)]").next().unwrap_or("");
+                    let code: Vec<&str> = live
+                        .lines()
+                        .filter(|l| !l.trim_start().starts_with("//"))
+                        .collect();
+                    out.push((path.display().to_string(), code.join("\n")));
+                }
+            }
+        }
+        out
+    }
+
+    /// The index of the `)` that closes the `(` at `open`, skipping string literals.
+    fn close_of(s: &str, open: usize) -> Option<usize> {
+        let (mut depth, mut in_str, mut escaped) = (0_i32, false, false);
+        for (i, c) in s.char_indices().skip_while(|(i, _)| *i < open) {
+            if in_str {
+                match (escaped, c) {
+                    (true, _) => escaped = false,
+                    (false, '\\') => escaped = true,
+                    (false, '"') => in_str = false,
+                    _ => {}
+                }
+                continue;
+            }
+            match c {
+                '"' => in_str = true,
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// `s` split at its top-level commas (string literals and brackets respected), trimmed.
+    fn args_of(s: &str) -> Vec<String> {
+        let (mut out, mut cur) = (Vec::new(), String::new());
+        let (mut depth, mut in_str, mut escaped) = (0_i32, false, false);
+        for c in s.chars() {
+            if in_str {
+                match (escaped, c) {
+                    (true, _) => escaped = false,
+                    (false, '\\') => escaped = true,
+                    (false, '"') => in_str = false,
+                    _ => {}
+                }
+            } else {
+                match c {
+                    '"' => in_str = true,
+                    '(' | '[' | '{' | '<' => depth += 1,
+                    ')' | ']' | '}' | '>' => depth -= 1,
+                    ',' if depth == 0 => {
+                        out.push(cur.trim().to_owned());
+                        cur.clear();
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            cur.push(c);
+        }
+        if !cur.trim().is_empty() {
+            out.push(cur.trim().to_owned());
+        }
+        out
+    }
+
+    /// The text of a plain string literal `"..."` (no escapes, no format), else `None`.
+    fn literal(arg: &str) -> Option<String> {
+        let inner = arg.strip_prefix('"')?.strip_suffix('"')?;
+        (!inner.contains(['"', '\\'])).then(|| inner.to_owned())
+    }
+
+    fn is_ident(s: &str) -> bool {
+        !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    }
+
+    /// The helper (`let NAME = |params|`, any whitespace around `=` including a line break, or
+    /// `fn NAME(params)`) defined last before `at`: `(name, parameter names)`.
+    fn helper_before(src: &str, at: usize) -> Option<(String, Vec<String>)> {
+        let head = &src[..at];
+        let closure = head
+            .match_indices("let ")
+            .filter_map(|(l, _)| {
+                let rest = head[l + 4..].trim_start_matches("mut ");
+                let end = rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))?;
+                let params = rest[end..]
+                    .trim_start()
+                    .strip_prefix('=')?
+                    .trim_start()
+                    .strip_prefix('|')?
+                    .split('|')
+                    .next()?;
+                Some((l, rest[..end].to_owned(), params.to_owned()))
+            })
+            .last();
+        let func = head.rfind("fn ").and_then(|f| {
+            let rest = &head[f + 3..];
+            let paren = rest.find('(')?;
+            let close = close_of(rest, paren)?;
+            Some((
+                f,
+                rest[..paren].to_owned(),
+                rest[paren + 1..close].to_owned(),
+            ))
+        });
+        let (_, name, params) = match (closure, func) {
+            (Some(c), Some(f)) => {
+                if c.0 > f.0 {
+                    c
+                } else {
+                    f
+                }
+            }
+            (c, f) => c.or(f)?,
+        };
+        let names = args_of(&params)
+            .iter()
+            .map(|p| {
+                p.split(':')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .trim_start_matches("mut ")
+                    .to_owned()
+            })
+            .collect();
+        is_ident(name.trim()).then(|| (name.trim().to_owned(), names))
+    }
+
+    /// The argument lists of every call `name(..)` in `src` (not its definition).
+    fn calls_of(src: &str, name: &str) -> Vec<Vec<String>> {
+        let needle = format!("{name}(");
+        let mut out = Vec::new();
+        for (at, _) in src.match_indices(&needle) {
+            let before = src[..at].chars().next_back();
+            if before.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+                || src[..at].ends_with("fn ")
+            {
+                continue;
+            }
+            let open = at + name.len();
+            if let Some(close) = close_of(src, open) {
+                out.push(args_of(&src[open + 1..close]));
+            }
+        }
+        out
+    }
+
+    /// What [`emissions`] read: every triple, and each `because` expression it could not
+    /// resolve to a literal (`file: expression`).
+    struct Scan {
+        found: BTreeSet<Emission>,
+        unresolved: BTreeSet<String>,
+    }
+
+    /// `because` expressions the scan cannot resolve, each with where its texts are checked.
+    const BECAUSE_ALLOW: &[(&str, &str)] = &[(
+        "entry.scope.because()",
+        "Scope::because(): every variant checked verbatim by scope_becauses_appear_in_the_unavailable_row",
+    )];
+
+    /// Every refusal the crate's live source emits through `Fault::new`, with its field and
+    /// `because` resolved to literals where the site or one helper level holds them.
+    fn emissions() -> Scan {
+        let mut out = BTreeSet::new();
+        let mut unresolved = BTreeSet::new();
+        for (file, src) in crate_sources() {
+            for (at, _) in src.match_indices("Fault::new(") {
+                let open = at + "Fault::new".len();
+                let Some(close) = close_of(&src, open) else {
+                    continue;
+                };
+                let args = args_of(&src[open + 1..close]);
+                let Some(code) = args
+                    .first()
+                    .and_then(|c| c.rsplit("Code::").next())
+                    .filter(|c| is_ident(c))
+                else {
+                    continue;
+                };
+                let Some(variant) = Code::ALL.iter().find(|v| format!("{v:?}") == code) else {
+                    continue;
+                };
+                let field = args.get(1).cloned().unwrap_or_default();
+                let mut because = None;
+                let mut rest = close + 1;
+                loop {
+                    let tail = src[rest..].trim_start();
+                    let skipped = src.len() - rest - tail.len();
+                    let Some(m) = tail.strip_prefix(".with_") else {
+                        break;
+                    };
+                    let Some(paren) = m.find('(') else { break };
+                    let start = rest + skipped + ".with_".len() + paren;
+                    let Some(end) = close_of(&src, start) else {
+                        break;
+                    };
+                    if m.starts_with("because(") {
+                        because = Some(src[start + 1..end].trim().to_owned());
+                    }
+                    rest = end + 1;
+                }
+                let lit = |a: &str| literal(a);
+                let field_lit = lit(&field);
+                let because_lit = because.as_deref().and_then(lit);
+                let needs =
+                    |a: Option<&str>, l: &Option<String>| l.is_none() && a.is_some_and(is_ident);
+                let helper = (needs(Some(&field), &field_lit)
+                    || needs(because.as_deref(), &because_lit))
+                .then(|| helper_before(&src, at))
+                .flatten();
+                let name = variant.name().to_owned();
+                let Some((helper, params)) = helper else {
+                    if let Some(b) = because.as_deref().filter(|_| because_lit.is_none()) {
+                        unresolved.insert(format!("{file}: {b}"));
+                    }
+                    out.insert(Emission {
+                        code: name,
+                        field: field_lit,
+                        because: because_lit,
+                    });
+                    continue;
+                };
+                let pos = |a: Option<&str>| a.and_then(|a| params.iter().position(|p| p == a));
+                let (fi, bi) = (pos(Some(&field)), pos(because.as_deref()));
+                for call in calls_of(&src, &helper) {
+                    let from = |i: Option<usize>, own: &Option<String>| {
+                        i.and_then(|i| call.get(i))
+                            .and_then(|a| literal(a))
+                            .or_else(|| own.clone())
+                    };
+                    let resolved = from(bi, &because_lit);
+                    if let Some(b) = because.as_deref().filter(|_| resolved.is_none()) {
+                        let arg = bi.and_then(|i| call.get(i)).map_or(b, String::as_str);
+                        unresolved.insert(format!("{file}: {helper}({arg})"));
+                    }
+                    out.insert(Emission {
+                        code: name.clone(),
+                        field: from(fi, &field_lit),
+                        because: resolved,
+                    });
+                }
+            }
+        }
+        Scan {
+            found: out,
+            unresolved,
+        }
+    }
+
+    /// The FLOW.md "Refusal names" row of `code`, whole.
+    fn flow_row(code: &str) -> Option<String> {
+        let flow = include_str!("../FLOW.md");
+        flow.lines()
+            .find(|l| l.starts_with(&format!("| `{code}` |")))
+            .map(str::to_owned)
+    }
+
+    /// Triple parity: every `(code, field, because)` the source emits (literal at the site or
+    /// one helper level up) appears in that code's FLOW.md row: the field as `` `field` ``, the
+    /// `because` text verbatim. A `because` the scan cannot resolve to a literal fails the test
+    /// unless [`BECAUSE_ALLOW`] lists it with where its texts are checked; an unresolved field
+    /// is not checked. The resync and `user bus absent` triples prove the helper resolution runs
+    /// (a closure whose `= |` spans two lines included).
+    #[test]
+    fn every_emitted_triple_appears_in_its_flow_row() {
+        let Scan { found, unresolved } = emissions();
+        let unlisted: Vec<&String> = unresolved
+            .iter()
+            .filter(|u| {
+                !BECAUSE_ALLOW
+                    .iter()
+                    .any(|(expr, _)| u.ends_with(&format!(": {expr}")))
+            })
+            .collect();
+        assert!(
+            unlisted.is_empty(),
+            "a `because` the scan cannot resolve and BECAUSE_ALLOW does not list: {unlisted:#?}"
+        );
+        for (expr, _) in BECAUSE_ALLOW {
+            assert!(
+                unresolved.iter().any(|u| u.ends_with(&format!(": {expr}"))),
+                "BECAUSE_ALLOW lists {expr}, which no site emits any more"
+            );
+        }
+        assert!(
+            found.contains(&Emission {
+                code: "unavailable".into(),
+                field: Some("/".into()),
+                because: Some("user bus absent".into()),
+            }),
+            "the scan no longer resolves a closure whose `= |` spans two lines: {found:?}"
+        );
+        assert!(
+            found.contains(&Emission {
+                code: "resync_required".into(),
+                field: Some("/body/since_seq".into()),
+                because: Some("future_sequence".into()),
+            }),
+            "the scan no longer resolves helper arguments: {found:?}"
+        );
+        let mut missing = Vec::new();
+        for e in &found {
+            let Some(row) = flow_row(&e.code) else {
+                missing.push(format!("{}: no row", e.code));
+                continue;
+            };
+            if let Some(f) = &e.field
+                && !row.contains(&format!("`{f}`"))
+            {
+                missing.push(format!("{}: field `{f}`", e.code));
+            }
+            if let Some(b) = &e.because
+                && !row.contains(b.as_str())
+            {
+                missing.push(format!("{}: because {b:?}", e.code));
+            }
+        }
+        assert!(missing.is_empty(), "FLOW.md rows miss: {missing:#?}");
+    }
+
+    /// Every [`Scope::because`] text (the `unavailable` registry miss) appears verbatim in the
+    /// `unavailable` row. The match is exhaustive, so a new scope must be listed here.
+    #[test]
+    fn scope_becauses_appear_in_the_unavailable_row() {
+        use hee4_contracts::catalogue::Scope;
+        let listed = |s: Scope| match s {
+            Scope::V40 | Scope::V41 | Scope::V42 | Scope::Held => s,
+        };
+        let row = flow_row("unavailable").unwrap_or_default();
+        for scope in [Scope::V40, Scope::V41, Scope::V42, Scope::Held].map(listed) {
+            assert!(
+                row.contains(&format!("\"{}\"", scope.because())),
+                "{scope:?}: {:?} not in the unavailable row",
+                scope.because()
+            );
+        }
     }
 
     #[test]
@@ -466,6 +864,44 @@ mod tests {
                 "{bad}: {parsed:?}"
             );
         }
+    }
+
+    /// `idempotency_key`, `precondition.resource` and `precondition.id` are tokens: empty or
+    /// over `MAX_TOKEN_BYTES` is `invalid_argument` at the member's own pointer; exactly
+    /// `MAX_TOKEN_BYTES` is accepted.
+    #[test]
+    fn token_members_are_bounded_at_their_pointers() {
+        let max = "k".repeat(MAX_TOKEN_BYTES);
+        let over = "k".repeat(MAX_TOKEN_BYTES + 1);
+        let refused_at = |line: String, at: &str| {
+            let parsed = parse(&line);
+            assert!(
+                matches!(&parsed, Err((id, f)) if id == "r" && f.code == Code::InvalidArgument && f.field == at),
+                "{at}: {parsed:?}"
+            );
+        };
+        let keyed = |k: &str| request_with("r", "a", Some(k), json!({}), None).to_string();
+        assert_eq!(
+            parse(&keyed(&max)).map(|r| r.idempotency_key),
+            Ok(Some(max.clone()))
+        );
+        refused_at(keyed(&over), "/idempotency_key");
+        refused_at(keyed(""), "/idempotency_key");
+        let pre = |resource: &str, id: &str| {
+            request_with(
+                "r",
+                "a",
+                None,
+                json!({}),
+                Some(json!({"resource": resource, "id": id, "generation": 1})),
+            )
+            .to_string()
+        };
+        assert!(parse(&pre(&max, &max)).is_ok());
+        refused_at(pre("", "x"), "/precondition/resource");
+        refused_at(pre(&over, "x"), "/precondition/resource");
+        refused_at(pre("roster", ""), "/precondition/id");
+        refused_at(pre("roster", &over), "/precondition/id");
     }
 
     #[test]

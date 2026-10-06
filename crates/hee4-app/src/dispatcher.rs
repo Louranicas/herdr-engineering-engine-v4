@@ -6,13 +6,14 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write as _;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hee4_contracts::bounds::MAX_VIEW_ITEMS;
 use hee4_contracts::{
-    AbandonReason, Brief, BriefField, Event, GitSha, Observation, Phase, ReceiptId, Resolution,
-    Settlement, Sha256Hex, SourceId, TaskId, Verdict, VerifyLine,
+    AbandonReason, Brief, BriefField, Event, GitSha, Observation, Outcome, Phase, ReceiptId,
+    Resolution, Settlement, Sha256Hex, SourceId, TaskId, VerifyLine,
 };
 use hee4_core::backup::{BackupError, SameDisk, backup_to};
 use hee4_core::recovery::Facts;
@@ -288,6 +289,9 @@ pub const fn backup_error_name(e: &BackupError) -> &'static str {
         BackupError::TargetOccupied { .. } => "target_occupied",
         BackupError::DigestMismatch { .. } => "digest_mismatch",
         BackupError::ObjectsMissing { .. } => "objects_missing",
+        BackupError::NotRegular { .. } => "not_regular",
+        // `BackupError` is `#[non_exhaustive]`: a variant added in hee4-core is named here
+        // only once this arm list grows.
         _ => "backup_error",
     }
 }
@@ -472,8 +476,8 @@ enum Pick {
     Stop(TaskId),
 }
 
-/// The first `admitted` task, or `cancellation_requested` task with no open attempt, oldest
-/// id first. The attempt is open by `recovery::Facts`, the one derivation reconcile also reads.
+/// The first `admitted` task, or `cancellation_requested` task with no open attempt, lowest
+/// id first (`Store::task_ids` order; ids are digests, so this is not arrival order). The attempt is open by `recovery::Facts`, the one derivation reconcile also reads.
 fn next_task(engine: &Engine) -> Result<Option<Pick>, StoreError> {
     let store = engine.store();
     for task in store.task_ids()? {
@@ -953,7 +957,11 @@ struct Sealing<'a> {
 }
 
 /// After the attempt: settle, ask deep-diff-forge over the workspace diff, ledger each
-/// observation, `decide_and_seal`, append, decide.
+/// observation, `decide_and_seal`, then seal and decide in one store transaction. A cancel can
+/// land at any point after the attempt (the workspace diff and deep-diff-forge run for up to the
+/// timebox), so every write here goes through [`unless_cancelled`] or [`seal_unless_cancelled`]:
+/// the task is stopped where the cancel is seen, and each observation row is written only after
+/// its `Observe` was applied.
 fn settle_and_decide(
     engine: &Engine,
     sealing: &Sealing<'_>,
@@ -971,25 +979,133 @@ fn settle_and_decide(
         apply(engine, task, Event::Settle(Settlement::NotReady))?;
         return Ok(Some((task.clone(), apply(engine, task, Event::Stop)?)));
     }
-    apply(engine, task, Event::Settle(Settlement::Ready))?;
+    if let Err(stopped) = unless_cancelled(engine, task, Event::Settle(Settlement::Ready))? {
+        return Ok(Some((task.clone(), stopped)));
+    }
     let mut observations = outcome.observations.clone();
     observations.extend(ddf_observation(sealing));
-    for obs in &observations {
-        let id = observation_id(task, obs)?;
-        engine.store().record_observation(task, &id, obs)?;
-        apply(engine, task, Event::Observe)?;
+    if let Err(stopped) = observe(engine, task, &observations)? {
+        return Ok(Some((task.clone(), stopped)));
     }
     let receipt = seal(engine, sealing, &observations)?;
-    let verdict = receipt.decision().verdict;
+    #[cfg(test)]
+    tests::before_seal(engine, task);
+    let phase = match seal_unless_cancelled(engine, &receipt)? {
+        Ok(p) => p,
+        Err(stopped) => return Ok(Some((task.clone(), stopped))),
+    };
     eprintln!(
-        "dispatch task={task} verdict={verdict:?} receipt={}",
-        receipt.hash_self()
+        "dispatch task={task} verdict={:?} receipt={} phase={}",
+        receipt.decision().verdict,
+        receipt.hash_self(),
+        phase.as_str()
     );
-    let mut phase = apply(engine, task, Event::Decide(verdict))?;
-    if verdict == Verdict::Pass {
-        phase = apply(engine, task, Event::Accept)?;
-    }
+    checkpoint(engine)?;
     Ok(Some((task.clone(), phase)))
+}
+
+/// K1's `Store::seal_and_decide` (the receipt, its `Decide` and, on a `Pass`, `Accept`, one
+/// transaction), unless a cancel has landed. The store lock is held from the phase check to the
+/// commit, so a cancel through this engine lands either before (no receipt is sealed; `Stop`)
+/// or after (the task is already decided). `Err(phase)`: the task was stopped. A cancel the
+/// transaction itself sees (the `Decide` leaves `cancellation_requested`, or is refused from
+/// there and rolls the receipt back) is stopped the same way, as [`unless_cancelled`] does.
+fn seal_unless_cancelled(
+    engine: &Engine,
+    receipt: &hee4_contracts::Receipt,
+) -> Result<Result<Phase, Phase>, StoreError> {
+    let task = receipt.task_id();
+    let sealed = {
+        let store = engine.store();
+        if store.phase(task)? == Some(Phase::CancellationRequested) {
+            None
+        } else {
+            Some(store.seal_and_decide(receipt))
+        }
+    };
+    match sealed {
+        None => stop_cancelled(engine, task, "seal_and_decide"),
+        Some(sealed) => stop_if_cancelled(engine, task, "seal_and_decide", sealed),
+    }
+}
+
+/// Each observation: apply `Observe`, then write its row, so no row is written once a cancel
+/// is seen. `Err(phase)`: the task was stopped. A cancel between an `Observe` and its row
+/// leaves the rows of the observations already applied, never more.
+fn observe(
+    engine: &Engine,
+    task: &TaskId,
+    observations: &[Observation],
+) -> Result<Result<(), Phase>, DispatchError> {
+    for obs in observations {
+        let id = observation_id(task, obs)?;
+        if let Err(stopped) = unless_cancelled(engine, task, Event::Observe)? {
+            return Ok(Err(stopped));
+        }
+        engine.store().record_observation(task, &id, obs)?;
+    }
+    Ok(Ok(()))
+}
+
+/// Apply one settle-path event, or stop a task whose cancel has landed. A cancel shows in
+/// two ways: the event leaves the task in `cancellation_requested` (`Settle`, `Decide`), or
+/// `transition` refuses it from there (`Observe`, `Accept` have no edge). Either way `Stop`
+/// is applied and its phase returned as `Err`; any other refusal is the caller's error.
+fn unless_cancelled(
+    engine: &Engine,
+    task: &TaskId,
+    event: Event,
+) -> Result<Result<Phase, Phase>, StoreError> {
+    stop_if_cancelled(
+        engine,
+        task,
+        &format!("{event:?}"),
+        apply(engine, task, event),
+    )
+}
+
+/// The cancel test of [`unless_cancelled`] over a write's answer: a phase of
+/// `cancellation_requested`, or an `Illegal` refusal from there, is stopped.
+fn stop_if_cancelled(
+    engine: &Engine,
+    task: &TaskId,
+    what: &str,
+    written: Result<Phase, StoreError>,
+) -> Result<Result<Phase, Phase>, StoreError> {
+    match written {
+        Ok(Phase::CancellationRequested)
+        | Err(StoreError::Refused(hee4_contracts::Refusal::Illegal {
+            from: Phase::CancellationRequested,
+            ..
+        })) => stop_cancelled(engine, task, what),
+        other => other.map(Ok),
+    }
+}
+
+/// `Stop` a task whose cancel was seen before `what` completed; its phase as `Err`.
+fn stop_cancelled(
+    engine: &Engine,
+    task: &TaskId,
+    what: &str,
+) -> Result<Result<Phase, Phase>, StoreError> {
+    eprintln!("dispatch task={task} cancelled before {what} completed; stopping");
+    apply(engine, task, Event::Stop).map(Err)
+}
+
+/// After a receipt: K1's `checkpoint_if_due` under `ledger.checkpoint_every`, one
+/// `dispatch checkpoint seq= count= root=` line when a checkpoint is written. The field's floor
+/// is 1 (`Budgets::parse`), so a zero never reaches here; it would write none.
+fn checkpoint(engine: &Engine) -> Result<(), StoreError> {
+    let Some(every) = NonZeroU64::new(engine.budgets().ledger.checkpoint_every) else {
+        return Ok(());
+    };
+    if let Some(c) = engine.store().checkpoint_if_due(every)? {
+        eprintln!(
+            "dispatch checkpoint seq={} count={} root={}",
+            c.seq, c.count, c.root
+        );
+    }
+    Ok(())
 }
 
 /// The bytes one workspace walk may read (file contents plus a per-entry charge for its
@@ -1127,25 +1243,22 @@ impl Snapshot {
     }
 }
 
-/// The workspace's change since `before`, as a git-style unified patch computed here: `None`
-/// when `<ws>/.git` is absent (no worktree); empty bytes when nothing changed. `<ws>/.git` is
-/// only stat'ed (`symlink_metadata`), never read and never handed to git.
+/// The workspace's change since `before`, as a git-style unified patch computed here, with or
+/// without a `<ws>/.git` (the snapshot needs no git, and the sandbox cannot run one); empty
+/// bytes when nothing changed. A `<ws>/.git` is only stat'ed (`symlink_metadata`), never read
+/// and never handed to git.
 ///
 /// # Errors
-/// [`DiffFault`]: a `.git` that is not a real directory, an unreadable or oversized workspace.
-pub fn workspace_diff(
-    ws: &Path,
-    before: &Snapshot,
-    cap: u64,
-) -> Result<Option<Vec<u8>>, DiffFault> {
+/// [`DiffFault`]: a `.git` that is a file or a symlink, an unreadable or oversized workspace.
+pub fn workspace_diff(ws: &Path, before: &Snapshot, cap: u64) -> Result<Vec<u8>, DiffFault> {
     match fs::symlink_metadata(ws.join(".git")) {
-        Ok(m) if m.is_dir() => {}
-        Ok(_) => return Err(DiffFault::GitDirNotDir),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Ok(m) if !m.is_dir() => return Err(DiffFault::GitDirNotDir),
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
     }
     let after = Snapshot::of(ws, cap)?;
-    Ok(Some(patch(before, &after)))
+    Ok(patch(before, &after))
 }
 
 /// `before` → `after` as a unified patch `git apply` accepts: whole-file hunks, git's path
@@ -1308,41 +1421,81 @@ const fn adapter_error_name(e: &AdapterError) -> &'static str {
 /// skip is a log line and nothing else: never a refusal, never an abandon.
 fn ddf_observation(sealing: &Sealing<'_>) -> Option<Observation> {
     let task = &sealing.subject.task_id;
-    let skipped = |reason: &str| {
-        eprintln!("dispatch task={task} ddf=skipped reason={reason}");
-        None
-    };
+    let log = &mut std::io::stderr();
     let diff = sealing
         .before
         .as_ref()
         .map_err(DiffFault::name)
         .and_then(|before| {
             workspace_diff(sealing.work_dir, before, DDF_DIFF_BYTES).map_err(|e| {
-                eprintln!("dispatch task={task} ddf diff_error={e}");
+                let _ = writeln!(log, "dispatch task={task} ddf diff_error={e}");
                 e.name()
             })
         });
-    let bytes = match diff {
-        Ok(bytes) => bytes,
-        Err(kind) => return skipped(&format!("diff_error:{kind}")),
-    };
-    let diff = bytes.as_deref().map_or(Diff::NoWorktree, Diff::Bytes);
-    match ddf::for_task(diff, sealing.subject, &SystemClock, sealing.budget) {
+    match diff {
+        Ok(bytes) => report_ddf(
+            task,
+            ddf::for_task(
+                Diff::Bytes(&bytes),
+                sealing.subject,
+                &SystemClock,
+                sealing.budget,
+            ),
+            log,
+        ),
+        Err(kind) => ddf_skipped(task, &format!("diff_error:{kind}"), log),
+    }
+}
+
+/// One `dispatch task= ddf=` line for deep-diff-forge's answer, written to `log` (stderr under
+/// `serve`), and the observation to record. Every `Observed` is returned, whatever its word:
+/// `decide` ignores an advisory row, and the dispatcher never reads the outcome.
+fn report_ddf(
+    task: &TaskId,
+    answer: Result<TaskObservation, AdapterError>,
+    log: &mut impl std::io::Write,
+) -> Option<Observation> {
+    match answer {
         Ok(TaskObservation::Observed(obs)) => {
-            eprintln!(
-                "dispatch task={task} ddf=observed tool={} {}",
-                obs.tool.name, obs.tool.version
+            let _ = writeln!(
+                log,
+                "dispatch task={task} ddf={} tool={} {}",
+                ddf_word(&obs),
+                obs.tool.name,
+                obs.tool.version
             );
             Some(obs)
         }
-        Ok(TaskObservation::Skipped(skip)) => skipped(skip.name()),
+        Ok(TaskObservation::Skipped(skip)) => ddf_skipped(task, skip.name(), log),
         Err(e) => {
-            eprintln!("dispatch task={task} ddf adapter_error={e}");
-            skipped(&format!("adapter_error:{}", adapter_error_name(&e)))
+            let _ = writeln!(log, "dispatch task={task} ddf adapter_error={e}");
+            ddf_skipped(
+                task,
+                &format!("adapter_error:{}", adapter_error_name(&e)),
+                log,
+            )
         }
     }
 }
 
+fn ddf_skipped(task: &TaskId, reason: &str, log: &mut impl std::io::Write) -> Option<Observation> {
+    let _ = writeln!(log, "dispatch task={task} ddf=skipped reason={reason}");
+    None
+}
+
+/// The `ddf=` word of an observation, read from its own outcome: K4 builds `Error` only for a
+/// run past its budget (`ddf::timeout_observation`) and `Refused` only for exit 7 (the tool
+/// declined to rank); anything else is a ranking.
+fn ddf_word(obs: &Observation) -> &'static str {
+    match obs.outcome {
+        Outcome::Error => "timeout",
+        Outcome::Refused { .. } => "declined",
+        _ => "observed",
+    }
+}
+
+/// Build the sealed receipt (`decide_and_seal`) over the ledgered observations. Writes nothing:
+/// [`seal_unless_cancelled`] appends it and applies its verdict in one transaction.
 fn seal(
     engine: &Engine,
     sealing: &Sealing<'_>,
@@ -1367,15 +1520,13 @@ fn seal(
         standards: source("gate.toml", crate::GATE_TOML)?,
     };
     let task = &sealing.subject.task_id;
-    let receipt = decide_and_seal(
+    Ok(decide_and_seal(
         store.chain_head(task)?,
         sealing.receipt_id.clone(),
         &ids,
         obs,
         sealing.subject,
-    )?;
-    store.append_receipt(&receipt)?;
-    Ok(receipt)
+    )?)
 }
 
 #[cfg(test)]
@@ -1453,6 +1604,16 @@ mod tests {
         assert_eq!(backup_due(&facts(Some((1000, b'a')), 0, 10)), None);
     }
 
+    /// A restore that finds a symlink, directory or device where a regular file belongs is
+    /// named, not reported as the catch-all.
+    #[test]
+    fn a_not_regular_backup_file_is_named_not_regular() {
+        let e = BackupError::NotRegular {
+            file: "manifest.json".into(),
+        };
+        assert_eq!(backup_error_name(&e), "not_regular");
+    }
+
     #[test]
     fn a_pass_line_round_trips_its_ts_and_head() {
         let line = "backup id=b-0000000003e8-0000000a objects=2 age_s=none trigger=start head=aaaaaaaaaaaa verdict=PASS";
@@ -1488,20 +1649,93 @@ mod tests {
 
     const CAP: u64 = DDF_DIFF_BYTES;
 
+    /// A workspace with no `.git` is still diffed: the engine never creates one and the
+    /// sandbox cannot run git, so a `.git` gate would skip every live attempt.
     #[test]
-    fn workspace_diff_without_git_dir_is_no_worktree() -> R<()> {
-        let ws = scratch("no-worktree")?;
+    fn workspace_diff_without_git_dir_is_a_patch() -> R<()> {
+        let ws = scratch("no-git-dir")?;
         let before = Snapshot::of(&ws, CAP)?;
-        fs::write(ws.join("f"), "x")?;
-        assert_eq!(workspace_diff(&ws, &before, CAP)?, None);
-        let skip = ddf::for_task(
-            Diff::NoWorktree,
-            &subject()?,
-            &SystemClock,
-            Duration::from_secs(5),
-        )?;
-        assert_eq!(skip, TaskObservation::Skipped(ddf::Skip::NoWorktree));
+        assert_eq!(workspace_diff(&ws, &before, CAP)?, b"");
+        fs::write(ws.join("f"), "x\n")?;
+        assert_eq!(
+            String::from_utf8(workspace_diff(&ws, &before, CAP)?)?,
+            "diff --git a/f b/f\nnew file mode 100644\n--- /dev/null\n+++ b/f\n@@ -0,0 +1 @@\n+x\n"
+        );
         let _ = fs::remove_dir_all(&ws);
+        Ok(())
+    }
+
+    /// One of hee4-evidence's committed deep-diff-forge stubs (mode 755; read at run time, never
+    /// a baked path).
+    fn ddf_stub(name: &str) -> R<PathBuf> {
+        let manifest = std::env::var("CARGO_MANIFEST_DIR")?;
+        Ok(PathBuf::from(manifest)
+            .join("../hee4-evidence/tests/fixtures")
+            .join(name))
+    }
+
+    /// `report_ddf` over the stub `name` run on `diff` within `budget`: the observation it
+    /// returns and the one line it printed.
+    fn ddf_run(name: &str, diff: &[u8], budget: Duration) -> R<(Option<Observation>, String)> {
+        let subject = subject()?;
+        let answer = ddf::for_task_with(
+            &ddf_stub(name)?,
+            Diff::Bytes(diff),
+            &subject,
+            &SystemClock,
+            budget,
+        );
+        let mut log = Vec::new();
+        let obs = report_ddf(&subject.task_id, answer, &mut log);
+        Ok((obs, String::from_utf8(log)?))
+    }
+
+    /// A deep-diff-forge run past its budget is printed `ddf=timeout`, and its advisory
+    /// observation is still returned for sealing.
+    #[test]
+    fn a_ddf_run_past_its_budget_prints_ddf_timeout() -> R<()> {
+        let (obs, line) = ddf_run("ddf-sleep5.sh", b"x", Duration::from_millis(200))?;
+        let task = subject()?.task_id;
+        assert_eq!(
+            line,
+            format!("dispatch task={task} ddf=timeout tool=deep-diff-forge unknown\n")
+        );
+        let obs = obs.ok_or("the timeout observation was not returned")?;
+        assert!(obs.advisory);
+        assert_eq!(obs.outcome, Outcome::Error);
+        Ok(())
+    }
+
+    /// Exit 7 (the tool declined to rank) is printed `ddf=declined`, its advisory observation
+    /// still returned.
+    #[test]
+    fn a_ddf_exit_7_prints_ddf_declined() -> R<()> {
+        let (obs, line) = ddf_run("ddf-exit7-silent.sh", b"x", Duration::from_secs(5))?;
+        let task = subject()?.task_id;
+        assert!(
+            line.starts_with(&format!(
+                "dispatch task={task} ddf=declined tool=deep-diff-forge "
+            )),
+            "{line}"
+        );
+        assert_eq!(line.lines().count(), 1, "{line}");
+        let obs = obs.ok_or("the exit-7 observation was not returned")?;
+        assert!(obs.advisory);
+        assert!(matches!(obs.outcome, Outcome::Refused { .. }), "{obs:?}");
+        Ok(())
+    }
+
+    /// NEGATIVE: a ranking is still printed `ddf=observed tool=`.
+    #[test]
+    fn a_ddf_ranking_prints_ddf_observed() -> R<()> {
+        let diff = fs::read(ddf_stub("verdict.diff")?)?;
+        let (obs, line) = ddf_run("ddf-pass.sh", &diff, Duration::from_secs(5))?;
+        let task = subject()?.task_id;
+        assert_eq!(
+            line,
+            format!("dispatch task={task} ddf=observed tool=deep-diff-forge stub\n")
+        );
+        assert_eq!(obs.ok_or("no observation")?.outcome, Outcome::Pass);
         Ok(())
     }
 
@@ -1512,7 +1746,7 @@ mod tests {
         let before = Snapshot::of(&ws, CAP)?;
         // What happens under `.git` is not the workspace's change.
         fs::write(ws.join(".git").join("index"), "staged")?;
-        let bytes = workspace_diff(&ws, &before, CAP)?.ok_or("no worktree")?;
+        let bytes = workspace_diff(&ws, &before, CAP)?;
         assert!(bytes.is_empty(), "{}", String::from_utf8_lossy(&bytes));
         let skip = ddf::for_task(
             Diff::Bytes(&bytes),
@@ -1522,7 +1756,7 @@ mod tests {
         )?;
         assert_eq!(skip, TaskObservation::Skipped(ddf::Skip::NoDiff));
         fs::write(ws.join("f"), "x\n")?;
-        let added = workspace_diff(&ws, &before, CAP)?.ok_or("no worktree")?;
+        let added = workspace_diff(&ws, &before, CAP)?;
         assert_eq!(
             String::from_utf8(added)?,
             "diff --git a/f b/f\nnew file mode 100644\n--- /dev/null\n+++ b/f\n@@ -0,0 +1 @@\n+x\n"
@@ -1558,7 +1792,7 @@ mod tests {
         fs::remove_file(ws.join(".git"))?;
         fs::create_dir(ws.join(".git"))?;
         std::os::unix::fs::symlink(victim.join("secret"), ws.join("s"))?;
-        let bytes = workspace_diff(&ws, &before, CAP)?.ok_or("no worktree")?;
+        let bytes = workspace_diff(&ws, &before, CAP)?;
         let text = String::from_utf8(bytes)?;
         assert!(text.contains("new file mode 120000"), "{text}");
         assert!(!text.contains("SECRET_TOKEN"), "{text}");
@@ -1612,7 +1846,7 @@ mod tests {
         fs::set_permissions(ws.join("run"), fs::Permissions::from_mode(0o755))?;
         fs::write(ws.join("we\"ird\nname"), "q\n")?;
         std::os::unix::fs::symlink("d/mod", ws.join("ln"))?;
-        let bytes = workspace_diff(&ws, &before, CAP)?.ok_or("no worktree")?;
+        let bytes = workspace_diff(&ws, &before, CAP)?;
         let text = String::from_utf8_lossy(&bytes).into_owned();
         assert!(text.contains("diff --git \"a/we\\\"ird\\nname\" \"b/we\\\"ird\\nname\"\n"));
         let patch_file = scratch("apply-patch")?.join("p.diff");
@@ -1632,7 +1866,7 @@ mod tests {
         // A binary change is named, not inlined.
         let before = Snapshot::of(&ws, CAP)?;
         fs::write(ws.join("bin"), b"a\0b")?;
-        let bin = String::from_utf8(workspace_diff(&ws, &before, CAP)?.ok_or("no worktree")?)?;
+        let bin = String::from_utf8(workspace_diff(&ws, &before, CAP)?)?;
         assert!(
             bin.contains("Binary files /dev/null and b/bin differ\n"),
             "{bin}"
@@ -1770,6 +2004,230 @@ mod tests {
             events(&engine, &task)?,
             [Event::Admit, Event::Cancel, Event::Stop]
         );
+        Ok(())
+    }
+
+    /// `task`'s observation rows, read through a read-only connection (SELECT only).
+    fn observation_rows(engine: &Engine, task: &TaskId) -> R<i64> {
+        let conn = rusqlite::Connection::open_with_flags(
+            engine.ledger(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        Ok(conn.query_row(
+            "SELECT count(*) FROM observations WHERE task_id = ?1",
+            [task.to_string()],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// A cancel that lands while the attempt runs: the attempt's steps pass, `Settle(Ready)`
+    /// leaves the task in `cancellation_requested`, and the dispatcher stops it there. No
+    /// observation row is written (there is no `Observe` edge from that phase), no receipt is
+    /// sealed, and `step` returns the `cancelled` phase, not an error.
+    #[test]
+    fn a_cancel_mid_attempt_ends_cancelled_without_observing() -> R<()> {
+        let engine = crate::actions::testing::engine("dispatch-cancel-mid")?;
+        let task: TaskId = "t-cancel-mid".parse()?;
+        let brief =
+            crate::actions::testing::BRIEF.replace("/usr/bin/test -d /usr", "/usr/bin/sleep 1");
+        fs::create_dir_all(engine.work().join("briefs"))?;
+        fs::write(engine.brief_path(&task), brief)?;
+        {
+            let store = engine.store();
+            assert!(hee4_core::reconcile(&store, &hee4_core::Observations::default())?.complete);
+            store.apply(&task, Event::Admit)?;
+        }
+        let stepped = std::thread::scope(|s| {
+            let canceller = s.spawn(|| -> Result<(), String> {
+                let t0 = std::time::Instant::now();
+                while t0.elapsed() < Duration::from_secs(20) {
+                    let store = engine.store();
+                    if store.phase(&task).map_err(|e| e.to_string())? == Some(Phase::Running) {
+                        store
+                            .apply(&task, Event::Cancel)
+                            .map_err(|e| e.to_string())?;
+                        return Ok(());
+                    }
+                    drop(store);
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err("the task never ran".into())
+            });
+            let stepped = step(&engine, &offline(), None);
+            (stepped, canceller.join())
+        });
+        let (stepped, cancelled) = stepped;
+        assert_eq!(cancelled.map_err(|_| "canceller panicked")?, Ok(()));
+        assert_eq!(stepped?, Some((task.clone(), Phase::Cancelled)));
+        assert_eq!(
+            events(&engine, &task)?,
+            [
+                Event::Admit,
+                Event::Dispatch,
+                Event::Cancel,
+                Event::Settle(Settlement::Ready),
+                Event::Stop
+            ]
+        );
+        assert_eq!(observation_rows(&engine, &task)?, 0);
+        assert_eq!(engine.store().receipt_count(&task)?, 0);
+        Ok(())
+    }
+
+    /// A task in `verifying`, then cancelled: the window after `Settle(Ready)` returned, while
+    /// the workspace diff, deep-diff-forge and the seal run.
+    fn cancelled_while_verifying(name: &str) -> R<(Engine, TaskId)> {
+        let engine = crate::actions::testing::engine(name)?;
+        let task: TaskId = format!("t-{name}").parse()?;
+        {
+            let store = engine.store();
+            assert!(hee4_core::reconcile(&store, &hee4_core::Observations::default())?.complete);
+            store.apply(&task, Event::Admit)?;
+            store.apply(&task, Event::Dispatch)?;
+            assert_eq!(
+                store.apply(&task, Event::Settle(Settlement::Ready))?,
+                Phase::Verifying
+            );
+            assert_eq!(
+                store.apply(&task, Event::Cancel)?,
+                Phase::CancellationRequested
+            );
+        }
+        Ok((engine, task))
+    }
+
+    fn an_observation() -> R<Observation> {
+        Ok(Observation {
+            source: "deep-diff-forge".parse()?,
+            input_sha256: Sha256Hex::digest(b"diff"),
+            tool: hee4_contracts::ToolId {
+                name: "ddf".parse()?,
+                version: "1".parse()?,
+            },
+            head_sha: "a".repeat(40).parse()?,
+            outcome: hee4_contracts::Outcome::Pass,
+            evidence: Vec::new(),
+            advisory: true,
+            elapsed_ms: 1,
+            budget_ms: 10,
+        })
+    }
+
+    /// A cancel that lands at `verifying` (after `Settle(Ready)`): the next `Observe` has no
+    /// edge, so the task is stopped there, `cancelled`, and no observation row is written.
+    #[test]
+    fn a_cancel_at_verifying_stops_before_any_observation_row() -> R<()> {
+        let (engine, task) = cancelled_while_verifying("cancel-verifying-observe")?;
+        assert_eq!(
+            observe(&engine, &task, &[an_observation()?])?,
+            Err(Phase::Cancelled)
+        );
+        assert_eq!(observation_rows(&engine, &task)?, 0);
+        assert_eq!(engine.store().phase(&task)?, Some(Phase::Cancelled));
+        Ok(())
+    }
+
+    /// A cancel that lands after the seal: `Decide` leaves the task in
+    /// `cancellation_requested`, and it is stopped there instead of erroring on `Accept`.
+    #[test]
+    fn a_cancel_at_verifying_stops_at_decide_or_accept() -> R<()> {
+        let (engine, task) = cancelled_while_verifying("cancel-verifying-decide")?;
+        assert_eq!(
+            unless_cancelled(&engine, &task, Event::Decide(hee4_contracts::Verdict::Pass))?,
+            Err(Phase::Cancelled)
+        );
+        let (engine, task) = cancelled_while_verifying("cancel-verifying-accept")?;
+        assert_eq!(
+            unless_cancelled(&engine, &task, Event::Accept)?,
+            Err(Phase::Cancelled)
+        );
+        assert_eq!(
+            events(&engine, &task)?,
+            [
+                Event::Admit,
+                Event::Dispatch,
+                Event::Settle(Settlement::Ready),
+                Event::Cancel,
+                Event::Stop
+            ]
+        );
+        Ok(())
+    }
+
+    type BeforeSeal = fn(&Engine, &TaskId);
+
+    thread_local! {
+        /// What this test thread runs on the settle path between the seal and
+        /// `seal_unless_cancelled` (the dispatcher is synchronous, so `step` runs it here).
+        static BEFORE_SEAL: std::cell::Cell<Option<BeforeSeal>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// The settle path's test seam: runs this thread's [`BEFORE_SEAL`], if any.
+    pub(super) fn before_seal(engine: &Engine, task: &TaskId) {
+        if let Some(f) = BEFORE_SEAL.with(std::cell::Cell::get) {
+            f(engine, task);
+        }
+    }
+
+    /// A cancel that lands after the last observation row and before the seal: the settle path
+    /// finds the task `cancellation_requested` at `seal_and_decide`, seals nothing and stops it.
+    /// `step` returns `cancelled`, not an error, and the store holds no receipt for it.
+    #[test]
+    fn a_cancel_landing_before_seal_and_decide_ends_cancelled_with_no_receipt() -> R<()> {
+        let engine = crate::actions::testing::engine("cancel-before-seal")?;
+        let task: TaskId = "t-cancel-before-seal".parse()?;
+        fs::create_dir_all(engine.work().join("briefs"))?;
+        fs::write(engine.brief_path(&task), crate::actions::testing::BRIEF)?;
+        {
+            let store = engine.store();
+            assert!(hee4_core::reconcile(&store, &hee4_core::Observations::default())?.complete);
+            store.apply(&task, Event::Admit)?;
+        }
+        BEFORE_SEAL.with(|c| {
+            c.set(Some(|engine: &Engine, task: &TaskId| {
+                let store = engine.store();
+                assert_eq!(store.phase(task).ok().flatten(), Some(Phase::Verifying));
+                assert_eq!(
+                    store.apply(task, Event::Cancel).ok(),
+                    Some(Phase::CancellationRequested)
+                );
+            }));
+        });
+        let stepped = step(&engine, &offline(), None);
+        BEFORE_SEAL.with(|c| c.set(None));
+        assert_eq!(stepped?, Some((task.clone(), Phase::Cancelled)));
+        assert_eq!(engine.store().receipt_count(&task)?, 0);
+        let events = events(&engine, &task)?;
+        assert_eq!(
+            events.iter().rev().take(2).collect::<Vec<_>>(),
+            [&Event::Stop, &Event::Cancel]
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::Decide(_) | Event::Accept)),
+            "{events:?}"
+        );
+        Ok(())
+    }
+
+    /// NEGATIVE: an event refused from any other phase is still the caller's error.
+    #[test]
+    fn unless_cancelled_passes_other_refusals_through() -> R<()> {
+        let engine = crate::actions::testing::engine("cancel-other-refusal")?;
+        let task: TaskId = "t-cancel-other-refusal".parse()?;
+        {
+            let store = engine.store();
+            assert!(hee4_core::reconcile(&store, &hee4_core::Observations::default())?.complete);
+            store.apply(&task, Event::Admit)?;
+        }
+        assert!(matches!(
+            unless_cancelled(&engine, &task, Event::Accept),
+            Err(StoreError::Refused(hee4_contracts::Refusal::Illegal {
+                from: Phase::Admitted,
+                event: Event::Accept
+            }))
+        ));
         Ok(())
     }
 

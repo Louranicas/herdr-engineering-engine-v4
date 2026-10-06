@@ -58,20 +58,13 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         "serve" => {
-            let (Some(ledger), Some(work)) = (flag(&args, "--ledger"), flag(&args, "--work"))
-            else {
-                return fail("serve needs --socket, --ledger and --work");
-            };
-            let serve = ServeArgs {
-                socket: sock,
-                ledger: ledger.into(),
-                work: work.into(),
-                // The one place a budgets path is named: the flag, else the unit's env.
-                budgets: flag(&args, "--budgets")
-                    .map(PathBuf::from)
-                    .or_else(|| std::env::var_os("HEE4_BUDGETS").map(PathBuf::from)),
-                backups: flag(&args, "--backups").map(PathBuf::from),
-                require_backups: std::env::var("HEE4_REQUIRE_BACKUPS").as_deref() == Ok("1"),
+            let serve = match serve_args(
+                &args,
+                std::env::var_os("HEE4_REQUIRE_BACKUPS"),
+                std::env::var_os("HEE4_BUDGETS"),
+            ) {
+                Ok(serve) => serve,
+                Err(e) => return fail(&format!("serve: {e}")),
             };
             match hee4_app::serve(&serve, &dispatcher::Config::from_env()) {
                 Ok(()) => ExitCode::SUCCESS,
@@ -111,6 +104,80 @@ fn main() -> ExitCode {
         }
         _ => client(verb, &args, &sock),
     }
+}
+
+/// The flags `hee4 serve` takes, each once and each with one value.
+const SERVE_FLAGS: [&str; 5] = ["--socket", "--ledger", "--work", "--budgets", "--backups"];
+
+/// Why `hee4 serve`'s argv or environment was refused at the boundary (exit 2, nothing opened).
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+enum ServeFlagError {
+    /// A flag with no value: last on the line, or followed by another flag or an empty word.
+    #[error("{0} needs a value")]
+    MissingValue(&'static str),
+    /// A flag given twice: which one wins would be a guess.
+    #[error("{0} is given twice")]
+    Repeated(&'static str),
+    /// A word that is not one of [`SERVE_FLAGS`] where a flag was due.
+    #[error(
+        "{0:?} is not a serve flag (expected one of --socket, --ledger, --work, --budgets, --backups)"
+    )]
+    Unknown(String),
+    /// `--ledger` or `--work` is absent.
+    #[error("{0} is required")]
+    Required(&'static str),
+    /// `--backups` is relative: the unit's working directory would choose the root.
+    #[error("--backups must be an absolute path, not {0:?}")]
+    RelativeBackups(PathBuf),
+    /// `HEE4_REQUIRE_BACKUPS` is set to something other than `1` or `0`.
+    #[error("HEE4_REQUIRE_BACKUPS must be 1 or 0, not {0:?}")]
+    RequireBackups(std::ffi::OsString),
+}
+
+/// `hee4 serve`'s argv (`args[0]` is `serve`) and environment, parsed once: every word after
+/// the verb is a [`SERVE_FLAGS`] flag followed by its value, each flag at most once; `--ledger`
+/// and `--work` are required, `--socket` defaults to `$XDG_RUNTIME_DIR/hee4/control.sock`,
+/// `--backups` is absolute, `--budgets` else `HEE4_BUDGETS` names the budgets file, and
+/// `HEE4_REQUIRE_BACKUPS` is unset, `0` or `1`.
+fn serve_args(
+    args: &[String],
+    require_backups: Option<std::ffi::OsString>,
+    budgets_env: Option<std::ffi::OsString>,
+) -> Result<ServeArgs, ServeFlagError> {
+    let mut values: [Option<&String>; SERVE_FLAGS.len()] = [None; SERVE_FLAGS.len()];
+    let mut words = args.iter().skip(1);
+    while let Some(word) = words.next() {
+        let Some(i) = SERVE_FLAGS.iter().position(|f| f == word) else {
+            return Err(ServeFlagError::Unknown(word.clone()));
+        };
+        let name = SERVE_FLAGS[i];
+        let value = words
+            .next()
+            .filter(|v| !v.is_empty() && !v.starts_with("--"))
+            .ok_or(ServeFlagError::MissingValue(name))?;
+        if values[i].replace(value).is_some() {
+            return Err(ServeFlagError::Repeated(name));
+        }
+    }
+    let [socket, ledger, work, budgets, backups] = values.map(|v| v.map(PathBuf::from));
+    let require_backups = match require_backups {
+        None => false,
+        Some(v) if v == "1" => true,
+        Some(v) if v == "0" => false,
+        Some(v) => return Err(ServeFlagError::RequireBackups(v)),
+    };
+    if let Some(b) = backups.as_ref().filter(|b| !b.is_absolute()) {
+        return Err(ServeFlagError::RelativeBackups(b.clone()));
+    }
+    Ok(ServeArgs {
+        socket: socket.unwrap_or_else(default_socket),
+        ledger: ledger.ok_or(ServeFlagError::Required("--ledger"))?,
+        work: work.ok_or(ServeFlagError::Required("--work"))?,
+        // The one place a budgets path is named: the flag, else the unit's env.
+        budgets: budgets.or_else(|| budgets_env.map(PathBuf::from)),
+        backups,
+        require_backups,
+    })
 }
 
 /// `hee4 restore`'s default backup root (the unit's `--backups`).
@@ -311,5 +378,126 @@ fn client(verb: &str, args: &[String], sock: &std::path::Path) -> ExitCode {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ServeFlagError, serve_args};
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    fn argv(line: &str) -> Vec<String> {
+        line.split_whitespace().map(str::to_owned).collect()
+    }
+
+    fn parse(line: &str) -> Result<hee4_app::ServeArgs, ServeFlagError> {
+        serve_args(&argv(line), None, None)
+    }
+
+    const BASE: &str = "serve --socket /r/s --ledger /l --work /w";
+
+    #[test]
+    fn a_flag_without_its_value_is_refused_by_name() {
+        assert_eq!(
+            parse(&format!("{BASE} --budgets")).err(),
+            Some(ServeFlagError::MissingValue("--budgets"))
+        );
+        assert_eq!(
+            parse(&format!("{BASE} --budgets --backups /b")).err(),
+            Some(ServeFlagError::MissingValue("--budgets"))
+        );
+        assert_eq!(
+            serve_args(
+                &[argv(BASE), vec!["--backups".into(), String::new()]].concat(),
+                None,
+                None
+            )
+            .err(),
+            Some(ServeFlagError::MissingValue("--backups"))
+        );
+    }
+
+    #[test]
+    fn a_repeated_or_unknown_flag_is_refused_by_name() {
+        assert_eq!(
+            parse(&format!("{BASE} --budgets /a --budgets /b")).err(),
+            Some(ServeFlagError::Repeated("--budgets"))
+        );
+        assert_eq!(
+            parse(&format!("{BASE} --backup /b")).err(),
+            Some(ServeFlagError::Unknown("--backup".into()))
+        );
+        assert_eq!(
+            parse("serve --ledger /l").err(),
+            Some(ServeFlagError::Required("--work"))
+        );
+    }
+
+    #[test]
+    fn a_relative_backups_root_is_refused() {
+        assert_eq!(
+            parse(&format!("{BASE} --backups rel/path")).err(),
+            Some(ServeFlagError::RelativeBackups("rel/path".into()))
+        );
+    }
+
+    #[test]
+    fn require_backups_is_one_or_zero_or_unset() {
+        let with = |v: &str| serve_args(&argv(BASE), Some(OsString::from(v)), None);
+        assert_eq!(with("1").map(|a| a.require_backups), Ok(true));
+        assert_eq!(with("0").map(|a| a.require_backups), Ok(false));
+        assert_eq!(parse(BASE).map(|a| a.require_backups), Ok(false));
+        for bad in ["true", "yes", "", " 1"] {
+            assert_eq!(
+                with(bad).err(),
+                Some(ServeFlagError::RequireBackups(bad.into())),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn budgets_flag_wins_over_the_env() {
+        let env = Some(OsString::from("/env.json"));
+        let parsed = serve_args(&argv(BASE), None, env.clone()).map(|a| a.budgets);
+        assert_eq!(parsed, Ok(Some(PathBuf::from("/env.json"))));
+        let flagged = serve_args(&argv(&format!("{BASE} --budgets /f.json")), None, env);
+        assert_eq!(
+            flagged.map(|a| a.budgets),
+            Ok(Some(PathBuf::from("/f.json")))
+        );
+    }
+
+    /// The unit's exact `ExecStart` argv (systemd specifiers expanded) parses to its paths,
+    /// with `HEE4_REQUIRE_BACKUPS=1` as the unit sets it.
+    #[test]
+    fn the_unit_exec_start_parses() -> Result<(), String> {
+        let unit = include_str!("../../../systemd/hee4.service");
+        let exec = unit
+            .lines()
+            .find_map(|l| l.strip_prefix("ExecStart="))
+            .ok_or("no ExecStart")?
+            .replace("%h", "/home/u")
+            .replace("%t", "/run/user/1");
+        let words: Vec<String> = exec.split_whitespace().skip(1).map(str::to_owned).collect();
+        let parsed = serve_args(&words, Some("1".into()), None).map_err(|e| e.to_string())?;
+        assert_eq!(
+            parsed.socket,
+            PathBuf::from("/run/user/1/hee4/control.sock")
+        );
+        assert_eq!(
+            parsed.ledger,
+            PathBuf::from("/home/u/.local/share/hee4/ledger.sqlite3")
+        );
+        assert_eq!(parsed.work, PathBuf::from("/home/u/.local/share/hee4/work"));
+        assert!(
+            parsed
+                .backups
+                .as_deref()
+                .is_some_and(std::path::Path::is_absolute)
+        );
+        assert!(parsed.require_backups);
+        Ok(())
     }
 }

@@ -33,13 +33,9 @@ pub const GATE_TOML: &[u8] = include_bytes!("../../../gate.toml");
 
 /// Budget fields `serve` loads, validates and `health` echoes, but nothing in this binary reads
 /// yet: `health` lists them under `budgets_inert` so the reply never reports them as applied.
-/// `attempt.ctx_tokens`: the roster default lives in `actions/roster.rs`; `ledger.*`: K1's
-/// `Store::open` and `checkpoint_if_due` take no budget from the app yet.
-pub const INERT_BUDGETS: [&str; 3] = [
-    "attempt.ctx_tokens",
-    "ledger.busy_timeout_ms",
-    "ledger.checkpoint_every",
-];
+/// `attempt.ctx_tokens`: the roster default lives in `actions/roster.rs`;
+/// `ledger.busy_timeout_ms`: K1's `Store::open` takes no budget from the app yet.
+pub const INERT_BUDGETS: [&str; 2] = ["attempt.ctx_tokens", "ledger.busy_timeout_ms"];
 
 /// The first 12 digits of [`HEAD`].
 #[must_use]

@@ -30,9 +30,30 @@ fn brief(verify: &str) -> String {
     )
 }
 
+/// A running `hee4 serve`. Dropping it kills and reaps the child, so a test that returns early
+/// or panics never leaves a serve behind; a test killed outright is covered by
+/// [`serve_command`]'s parent-death signal.
 struct Server {
     child: Child,
     sock: PathBuf,
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        // Already reaped by the test, or already gone: both errors mean nothing is left to stop.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// `hee4` started through util-linux `setpriv --pdeathsig KILL`, which sets
+/// `PR_SET_PDEATHSIG=SIGKILL` and then execs `hee4` in place (same pid): when the test thread
+/// that spawned it dies (the harness killed, `timeout -s KILL`), the kernel kills the serve.
+/// `pre_exec` would need `unsafe`, which the workspace forbids.
+fn serve_command() -> Command {
+    let mut cmd = Command::new("setpriv");
+    cmd.args(["--pdeathsig", "KILL", "--", BIN]);
+    cmd
 }
 
 fn start(dir: &Path, log: &str) -> R<Server> {
@@ -42,7 +63,7 @@ fn start(dir: &Path, log: &str) -> R<Server> {
 /// `hee4 serve` over `dir` with `env` set (and `HEE4_BUDGETS` removed unless `env` names it).
 fn start_with(dir: &Path, log: &str, live: bool, env: &[(&str, &Path)]) -> R<Server> {
     let sock = dir.join("rt/control.sock");
-    let mut cmd = Command::new(BIN);
+    let mut cmd = serve_command();
     if live {
         cmd.env("HEE4_LIVE_MODEL", "1");
     } else {
@@ -626,7 +647,7 @@ fn a_budgets_refusal_names_the_field_and_serve_does_not_listen() -> R<()> {
     let file = dir.join("b.json");
     fs::write(&file, r#"{"door":{"max_body_bytes":0}}"#)?;
     for by_flag in [false, true] {
-        let mut cmd = Command::new(BIN);
+        let mut cmd = serve_command();
         cmd.env_remove("HEE4_BUDGETS")
             .args(["serve", "--socket"])
             .arg(dir.join("rt/control.sock"))
@@ -839,7 +860,9 @@ fn a_repair_that_never_passes_stops_after_max_generations() -> R<()> {
 ///
 /// `/dev/shm` is machine-global, so the root is unique per run (package, pid, nanosecond
 /// stamp): concurrent slices or cargo invocations never share, delete or `pkill -f` each
-/// other's directories. The guard removes the root when the test ends, pass or panic.
+/// other's directories. The guard removes the root when the test ends, pass or panic; a test
+/// binary killed outright (SIGKILL) runs no guard, so each new run first sweeps the roots of
+/// this package's dead runs ([`sweep_dead_runs`]).
 struct RunDir(PathBuf);
 
 impl Drop for RunDir {
@@ -848,7 +871,45 @@ impl Drop for RunDir {
     }
 }
 
+/// Remove each `<parent>/hee4-e2e-<package>-<pid>-<stamp>` directory whose `<pid>` has no
+/// `/proc` entry and whose owner is this process's uid: the leftovers of a killed run of this
+/// package. A live pid's directory, another package's, another user's, a symlink or a name
+/// that does not parse is never touched. Returns the directories removed.
+fn sweep_dead_runs(parent: &Path, package: &str) -> R<Vec<PathBuf>> {
+    use std::os::unix::fs::MetadataExt as _;
+    let uid = fs::metadata("/proc/self")?.uid();
+    let prefix = format!("hee4-e2e-{package}-");
+    let mut removed = Vec::new();
+    let Ok(entries) = fs::read_dir(parent) else {
+        return Ok(removed);
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(rest) = name.to_str().and_then(|n| n.strip_prefix(&prefix)) else {
+            continue;
+        };
+        let Some((pid, stamp)) = rest.split_once('-') else {
+            continue;
+        };
+        let digits = |t: &str| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit());
+        if !digits(pid) || !digits(stamp) || Path::new("/proc").join(pid).exists() {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_dir() && meta.uid() == uid && fs::remove_dir_all(&path).is_ok() {
+            removed.push(path);
+        }
+    }
+    Ok(removed)
+}
+
 fn fsync_cheap_dir(name: &str) -> R<(RunDir, PathBuf)> {
+    for gone in sweep_dead_runs(Path::new("/dev/shm"), env!("CARGO_PKG_NAME"))? {
+        println!("removed a dead run's directory: {}", gone.display());
+    }
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_nanos();
@@ -868,6 +929,41 @@ fn fsync_cheap_dir(name: &str) -> R<(RunDir, PathBuf)> {
     let dir = root.join(name);
     fs::create_dir_all(&dir)?;
     Ok((RunDir(root), dir))
+}
+
+/// A killed run's `/dev/shm` root is removed by the next run's fresh-directory helper; a live
+/// pid's root (this test's own pid) and another package's root are kept.
+#[test]
+fn the_fresh_dir_helper_removes_only_this_packages_dead_runs() -> R<()> {
+    let shm = Path::new("/dev/shm");
+    if !shm.is_dir() {
+        println!("UNMEASURED: no /dev/shm");
+        return Ok(());
+    }
+    // A pid that was ours and is now reaped: no `/proc` entry.
+    let mut child = Command::new("/usr/bin/true").spawn()?;
+    let dead = child.id();
+    child.wait()?;
+    if Path::new("/proc").join(dead.to_string()).exists() {
+        return Err(format!("pid {dead} was reused before the test could plant it").into());
+    }
+    let pkg = env!("CARGO_PKG_NAME");
+    let dead_run = shm.join(format!("hee4-e2e-{pkg}-{dead}-1"));
+    let live_run = shm.join(format!("hee4-e2e-{pkg}-{}-1", std::process::id()));
+    let other_run = shm.join(format!("hee4-e2e-other-{dead}-1"));
+    for d in [&dead_run, &live_run, &other_run] {
+        fs::create_dir_all(d.join("inner"))?;
+    }
+    let made = fsync_cheap_dir("sweep");
+    let kept = (live_run.is_dir(), other_run.is_dir());
+    let swept = !dead_run.exists();
+    for d in [&dead_run, &live_run, &other_run] {
+        let _ = fs::remove_dir_all(d);
+    }
+    drop(made?);
+    assert!(swept, "{} was left behind", dead_run.display());
+    assert_eq!(kept, (true, true), "a live or foreign run root was removed");
+    Ok(())
 }
 
 /// The server's `slow_consumer` log line: the reader dropped the subscriber, or the close frame
@@ -1298,7 +1394,7 @@ fn backup_root(dir: &Path, name: &str) -> R<(RunDir, PathBuf)> {
 /// `hee4 serve --backups backups` over `dir`, with `env` set; polls health like `start_with`.
 fn start_backed(dir: &Path, log: &str, backups: &Path, env: &[(&str, &str)]) -> R<Server> {
     let sock = dir.join("rt/control.sock");
-    let mut cmd = Command::new(BIN);
+    let mut cmd = serve_command();
     cmd.env_remove("HEE4_LIVE_MODEL")
         .env_remove("HEE4_BUDGETS")
         .env_remove("HEE4_REQUIRE_BACKUPS");
@@ -1405,7 +1501,8 @@ fn backup_at_start_then_restore_into_round_trip() -> R<()> {
     let (task, done) = run_task(&server.sock, "key-bk", FIXTURE)?;
     assert_eq!(done["body"]["phase"], "accepted", "{done}");
     let serve_log = fs::read_to_string(dir.join("serve.log"))?;
-    let skip = format!("dispatch task={task} ddf=skipped reason=no_worktree");
+    // The fixture writes nothing: the workspace is diffed (no `.git` needed) and is empty.
+    let skip = format!("dispatch task={task} ddf=skipped reason=no_diff");
     println!("serve.log has `{skip}`: {}", serve_log.contains(&skip));
     assert!(serve_log.contains(&skip), "{serve_log}");
     server.child.kill()?;
@@ -1447,7 +1544,7 @@ fn batch_backup_fires_before_the_ninth_dispatch_and_a_failed_backup_blocks_dispa
     let (_bk_run, bk) = backup_root(&dir, "batch")?;
     let mut server = start_backed(&dir, "serve.log", &bk, &[])?;
     let sock = server.sock.clone();
-    for i in 1..=8 {
+    for i in 1..=hee4_app::dispatcher::DC22_BATCH_TASKS {
         let (_, done) = run_task(&sock, &format!("key-batch-{i}"), FIXTURE)?;
         assert_eq!(done["body"]["phase"], "accepted", "{done}");
     }
@@ -1529,7 +1626,7 @@ fn batch_backup_fires_before_the_ninth_dispatch_and_a_failed_backup_blocks_dispa
 fn serve_without_backups_is_refused_by_name_when_required() -> R<()> {
     let (_run, dir) = fsync_cheap_dir("e2e-require")?;
     let sock = dir.join("rt/control.sock");
-    let mut child = Command::new(BIN)
+    let mut child = serve_command()
         .env("HEE4_REQUIRE_BACKUPS", "1")
         .args(["serve", "--socket"])
         .arg(&sock)
@@ -1805,5 +1902,185 @@ fn a_stale_claim_is_reported_by_name_at_serve_start() -> R<()> {
     assert_eq!(named.len(), 1, "{log}");
     assert!(named[0].contains(&line), "{log}");
     assert!(named[0].ends_with(" reason=generation_moved"), "{log}");
+    Ok(())
+}
+
+/// `ledger.checkpoint_every` is read: with it at 2, two accepted tasks (two receipts) write at
+/// least one `checkpoints` row (read-only SELECT), the dispatcher logs it, and `hee4
+/// verify-ledger` re-derives every root and passes.
+#[test]
+fn checkpoints_are_written_every_n_receipts() -> R<()> {
+    let (_run, dir) = fsync_cheap_dir("e2e-checkpoint")?;
+    let budgets = dir.join("budgets.json");
+    fs::write(&budgets, r#"{"ledger":{"checkpoint_every":2}}"#)?;
+    let mut server = start_with(&dir, "serve.log", false, &[("HEE4_BUDGETS", &budgets)])?;
+    for key in ["key-cp-1", "key-cp-2"] {
+        let (_, done) = run_task(&server.sock, key, FIXTURE)?;
+        assert_eq!(done["body"]["phase"], "accepted", "{done}");
+    }
+    server.child.kill()?;
+    server.child.wait()?;
+    let log = fs::read_to_string(dir.join("serve.log"))?;
+    let ledger = dir.join("ledger.sqlite3");
+    let conn =
+        rusqlite::Connection::open_with_flags(&ledger, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let rows: i64 = conn.query_row("SELECT count(*) FROM checkpoints", [], |r| r.get(0))?;
+    println!("MEASURED checkpoints={rows}");
+    assert!(rows >= 1, "no checkpoint row; {log}");
+    assert!(log.contains("dispatch checkpoint seq="), "{log}");
+    let out = Command::new(BIN)
+        .args(["verify-ledger", "--ledger"])
+        .arg(&ledger)
+        .output()?;
+    let stdout = String::from_utf8(out.stdout)?;
+    println!("{stdout}");
+    assert!(out.status.success(), "{stdout}");
+    assert!(stdout.trim_end().ends_with("verdict=PASS"), "{stdout}");
+    assert!(!stdout.contains(" checkpoints=0 "), "{stdout}");
+    Ok(())
+}
+
+/// `hee4 serve` with `extra` after the base argv over `dir` and `env` set: `(exit code,
+/// stderr)`. A serve still running after 5 s is killed and is an error (the refusal was due).
+fn serve_refusal(dir: &Path, extra: &[&str], env: &[(&str, &str)]) -> R<(Option<i32>, String)> {
+    let mut cmd = serve_command();
+    cmd.env_remove("HEE4_BUDGETS")
+        .env_remove("HEE4_REQUIRE_BACKUPS");
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let log = dir.join("refusal.log");
+    let mut child = cmd
+        .args(["serve", "--socket"])
+        .arg(dir.join("rt/control.sock"))
+        .arg("--ledger")
+        .arg(dir.join("ledger.sqlite3"))
+        .arg("--work")
+        .arg(dir.join("work"))
+        .args(extra)
+        .stdout(Stdio::null())
+        .stderr(fs::File::create(&log)?)
+        .spawn()?;
+    let t0 = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if t0.elapsed() > Duration::from_secs(5) {
+            child.kill()?;
+            child.wait()?;
+            return Err(format!("serve {extra:?} still running after 5 s").into());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    Ok((status.code(), fs::read_to_string(&log)?))
+}
+
+/// One refused serve: extra argv, extra env, and the text stderr must carry.
+type FlagCase<'a> = (&'a [&'a str], &'a [(&'a str, &'a str)], &'a str);
+
+/// Serve's flags and `HEE4_REQUIRE_BACKUPS` are parsed at the boundary: a flag with no value
+/// (last, or followed by a flag), a repeated flag, a relative `--backups` and a
+/// `HEE4_REQUIRE_BACKUPS` other than 1/0 each exit 2 naming the flag or variable, before the
+/// ledger is opened.
+#[test]
+fn serve_flags_are_refused_by_name_at_the_boundary() -> R<()> {
+    let (_run, dir) = fsync_cheap_dir("e2e-serve-flags")?;
+    let cases: &[FlagCase] = &[
+        (&["--budgets"], &[], "--budgets needs a value"),
+        (
+            &["--budgets", "--backups", "/x"],
+            &[],
+            "--budgets needs a value",
+        ),
+        (
+            &["--budgets", "/a.json", "--budgets", "/b.json"],
+            &[],
+            "--budgets is given twice",
+        ),
+        (
+            &["--backups", "rel/path"],
+            &[],
+            "--backups must be an absolute path",
+        ),
+        (
+            &[],
+            &[("HEE4_REQUIRE_BACKUPS", "true")],
+            "HEE4_REQUIRE_BACKUPS must be 1 or 0",
+        ),
+    ];
+    for &(extra, env, named) in cases {
+        let (code, stderr) = serve_refusal(&dir, extra, env)?;
+        println!(
+            "{extra:?} {env:?} -> exit={code:?} {}",
+            stderr.lines().next().unwrap_or("")
+        );
+        assert_eq!(code, Some(2), "{extra:?} {env:?}: {stderr}");
+        assert!(stderr.contains(named), "{extra:?} {env:?}: {stderr}");
+        assert!(
+            !dir.join("ledger.sqlite3").exists(),
+            "{extra:?}: refused before Store::open"
+        );
+    }
+    Ok(())
+}
+
+/// The unit's exact `ExecStart` argv, with `%h`/`%t` expanded under this run and its
+/// `--backups` value moved to a cross-device scratch root (never the live one), plus the unit's
+/// `HEE4_REQUIRE_BACKUPS=1`, still parses and serves.
+#[test]
+fn the_unit_exec_start_argv_serves() -> R<()> {
+    let (_run, dir) = fsync_cheap_dir("e2e-unit-argv")?;
+    let (_bk_run, bk) = backup_root(&dir, "unit-argv")?;
+    let unit = include_str!("../../../systemd/hee4.service");
+    let exec = unit
+        .lines()
+        .find_map(|l| l.strip_prefix("ExecStart="))
+        .ok_or("no ExecStart")?;
+    let home = dir.join("home");
+    let rt = dir.join("rt-unit");
+    let mut words: Vec<String> = exec
+        .split_whitespace()
+        .skip(1)
+        .map(|w| {
+            w.replace("%h", &home.to_string_lossy())
+                .replace("%t", &rt.to_string_lossy())
+        })
+        .collect();
+    let at = words
+        .iter()
+        .position(|w| w == "--backups")
+        .ok_or("the unit names no --backups")?;
+    *words.get_mut(at + 1).ok_or("--backups has no value")? = bk.to_string_lossy().into_owned();
+    fs::create_dir_all(home.join(".local/share/hee4"))?;
+    let child = serve_command()
+        .env_remove("HEE4_LIVE_MODEL")
+        .env_remove("HEE4_BUDGETS")
+        .env("HEE4_REQUIRE_BACKUPS", "1")
+        .args(&words)
+        .stdout(Stdio::null())
+        .stderr(fs::File::create(dir.join("serve.log"))?)
+        .spawn()?;
+    let mut server = Server {
+        child,
+        sock: rt.join("hee4/control.sock"),
+    };
+    let t0 = Instant::now();
+    let healthy = loop {
+        if let Ok(v) = call(&server.sock, "health", None, json!({}))
+            && v["body"]["ok"] == true
+        {
+            break true;
+        }
+        if t0.elapsed() > Duration::from_secs(20) || server.child.try_wait()?.is_some() {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    server.child.kill()?;
+    server.child.wait()?;
+    let log = fs::read_to_string(dir.join("serve.log"))?;
+    println!("argv {words:?}");
+    assert!(healthy, "{log}");
     Ok(())
 }
