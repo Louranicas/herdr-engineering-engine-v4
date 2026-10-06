@@ -19,11 +19,13 @@ Every `--version` and `health` read-back runs the unit's own binary (ExecStart a
 --control: a disposable HOME under ~/.cache/hee4-host (never /tmp) with stub systemctl/loginctl/
 hee4 on PATH, a real AF_UNIX listener held by a fake MainPID, a fake /api/ps, a synthetic ledger,
 a stub drive and a rehearsal record; one fault planted per row, each asserted by its row's own
-diagnostic text. Prints `check-deployed control cases=k/9 verdict=PASS|FAIL`. The control's
-children die with it (PR_SET_PDEATHSIG) and a control start sweeps cd-control-* dirs whose pid is dead.
---control-skip D<n> (test only) removes that one plant: the control must then print cases=8/9.
+diagnostic text; case D5h reruns the rows against a second backup dir whose newest manifest sits at 90%
+of its bound (D5 must fail on headroom). Prints `check-deployed control cases=k/10 verdict=PASS|FAIL`
+(one case per PLANTS entry). The control's children die with it (PR_SET_PDEATHSIG) and a control
+start sweeps cd-control-* dirs whose pid is dead.
+--control-skip <case> (test only) removes that one plant: the control must then print cases=9/10.
 """
-import argparse, ctypes, hashlib, importlib.machinery, importlib.util, http.server, json, os, shlex, shutil, signal, socket, sqlite3, stat, subprocess, sys, tempfile, threading, time, uuid
+import argparse, ctypes, fractions, hashlib, importlib.machinery, importlib.util, http.server, json, math, os, shlex, shutil, signal, socket, sqlite3, stat, subprocess, sys, tempfile, threading, time, uuid
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
@@ -421,11 +423,34 @@ def d4(a, ctx):
     return r
 
 
+def count_field(v):
+    """A manifest count: a non-negative int (a bool is not one); None otherwise."""
+    return v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else None
+
+
 def manifest_objects(m):
     """(objects_n, objects_bound) from a ledger backup manifest (hee4-core backup.rs writes both); None where absent."""
-    n, bound = m.get("objects_n"), m.get("objects_bound")
-    ok = lambda v: isinstance(v, int) and not isinstance(v, bool) and v >= 0
-    return (n if ok(n) else None), (bound if ok(bound) else None)
+    return count_field(m.get("objects_n")), count_field(m.get("objects_bound"))
+
+
+# D5 fails at 80% of a backup bound, not at 100%: past the bound backup_to refuses, `hee4 serve` refuses
+# at start (crates/hee4-app/FLOW.md, DC-22) and every restart leaves the unit down. The 20% left is the
+# operator's warning time (about 200 tasks at objects_bound=1024, one brief per task). Exact: a Fraction.
+HEADROOM = fractions.Fraction(4, 5)
+
+
+def headroom(n, bound):
+    """floor(HEADROOM * bound) - n: how many more objects (or bytes) fit before D5 fails; negative is over."""
+    return math.floor(HEADROOM * bound) - n
+
+
+def manifest_bytes(m):
+    """("absent", None, None) when the manifest has neither bytes_n nor bytes_bound (written before the bytes
+    bound); ("present", n, bound) when both are counts; ("unreadable", None, None) otherwise (one key, or not a count)."""
+    if "bytes_n" not in m and "bytes_bound" not in m:
+        return "absent", None, None
+    n, bound = count_field(m.get("bytes_n")), count_field(m.get("bytes_bound"))
+    return ("present", n, bound) if n is not None and bound is not None else ("unreadable", None, None)
 
 
 def habitat_tool():
@@ -472,6 +497,19 @@ def d5(a, ctx):
             n, bound = manifest_objects(m)
             r.check("objects", "absent" if n is None else n, n is not None and bound is not None and n <= bound)
             r.val("objects_bound", "absent" if bound is None else bound)
+            if n is not None and bound is not None:
+                h = headroom(n, bound)
+                r.check("headroom_objects", h, h >= 0)
+            state, bn, bbound = manifest_bytes(m)
+            if state == "absent":
+                r.val("bytes", "absent")
+            elif state == "unreadable":
+                r.check("bytes", "unreadable", False)
+            else:
+                r.check("bytes", bn, bn <= bbound)
+                r.val("bytes_bound", bbound)
+                h = headroom(bn, bbound)
+                r.check("headroom_bytes", h, h >= 0)
             r.val("age_s", int(time.time() - os.stat(mp).st_mtime))
         except (OSError, ValueError) as e:
             r.check("manifest", f"unparseable({e})", False)
@@ -672,6 +710,7 @@ PLANTS = {  # row -> (what is planted, the diagnostic text its row must carry)
     "D3": ("the listener is held by another pid, not MainPID", "in_mainpid_fds=no"),
     "D4": ("ledger user_version is one below health schema_version", "schema=mismatch"),
     "D5": ("a backup dir with no manifest", "manifest=absent"),
+    "D5h": ("the newest manifest at 90% of objects_bound (922/1024), bytes at 50%", "headroom_objects=-103"),
     "D6": ("the accepted task has no model-door observation", "accepted_with_model_door=0"),
     "D7": ("rehearsal record with acked_present 2/3", "acked_present=2/3"),
     "D8": ("a drive feature line UNMEASURED with neither scope= nor reason=", "unexplained=1"),
@@ -749,9 +788,9 @@ def write(path, body, mode=0o644):
 
 def control(a):
     skip = set(a.control_skip or [])
-    bad = skip - set(ROWS)
+    bad = skip - set(PLANTS)
     if bad:
-        print(f"check-deployed control refused: --control-skip {','.join(sorted(bad))} is not one of {','.join(ROWS)}")
+        print(f"check-deployed control refused: --control-skip {','.join(sorted(bad))} is not one of {','.join(PLANTS)}")
         sys.exit(2)
     planted = lambda n: n not in skip
     # HEE4_CONTROL_ROOT lets a test own its root: two controls sharing ~/.cache/hee4-host sweep each
@@ -923,16 +962,26 @@ esac
         env = dict(os.environ)
         env.update({"HOME": ctl, "PATH": bindir + ":" + os.environ.get("PATH", ""), "HEE4_HEAD": head40, "USER": os.environ.get("USER", "ctl")})
         env.pop("HEE4_MODEL", None)
-        rc, out, err = sh(sys.executable, os.path.abspath(__file__), "--unit", unit, "--repo", repo, "--proc", proc,
-                          "--backups", backups, "--drive-cmd", drive_stub, "--model-url", f"http://127.0.0.1:{httpd.server_port}",
-                          "--evidence-root", ev_root, "--drill-root", drill_root, env=env, timeout=120)
+        run_world = lambda bdir: sh(sys.executable, os.path.abspath(__file__), "--unit", unit, "--repo", repo, "--proc", proc,
+                                    "--backups", bdir, "--drive-cmd", drive_stub, "--model-url", f"http://127.0.0.1:{httpd.server_port}",
+                                    "--evidence-root", ev_root, "--drill-root", drill_root, env=env, timeout=120)
+        rc, out, err = run_world(backups)
+        # case D5h: the same world against a second backup dir whose newest manifest is near its bound
+        # (planted: 922/1024 objects, over the 80% headroom; skipped: 512/1024); bytes sit at 50% either way
+        near = os.path.join(ctl, "backups-near")
+        write(os.path.join(near, "b-0002", "manifest.json"), json.dumps(
+            {"id": "b-0002", "objects_n": 922 if planted("D5h") else 512, "objects_bound": 1024,
+             "bytes_n": 1 << 29, "bytes_bound": 1 << 30, "files": {}}))
+        _, out_near, _ = run_world(near)
         httpd.shutdown()
-        rows = {l.split(" ", 1)[0]: l for l in out.splitlines() if l.split(" ", 1)[0] in ROWS}
+        parse_rows = lambda text: {l.split(" ", 1)[0]: l for l in text.splitlines() if l.split(" ", 1)[0] in ROWS}
+        rows = parse_rows(out)
+        rows["D5h"] = parse_rows(out_near).get("D5", "")
         print(f"control home={ctl} rows_rc={rc} control_ledger=synthetic swept_dead_controls={swept}")
         if err:
             print(f"control stderr={err.splitlines()[-1]}")
         met = 0
-        for n in ROWS:
+        for n in PLANTS:
             line = rows.get(n, "")
             what, diag = PLANTS[n]
             if n in skip:
@@ -944,8 +993,8 @@ esac
                 hit = kv.get("binary", "") != kv.get("head", "?") and kv.get("binary", "") not in ("", "mismatch")
             met += hit
             print(f"control {n} plant={what!r} detected={'yes' if hit else 'no'} line={line or 'MISSING'}")
-        v = "PASS" if met == len(ROWS) else "FAIL"
-        print(f"check-deployed control cases={met}/{len(ROWS)} verdict={v}")
+        v = "PASS" if met == len(PLANTS) else "FAIL"
+        print(f"check-deployed control cases={met}/{len(PLANTS)} verdict={v}")
         sys.exit(0 if v == "PASS" else 1)
     finally:
         for p in procs:
@@ -970,7 +1019,7 @@ def main():
     ap.add_argument("--drive-cmd", default=f"{HERE}/drive --doctor-first --allow-restart")
     ap.add_argument("--proc", default="/proc", help="the proc root (the control points it at a fake)")
     ap.add_argument("--control", action="store_true")
-    ap.add_argument("--control-skip", action="append", metavar="D<n>", help="test only: remove one plant")
+    ap.add_argument("--control-skip", action="append", metavar="CASE", help="test only: remove one plant")
     a = ap.parse_args()
     if a.control:
         control(a)

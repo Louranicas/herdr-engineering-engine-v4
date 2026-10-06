@@ -3,6 +3,7 @@ from common import TOOLS, run
 
 CD = os.path.join(TOOLS, "check-deployed")
 ROWS = [f"D{n}" for n in range(1, 10)]
+CASES = ROWS + ["D5h"]  # the control's cases: one plant per row, plus D5's headroom plant
 
 # A `systemctl --user show -p ExecStart hee4.service` line saved from the live host (2026-10-05), the owner's home rewritten to /home/op.
 LIVE_EXECSTART = ("{ path=/home/op/.local/bin/hee4 ; argv[]=/home/op/.local/bin/hee4 serve "
@@ -46,11 +47,13 @@ class CheckDeployedTests(unittest.TestCase):
     def test_quiet_control_every_plant_detected(self):
         rc, out, err = run(CD, "--control", timeout=180, env={"HEE4_CONTROL_ROOT": control_root(self)})
         self.assertEqual(rc, 0, out + err)
-        self.assertEqual(out.strip().splitlines()[-1], "check-deployed control cases=9/9 verdict=PASS")
-        for n in ROWS:
+        self.assertEqual(set(load().PLANTS), set(CASES))
+        self.assertEqual(out.strip().splitlines()[-1], f"check-deployed control cases={len(CASES)}/{len(CASES)} verdict=PASS")
+        for n in CASES:
             self.assertEqual(len(row(out, "control " + n)), 1, n)
             self.assertIn("detected=yes", row(out, "control " + n)[0])
         self.assertIn("control_ledger=synthetic", out)
+        self.assertIn("headroom_objects=-103", row(out, "control D5h")[0]); self.assertTrue(row(out, "control D5h")[0].endswith(" FAIL"))
         self.assertIn("in_mainpid_fds=no", row(out, "control D3")[0]); self.assertIn("held_by=", row(out, "control D3")[0])
         d1 = dict(t.split("=", 1) for t in row(out, "control D1")[0].split() if "=" in t)  # the PATH stub says the tree; D1 asked the unit's binary
         self.assertNotEqual(d1["binary"], d1["head"]); self.assertIn("exe_head", d1); self.assertNotEqual(d1["exe_head"], d1["binary"])
@@ -91,13 +94,15 @@ class CheckDeployedTests(unittest.TestCase):
 
     def test_fire_control_skip_removes_exactly_one_case(self):
         env = {"HEE4_CONTROL_ROOT": control_root(self)}
-        for n in ROWS:
+        for n in CASES:
             rc, out, err = run(CD, "--control", "--control-skip", n, timeout=180, env=env)
             self.assertEqual(rc, 1, n + out + err)
-            self.assertEqual(out.strip().splitlines()[-1], "check-deployed control cases=8/9 verdict=FAIL", n)
+            self.assertEqual(out.strip().splitlines()[-1], f"check-deployed control cases={len(CASES) - 1}/{len(CASES)} verdict=FAIL", n)
             line = row(out, "control " + n)[0]
             self.assertIn("plant=skipped", line)
-            if n == "D5":
+            if n == "D5h":  # 512/1024 is inside the headroom; the row still fails on the control world's absent habitat run
+                self.assertIn("objects=512 objects_bound=1024 headroom_objects=307 ", line); self.assertNotIn("headroom_objects=-", line)
+            elif n == "D5":
                 self.assertIn("UNMEASURED(no backup dir at", line); self.assertTrue(line.endswith(" UNMEASURED"), line)
             else:
                 self.assertTrue(line.endswith(" PASS"), line)
@@ -173,7 +178,7 @@ class CheckDeployedTests(unittest.TestCase):
     INV = "0123456789abcdef0123456789abcdef"
 
     def _d5(self, enabled, verdict_line, status="0", result="success", exit_ts="Mon 2026-10-05 03:15:09 AEDT",
-            unit_inv=INV, log_text=None):
+            unit_inv=INV, log_text=None, manifest=None):
         """d5() against a fixture world: a ledger backup on another device than HOME, a stubbed systemctl
         (is-enabled answers `enabled`; show answers Result, ExecMainStatus, ExecMainExitTimestamp, InvocationID),
         a stub restore, and the habitat tool's log (one run block of the unit's invocation, unless log_text)."""
@@ -186,7 +191,7 @@ class CheckDeployedTests(unittest.TestCase):
         bid = self.LEDGER_MANIFEST["id"]
         os.makedirs(os.path.join(other, bid))
         with open(os.path.join(other, bid, "manifest.json"), "w") as f:
-            json.dump(self.LEDGER_MANIFEST, f)
+            json.dump(manifest or self.LEDGER_MANIFEST, f)
         with open(os.path.join(other, "restore.log"), "w") as f:
             f.write(f"restore backup={bid} ledger=e9580e780f40 objects=120/120 rto_s=0.075 verdict=PASS\n")
         bindir = os.path.join(home, "bin"); os.makedirs(bindir)
@@ -258,6 +263,42 @@ esac
         self.assertEqual(kv["habitat_agree"], "no(verdict=PASS,status=30)"); self.assertTrue(line.endswith(" FAIL"), line)
         line, kv = self._d5(True, self.PASS_LINE.replace("PASS", "FAIL"), status="0")  # an rc that reads FAIL as success
         self.assertEqual(kv["habitat_agree"], "no(verdict=FAIL,status=0)"); self.assertTrue(line.endswith(" FAIL"), line)
+
+    def test_d5_headroom_is_exact_at_eighty_percent(self):
+        m = load()
+        self.assertEqual((m.headroom(819, 1024), m.headroom(820, 1024), m.headroom(0, 5), m.headroom(5, 5)), (0, -1, 4, -1))
+        self.assertEqual(m.manifest_bytes(self.LEDGER_MANIFEST), ("absent", None, None))
+        self.assertEqual(m.manifest_bytes({"bytes_n": 3, "bytes_bound": 10}), ("present", 3, 10))
+        self.assertEqual(m.manifest_bytes({"bytes_n": 3}), ("unreadable", None, None))
+        self.assertEqual(m.manifest_bytes({"bytes_n": True, "bytes_bound": 10}), ("unreadable", None, None))
+
+    def test_d5_objects_at_81_percent_fails_naming_headroom(self):
+        line, kv = self._d5(True, self.PASS_LINE, manifest={**self.LEDGER_MANIFEST, "objects_n": 830})  # 830/1024 = 81%
+        self.assertEqual((kv["objects"], kv["objects_bound"], kv["headroom_objects"]), ("830", "1024", "-11"))
+        self.assertEqual((kv["habitat_verdict"], kv["habitat_agree"], kv["timer"]), ("PASS", "yes", "enabled"))  # only headroom is red
+        self.assertTrue(line.endswith(" FAIL"), line)
+
+    def test_d5_objects_at_79_percent_passes_with_headroom_printed(self):
+        line, kv = self._d5(True, self.PASS_LINE, manifest={**self.LEDGER_MANIFEST, "objects_n": 809})  # 809/1024 = 79%
+        self.assertEqual((kv["objects"], kv["headroom_objects"], kv["bytes"]), ("809", "10", "absent"))
+        self.assertTrue(line.endswith(" PASS"), line)
+
+    def test_d5_bytes_at_81_percent_fails_naming_headroom(self):
+        man = {**self.LEDGER_MANIFEST, "bytes_n": 810, "bytes_bound": 1000}
+        line, kv = self._d5(True, self.PASS_LINE, manifest=man)
+        self.assertEqual((kv["headroom_objects"], kv["bytes"], kv["bytes_bound"], kv["headroom_bytes"]), ("699", "810", "1000", "-10"))
+        self.assertTrue(line.endswith(" FAIL"), line)
+        line, kv = self._d5(True, self.PASS_LINE, manifest={**man, "bytes_n": 790})  # 79%: green
+        self.assertEqual(kv["headroom_bytes"], "10"); self.assertTrue(line.endswith(" PASS"), line)
+
+    def test_d5_manifest_without_bytes_passes_on_objects_alone(self):
+        line, kv = self._d5(True, self.PASS_LINE)  # the live manifest shape: objects_n/objects_bound, no bytes fields
+        self.assertEqual((kv["objects"], kv["headroom_objects"], kv["bytes"]), ("120", "699", "absent"))
+        self.assertNotIn("headroom_bytes", kv); self.assertTrue(line.endswith(" PASS"), line)
+
+    def test_d5_half_written_bytes_fields_fail(self):
+        line, kv = self._d5(True, self.PASS_LINE, manifest={**self.LEDGER_MANIFEST, "bytes_n": 10})
+        self.assertEqual(kv["bytes"], "unreadable"); self.assertTrue(line.endswith(" FAIL"), line)
 
     def test_no_declaration_is_parsed(self):
         src = open(CD).read()
