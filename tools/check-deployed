@@ -546,7 +546,7 @@ def d5(a, ctx):
         root = os.path.expanduser("~/.cache/hee4-host")
         os.makedirs(root, exist_ok=True)
         into = tempfile.mkdtemp(prefix="cd-restore-", dir=root)
-        rc, out, err = sh(ctx["bin"] or "hee4-absent", "restore", "--into", into, newest, timeout=600)
+        rc, out, err = sh(ctx["bin"] or "hee4-absent", "restore", "--backups", b, "--into", into, newest, timeout=600)  # the root D5 read, never the default live one
         shutil.rmtree(into, ignore_errors=True)
         if rc == 2 and "unknown verb" in err:
             r.unm("restore", "restore verb absent")

@@ -231,7 +231,8 @@ class CheckDeployedTests(unittest.TestCase):
   *) exit 1 ;;
 esac
 """)
-        script("hee4", f'[ "$1" = restore ] && echo "restore backup={bid} ledger=e9580e780f40 objects=120/120 rto_s=0.01 verdict=PASS"\n')
+        script("hee4", f'printf "%s\\n" "$@" > {home}/restore.argv\n[ "$1" = restore ] && echo "restore backup={bid} ledger=e9580e780f40 objects=120/120 rto_s=0.01 verdict=PASS"\n')
+        self.d5_argv = os.path.join(home, "restore.argv")
         log = os.path.join(home, "habitat-backup.log")
         if log_text is None and verdict_line is not None:
             log_text = f"habitat-backup run ts=2026-10-05T03:15:00Z invocation={self.INV} child_rc=0 exit=0\n{verdict_line}\n"
@@ -246,6 +247,17 @@ esac
             if "=" in t:
                 kv.setdefault(*t.split("=", 1))
         return r.line(), kv
+
+    def test_d5_restores_from_the_root_it_read_the_manifest_from(self):
+        """D5 restores through `--backups <the root it read>`: without it, hee4 restore falls back to the
+        live default root and appends to its restore.log (wave U-harden-06 refuter, MEASURED)."""
+        line, _kv = self._d5(True, self.PASS_LINE)
+        with open(self.d5_argv) as f:
+            argv = f.read().split("\n")
+        self.assertIn("--backups", argv, line)
+        root = argv[argv.index("--backups") + 1]
+        self.assertTrue(root.startswith(tempfile.gettempdir()) or "cd-d5-backups-" in root, root)
+        self.assertNotEqual(root, "/mnt/storage-10tb/hee4-backups")
 
     PASS_LINE = "habitat-backup verdict=PASS objects=208 bytes=1 backup=h-20261005T031500-000000Z dest=/d keep=14 pruned=0"
 
